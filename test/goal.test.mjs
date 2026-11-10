@@ -380,6 +380,87 @@ test("interrupting the kickoff run preserves the durable Goal", async () => {
 	}
 });
 
+test("two /goal commands issued while Pi is busy create exactly one Goal", async () => {
+	const session = await PiRpcSession.start();
+	// Step 0 hangs the ordinary run; step 1 answers the winner's kickoff.
+	script([{ hang: true }, { text: "Kickoff done." }], session);
+	try {
+		// Start an ordinary run that never settles.
+		const started = await session.prompt("start something slow");
+		assert.equal(started.data.disposition, "started");
+		// Wait until the hanging request is provably in flight: the scripted
+		// provider has emitted the assistant message_start of the stuck stream.
+		// This pins which run consumes the hang step and guarantees the abort
+		// below has an active run to abort.
+		await session.waitFor(
+			"hanging run streaming",
+			(records) =>
+				records.some((r) => r.type === "message_start" && r.message?.role === "assistant") ? true : undefined,
+		);
+
+		// Two /goal commands while busy: both handlers must wait for idle and
+		// then serialize — the second has to refuse, not replace the first.
+		session.writeCommand({ id: "goal-1", type: "prompt", message: "/goal First concurrent objective" });
+		session.writeCommand({ id: "goal-2", type: "prompt", message: "/goal Second concurrent objective" });
+
+		// Abort the hanging run: idle returns, both queued creations run.
+		session.writeCommand({ id: "abort-1", type: "abort" });
+
+		// Exactly one creation succeeds and exactly one refusal warns.
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await session.waitForNotify((r) => r.message.includes("already set"));
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.message?.includes("created and activated")).length,
+			1,
+			"exactly one Goal was created",
+		);
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.message?.includes("already set")).length,
+			1,
+			"exactly one command was refused as a replacement",
+		);
+
+		// No kickoff delivery was rejected (the original defect surfaced as an
+		// extension error from the loser's sendUserMessage while streaming).
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+
+		// Both command handlers completed.
+		const first = await session.waitFor(
+			"goal-1 response",
+			(records) => records.find((r) => r.type === "response" && r.id === "goal-1"),
+		);
+		const second = await session.waitFor(
+			"goal-2 response",
+			(records) => records.find((r) => r.type === "response" && r.id === "goal-2"),
+		);
+		assert.equal(first.data.disposition, "handled");
+		assert.equal(second.data.disposition, "handled");
+
+		// The kickoff run finished and the session settled.
+		await session.waitForSettled(2); // aborted hanging run + kickoff
+
+		// Exactly one Goal snapshot was persisted: the first command's.
+		const entries = readSessionEntries(await session.sessionFile());
+		const goalStates = entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
+		assert.equal(goalStates.length, 1, "only one goal-state entry was persisted");
+		assert.equal(lastGoalSnapshot(entries).data.goal.objective, "First concurrent objective");
+
+		// The loser's objective never became visible anywhere.
+		assert.ok(
+			!session.records.some(
+				(r) => r.type === "extension_ui_request" && r.message?.includes("Second concurrent objective"),
+			),
+		);
+		await session.prompt("/goal");
+		const status = await session.waitForNotify(
+			(r) => r.message.includes("First concurrent objective") && r.message.includes("active"),
+		);
+		assert.ok(status);
+	} finally {
+		await session.stop();
+	}
+});
+
 test("objectives that merely begin with a reserved subcommand word are accepted", async () => {
 	const session = await PiRpcSession.start();
 	script([{ text: "On it." }], session);

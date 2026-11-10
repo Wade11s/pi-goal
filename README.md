@@ -87,6 +87,9 @@ objective is absent or truncated in context.
 - Interrupting the kickoff (Ctrl+C, killing the process, a hung model) does not
   lose the Goal: the snapshot and kickoff are already on disk and are restored
   by the next session.
+- Concurrent `/goal` commands (for example two issued while Pi is busy with a
+  run) are serialized: exactly one Goal is created and the losing command is
+  refused with the already-set warning — a silent replacement cannot happen.
 - Ephemeral sessions (started with `--no-session`) cannot persist a Goal:
   creating one returns a clear error instead of claiming durable storage.
 - Sessions without a Goal behave exactly as before; installing the extension

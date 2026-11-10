@@ -45,6 +45,21 @@ const DURABILITY_POLL_MS = 15;
 export default function goalExtension(pi: ExtensionAPI): void {
 	const store = new GoalStore();
 
+	/**
+	 * Serializes Goal creation across concurrent /goal commands. Commands that
+	 * arrive while Pi is busy both wait for idle; without serialization both
+	 * could pass the existing-Goal check before either persists, and the second
+	 * would silently replace the first. Every create runs its guards, write,
+	 * kickoff, and durability confirmation exclusively, so a losing command
+	 * always sees the winner's committed Goal and refuses.
+	 */
+	let createLock: Promise<void> = Promise.resolve();
+	function runExclusive(fn: () => Promise<void>): Promise<void> {
+		const run = createLock.then(fn, fn);
+		createLock = run.catch(() => {});
+		return run;
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		store.reconstruct(ctx);
 		const goal = store.get();
@@ -129,41 +144,67 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					return;
 				}
 
-				// sendUserMessage needs an idle agent; wait for any active run to settle.
-				await ctx.waitForIdle();
+				// Serialized creation: concurrent /goal commands (for example two
+				// sent while Pi is busy) each wait for idle and then run
+				// exclusively; the authoritative existing-Goal check happens
+				// inside the lock, so the second command always sees the first's
+				// committed Goal and refuses instead of silently replacing it.
+				await runExclusive(async () => {
+					// sendUserMessage needs an idle agent; wait for any active run
+					// to settle (abort also settles a stuck run).
+					await ctx.waitForIdle();
 
-				const goal = store.create(validation.objective);
-				try {
-					// Stage the snapshot first: a write failure here abandons creation
-					// with no visible state change and the attempt can be retried.
-					store.stage(pi, goal);
-					// Make the Goal visible to get_goal for the kickoff run that starts now.
-					store.commit(goal);
-				} catch (error) {
-					notifyWriteFailure(ctx, error);
-					return;
-				}
+					// Authoritative recheck: a concurrent command may have
+					// committed a Goal while this handler was waiting above.
+					if (store.hasGoal()) {
+						ctx.ui.notify(
+							"A Goal is already set for this session. Use bare /goal to inspect it. " +
+								"Replacing or editing the objective arrives in a later pi-goal milestone.",
+							"warning",
+						);
+						return;
+					}
 
-				// Start initial work. The kickoff is a user message: it carries the
-				// objective into model context as user-provided Goal data and, as the
-				// session's first conversation entry, makes Pi flush the session file
-				// with the staged snapshot.
-				pi.sendUserMessage(formatKickoffMessage(goal));
+					const goal = store.create(validation.objective);
+					try {
+						// Stage the snapshot first: a write failure here abandons
+						// creation with no visible state change and the attempt
+						// can be retried.
+						store.stage(pi, goal);
+						// Make the Goal visible to get_goal for the kickoff run
+						// that starts now.
+						store.commit(goal);
+						// Start initial work. The kickoff is a user message: it
+						// carries the objective into model context as
+						// user-provided Goal data and, as the session's first
+						// conversation entry, makes Pi flush the session file
+						// with the staged snapshot.
+						pi.sendUserMessage(formatKickoffMessage(goal));
+					} catch (error) {
+						// Nothing durable was confirmed: retract the committed
+						// Goal so no phantom state survives a failed stage or
+						// kickoff delivery.
+						store.rollback(pi);
+						notifyWriteFailure(ctx, error);
+						return;
+					}
 
-				// Confirm durability before announcing success. If the snapshot never
-				// reaches disk (unwritable storage, interrupted flush), retract the
-				// Goal with a tombstone and report a retryable persistence error.
-				const durable = await waitForDurability(ctx, goal.id);
-				if (!durable) {
-					store.rollback(pi);
-					notifyWriteFailure(
-						ctx,
-						new Error("the Goal snapshot did not reach the session file in time"),
-					);
-					return;
-				}
+					// Confirm durability before announcing success. If the
+					// snapshot never reaches disk (unwritable storage,
+					// interrupted flush), retract the Goal with a tombstone and
+					// report a retryable persistence error.
+					const durable = await waitForDurability(ctx, goal.id);
+					if (!durable) {
+						store.rollback(pi);
+						notifyWriteFailure(
+							ctx,
+							new Error("the Goal snapshot did not reach the session file in time"),
+						);
+						return;
+					}
 
-				ctx.ui.notify(`Goal ${goal.id} created and activated. Initial work started.`, "info");
+					ctx.ui.notify(`Goal ${goal.id} created and activated. Initial work started.`, "info");
+				});
 			} catch (error) {
 				ctx.ui.notify(`pi-goal error: ${error instanceof Error ? error.message : String(error)}`, "error");
 			}
