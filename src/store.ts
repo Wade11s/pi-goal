@@ -19,6 +19,7 @@ import {
 	CUSTOM_ENTRY_TYPE,
 	type GoalRecord,
 	type GoalSnapshot,
+	type GoalOrigin,
 	MAX_OBJECTIVE_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 } from "./goal.ts";
@@ -27,6 +28,17 @@ function goalId(): string {
 	// 8 hex chars from a UUID; stable across continuation, compaction, and restore.
 	return `goal_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
 }
+
+/**
+ * Outcome of completing the current Goal. Distinguishes "there was nothing to
+ * complete" from "the completion could not be made durable", because the second
+ * leaves the Goal active and must be reported as a persistence failure rather
+ * than as a lifecycle refusal.
+ */
+export type CompleteGoalResult =
+	| { ok: true; goal: GoalRecord }
+	| { ok: false; reason: "not-active" }
+	| { ok: false; reason: "persistence"; error: unknown };
 
 export class GoalStore {
 	/** undefined = not reconstructed yet; null = no Goal (or tombstone); record = present. */
@@ -120,17 +132,20 @@ export class GoalStore {
 
 	/**
 	 * Mark the current active Goal complete. Increments revision and updates
-	 * timestamp. Returns the updated record, or null when there is no active
-	 * Goal to complete. Stages the snapshot durably through the supplied Pi API.
+	 * timestamp, and stages the snapshot durably through the supplied Pi API.
 	 *
 	 * Only an active Goal can be completed, so a second call (for example two
 	 * update_goal calls in one assistant turn) is refused instead of appending a
 	 * duplicate snapshot. Completion is terminal for this Goal identity: the
 	 * continuation seam never restarts a complete Goal.
+	 *
+	 * A write failure is reported as `persistence` and leaves the in-memory Goal
+	 * untouched and still active, so a retry is possible and no phantom complete
+	 * state is claimed.
 	 */
-	markComplete(pi: ExtensionAPI): GoalRecord | null {
+	markComplete(pi: ExtensionAPI): CompleteGoalResult {
 		const current = this.current;
-		if (!current || current.status !== "active") return null;
+		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
 		const updated: GoalRecord = {
 			...current,
 			status: "complete",
@@ -139,11 +154,11 @@ export class GoalStore {
 		};
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
-		} catch {
-			return null;
+		} catch (error) {
+			return { ok: false, reason: "persistence", error };
 		}
 		this.current = updated;
-		return updated;
+		return { ok: true, goal: updated };
 	}
 
 	/**
@@ -161,12 +176,13 @@ export class GoalStore {
 	}
 
 	/** Build a new active Goal record (revision 0). Pure: no state is changed. */
-	create(objective: string): GoalRecord {
+	create(objective: string, origin: GoalOrigin = "command"): GoalRecord {
 		const now = Date.now();
 		return {
 			id: goalId(),
 			objective,
 			status: "active",
+			origin,
 			createdAt: now,
 			updatedAt: now,
 			revision: 0,
@@ -191,6 +207,13 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 	if (value === null) return true; // tombstone
 	if (typeof value !== "object" || value === null) return false;
 	const record = value as Record<string, unknown>;
+	if (
+		record.origin !== undefined &&
+		record.origin !== "command" &&
+		record.origin !== "tool"
+	) {
+		return false;
+	}
 	return (
 		typeof record.id === "string" &&
 		typeof record.objective === "string" &&

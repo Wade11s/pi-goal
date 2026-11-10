@@ -11,12 +11,36 @@ import assert from "node:assert/strict";
 import { chmodSync, copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
-import { PiRpcSession, readSessionEntries, lastGoalSnapshot } from "./helpers/rpc-harness.mjs";
+import {
+	PiRpcSession,
+	assertOnlyFailures,
+	lastGoalSnapshot,
+	readSessionEntries,
+} from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
 
 function script(steps, session) {
 	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
+}
+
+/**
+ * Stop an active Goal's continuation loop deliberately.
+ *
+ * A missing scripted-provider step would also stop it, but that settles the test
+ * on a provider error rather than on the Goal lifecycle. An aborted run is Pi's
+ * documented hard exit, so the Goal stays active and the stop is explicit: the
+ * caller asserts the aborted outcome instead of hiding it.
+ *
+ * `runs` is the number of agent runs the test expects before the abort, so the
+ * abort always has a run in flight.
+ */
+async function abortActiveLoop(session, runs) {
+	await session.waitFor(`${runs} agent runs started`, (records) =>
+		records.filter((r) => r.type === "agent_start").length >= runs ? true : undefined,
+	);
+	await session.sendSimple("abort");
+	return session.waitForSettled(1);
 }
 
 test("loading the extension exposes /goal and leaves Goal-less sessions unchanged", async () => {
@@ -54,10 +78,13 @@ test("loading the extension exposes /goal and leaves Goal-less sessions unchange
 
 test("/goal <objective> stores an active Goal, starts initial work, and get_goal returns structured state", async () => {
 	const session = await PiRpcSession.start();
+	// Kickoff run, the continuation it triggers, and a held response so the loop
+	// can be stopped deliberately instead of by a missing scripted step.
 	script(
 		[
 			{ toolCalls: [{ name: "get_goal", args: {} }], usage: { input: 120, output: 8 } },
 			{ text: "Goal retrieved. Starting work.", usage: { input: 150, output: 12 } },
+			{ hang: true },
 		],
 		session,
 	);
@@ -70,8 +97,10 @@ test("/goal <objective> stores an active Goal, starts initial work, and get_goal
 
 		// The kickoff message started initial work: one run with a get_goal tool call.
 		await session.waitForToolResult("get_goal", 1);
-		const settled = await session.waitForSettled(1);
-		assert.equal(settled.aborted, false);
+		// Stop the continuing loop deliberately. The abort is the only non-clean
+		// outcome, and it is the reason the session settled.
+		const settled = await abortActiveLoop(session, 2);
+		assert.equal(settled.aborted, true);
 		assert.equal(session.extensionErrors().length, 0);
 
 		// get_goal returned the structured state to the model.
@@ -104,6 +133,7 @@ test("/goal <objective> stores an active Goal, starts initial work, and get_goal
 			),
 			"kickoff user message persisted in the session file",
 		);
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
 	}
@@ -111,10 +141,12 @@ test("/goal <objective> stores an active Goal, starts initial work, and get_goal
 
 test("bare /goal reports objective, lifecycle status, and available usage fields", async () => {
 	const session = await PiRpcSession.start();
-	script([{ text: "On it." }], session);
+	// Kickoff, its continuation, and a held response so the loop can be stopped
+	// deliberately with the Goal still active.
+	script([{ text: "On it." }, { text: "Continuing." }, { hang: true }], session);
 	try {
 		await session.prompt(`/goal ${OBJECTIVE}`);
-		await session.waitForSettled(1);
+		await abortActiveLoop(session, 3);
 
 		const runsBefore = session.records.filter((r) => r.type === "agent_start").length;
 		const response = await session.prompt("/goal");
@@ -136,6 +168,7 @@ test("bare /goal reports objective, lifecycle status, and available usage fields
 			assert.equal(state.objective, OBJECTIVE);
 			assert.equal(state.status, "active");
 		}
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
 	}
@@ -147,15 +180,18 @@ test("restart and resume reconstruct the Goal without restating it", async () =>
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-workdir-"));
 	// Process 1: create the Goal and let the initial work settle.
 	const first = await PiRpcSession.start({ cwd: workDir });
-	script([{ text: "On it." }], first);
+	// Kickoff, its continuation, and a held response so the loop can be stopped
+	// deliberately with the Goal still active.
+	script([{ text: "On it." }, { text: "Continuing." }, { hang: true }], first);
 	// The session outlives process 1's temp dirs: copy it aside before cleanup.
 	const resumedDir = mkdtempSync(join(tmpdir(), "pi-goal-resumed-"));
 	let sessionFile;
 	try {
 		await first.prompt("/goal Ship the release notes page");
-		await first.waitForSettled(1);
+		await abortActiveLoop(first, 3);
 		sessionFile = await first.sessionFile();
 		copyFileSync(sessionFile, join(resumedDir, basename(sessionFile)));
+		assertOnlyFailures(first, [{ stopReason: "aborted" }]);
 	} finally {
 		await first.stop();
 	}
@@ -163,10 +199,13 @@ test("restart and resume reconstruct the Goal without restating it", async () =>
 
 	// Process 2: a fresh Pi process resumes the persisted session.
 	const second = await PiRpcSession.start({ sessionFile, cwd: workDir });
+	// One run, its continuation, and a held response so the loop can be stopped
+	// deliberately with the Goal still active.
 	script(
 		[
 			{ toolCalls: [{ name: "get_goal", args: {} }] },
 			{ text: "Resumed and working." },
+			{ hang: true },
 		],
 		second,
 	);
@@ -181,7 +220,7 @@ test("restart and resume reconstruct the Goal without restating it", async () =>
 		const state = toolEnd.result.structuredContent?.goal ?? toolEnd.result.details?.goal;
 		assert.equal(state.objective, "Ship the release notes page");
 		assert.equal(state.status, "active");
-		await second.waitForSettled(1);
+		await abortActiveLoop(second, 2);
 
 		// Bare /goal also reports the restored objective.
 		await second.prompt("/goal");
@@ -192,6 +231,7 @@ test("restart and resume reconstruct the Goal without restating it", async () =>
 		const entries = readSessionEntries(sessionFile);
 		const snapshot = lastGoalSnapshot(entries);
 		assert.equal(snapshot.data.goal.id, state.id);
+		assertOnlyFailures(second, [{ stopReason: "aborted" }]);
 	} finally {
 		await second.stop();
 		rmSync(resumedDir, { recursive: true, force: true });
@@ -201,10 +241,12 @@ test("restart and resume reconstruct the Goal without restating it", async () =>
 
 test("extension reload reconstructs the Goal (runtime replacement via session switch)", async () => {
 	const session = await PiRpcSession.start();
-	script([{ text: "On it." }], session);
+	// Kickoff, its continuation, and a held response so the loop can be stopped
+	// deliberately with the Goal still active.
+	script([{ text: "On it." }, { text: "Continuing." }, { hang: true }], session);
 	try {
 		await session.prompt("/goal Restore me after reload");
-		await session.waitForSettled(1);
+		await abortActiveLoop(session, 3);
 		const sessionFile = await session.sessionFile();
 
 		// No runtime replacement has happened yet: no restored notification exists.
@@ -242,6 +284,7 @@ test("extension reload reconstructs the Goal (runtime replacement via session sw
 
 		const entries = readSessionEntries(sessionFile);
 		assert.equal(lastGoalSnapshot(entries).data.goal.objective, "Restore me after reload");
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
 	}
@@ -269,8 +312,9 @@ test("ephemeral sessions return a clear persistence error and create nothing", a
 
 test("a failed session write leaves no phantom Goal and permits a retry", async () => {
 	const session = await PiRpcSession.start();
-	// Step 0 warms up the session; step 1 serves the successful retry's kickoff run.
-	script([{ text: "On it." }, { text: "Retry worked." }], session);
+	// Step 0 warms up the session, step 1 serves the retried kickoff, step 2 its
+	// continuation, and the last step is held so the loop stops deliberately.
+	script([{ text: "On it." }, { text: "Retry worked." }, { text: "Continuing." }, { hang: true }], session);
 	let sessionFile;
 	try {
 		// Establish a known session file with one ordinary run.
@@ -301,11 +345,13 @@ test("a failed session write leaves no phantom Goal and permits a retry", async 
 		const retry = await session.prompt("/goal This goal persists after the write failure");
 		assert.equal(retry.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await session.waitForSettled(2);
+		// Warm-up run, kickoff, continuation, then the held response.
+		await abortActiveLoop(session, 4);
 		const snapshot = lastGoalSnapshot(readSessionEntries(sessionFile));
 		assert.ok(snapshot, "goal-state entry persisted after retry");
 		assert.equal(snapshot.data.goal.objective, "This goal persists after the write failure");
 		assert.equal(snapshot.data.goal.status, "active");
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		// Restore writability so shutdown flushes cleanly.
 		if (sessionFile) {
@@ -383,7 +429,9 @@ test("interrupting the kickoff run preserves the durable Goal", async () => {
 test("two /goal commands issued while Pi is busy create exactly one Goal", async () => {
 	const session = await PiRpcSession.start();
 	// Step 0 hangs the ordinary run; step 1 answers the winner's kickoff.
-	script([{ hang: true }, { text: "Kickoff done." }], session);
+	// The hanging run is aborted; the winner's kickoff and its continuation each
+	// need a step.
+	script([{ hang: true }, { text: "Kickoff done." }, { text: "Continuing." }], session);
 	try {
 		// Start an ordinary run that never settles.
 		const started = await session.prompt("start something slow");
@@ -463,7 +511,8 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 
 test("objectives that merely begin with a reserved subcommand word are accepted", async () => {
 	const session = await PiRpcSession.start();
-	script([{ text: "On it." }], session);
+	// Kickoff plus the continuation it triggers; both need a step.
+	script([{ text: "On it." }, { text: "Continuing." }], session);
 	try {
 		const objective = "clear the lint errors and make the build green";
 		const response = await session.prompt(`/goal ${objective}`);
@@ -488,7 +537,8 @@ test("objectives that merely begin with a reserved subcommand word are accepted"
 
 test("create rejects invalid objectives and refuses to replace an existing Goal", async () => {
 	const session = await PiRpcSession.start();
-	script([{ text: "On it." }], session);
+	// Kickoff plus the continuation it triggers; both need a step.
+	script([{ text: "On it." }, { text: "Continuing." }], session);
 	try {
 		// Too short (validation).
 		await session.prompt("/goal ab");

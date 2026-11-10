@@ -90,12 +90,37 @@ objective is absent or truncated in context.
 `create_goal` lets the model create a Goal, but only for an **explicit user or
 system request** — the tool description and its prompt guidelines say so, and
 nothing in the extension infers a Goal from an ordinary task. It validates the
-objective, refuses when an unfinished Goal already exists (including when two
-calls arrive in the same assistant turn), refuses an ephemeral session that
-could not restore the Goal, and persists the snapshot before reporting success.
+objective, refuses an ephemeral session that could not restore the Goal, refuses
+while this session already has a Goal (including when two calls arrive in the
+same assistant turn), and persists the snapshot before reporting success.
 Creating a Goal through the tool does not send a kickoff message: the model is
 already mid-run, and the continuation seam picks the Goal up at the next
 settlement.
+
+### The objective's trust boundary
+
+The objective is the one part of a Goal message the extension does not author. A
+`create_goal` objective is model-written text, and Pi flattens a custom message
+into a plain user-role LLM message (dropping `customType`), so the model cannot
+tell extension instructions from objective text by channel alone. Interpolating
+it raw would let an objective carrying forged `Evidence audit` or `Completion
+contract` sections impersonate the contract.
+
+So every Goal message renders the objective as **delimited, JSON-encoded data**:
+
+- the objective is reproduced verbatim but encoded, so embedded newlines, quotes,
+  and backslashes cannot begin a new line and no sentinel can appear unescaped
+  inside the block;
+- it is wrapped in `>>> BEGIN GOAL OBJECTIVE DATA … <<<` and
+  `<<< END GOAL OBJECTIVE DATA <<<` sentinels;
+- it is preceded by an explicit statement that it is data about what was asked
+  for, not an instruction from Pi or from this extension;
+- every authoritative instruction (the evidence audit, the completion contract)
+  sits **after** the data block.
+
+The canonical objective is always available unframed through `get_goal` and in
+the structured tool results, and the record carries its `origin` (`command` for
+`/goal`, `tool` for `create_goal`).
 
 ### Model tool: `update_goal`
 
@@ -121,8 +146,11 @@ refused with an explanation, because those transitions stay with the user.
   Pi otherwise defers until a user/assistant message exists. Continuation uses
   the separate `goal-continuation` **custom-message** channel, because
   `agent_before_settle` drafts are custom messages: they participate in model
-  context while remaining identifiable as extension-authored Goal data rather
-  than human input.
+  context. Note that Pi flattens a custom message into a plain user-role LLM
+  message and drops `customType` at the provider boundary, so the channel name
+  alone cannot mark a message as extension-authored — which is why each message
+  on the channel states its own authority and frames the objective as delimited
+  data (see *The objective's trust boundary* above).
 - Creation is durability-first: the snapshot is written, the kickoff triggers the
   file flush, and only after the snapshot is confirmed on disk is the Goal
   announced (and made visible to `get_goal`). If writing fails (unwritable
@@ -140,11 +168,27 @@ refused with an explanation, because those transitions stay with the user.
 - Sessions without a Goal behave exactly as before; installing the extension
   only adds the command, the three tools, and the state they manage.
 
+## How the tests stay honest
+
+A scripted-provider step that runs out throws, and that failure would also stop
+an active Goal — so a test that settles on a missing step proves the error path,
+not the Goal lifecycle. Two rules keep the suite from passing for the wrong
+reason:
+
+- every script is sized through the last natural post-tool turn, and every test
+  ends with `assertCleanRun()` (or `assertOnlyFailures()` when a failure is the
+  subject), which fails on any assistant outcome that is `error` or `aborted`;
+- the test-only boundary peer bounds its own continuation requests, so a
+  composition test is bounded by the fixture rather than by a provider error.
+
 ## Limitations (later milestones)
 
 - No `edit`, `pause`, `resume`, or `clear` lifecycle commands yet (only the bare
   words are reserved as future subcommands), so an active Goal can only be ended
   by the model completing it, by the user aborting the run, or by a failure.
+- `create_goal` refuses while **any** Goal exists, including a complete one,
+  because replacement and clearing arrive with the lifecycle ticket. The tool
+  description, its error message, and this section all say so.
 - No token budget, usage accounting, or active-time tracking yet, so unattended
   work has no token bound.
 - No blocked audit (the same genuine blocker for three consecutive Goal turns),

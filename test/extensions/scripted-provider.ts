@@ -9,12 +9,12 @@
  *   { "toolCalls": [{ "name": "get_goal", "args": {} }], "usage"?: {...} }
  *   { "error": "message", "stopReason"?: "error" }
  *   { "hang": true }   // never completes; for interrupted-run tests
- *   { "delayMs": 400 } // holds the response open; gives a test a busy window
+ *   { "waitForFile": "/abs/path" } // holds the response until the file exists
  *
  * No network access or credentials are required, which lets the RPC tests drive
  * real Pi sessions end to end.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
@@ -43,11 +43,12 @@ export interface ScriptedStep {
 	/** Never complete this response; the agent run hangs until aborted or killed. */
 	hang?: boolean;
 	/**
-	 * Hold the response open for this long before streaming it. Gives a test a
-	 * deterministic window in which the agent is provably busy, so queued
-	 * steering or follow-up messages can be exercised without a race.
+	 * Hold the response until this absolute path exists (polled every 5ms, and
+	 * released by an abort). Unlike a fixed delay this is race-free: the test
+	 * knows the agent is provably busy, and releases the response only once it
+	 * has queued whatever it wanted to queue.
 	 */
-	delayMs?: number;
+	waitForFile?: string;
 }
 
 function readSteps(): ScriptedStep[] {
@@ -132,15 +133,21 @@ function streamScriptedStep(
 			return;
 		}
 
-		// Hold the response open so a test has a deterministic window in which the
-		// agent is provably busy (for queueing steering or follow-up messages).
-		if (step.delayMs !== undefined) {
+		// Hold the response until the test releases it, so a test has a
+		// deterministic window in which the agent is provably busy (for queueing
+		// steering or follow-up messages) without depending on wall-clock timing.
+		if (step.waitForFile !== undefined) {
+			const gate = step.waitForFile;
 			await new Promise<void>((resolve) => {
-				const timer = setTimeout(resolve, step.delayMs);
-				options?.signal?.addEventListener("abort", () => {
-					clearTimeout(timer);
-					resolve();
-				});
+				const poll = () => {
+					if (existsSync(gate)) {
+						resolve();
+						return;
+					}
+					setTimeout(poll, 5);
+				};
+				options?.signal?.addEventListener("abort", () => resolve());
+				poll();
 			});
 		}
 

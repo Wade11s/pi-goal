@@ -68,6 +68,10 @@ function goalToolError(message: string, goal: GoalPublicState | null) {
 	};
 }
 
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 export default function goalExtension(pi: ExtensionAPI): void {
 	const store = new GoalStore();
 
@@ -171,7 +175,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Create Goal",
 		description:
 			"Create a persistent Goal for an explicit user or system request. " +
-			"Rejects creation when an unfinished Goal already exists.",
+			"Refuses when this session already has a Goal.",
 		parameters: Type.Object({
 			objective: Type.String({ minLength: MIN_OBJECTIVE_LENGTH, maxLength: MAX_OBJECTIVE_LENGTH }),
 		}),
@@ -179,7 +183,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		promptSnippet: "Create a persistent session Goal from an explicit user or system request",
 		promptGuidelines: [
 			"Call create_goal only when the user or the system explicitly asked for a Goal. Never infer one because a task looks large.",
-			"Do not call create_goal while another Goal is unfinished; it is refused. Use get_goal to inspect the current Goal instead.",
+			"Do not call create_goal while this session already has a Goal; it is refused. Use get_goal to inspect the current Goal instead.",
 		],
 		async execute(_toolCallId: string, params: { objective: string }, _signal, _onUpdate, ctx) {
 			const validation = validateObjective(String(params.objective ?? ""));
@@ -197,13 +201,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			}
 			const existing = store.get();
 			if (existing) {
+				// Conservative for this milestone: a Goal of any status, including a
+				// complete one, still occupies the session's single Goal slot.
+				// Replacement and clearing arrive with the lifecycle ticket.
 				return goalToolError(
-					"A Goal is already set for this session; cannot create another unfinished Goal. " +
-						"Use get_goal to inspect it, or update_goal to complete it.",
+					"A Goal is already set for this session (status: " +
+						`${existing.status}); cannot create another one. ` +
+						"Use get_goal to inspect it, or update_goal to complete it. Replacing or clearing a Goal arrives in a later milestone.",
 					toPublicState(existing),
 				);
 			}
-			const goal = store.create(validation.objective);
+			const goal = store.create(validation.objective, "tool");
 			try {
 				// Stage before announcing: a write failure here abandons creation with no
 				// visible state change, and the attempt can simply be retried.
@@ -275,16 +283,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					toPublicState(goal),
 				);
 			}
-			const updated = store.markComplete(pi);
-			if (!updated) {
-				return goalToolError(
-					"Goal could not be marked complete (no active Goal to complete).",
-					toPublicState(goal),
-				);
+			const completed = store.markComplete(pi);
+			if (!completed.ok) {
+				// Distinguish a lifecycle refusal from a persistence failure: the Goal
+				// is still active in the second case, and saying otherwise would hide a
+				// real durability problem behind a lifecycle message.
+				const message =
+					completed.reason === "persistence"
+						? `Goal not marked complete: writing the Goal to the session failed (${describeError(completed.error)}). The Goal is still active; fix the cause and call update_goal again.`
+						: "Goal could not be marked complete: no active Goal to complete.";
+				return goalToolError(message, toPublicState(goal));
 			}
-			const state = toPublicState(updated);
+			const state = toPublicState(completed.goal);
 			return {
-				content: [{ type: "text", text: `Goal ${updated.id} marked complete.` }],
+				content: [{ type: "text", text: `Goal ${completed.goal.id} marked complete.` }],
 				structuredContent: { goal: state },
 				details: { goal: state },
 			};
@@ -355,7 +367,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						return;
 					}
 
-					const goal = store.create(validation.objective);
+					const goal = store.create(validation.objective, "command");
 					try {
 						// Stage the snapshot first: a write failure here abandons
 						// creation with no visible state change and the attempt
