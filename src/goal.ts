@@ -31,8 +31,7 @@ export const MAX_OBJECTIVE_LENGTH = 2000;
  */
 export type GoalOrigin = "command" | "tool";
 
-/**
- * Durable, session-scoped Goal record. Snapshots of this record are persisted as
+/** Durable, session-scoped Goal record. Snapshots of this record are persisted as
  * custom session entries and reconstructed from the active session branch.
  */
 export interface GoalRecord {
@@ -54,6 +53,17 @@ export interface GoalRecord {
 	revision: number;
 	/** Optional token budget. Reserved for a later milestone; restored when present. */
 	tokenBudget?: number;
+}
+
+/**
+ * The Goal identity and revision a transition was prepared against. Model-side
+ * transitions (`update_goal`) must carry the binding captured when the model's
+ * request was prepared, so a stale call (a held response released after a user
+ * edit, replacement, pause, or resume) cannot mutate a revised Goal.
+ */
+export interface GoalBinding {
+	id: string;
+	revision: number;
 }
 
 /**
@@ -171,9 +181,10 @@ export function previewObjective(objective: string, maxLength = 160): string {
  * Explicit-request corroboration bounds for a model-requested pause.
  *
  * `update_goal` may pause only after the user explicitly asked for it. The model
- * must quote the user's words; the quote must appear verbatim in a recent
- * human-authored user message on the active branch. These bounds keep the scan
- * cheap and the authority window bounded in time.
+ * must quote the user's words, and the quote must sit inside an *affirmative
+ * pause instruction* in a recent human-authored user message on the active
+ * branch (see `corroboratePauseRequest`). These bounds keep the scan cheap and
+ * the authority window bounded in time.
  */
 export const MIN_USER_REQUEST_LENGTH = 3;
 export const MAX_PAUSE_CORROBORATION_MESSAGES = 16;
@@ -219,31 +230,180 @@ export function isHumanUserText(text: string): boolean {
 	return true;
 }
 
+/** Collapse every whitespace run to one space, so quoting survives reflow. */
+function normalizeWhitespace(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
 /**
- * Find the human-authored user message that contains `quote` verbatim, newest
- * first, among the most recent `MAX_PAUSE_CORROBORATION_MESSAGES` such messages.
- * Returns the containing message text, or undefined when the quote is grounded
- * in nothing the user actually said.
+ * Pause-instruction vocabulary. A quote only counts toward pausing when it
+ * actually names the act of pausing this work; a common word or an incidental
+ * fragment of an unrelated sentence is not an instruction.
  */
-export function findUserRequestCorroboration(
+const PAUSE_REQUEST_KEYWORD =
+	/\b(?:pause|pauses|paused|pausing|halt|halts|halted|halting|shelve|shelves|shelved|shelving|park|parked|parking|suspend|suspends|suspended|suspending|hold\s+off|take\s+a\s+break)\b/i;
+
+/** Pause verbs/nouns, used to find a negation that governs the quoted words. */
+const PAUSE_ACTION =
+	/\b(?:pause\w*|halt\w*|shelv\w*|park\w*|suspend\w*|hold\s+off|take\s+a\s+break)\b/gi;
+
+/**
+ * Affirmative keep-working or resume vocabulary. One of these in the same
+ * message (or a newer one) contradicts a pause: the user asked to continue, not
+ * to stop admission of work.
+ */
+const KEEP_WORKING =
+	/\b(?:keep\s+(?:going|working|at\s+it|it\s+up)|carry\s+on|go\s+on|continue\w*|resume\w*|unpause\w*)\b/gi;
+
+/** A deferral such as "pause it, not now" is not an explicit pause request. */
+const PAUSE_DEFERRAL =
+	/\b(?:pause\w*|halt\w*|shelv\w*|park\w*|suspend\w*)\b[\s\S]{0,30}?\bnot\s+(?:now|yet|today|anymore)\b/i;
+
+/**
+ * A negation up to four words before a pause/continue word: "do not pause",
+ * "no need to pause", "never continue", "without pausing", "don't want you to
+ * pause". The window is deliberately short; it exists to reject the direct
+ * negations a user writes, not to perform natural-language inference.
+ */
+function hasNegationBefore(text: string, index: number): boolean {
+	const before = text.slice(Math.max(0, index - 64), index);
+	return /\b(?:not|never|no|none|without|avoid|avoids|avoiding|refuse|refuses|refused|don'?t|dont|doesn'?t|didn'?t|won'?t|wouldn'?t|can'?t|couldn'?t|shouldn'?t|isn'?t|aren'?t|wasn'?t|weren'?t|hasn'?t|haven'?t|hadn'?t)\b(?:\s+\w+){0,4}\s*$/i.test(
+		before,
+	);
+}
+
+/** Whether text contradicts pausing: a negated pause, a keep-working word, or a deferral. */
+function contradictsPause(text: string): boolean {
+	for (const match of text.matchAll(PAUSE_ACTION)) {
+		if (hasNegationBefore(text, match.index)) return true;
+	}
+	for (const match of text.matchAll(KEEP_WORKING)) {
+		if (!hasNegationBefore(text, match.index)) return true;
+	}
+	return PAUSE_DEFERRAL.test(text);
+}
+
+/**
+ * Politeness, modal, and first-person lead-ins that may precede an imperative
+ * pause verb ("please", "can you", "I want you to", "let's", ...). Each is
+ * stripped in turn, so "could you please just pause" resolves to "pause".
+ */
+const REQUEST_LEAD =
+	/^(?:(?:please|kindly|pls|now|then|just|also|okay|ok|so|and|but|maybe|perhaps|quickly|immediately|hey|alright|all\s+right|do|go\s+ahead(?:\s+and)?|feel\s+free\s+to|i(?:'d| would)\s+(?:like|want|need|prefer)(?:\s+you)?\s+to|i\s+(?:want|need|would\s+like|would\s+prefer)(?:\s+you)?\s+to|i(?:'m| am)\s+asking\s+you\s+to|i\s+ask\s+you\s+to|i\s+think|you\s+(?:should|must|need\s+to|can|could|may|have\s+to|will|are\s+to|want\s+to)|we\s+(?:should|must|need\s+to|can|could|may|have\s+to|will|want\s+to)|(?:can|could|would|will|should|may)\s+(?:you|we)|let'?s|let\s+us|time\s+to|it(?:'s| is)\s+time\s+to|it\s+would\s+be\s+(?:good|best|helpful|great|wise)|it\s+should\s+be\s+(?:good|best|helpful|great|wise)))(?:\s+|$)/i;
+
+/** Base-form pause verbs that start an imperative request. */
+const IMPERATIVE_PAUSE =
+	/^(?:pause|halt|shelve|park|suspend|hold\s+off|take\s+a\s+break)\b/i;
+
+/** A passive but still direct instruction: "the goal should be paused". */
+const PASSIVE_PAUSE_REQUEST =
+	/^(?:(?:the|this|that)\s+)?(?:goal|work|task|run|session)\s+(?:should|must|can|could|may|will|needs?\s+to|has\s+to|is\s+to)\s+(?:be\s+)?(?:paused|halted|shelved|suspended|parked)\b/i;
+
+/**
+ * A noun/mention after which "pause" is not an imperative verb. Keeps
+ * "Pause is not needed" and "Pause button" from being read as a request while
+ * allowing "Pause the goal", "Pause it", "Pause now", and "Pause for a moment".
+ */
+const PAUSE_MENTION_FOLLOW =
+	/^(?:is|was|are|were|has|have|had|will|would|can|could|should|may|might|must|means|seems|sounds|remains|needs|gets|got|becomes|became|button|command|tool|action|status|state|request|instruction|feature|mode|option)\b/i;
+
+/** Clause separators: sentence punctuation, commas, dashes, and line breaks. */
+const CLAUSE_SEPARATORS = /[,.;:!?\u2014\u2013\n\r\u2028\u2029\u0085]+/;
+
+/** Outcome of verifying a model-requested pause against the user's messages. */
+export type PauseCorroboration =
+	| { ok: true; message: string }
+	| { ok: false; reason: "quote-empty" | "quote-not-request" | "not-found" | "not-an-instruction" };
+
+/** Whether one clause is an affirmative instruction to pause. */
+function isPauseRequestClause(clause: string): boolean {
+	let rest = clause.trim();
+	if (!rest || contradictsPause(rest)) return false;
+	for (let pass = 0; pass < 20; pass++) {
+		const lead = rest.match(REQUEST_LEAD);
+		if (!lead) break;
+		rest = rest.slice(lead[0].length).trimStart();
+	}
+	const imperative = rest.match(IMPERATIVE_PAUSE);
+	if (imperative) {
+		return !PAUSE_MENTION_FOLLOW.test(rest.slice(imperative[0].length).trimStart());
+	}
+	return PASSIVE_PAUSE_REQUEST.test(rest);
+}
+
+/**
+ * Whether one message carries an affirmative pause instruction containing the
+ * quote. A quote found only inside a negation, a keep-working instruction, a
+ * mention ("what a pause"), or a deferral does not count.
+ */
+function containsAffirmativePauseClause(text: string, needle: string): boolean {
+	for (const rawClause of text.split(CLAUSE_SEPARATORS)) {
+		const clause = normalizeWhitespace(rawClause);
+		if (!clause || !clause.includes(needle)) continue;
+		if (!PAUSE_REQUEST_KEYWORD.test(clause)) continue;
+		if (isPauseRequestClause(clause)) return true;
+	}
+	return false;
+}
+
+/**
+ * Verify the quote for a model-requested pause against the user's messages.
+ *
+ * A pause is corroborated only when ALL of these hold, which is what "the user
+ * explicitly requested this pause" can mean without semantic understanding:
+ *
+ * 1. the quote itself names the act of pausing (so "the", a verbatim fragment of
+ *    an unrelated sentence, or a paraphrase is rejected up front);
+ * 2. the *newest* human-authored user message containing the quote carries an
+ *    affirmative pause instruction containing the quote: the clause is
+ *    imperative/request-shaped and is not negated ("do not pause"), does not
+ *    instruct continued work ("keep working", "continue"), and is not a
+ *    deferral ("pause, not now") or a mere mention ("what a pause");
+ * 3. no *newer* human message contradicts it ("keep working"/"resume" after the
+ *    request supersedes it).
+ *
+ * Occurrence of the words alone never grants pause authority; the user always
+ * retains `/goal pause`.
+ */
+export function corroboratePauseRequest(
 	entries: readonly BranchEntryLike[],
 	quote: string,
-): string | undefined {
-	const needle = quote.trim();
-	if (needle.length < MIN_USER_REQUEST_LENGTH) return undefined;
-	let examined = 0;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		if (examined >= MAX_PAUSE_CORROBORATION_MESSAGES) break;
+): PauseCorroboration {
+	const needle = normalizeWhitespace(quote);
+	if (needle.length < MIN_USER_REQUEST_LENGTH) return { ok: false, reason: "quote-empty" };
+	if (!PAUSE_REQUEST_KEYWORD.test(needle)) return { ok: false, reason: "quote-not-request" };
+
+	// Newest-first human-authored user messages, bounded by the scan window.
+	const human: string[] = [];
+	for (let index = entries.length - 1; index >= 0 && human.length < MAX_PAUSE_CORROBORATION_MESSAGES; index--) {
 		const entry = entries[index] as BranchEntryLike | undefined;
 		if (!entry || entry.type !== "message") continue;
 		const message = entry.message;
 		if (!message || message.role !== "user") continue;
 		const text = messageText(message.content);
 		if (!isHumanUserText(text)) continue;
-		examined += 1;
-		if (text.includes(needle)) return text;
+		human.push(text);
 	}
-	return undefined;
+
+	for (let index = 0; index < human.length; index++) {
+		const normalized = normalizeWhitespace(human[index]!);
+		if (!normalized.includes(needle)) continue;
+		// The newest occurrence decides: an older affirmative copy cannot outrank
+		// a newest negated one. The whole message is checked because a later clause
+		// in the same message can negate an earlier request.
+		if (contradictsPause(normalized)) return { ok: false, reason: "not-an-instruction" };
+		if (!containsAffirmativePauseClause(normalized, needle)) {
+			return { ok: false, reason: "not-an-instruction" };
+		}
+		// A newer human message that contradicts the request supersedes it.
+		for (let newer = 0; newer < index; newer++) {
+			if (contradictsPause(normalizeWhitespace(human[newer]!))) {
+				return { ok: false, reason: "not-an-instruction" };
+			}
+		}
+		return { ok: true, message: human[index]! };
+	}
+	return { ok: false, reason: "not-found" };
 }
 
 /**

@@ -20,6 +20,7 @@ import {
 	type GoalRecord,
 	type GoalSnapshot,
 	type GoalOrigin,
+	type GoalBinding,
 	MAX_OBJECTIVE_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 } from "./goal.ts";
@@ -31,15 +32,19 @@ function goalId(): string {
 
 /**
  * Outcome of a durable Goal transition (completion, pause, resume, clear,
- * objective edit). Distinguishes lifecycle refusals ("no-goal" / "not-eligible",
- * with an explanation) from persistence failures, because the second leaves the
- * previous state in force and must be reported as a durability problem rather
- * than as a lifecycle refusal. `goal` is `null` for a successful clear.
+ * objective edit). Distinguishes lifecycle refusals ("no-goal" / "not-eligible" /
+ * "stale", with an explanation) from persistence failures, because the second
+ * leaves the previous state in force and must be reported as a durability
+ * problem rather than as a lifecycle refusal. `goal` is `null` for a successful
+ * clear.
  */
 export type GoalMutationResult =
 	| { ok: true; goal: GoalRecord | null }
-	| { ok: false; reason: "no-goal" | "not-eligible"; message: string }
+	| { ok: false; reason: "no-goal" | "not-eligible" | "stale"; message: string }
 	| { ok: false; reason: "persistence"; error: unknown };
+
+/** The failure side of {@link GoalMutationResult}. */
+export type GoalMutationFailure = Extract<GoalMutationResult, { ok: false }>;
 
 export class GoalStore {
 	/** undefined = not reconstructed yet; null = no Goal (or tombstone); record = present. */
@@ -100,15 +105,19 @@ export class GoalStore {
 	}
 
 	/**
-	 * Confirm the snapshot is durably on disk. Pi defers creating the session
-	 * file until the session has a user or assistant message, so a staged
-	 * snapshot on a fresh session is in memory only until the kickoff's user
-	 * message flushes the file.
+	 * Confirm the snapshot is durably on disk **as the current state**: the last
+	 * `goal-state` entry in the session file must be this Goal. Pi defers creating
+	 * the session file until the session has a user or assistant message, so a
+	 * staged snapshot on a fresh session is in memory only until the kickoff's
+	 * user message flushes the file. Matching "this id occurs somewhere in the
+	 * file" would not do: a later tombstone (a `/goal clear` that landed during
+	 * the durability wait) must count as *not* durable.
 	 */
 	isDurable(ctx: ExtensionContext, goalId: string): boolean {
 		try {
 			const file = ctx.sessionManager.getSessionFile();
 			if (!file) return false;
+			let lastGoal: { id?: string } | undefined;
 			for (const line of readFileSync(file, "utf8").split("\n")) {
 				if (!line.includes(CUSTOM_ENTRY_TYPE)) continue;
 				let entry: unknown;
@@ -118,9 +127,9 @@ export class GoalStore {
 					continue;
 				}
 				const custom = entry as { customType?: string; data?: GoalSnapshot };
-				if (custom?.customType === CUSTOM_ENTRY_TYPE && custom.data?.goal?.id === goalId) return true;
+				if (custom?.customType === CUSTOM_ENTRY_TYPE) lastGoal = custom.data?.goal ?? undefined;
 			}
-			return false;
+			return lastGoal?.id === goalId;
 		} catch {
 			return false;
 		}
@@ -150,23 +159,43 @@ export class GoalStore {
 	}
 
 	/**
+	 * Refuse a bound transition when the current record is not the exact record
+	 * the transition was prepared against. `expected` is omitted for synchronous
+	 * user commands, which by construction act on the state they just read.
+	 */
+	private checkBinding(current: GoalRecord, expected: GoalBinding | undefined): string | undefined {
+		if (!expected) return undefined;
+		if (expected.id === current.id && expected.revision === current.revision) return undefined;
+		const where =
+			expected.id === current.id
+				? `it was prepared against revision ${expected.revision} but the Goal is now revision ${current.revision}`
+				: `it was prepared against Goal ${expected.id} but the current Goal is ${current.id} (revision ${current.revision})`;
+		return `the Goal changed while the call was in flight: ${where}. Call get_goal, re-read the current objective, and re-audit before changing the lifecycle`;
+	}
+
+	/**
 	 * Mark the current active Goal complete. Increments revision and updates
 	 * timestamp, and stages the snapshot durably through the supplied Pi API.
 	 *
 	 * Only an active Goal can be completed, so a second call (for example two
 	 * update_goal calls in one assistant turn) is refused instead of appending a
 	 * duplicate snapshot. Completion is terminal for this Goal identity: the
-	 * continuation seam never restarts a complete Goal.
+	 * continuation seam never restarts a complete Goal. `expected` binds the
+	 * completion to the Goal revision the model's call was prepared against, so
+	 * a stale held response cannot complete a Goal the user has since edited,
+	 * replaced, paused, or resumed.
 	 *
 	 * A write failure is reported as `persistence` and leaves the in-memory Goal
 	 * untouched and still active, so a retry is possible and no phantom complete
 	 * state is claimed.
 	 */
-	markComplete(pi: ExtensionAPI): GoalMutationResult {
+	markComplete(pi: ExtensionAPI, expected?: GoalBinding): GoalMutationResult {
 		const current = this.current;
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
+		const stale = this.checkBinding(current, expected);
+		if (stale) return { ok: false, reason: "stale", message: stale };
 		if (current.status !== "active") {
 			return {
 				ok: false,
@@ -187,13 +216,17 @@ export class GoalStore {
 	 * visible, and once visible it immediately stops admission of further
 	 * automatic Goal runs: the continuation seam only continues an `active` Goal.
 	 * The in-flight run (if any) is left to finish on its own — pause never aborts
-	 * work; aborting stays with the user.
+	 * work; aborting stays with the user. `expected` binds the pause to the Goal
+	 * revision the model's call was prepared against (stale held responses are
+	 * refused); user commands omit it and act on the state they just read.
 	 */
-	markPaused(pi: ExtensionAPI): GoalMutationResult {
+	markPaused(pi: ExtensionAPI, expected?: GoalBinding): GoalMutationResult {
 		const current = this.current;
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
+		const stale = this.checkBinding(current, expected);
+		if (stale) return { ok: false, reason: "stale", message: stale };
 		if (current.status !== "active") {
 			return {
 				ok: false,
@@ -287,6 +320,15 @@ export class GoalStore {
 		} catch {
 			// Nothing more we can do; the staged entry was never confirmed durable.
 		}
+	}
+
+	/**
+	 * Restore a previously captured record durably. Used to retract a
+	 * replacement whose durability could not be confirmed: the previous record
+	 * is still the correct current state, and a tombstone would wrongly erase it.
+	 */
+	restore(pi: ExtensionAPI, previous: GoalRecord): GoalMutationResult {
+		return this.commitSnapshot(pi, previous);
 	}
 
 	/** Build a new active Goal record (revision 0). Pure: no state is changed. */

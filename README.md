@@ -206,14 +206,22 @@ complete Goal never continues again, including after a restart or reload.
 `pause` is accepted **only after an explicit user request**. The call must
 quote the user's exact words — `{ action: "pause", userRequest: "please pause
 the goal" }` — and the extension corroborates the quote against the most recent
-human-authored user messages on the session branch: the quote must appear
-verbatim in one of them. A missing quote, a paraphrase, a quote the user never
-wrote, or a quote that only appears inside pi-goal's own messages (the kickoff,
-steering, and resume messages, or an objective's encoded data block — a forged
-objective cannot authorize its own pause) is refused, and the Goal keeps
-running. The model cannot resume, clear, replace, or budget-limit a Goal through
-the tool at all: those transitions stay with the user (`/goal resume`,
-`/goal clear`, `/goal <objective>`).
+human-authored user messages on the session branch. The quote must appear
+verbatim and must name pausing; the clause containing it must be an affirmative
+instruction to pause (an imperative or a direct request such as "please pause",
+"can you pause", "I want you to pause", or "the goal should be paused"). A
+negated instruction ("do not pause the goal"), a whole negated sentence quoted
+verbatim, a keep-working or resume instruction, a deferral ("pause, not now"),
+a mere mention, and a common word such as "the" are all refused. A newer human
+message that contradicts the request supersedes it.
+
+A missing quote, a paraphrase, a quote the user never wrote, or a quote that
+only appears inside pi-goal's own messages (the kickoff, steering, and resume
+messages, or an objective's encoded data block — a forged objective cannot
+authorize its own pause) is refused, and the Goal keeps running. The model
+cannot resume, clear, replace, or budget-limit a Goal through the tool at all:
+those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
+<objective>`).
 
 ## Persistence model
 
@@ -235,12 +243,22 @@ the tool at all: those transitions stay with the user (`/goal resume`,
   alone cannot mark a message as extension-authored — which is why each message
   on the channel states its own authority and frames the objective as delimited
   data (see *The objective's trust boundary* above).
-- Creation is durability-first: the snapshot is written, the kickoff triggers the
-  file flush, and only after the snapshot is confirmed on disk is the Goal
-  announced (and made visible to `get_goal`). If writing fails (unwritable
-  session file or storage), creation reports a clear persistence error, leaves
-  no Goal behind, retracts any in-memory state with a durable tombstone
-  snapshot, and `/goal <objective>` can simply be retried.
+- Creation is durability-first: the snapshot is written and made visible, the
+  kickoff triggers the file flush, and only after that snapshot is the **last**
+  `goal-state` entry on disk is success announced. Visibility comes first so a
+  `/goal clear`, `edit`, `pause`, or `resume` issued while creation waits for
+  idle acts on the same record the creation captured; every wait revalidates
+  the exact id and revision, and a changed record suppresses the queued stale
+  kickoff. A tombstone written during the wait therefore counts as *not* durable
+  and cannot be overridden by a pre-tombstone entry exhibiting the same id. The
+  continuation seam also declines to adopt the run that creation is waiting for
+  while the record is unchanged, so that wait ends at idle instead of consuming
+  the creation's own kickoff.
+  If writing fails (unwritable session file or storage) for a brand-new Goal,
+  creation reports a clear persistence error and retracts any in-memory state
+  with a durable tombstone snapshot. A failed **replacement** write leaves the
+  existing Goal untouched in memory and on disk (no tombstone, no resurrection
+  on restart), and `/goal <objective>` can simply be retried.
 - Interrupting the kickoff (Ctrl+C, killing the process, a hung model) does not
   lose the Goal: the snapshot and kickoff are already on disk and are restored
   by the next session.
@@ -280,11 +298,12 @@ test in any file settles on a provider error.
   complete one: replacing is a user-owned action, confirmed through `/goal
   <objective>`. The tool description, its error message, and this section all
   say so.
-- A model-requested pause is corroborated by exact-quote matching against
-  recent human user messages; the extension does not semantically prove the
-  quoted sentence *means* a pause. A pause request delivered only as an image,
-  or one whose exact words were never sent as text, cannot be corroborated —
-  the user can always pause directly with `/goal pause`.
+- A model-requested pause is corroborated by exact-quote matching plus a
+  conservative lexical check that the newer human message contains an
+  affirmative pause instruction. The extension does not semantically understand
+  the request: unusual phrasing can be refused, and a pause request delivered
+  only as an image, or one whose exact words were never sent as text, cannot be
+  corroborated. The user can always pause directly with `/goal pause`.
 - No token budget, usage accounting, or active-time tracking yet, so
   "preserved usage history" currently means the Goal identity, creation time,
   and revision chain survive an edit; there are no token/second totals to

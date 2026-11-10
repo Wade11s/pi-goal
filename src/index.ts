@@ -38,7 +38,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { Type } from "typebox";
 import {
 	CUSTOM_MESSAGE_TYPE,
-	findUserRequestCorroboration,
+	corroboratePauseRequest,
 	formatContinuationMessage,
 	formatEditMessage,
 	formatGoalSummary,
@@ -49,12 +49,13 @@ import {
 	MAX_OBJECTIVE_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 	MIN_USER_REQUEST_LENGTH,
+	type GoalBinding,
 	type GoalPublicState,
 	type GoalRecord,
 	previewObjective,
 	toPublicState,
 } from "./goal.ts";
-import { GoalStore, validateObjective } from "./store.ts";
+import { GoalStore, validateObjective, type GoalMutationFailure } from "./store.ts";
 
 /** Auto-decline a replacement confirmation after this long (safe default: no discard). */
 const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
@@ -127,6 +128,34 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	const store = new GoalStore();
 
 	/**
+	 * The Goal (identity + revision) the model's current request was prepared
+	 * against, snapshotted at every `turn_start` — before the provider request,
+	 * hence before the model could have seen anything newer. Model-side lifecycle
+	 * transitions (`update_goal`) are bound to this snapshot: a held response
+	 * released after a user edit, replacement, pause, or resume executes against
+	 * a revised Goal and must be refused instead of mutating it, because the
+	 * model decided on state it can no longer see reflected. `null` while no
+	 * turn has started or no Goal existed when the turn began.
+	 */
+	let turnGoal: GoalBinding | null = null;
+
+	/**
+	 * An initial Goal staged by `/goal <objective>` while that command waits for
+	 * an ordinary (non-Goal) run to finish. The continuation seam must not adopt
+	 * that run before the command has sent the kickoff: otherwise the run the
+	 * command is waiting for continues as Goal work, `waitForIdle` may not resolve
+	 * until the Goal completes, and the creation announcement races its own
+	 * objective. Cleared as soon as the wait ends; a concurrent edit/pause/resume
+	 * changes the revision and therefore stops matching this binding.
+	 */
+	let pendingInitialKickoff: GoalBinding | null = null;
+
+	pi.on("turn_start", () => {
+		const goal = store.get();
+		turnGoal = goal ? { id: goal.id, revision: goal.revision } : null;
+	});
+
+	/**
 	 * Serializes Goal creation across concurrent /goal commands. Commands that
 	 * arrive while Pi is busy both wait for idle; without serialization both
 	 * could pass the existing-Goal check before either persists, and the second
@@ -177,6 +206,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("agent_before_settle", async (event, _ctx) => {
 		const goal = store.get();
 		if (!goal || goal.status !== "active") return;
+		if (
+			pendingInitialKickoff &&
+			goal.id === pendingInitialKickoff.id &&
+			goal.revision === pendingInitialKickoff.revision
+		) {
+			// `/goal <objective>` has not sent its kickoff yet. Let the ordinary
+			// run settle so the command can start work itself (or observe a
+			// user clear/edit/pause and cancel the stale kickoff).
+			return;
+		}
 		if (event.outcome !== "completed") return;
 		return {
 			entries: [
@@ -348,17 +387,49 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (!goal) {
 				return goalToolError(formatNoGoal(), null);
 			}
+			/**
+			 * Refuse a call whose decision was prepared against a different Goal
+			 * state. The binding comes from `turn_start` of the turn whose model
+			 * request proposed this call, so a held response released after a user
+			 * edit / replacement / pause / resume is refused instead of mutating
+			 * the revised Goal the model never saw.
+			 */
+			const staleRefusal = (binding: GoalBinding | null) => {
+				if (!binding) {
+					return goalToolError(
+						"update_goal cannot verify which Goal revision this call was prepared against; " +
+							"call get_goal to inspect the current state and try again.",
+						toPublicState(goal),
+					);
+				}
+				return goalToolError(
+					"Goal not updated: this call was prepared against a Goal state that has since changed " +
+						`(expected ${binding.id} revision ${binding.revision}, current ${goal.id} revision ${goal.revision}). ` +
+						"The user may have edited, replaced, paused, or resumed the Goal while your response was in flight. " +
+						"Call get_goal, re-read the current objective, and re-audit before completing or pausing.",
+					toPublicState(goal),
+				);
+			};
+			const reportMutationFailure = (action: string, failure: GoalMutationFailure) => {
+				if (failure.reason === "persistence") {
+					return goalToolError(
+						`Goal not ${action}: writing the Goal to the session failed (${describeError(failure.error)}). ` +
+							"The Goal is unchanged; fix the cause and try again.",
+						toPublicState(goal),
+					);
+				}
+				return goalToolError(`Goal could not be ${action}: ${failure.message}.`, toPublicState(goal));
+			};
 			if (params?.action === "complete") {
-				const completed = store.markComplete(pi);
+				if (!turnGoal || goal.id !== turnGoal.id || goal.revision !== turnGoal.revision) {
+					return staleRefusal(turnGoal);
+				}
+				const completed = store.markComplete(pi, turnGoal);
 				if (!completed.ok) {
 					// Distinguish a lifecycle refusal from a persistence failure: the Goal
 					// is still active in the second case, and saying otherwise would hide a
 					// real durability problem behind a lifecycle message.
-					const message =
-						completed.reason === "persistence"
-							? `Goal not marked complete: writing the Goal to the session failed (${describeError(completed.error)}). The Goal is still active; fix the cause and call update_goal again.`
-							: `Goal could not be marked complete: ${completed.message}.`;
-					return goalToolError(message, toPublicState(goal));
+					return reportMutationFailure("marked complete", completed);
 				}
 				const state = toPublicState(completed.goal!);
 				return {
@@ -374,6 +445,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						toPublicState(goal),
 					);
 				}
+				if (!turnGoal || goal.id !== turnGoal.id || goal.revision !== turnGoal.revision) {
+					return staleRefusal(turnGoal);
+				}
 				const quote = typeof params.userRequest === "string" ? params.userRequest : "";
 				if (quote.trim().length < MIN_USER_REQUEST_LENGTH) {
 					return goalToolError(
@@ -384,8 +458,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						toPublicState(goal),
 					);
 				}
-				const corroborated = findUserRequestCorroboration(ctx.sessionManager.getBranch(), quote);
-				if (!corroborated) {
+				const corroboration = corroboratePauseRequest(ctx.sessionManager.getBranch(), quote);
+				if (!corroboration.ok) {
+					if (corroboration.reason === "quote-not-request") {
+						return goalToolError(
+							"update_goal could not verify an explicit pause request: the quoted text is not itself a " +
+								`pause request (${JSON.stringify(previewObjective(quote, 120))} does not name pausing). Quote ` +
+								'the user\u2019s actual instruction \u2014 the sentence in which they ask to pause, for example ' +
+								'"please pause the goal" \u2014 not an incidental fragment of something else they wrote.',
+							toPublicState(goal),
+						);
+					}
+					if (corroboration.reason === "not-an-instruction") {
+						return goalToolError(
+							"update_goal could not verify an explicit pause request: the quote was found, but the " +
+								'user\u2019s message is not an affirmative pause instruction \u2014 it is negated ("do not pause"), ' +
+								'a keep-working or resume instruction, a deferral ("not now"), or a later user message ' +
+								"supersedes the request. If the user does want a pause they can run /goal pause; otherwise keep working.",
+							toPublicState(goal),
+						);
+					}
 					return goalToolError(
 						"update_goal could not verify an explicit user request to pause this Goal: no recent " +
 							`user message contains ${JSON.stringify(previewObjective(quote, 200))}. ` +
@@ -394,13 +486,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						toPublicState(goal),
 					);
 				}
-				const paused = store.markPaused(pi);
+				const paused = store.markPaused(pi, turnGoal);
 				if (!paused.ok) {
-					const message =
-						paused.reason === "persistence"
-							? `Goal not paused: writing the Goal to the session failed (${describeError(paused.error)}). The Goal is still active.`
-							: `Goal could not be paused: ${paused.message}.`;
-					return goalToolError(message, toPublicState(goal));
+					return reportMutationFailure("paused", paused);
 				}
 				ctx.ui.notify(
 					`Goal ${goal.id} paused at the model's request; the quoted request was verified against the user's messages. No further automatic Goal runs will start.`,
@@ -657,14 +745,31 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 
 		// Serialized create-or-replace: concurrent /goal commands (for example two
-		// sent while Pi is busy) each wait for idle and then run exclusively; the
-		// authoritative existing-Goal check and the replacement confirmation both
-		// happen inside the lock, so the second command always sees the first's
-		// committed Goal and must be confirmed before replacing it.
+		// sent while Pi is busy) run exclusively; the authoritative existing-Goal
+		// check and the replacement confirmation both happen inside the lock, so
+		// the second command always sees the first's committed Goal and must be
+		// confirmed before replacing it. Every await is followed by a revalidation
+		// of the Goal the command captured: a confirmation or kickoff that was
+		// prepared against older state must never override the lifecycle commands
+		// the user ran in the meantime.
 		await runExclusive(async () => {
 			const existing = store.get();
 			if (existing && existing.status !== "complete") {
 				const confirmed = await confirmReplacement(ctx, existing);
+				// The answer applies only to the exact record the dialog described.
+				// If the Goal was cleared, edited, paused, resumed, or replaced
+				// while the dialog was open, neither answer may act on it.
+				const current = store.get();
+				if (!current || current.id !== existing.id || current.revision !== existing.revision) {
+					ctx.ui.notify(
+						`Replacement cancelled: the Goal changed while the confirmation was open` +
+							(current ? ` (now ${current.status}, revision ${current.revision})` : " (no Goal is set anymore)") +
+							", so the confirmation no longer described the current state. Nothing was replaced; " +
+							"run /goal <objective> again to confirm against the current Goal.",
+						"warning",
+					);
+					return;
+				}
 				if (!confirmed) {
 					ctx.ui.notify(
 						`Replacement cancelled: the current ${existing.status} Goal was kept. ` +
@@ -674,20 +779,35 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					return;
 				}
 			}
-			const replacing = existing != null;
+			const previous = store.get();
+			const replacing = previous != null;
 
 			const goal = store.create(validation.objective, "command");
+			const sameRecord = (candidate: GoalRecord | null | undefined) =>
+				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
 			try {
-				// Stage the snapshot first: a write failure here abandons
-				// creation with no visible state change and the attempt
-				// can be retried.
+				// Stage and commit before any wait: the new record is what a
+				// concurrent /goal clear, edit, pause, or resume acts on, and
+				// revalidating it after the wait detects exactly that change.
 				store.stage(pi, goal);
-				// Make the Goal visible to get_goal for the kickoff run
-				// that starts now.
 				store.commit(goal);
 			} catch (error) {
-				// Nothing durable was confirmed: retract the committed
-				// Goal so no phantom state survives a failed stage.
+				if (replacing) {
+					// A failed *replacement* write must not erase the existing
+					// Goal: nothing was appended, so the previous record stays
+					// current in memory and on disk. The creation rollback
+					// (tombstone + no Goal) would be wrong here - it would drop
+					// the Goal the user still has.
+					const reason = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(
+						`Goal not created: writing the replacement to the session failed (${reason}). ` +
+							"The current Goal is unchanged; fix the cause and run /goal again.",
+						"error",
+					);
+					return;
+				}
+				// Nothing durable was confirmed for a brand-new Goal: retract it
+				// so no phantom state survives a failed stage.
 				store.rollback(pi);
 				notifyWriteFailure(ctx, error);
 				return;
@@ -696,36 +816,71 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			let delivery: "started" | "steered";
 			if (replacing) {
 				// Replacing must work while the discarded Goal's own run is still
-				// in flight — waiting for idle would deadlock behind its
-				// continuation loop — so the kickoff is steered into the active
+				// in flight - waiting for idle would deadlock behind its
+				// continuation loop - so the kickoff is steered into the active
 				// run or starts immediately when idle.
 				delivery = deliverWorkMessage(formatKickoffMessage(goal), ctx);
 			} else {
-				// sendUserMessage needs an idle agent; wait for any active run
-				// to settle (abort also settles a stuck run). With no existing
-				// Goal there is no Goal continuation loop that could starve us.
-				await ctx.waitForIdle();
+				// There is no Goal continuation loop that could starve this wait
+				// (abort also settles a stuck run), and the seam above declines to
+				// adopt the run we are waiting for. Revalidate afterwards: a
+				// clear/edit/pause issued while creation waited must win over
+				// starting the objective the user has already moved away from.
+				pendingInitialKickoff = { id: goal.id, revision: goal.revision };
+				try {
+					await ctx.waitForIdle();
+				} finally {
+					pendingInitialKickoff = null;
+				}
+				const waited = store.get();
+				if (!sameRecord(waited)) {
+					ctx.ui.notify(
+						waited
+							? `Goal ${goal.id} was not started: it changed while creation waited for the current run to finish ` +
+									`(now ${waited.status}, revision ${waited.revision}). Initial work was not started; the current state stands.`
+							: `Goal ${goal.id} was not started: it was cleared while creation waited for the current run to finish. ` +
+									"Nothing remains active; run /goal <objective> again to start over.",
+						"warning",
+					);
+					return;
+				}
 				pi.sendUserMessage(formatKickoffMessage(goal));
 				delivery = "started";
 			}
 
-			// Confirm durability before announcing success. If the
-			// snapshot never reaches disk (unwritable storage,
-			// interrupted flush), retract the Goal with a tombstone and
-			// report a retryable persistence error.
+			// Confirm durability before announcing success: the *last* goal-state
+			// entry on disk must be this Goal (a tombstone written by a /goal
+			// clear during the wait counts as not durable). Re-read the current
+			// record after the wait so the announcement describes reality.
 			const durable = await waitForDurability(ctx, goal.id);
-			if (!durable) {
-				store.rollback(pi);
+			const now = store.get();
+			if (now?.id === goal.id && !durable) {
+				// Retract only this command's record. A replacement must restore
+				// the previous Goal; clearing the slot with a tombstone would throw
+				// away a Goal that was never replaced on disk.
+				if (replacing && previous) store.restore(pi, previous);
+				else store.rollback(pi);
 				notifyWriteFailure(
 					ctx,
 					new Error("the Goal snapshot did not reach the session file in time"),
 				);
 				return;
 			}
+			if (!now || now.id !== goal.id) {
+				// The Goal this command created was cleared (or otherwise removed)
+				// before creation could be announced; report that instead of
+				// claiming success for state that no longer exists.
+				ctx.ui.notify(
+					`Goal ${goal.id} was cleared before creation finished; nothing remains active. ` +
+						"Run /goal <objective> again to start over.",
+					"warning",
+				);
+				return;
+			}
 
 			ctx.ui.notify(
 				replacing
-					? `Goal ${goal.id} created and activated, replacing ${existing!.id}. Initial work ${delivery === "started" ? "started" : "steered into the running work"}.`
+					? `Goal ${goal.id} created and activated, replacing ${previous!.id}. Initial work ${delivery === "started" ? "started" : "steered into the running work"}.`
 					: `Goal ${goal.id} created and activated. Initial work started.`,
 				"info",
 			);
