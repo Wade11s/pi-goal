@@ -56,14 +56,25 @@ observable Pi events, with thresholds that are constants rather than settings.
    a row stop the Goal.
 4. **Provider failures are classified from Pi's evidence, and only definitive
    exhaustion evidence counts.** A terminal provider error becomes `usage_limited`
-   only when the error text or a provider diagnostic pairs a quota, usage-limit,
-   credit, billing, or account-budget noun with an exhaustion verb, or names a
-   provider error code whose meaning is a plan usage limit. Bare account
-   vocabulary, internal and per-request budgets, negated statements, and lookups
-   are all excluded, because `usage_limited` is terminal and a false positive would
-   wedge the session's Goal. Negation is checked inside the matched phrase as well
-   as in front of it, since "quota is not exceeded" and "not exceeded your quota"
-   are equally clear statements that the plan is fine. Exhaustion evidence is evaluated before anything else, so a
+   only when the error text or a provider diagnostic carries one of two kinds of
+   evidence:
+   - *decisive* account or plan depletion — a provider usage-limit error code, a
+     usage limit, a billing or plan limit, an account/plan/period quota or budget,
+     or an empty credit pool. This tier survives throttle wording in the same
+     failure, because it says the plan itself is used up rather than that a rate
+     was hit;
+   - a bare quota plus an exhaustion verb, which is *not* decisive on its own,
+     because that is also exactly how a provider describes a per-minute quota
+     metric that resets within a minute. It only counts when its sentence is not
+     about a rate dimension.
+
+   Bare account vocabulary, internal and per-request budgets, negated statements,
+   and lookups are all excluded, because `usage_limited` is terminal and a false
+   positive would wedge the session's Goal. Negation is checked inside the matched
+   phrase as well as in front of it, since "quota is not exceeded" and "not
+   exceeded your quota" are equally clear statements that the plan is fine, and a
+   leading "no" counts too. Every match of every pattern is scanned, so a rejected
+   earlier lookup cannot hide a later explicit statement of exhaustion. Exhaustion evidence is evaluated before anything else, so a
    failure that reports both a throttle and an exhausted quota is classified by the
    quota. Anything else stops the continuation for that run, is surfaced to the
    user, and leaves the Goal active so the next successful run resumes it.

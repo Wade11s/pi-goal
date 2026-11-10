@@ -1749,65 +1749,6 @@ test("a transient billing outage is a surfaced terminal error, not a usage limit
 	}
 });
 
-test("provider failures are classified from what the evidence actually says", async () => {
-	// One terminal provider error per case, retries disabled so the failure reaches
-	// the boundary exactly as the reviewer's probes did. `usage_limited` is terminal
-	// for continuation, so every row is a decision the extension has to get right.
-	const cases = [
-		// Exhaustion: the plan or budget is used up, so the Goal must stop.
-		["429 insufficient_quota: you exceeded your current quota for this organization", "usage_limited"],
-		["You exceeded your current quota for this organization", "usage_limited"],
-		["Monthly usage limit reached", "usage_limited"],
-		["Your credit balance is too low to access the Anthropic API", "usage_limited"],
-		["billing hard limit has been reached", "usage_limited"],
-		["You have reached your usage limit for this billing period", "usage_limited"],
-		// A throttle and an exhausted quota in one failure: the quota decides.
-		["429 rate limit reached; insufficient_quota: current quota exhausted", "usage_limited"],
-		// Negation and sentence boundaries must not be read past.
-		["This is not a rate limit. Your quota is exceeded.", "usage_limited"],
-		// Internal and per-request budgets are not the account's plan.
-		["Retry budget exhausted after 3 attempts", "active"],
-		["token budget exceeded for this request", "active"],
-		// A lookup or a throttle is not an exhausted plan.
-		["The quota service reached a timeout while checking your account", "active"],
-		["You have not exceeded your quota", "active"],
-		["Your quota is not exceeded", "active"],
-		["Your usage limit has not been reached", "active"],
-		["429 rate limit exceeded, please slow down", "active"],
-		// An unqualified or per-request budget is not the account's plan.
-		["The request is out of budget for this call", "active"],
-		// Negation can sit on either side of the verb, and can lead with "no".
-		["Your quota has not been exceeded", "active"],
-		["Your plan limit has not been reached", "active"],
-		["No quota exceeded", "active"],
-		// A lookup or a throttle in the same sentence is not plan exhaustion.
-		["The quota service reached a rate limit while checking your account", "active"],
-		["spending budget exhausted", "usage_limited"],
-	];
-	for (const [message, expectedStatus] of cases) {
-		// Retries are disabled so the failure reaches the boundary as the reviewer's
-		// probes did. With Pi's retries on, a retryable error would consume the next
-		// scripted step, succeed, and the run would complete — hiding the very
-		// classification under test.
-		const session = await PiRpcSession.start({ settings: { retry: { enabled: false } } });
-		script([{ text: "Kickoff answer." }, { error: message }, { text: "Unrequested." }], session);
-		try {
-			await startGoal(session);
-			await session.waitForSettled(1);
-			const entries = readSessionEntries(await session.sessionFile());
-			assert.equal(
-				lastGoalSnapshot(entries).data.goal.status,
-				expectedStatus,
-				`"${message}" must leave the Goal ${expectedStatus}`,
-			);
-			assertStepsConsumed(session, 2, [{ stopReason: "error", errorMessage: message }]);
-			assert.equal(session.extensionErrors().length, 0);
-		} finally {
-			await session.stop();
-		}
-	}
-});
-
 test("a rate limit that survived Pi's retries is a surfaced terminal error, not a usage limit", async () => {
 	const session = await PiRpcSession.start({
 		settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 } },

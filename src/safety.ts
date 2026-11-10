@@ -394,52 +394,90 @@ export interface ProviderFailureClassification {
 /** The verbs that mean a limit, quota, or budget is used up. */
 const EXHAUSTION_VERB = "(?:exceeded|exhausted|depleted|reached)";
 
+/** Expand the verb placeholder in a pattern source. */
+function withVerb(source: string): RegExp {
+	return new RegExp(source.replace("EXHAUSTION_VERB", EXHAUSTION_VERB), "i");
+}
+
 /**
- * Wording that means the account, plan, or budget is *exhausted*, as opposed to a
- * transient throttle, an internal technical budget, or an unrelated account
- * problem.
+ * Evidence that names account or plan depletion directly.
  *
- * Every entry pairs a quota / usage-limit / credit noun with an exhaustion verb,
- * pairs a billing or plan limit with one, or names a provider error code whose
- * meaning is a plan usage limit. Three kinds of look-alike are deliberately
- * excluded, because each of them would stop a Goal permanently on evidence that
- * does not support it:
+ * Every entry either names a provider error code whose meaning is a plan usage
+ * limit, pairs a *usage limit*, *billing limit*, *account/plan/period quota*, or
+ * *account/plan/period budget* with an exhaustion verb, or states that a credit
+ * pool is empty. These may coexist with throttle wording in the same failure,
+ * because they say the plan itself is used up rather than that a rate was hit —
+ * which is why "429 rate limit reached; insufficient_quota: current quota
+ * exhausted" is a usage limit and not a throttle.
  *
- * - bare account vocabulary ("billing address could not be verified", "billing
- *   service temporarily unavailable", "payment method declined", "available
- *   balance") describes an account problem or a transient condition;
- * - internal budgets ("retry budget exhausted", "token budget exceeded for this
- *   request") are Pi's or the request's own limits, not the account's plan, so
- *   the budget noun must name an account, plan, or period;
- * - a *billing or plan limit* that has been reached is exhaustion, which is why
- *   those nouns are matched explicitly.
- *
- * The narrowness is the point. `usage_limited` is terminal for continuation and
- * resuming it is a user decision, so a false positive wedges the session's Goal;
- * a false negative only costs one more surfaced terminal error.
+ * Bare account vocabulary is deliberately absent ("billing address could not be
+ * verified", "billing service temporarily unavailable", "payment method
+ * declined", "available balance"): those describe an account problem or a
+ * transient condition, not an exhausted plan.
  */
-const USAGE_LIMIT_PATTERNS: RegExp[] = [
+const ACCOUNT_EXHAUSTION_PATTERNS: RegExp[] = [
 	// Provider error codes and types whose meaning is a quota or plan usage limit.
 	/insufficient[ _-]?quota/i,
 	/(?:go|free)usagelimiterror/i,
 	/"code"\s*:\s*"?1308(?![0-9])/,
 	/subscription_sharing_[a-z_]*usage_limit_exceeded/i,
-	// A usage limit or quota that has been reached, in either word order.
-	/usage[ _-]?limit[^.\n]{0,30}EXHAUSTION_VERB/i,
-	/EXHAUSTION_VERB[^.\n]{0,30}usage[ _-]?limit/i,
-	/quota[^.\n]{0,30}EXHAUSTION_VERB/i,
-	/EXHAUSTION_VERB[^.\n]{0,30}quota/i,
+	// A usage limit that has been reached, in either word order.
+	withVerb("usage[ _-]?limit[^.\n]{0,30}EXHAUSTION_VERB"),
+	withVerb("EXHAUSTION_VERB[^.\n]{0,30}usage[ _-]?limit"),
 	// An explicit billing or plan limit that has been reached.
-	/(?:billing|plan|spending|account|subscription)[ _-]?(?:hard[ _-]?)?limit[^.\n]{0,30}EXHAUSTION_VERB/i,
-	// An account, plan, or period budget that has been used up.
-	/(?:spending|account|plan|monthly|weekly|daily|organization|org)[ _-]?budget[^.\n]{0,30}EXHAUSTION_VERB/i,
-	// Explicit exhaustion of a credit pool. `budget` is deliberately absent here: an
-	// unqualified "out of budget" is at least as likely to describe this request's
-	// own allowance ("The request is out of budget for this call") as the account's
-	// plan, and only a qualified account, plan, or period budget matches above.
+	withVerb("(?:billing|plan|spending|account|subscription)[ _-]?(?:hard[ _-]?)?limit[^.\n]{0,30}EXHAUSTION_VERB"),
+	// A quota that names the account, the plan, or a billing period.
+	withVerb("(?:current|account|plan|billing|monthly|weekly|daily|remaining|total)[ _-]?quota[^.\n]{0,30}EXHAUSTION_VERB"),
+	withVerb("EXHAUSTION_VERB[^.\n]{0,30}(?:current|account|plan|monthly|weekly|daily)[ _-]?quota"),
+	// An account, plan, or period budget that has been used up. `retry` and `token`
+	// are deliberately absent: those are Pi's or the request's own limits.
+	withVerb("(?:spending|account|plan|monthly|weekly|daily|organization|org)[ _-]?budget[^.\n]{0,30}EXHAUSTION_VERB"),
+	// Explicit exhaustion of a credit pool. An unqualified `budget` is absent here
+	// on purpose: "out of budget" is at least as likely to describe this request's
+	// own allowance as the account's plan.
 	/out of credits/i,
 	/credit balance (?:is )?too low/i,
-].map((pattern) => new RegExp(pattern.source.replace("EXHAUSTION_VERB", EXHAUSTION_VERB), pattern.flags));
+];
+
+/**
+ * A bare quota plus an exhaustion verb, in either word order.
+ *
+ * This is also exactly how a provider describes a *per-minute quota metric* —
+ * Google's "Quota exceeded for quota metric 'Generate Content API requests per
+ * minute'." is a throttle that resets within a minute, not a used-up plan — so a
+ * match here only counts when its sentence is not about a rate dimension.
+ */
+const QUOTA_EXHAUSTION_PATTERNS: RegExp[] = [
+	withVerb("quota[^.\n]{0,30}EXHAUSTION_VERB"),
+	withVerb("EXHAUSTION_VERB[^.\n]{0,30}quota"),
+];
+
+/**
+ * Wording that makes an exhaustion verb describe a lookup or a rate dimension
+ * rather than a used-up plan.
+ *
+ * "The quota service reached a timeout while checking your account" and "The quota
+ * service reached a rate limit while checking your account" both contacted a
+ * service and exhausted nothing, and "Quota exceeded for quota metric ... requests
+ * per minute" describes an allowance that resets within a minute. `reached` is the
+ * weakest of the four verbs — a service can reach a timeout or a rate limit, and
+ * only a limit can be reached — but a per-minute quota metric can be *exceeded*
+ * too, so the whole bare-quota tier is guarded, not just `reached`.
+ */
+const NON_EXHAUSTION_CONTEXT_PATTERN =
+	/\b(?:timeout|timed out|time limit|deadline|latency|throttl\w*|rate[ _-]?limit|quota[ _-]?metric|requests?[ _-]?per[ _-]?(?:minute|second|hour)|per[ _-]?(?:minute|second|hour)|rpm|tpm|tokens?[ _-]?per[ _-]?(?:minute|second))\b/i;
+
+/**
+ * The sentence containing `index`, so a lookup or a rate dimension mentioned
+ * *elsewhere* in the message cannot mask genuine exhaustion in this one.
+ */
+function sentenceAt(text: string, index: number): string {
+	const lineStart = Math.max(text.lastIndexOf(".", index), text.lastIndexOf("\n", index)) + 1;
+	const period = text.indexOf(".", index);
+	const newline = text.indexOf("\n", index);
+	const lineEnd = Math.min(period === -1 ? text.length : period, newline === -1 ? text.length : newline);
+	return text.slice(lineStart, lineEnd);
+}
 
 /**
  * Wording that negates a statement.
@@ -464,30 +502,6 @@ const NEGATION_PATTERN = new RegExp(`\\b${NEGATION_WORD}\\b`, "i");
  * an unnegated one that follows it.
  */
 const NEGATION_BEFORE_PATTERN = new RegExp(`\\b${NEGATION_WORD}\\b[^.\\n]{0,30}$`, "i");
-
-/**
- * Wording that makes "reached" describe a lookup or a throttle rather than an
- * exhausted plan.
- *
- * "The quota service reached a timeout while checking your account" and "The quota
- * service reached a rate limit while checking your account" both contacted a
- * service and exhausted nothing. `reached` is the weakest of the four verbs — a
- * service can reach a timeout or a rate limit, and only a limit can be reached — so
- * a match that leans on it needs a sentence free of that wording.
- */
-const LOOKUP_CONTEXT_PATTERN = /\b(?:timeout|timed out|time limit|deadline|latency|throttl\w*|rate[ _-]?limit)\b/i;
-
-/**
- * The sentence containing `index`, so a lookup or a throttle mentioned *elsewhere*
- * in the message cannot mask genuine exhaustion in this one.
- */
-function sentenceAt(text: string, index: number): string {
-	const lineStart = Math.max(text.lastIndexOf(".", index), text.lastIndexOf("\n", index)) + 1;
-	const period = text.indexOf(".", index);
-	const newline = text.indexOf("\n", index);
-	const lineEnd = Math.min(period === -1 ? text.length : period, newline === -1 ? text.length : newline);
-	return text.slice(lineStart, lineEnd);
-}
 
 /** Everything Pi exposes about one provider failure, flattened for matching. */
 function evidenceText(evidence: ProviderFailureEvidence): string {
@@ -514,40 +528,44 @@ function evidenceText(evidence: ProviderFailureEvidence): string {
  */
 export function classifyProviderFailure(evidence: ProviderFailureEvidence): ProviderFailureClassification {
 	const text = evidenceText(evidence);
-	// Definitive exhaustion evidence is evaluated first, and nothing else can
-	// suppress it: a provider can report a throttle and an exhausted quota in the
-	// same failure ("429 rate limit reached; insufficient_quota: current quota
-	// exhausted"), and it is the quota that needs a user decision. A plain rate
-	// limit matches none of the patterns above — no quota, usage-limit, billing, or
-	// account-budget noun — so it stays a terminal error on its own.
-	const exhausted = matchExhaustionEvidence(text);
+	// Account or plan depletion is looked for first and is decisive: it survives
+	// throttle wording in the same failure, because it says the plan itself is used
+	// up. Every match of every pattern is scanned, so a rejected earlier one cannot
+	// hide a later statement of exhaustion.
+	const exhausted = firstEvidence(text, ACCOUNT_EXHAUSTION_PATTERNS, false);
 	if (exhausted !== null) {
 		return { kind: "usage-limit", evidence: exhausted };
+	}
+	// A bare quota plus an exhaustion verb is then considered, but only when its
+	// sentence is not about a rate dimension: that is the wording of a per-minute
+	// quota metric, which is a throttle.
+	const quota = firstEvidence(text, QUOTA_EXHAUSTION_PATTERNS, true);
+	if (quota !== null) {
+		return { kind: "usage-limit", evidence: quota };
 	}
 	return { kind: "terminal-error", evidence: terminalEvidence(evidence) };
 }
 
-/** `reached`, the weakest of the exhaustion verbs. */
-const REACHED_VERB = /\breached\b/i;
-
 /**
- * The exhaustion evidence in a provider failure, or null when there is none.
+ * The first match of any pattern that survives the guards, or null.
  *
- * A pattern match is only evidence when it survives every guard: it is not
- * negated, either inside the matched phrase or just in front of it, and a match
- * that leans on `reached` does not sit in timeout or throttling wording in its own
- * sentence. The stronger verbs — exceeded, exhausted, depleted — are unambiguous
- * and only the negation guards apply to them.
+ * `guardRateContext` adds the lookup/rate-dimension guard used for the bare-quota
+ * tier. Scanning every match rather than only the first is what lets a later
+ * sentence state exhaustion after an earlier one was rejected as a lookup.
  */
-function matchExhaustionEvidence(text: string): string | null {
-	for (const pattern of USAGE_LIMIT_PATTERNS) {
-		const match = pattern.exec(text);
-		if (!match) continue;
-		if (NEGATION_PATTERN.test(match[0])) continue;
-		const before = text.slice(Math.max(0, match.index - NEGATION_WINDOW), match.index);
-		if (NEGATION_BEFORE_PATTERN.test(before)) continue;
-		if (REACHED_VERB.test(match[0]) && LOOKUP_CONTEXT_PATTERN.test(sentenceAt(text, match.index))) continue;
-		return match[0];
+function firstEvidence(text: string, patterns: RegExp[], guardRateContext: boolean): string | null {
+	for (const pattern of patterns) {
+		// A fresh global regex per pattern, so no lastIndex state leaks between calls.
+		const scanner = new RegExp(pattern.source, `${pattern.flags}g`);
+		for (const match of text.matchAll(scanner)) {
+			const index = match.index ?? 0;
+			const matched = match[0];
+			if (NEGATION_PATTERN.test(matched)) continue;
+			const before = text.slice(Math.max(0, index - NEGATION_WINDOW), index);
+			if (NEGATION_BEFORE_PATTERN.test(before)) continue;
+			if (guardRateContext && NON_EXHAUSTION_CONTEXT_PATTERN.test(sentenceAt(text, index))) continue;
+			return matched;
+		}
 	}
 	return null;
 }

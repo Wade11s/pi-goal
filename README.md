@@ -218,33 +218,32 @@ to be over.
   for that run and is surfaced as a warning, while the Goal stays active and
   continues on the next successful run. Pi's own retries are untouched.
 - A **usage-limit** error is only classified as one when Pi exposes enough
-  evidence: the error text or a provider diagnostic has to pair a quota,
-  usage-limit, credit, billing, or account-budget noun with an exhaustion verb
-  (`insufficient quota`, `quota exceeded`, `usage limit reached`, `out of
-  credits`, `credit balance is too low`, `billing hard limit has been reached`,
-  provider error codes whose meaning is a plan usage limit). Three kinds of
-  look-alike are deliberately not enough, and each of them would wedge the Goal on
-  evidence that does not support it:
-  - bare account vocabulary (`billing address could not be verified`, `billing
-    service temporarily unavailable`, `payment method declined`, `available
-    balance`) describes an account problem or a transient condition;
-  - internal budgets (`retry budget exhausted after 3 attempts`, `token budget
-    exceeded for this request`) are Pi's or the request's own limits, so a budget
-    must name an account, plan, or period;
-  - a negated statement (`You have not exceeded your quota`, `Your quota is not
-    exceeded`, `Your usage limit has not been reached`, `No quota exceeded`) says
-    the plan is fine — the negation is checked inside the matched phrase, in the
-    window in front of it, and includes a leading `no`;
-  - a lookup or a throttle in the same sentence (`The quota service reached a
-    timeout while checking your account`, `The quota service reached a rate limit
-    while checking your account`) says a service was contacted;
-  - an unqualified or per-request budget (`The request is out of budget for this
-    call`, `token budget exceeded for this request`) describes this request's own
-    allowance, not the account's plan.
-  A rate limit is never a usage limit on its own, because Pi retries those itself
-  — but when the same failure also carries explicit quota-exhaustion evidence
-  (`429 rate limit reached; insufficient_quota: current quota exhausted`), the
-  quota decides, because that is the part needing a user decision.
+  evidence, and the evidence is read in two tiers:
+  - **Account or plan depletion is decisive.** A provider error code whose meaning
+    is a plan usage limit (`insufficient_quota`, `GoUsageLimitError`, code `1308`,
+    `subscription_sharing_…_usage_limit_exceeded`), a *usage limit*, *billing or
+    plan limit*, *account/plan/period quota*, or *account/plan/period budget* paired
+    with an exhaustion verb, an empty credit pool (`out of credits`, `credit balance
+    is too low`). This tier survives throttle wording in the same failure, because
+    it says the plan itself is used up rather than that a rate was hit —
+    `429 rate limit reached; insufficient_quota: current quota exhausted` is a usage
+    limit, not a throttle.
+  - **A bare quota plus an exhaustion verb is not decisive.** That is also exactly
+    how a provider describes a *per-minute quota metric*, which resets within a
+    minute, so it only counts when its sentence is not about a rate dimension.
+  Every match of every pattern is scanned, so a rejected earlier lookup or throttle
+  cannot hide a later explicit statement of exhaustion.
+
+  These look-alikes are deliberately not enough, and each of them would wedge the
+  Goal on evidence that does not support it:
+
+  | Look-alike | Example |
+  | --- | --- |
+  | A transient throttle described with quota vocabulary | `Rate limit exceeded; quota is not exhausted.`, `429 rate limit exceeded for quota metric requests per minute`, `Quota exceeded for quota metric 'Generate Content API requests per minute'` |
+  | A lookup or a throttle in the same sentence | `The quota service reached a timeout while checking your account`, `The quota service reached a rate limit while checking your account` |
+  | A negated statement | `You have not exceeded your quota`, `Your quota is not exceeded`, `Your quota has not been exceeded`, `Your plan limit has not been reached`, `No quota exceeded` |
+  | An internal or per-request budget | `Retry budget exhausted after 3 attempts`, `token budget exceeded for this request`, `The request is out of budget for this call` |
+  | Bare account vocabulary | `Your billing address could not be verified; update your account details`, `Billing service temporarily unavailable; please retry later` |
 - Every stop is explained to the user through a notification and recorded on the
   Goal, so `get_goal` and bare `/goal` report the blocker and the audit count.
 - **User actions reset the counters.** A prompt the user types (including one
