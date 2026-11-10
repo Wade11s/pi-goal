@@ -451,6 +451,41 @@ test("update_goal without a Goal reports that none is set and creates nothing", 
 	}
 });
 
+test("update_goal accepts the complete spellings a model drifts into", async () => {
+	const session = await PiRpcSession.start();
+	// `{ status: "complete" }` completes the Goal; the later `{ complete: true }` is
+	// recognized as a completion request and refused because the Goal is already
+	// complete (not because the spelling was rejected).
+	script(
+		[
+			{ toolCalls: [{ name: "update_goal", args: { status: "complete" } }] },
+			{ toolCalls: [{ name: "update_goal", args: { complete: true } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await session.waitForSettled(1);
+
+		const results = toolResults(session, "update_goal");
+		assert.equal(results.length, 2);
+		assert.equal(results[0].isError, false, "the status spelling completes the Goal");
+		assert.equal(structuredGoal(results[0].result).status, "complete");
+		assert.equal(results[1].isError, true);
+		assert.match(String(results[1].result.content[0].text), /no active Goal to complete/);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete");
+		assert.equal(continuationEntries(entries).length, 0, "the Goal completed before any settlement");
+		assert.equal(runCount(session), 1);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
 test("create_goal refuses an ephemeral session instead of promising durability", async () => {
 	const session = await PiRpcSession.start({ noSession: true });
 	script(
