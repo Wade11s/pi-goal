@@ -5,7 +5,15 @@
  * context). The current state is reconstructed from the last such entry on the
  * active session branch, so restart, resume, reload, fork, and tree navigation
  * all reconstruct the state that belongs to the selected branch.
+ *
+ * Creation is staged before it is announced: `stage()` only writes the snapshot
+ * (throwing on write failure without touching memory), `commit()` makes it
+ * visible, and `rollback()` retracts it with a durable tombstone. Pi 1.5.1
+ * defers creating the session file until the first user/assistant message, so
+ * durability is confirmed separately (`isDurable`) before success is reported.
  */
+import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	CUSTOM_ENTRY_TYPE,
@@ -15,8 +23,9 @@ import {
 	MIN_OBJECTIVE_LENGTH,
 } from "./goal.ts";
 
-function randomId(): string {
-	return Math.random().toString(16).slice(2, 10).padEnd(8, "0");
+function goalId(): string {
+	// 8 hex chars from a UUID; stable across continuation, compaction, and restore.
+	return `goal_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
 }
 
 export class GoalStore {
@@ -64,29 +73,72 @@ export class GoalStore {
 	}
 
 	/**
-	 * Persist a snapshot of `goal` as-is and update in-memory state. The entry
-	 * participates in the session tree, so forks and tree navigation see
-	 * branch-correct state. Later milestones add a transition helper that bumps
-	 * the revision; creation persists revision 0.
+	 * Write the snapshot as a custom entry. Throws on write failure without
+	 * changing in-memory state, so a failed stage can simply be abandoned.
+	 * The entry participates in the session tree, so forks and tree navigation
+	 * see branch-correct state.
 	 */
-	persist(pi: ExtensionAPI, goal: GoalRecord): void {
+	stage(pi: ExtensionAPI, goal: GoalRecord): void {
 		pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal } satisfies GoalSnapshot);
+	}
+
+	/**
+	 * Confirm the snapshot is durably on disk. Pi defers creating the session
+	 * file until the session has a user or assistant message, so a staged
+	 * snapshot on a fresh session is in memory only until the kickoff's user
+	 * message flushes the file.
+	 */
+	isDurable(ctx: ExtensionContext, goalId: string): boolean {
+		try {
+			const file = ctx.sessionManager.getSessionFile();
+			if (!file) return false;
+			for (const line of readFileSync(file, "utf8").split("\n")) {
+				if (!line.includes(CUSTOM_ENTRY_TYPE)) continue;
+				let entry: unknown;
+				try {
+					entry = JSON.parse(line);
+				} catch {
+					continue;
+				}
+				const custom = entry as { customType?: string; data?: GoalSnapshot };
+				if (custom?.customType === CUSTOM_ENTRY_TYPE && custom.data?.goal?.id === goalId) return true;
+			}
+			return false;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Make a staged Goal visible to /goal and get_goal. */
+	commit(goal: GoalRecord): void {
 		this.current = goal;
 	}
 
-	/** Create a new active Goal record (revision 0). */
+	/**
+	 * Retract a Goal that could not be made durable: clear in-memory state and
+	 * append a tombstone snapshot so a later flush of the abandoned staged entry
+	 * cannot resurrect it during reconstruction. Best effort.
+	 */
+	rollback(pi: ExtensionAPI): void {
+		this.current = null;
+		try {
+			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
+		} catch {
+			// Nothing more we can do; the staged entry was never confirmed durable.
+		}
+	}
+
+	/** Build a new active Goal record (revision 0). Pure: no state is changed. */
 	create(objective: string): GoalRecord {
 		const now = Date.now();
-		const goal: GoalRecord = {
-			id: `goal_${randomId()}`,
+		return {
+			id: goalId(),
 			objective,
 			status: "active",
 			createdAt: now,
 			updatedAt: now,
 			revision: 0,
 		};
-		this.current = goal;
-		return goal;
 	}
 }
 

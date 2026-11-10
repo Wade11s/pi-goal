@@ -4,8 +4,16 @@
  * Registers the /goal command and the get_goal model tool. A Goal is a durable,
  * session-scoped record persisted as custom session entries and reconstructed
  * from the active branch on session start (restart, resume, reload, fork) and
- * after tree navigation. Creating a Goal sends the objective into model context
- * as a custom message and starts initial work.
+ * after tree navigation.
+ *
+ * Creating a Goal sends the objective into model context as a user message and
+ * starts initial work. Pi 1.5.1 creates the session file only once a session
+ * has a user or assistant message, so the kickoff is delivered as a user
+ * message (a conversation entry, via the public sendUserMessage API): staging
+ * the snapshot and sending the kickoff flushes the file, and the command
+ * confirms durability on disk before announcing success. The custom-message
+ * channel (`goal-continuation`) is reserved for the automatic-continuation seam
+ * of a later milestone.
  *
  * Later milestones add automatic continuation at agent_before_settle, lifecycle
  * subcommands (edit/pause/resume/clear), create_goal/update_goal, and usage
@@ -14,7 +22,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-	CUSTOM_MESSAGE_TYPE,
 	formatGoalSummary,
 	formatKickoffMessage,
 	formatNoGoal,
@@ -24,14 +31,26 @@ import {
 } from "./goal.ts";
 import { GoalStore, validateObjective } from "./store.ts";
 
-/** Subcommands reserved by later milestones; refuse them instead of treating them as objectives. */
+/**
+ * Subcommand words reserved for later milestones. Refused only when they are
+ * the entire argument; objectives that merely begin with one of these words
+ * (for example "clear the lint errors") are valid.
+ */
 const RESERVED_SUBCOMMANDS = new Set(["edit", "pause", "resume", "clear"]);
+
+/** How long creation waits for the snapshot to become durable on disk. */
+const DURABILITY_TIMEOUT_MS = 5000;
+const DURABILITY_POLL_MS = 15;
 
 export default function goalExtension(pi: ExtensionAPI): void {
 	const store = new GoalStore();
 
 	pi.on("session_start", (_event, ctx) => {
 		store.reconstruct(ctx);
+		const goal = store.get();
+		if (goal) {
+			ctx.ui.notify(`Goal ${goal.id} restored (${goal.status}).`, "info");
+		}
 	});
 	pi.on("session_tree", (_event, ctx) => {
 		store.reconstruct(ctx);
@@ -77,10 +96,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					return;
 				}
 
-				const firstWord = trimmed.split(/\s+/)[0]?.toLowerCase() ?? "";
-				if (RESERVED_SUBCOMMANDS.has(firstWord)) {
+				if (RESERVED_SUBCOMMANDS.has(trimmed.toLowerCase())) {
 					ctx.ui.notify(
-						`"/goal ${firstWord}" is not implemented in this milestone of pi-goal. ` +
+						`"/goal ${trimmed.toLowerCase()}" is not implemented in this milestone of pi-goal. ` +
 							"Bare /goal reports the current Goal; /goal <objective> creates one.",
 						"warning",
 					);
@@ -111,20 +129,39 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					return;
 				}
 
-				const goal = store.create(validation.objective);
-				store.persist(pi, goal);
+				// sendUserMessage needs an idle agent; wait for any active run to settle.
+				await ctx.waitForIdle();
 
-				// Start initial work: continuation instructions live in model context
-				// (custom_message entry), attributed as user-provided Goal data.
-				pi.sendMessage(
-					{
-						customType: CUSTOM_MESSAGE_TYPE,
-						content: formatKickoffMessage(goal),
-						display: true,
-						details: { goalId: goal.id, revision: goal.revision, kind: "kickoff" },
-					},
-					{ triggerTurn: true },
-				);
+				const goal = store.create(validation.objective);
+				try {
+					// Stage the snapshot first: a write failure here abandons creation
+					// with no visible state change and the attempt can be retried.
+					store.stage(pi, goal);
+					// Make the Goal visible to get_goal for the kickoff run that starts now.
+					store.commit(goal);
+				} catch (error) {
+					notifyWriteFailure(ctx, error);
+					return;
+				}
+
+				// Start initial work. The kickoff is a user message: it carries the
+				// objective into model context as user-provided Goal data and, as the
+				// session's first conversation entry, makes Pi flush the session file
+				// with the staged snapshot.
+				pi.sendUserMessage(formatKickoffMessage(goal));
+
+				// Confirm durability before announcing success. If the snapshot never
+				// reaches disk (unwritable storage, interrupted flush), retract the
+				// Goal with a tombstone and report a retryable persistence error.
+				const durable = await waitForDurability(ctx, goal.id);
+				if (!durable) {
+					store.rollback(pi);
+					notifyWriteFailure(
+						ctx,
+						new Error("the Goal snapshot did not reach the session file in time"),
+					);
+					return;
+				}
 
 				ctx.ui.notify(`Goal ${goal.id} created and activated. Initial work started.`, "info");
 			} catch (error) {
@@ -132,6 +169,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			}
 		},
 	});
+
+	function notifyWriteFailure(ctx: ExtensionCommandContext, cause: unknown): void {
+		const reason = cause instanceof Error ? cause.message : String(cause);
+		ctx.ui.notify(
+			`Goal not created: writing the Goal to the session failed (${reason}). ` +
+				"Nothing was stored; fix the cause and run /goal again.",
+			"error",
+		);
+	}
+
+	async function waitForDurability(ctx: ExtensionCommandContext, goalId: string): Promise<boolean> {
+		const deadline = Date.now() + DURABILITY_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			if (store.isDurable(ctx, goalId)) return true;
+			await new Promise((resolve) => setTimeout(resolve, DURABILITY_POLL_MS));
+		}
+		return store.isDurable(ctx, goalId);
+	}
 
 	async function reportStatus(ctx: ExtensionCommandContext): Promise<void> {
 		const goal = store.get();

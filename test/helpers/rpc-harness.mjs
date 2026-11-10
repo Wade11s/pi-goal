@@ -6,9 +6,14 @@
  * scripted test provider. JSONL records are collected and exposed through
  * promise-based waiters so tests can assert on responses, events, extension UI
  * notifications, tool executions, and session files.
+ *
+ * Temp directories created here are removed when the session is stopped; a
+ * session dir passed in via options is left in place for sharing across
+ * processes. Spawn failures (for example a missing `pi` binary) reject waiters
+ * immediately instead of hanging until the timeout.
  */
 import { spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,9 +33,19 @@ export class PiRpcSession {
 		this.scriptPath = options.scriptPath ?? join(this.cwd, "provider-script.json");
 		this.noSession = options.noSession ?? false;
 		this.resumeSessionFile = options.sessionFile;
+
+		// Only remove directories this session created; dirs passed in via options
+		// (shared cwd, shared session dir) outlive this instance and are the
+		// caller's responsibility.
+		this.ownedTempDirs = [this.agentDir];
+		if (!options.cwd) this.ownedTempDirs.push(this.cwd);
+		if (!options.sessionDir) this.ownedTempDirs.push(this.sessionDir);
+
 		this.records = [];
 		this.waiters = [];
 		this.exitInfo = null;
+		this.spawnError = null;
+		this.cleanedUp = false;
 		this.closed = false;
 	}
 
@@ -54,7 +69,7 @@ export class PiRpcSession {
 			"scripted-1",
 		];
 		if (this.noSession) args.push("--no-session");
-		else if (this.resumeSessionFile) args.push("--session-dir", this.sessionDir, "--session", this.resumeSessionFile);
+		else if (this.resumeSessionFile) args.push("--session", this.resumeSessionFile);
 		else args.push("--session-dir", this.sessionDir);
 
 		this.proc = spawn(PI_BINARY, args, {
@@ -81,6 +96,14 @@ export class PiRpcSession {
 		this.stderr = [];
 		this.proc.stderr.on("data", (chunk) => this.stderr.push(chunk.toString("utf8")));
 
+		this.proc.on("error", (error) => {
+			this.spawnError = new Error(
+				`Failed to spawn Pi binary "${PI_BINARY}" (${error.message}). ` +
+					"Install Pi 1.5.1+ or set PI_BINARY to a valid binary.",
+			);
+			this.flushWaiters();
+		});
+
 		this.proc.on("exit", (code, signal) => {
 			this.exitInfo = { code, signal };
 			this.flushWaiters();
@@ -98,6 +121,7 @@ export class PiRpcSession {
 
 	/** Wait until a predicate over the accumulated records holds. */
 	waitFor(description, predicate, timeoutMs = PI_TIMEOUT_MS) {
+		if (this.spawnError) return Promise.reject(this.spawnError);
 		const test = (records) => {
 			try {
 				return predicate(records);
@@ -108,22 +132,6 @@ export class PiRpcSession {
 		const immediate = test(this.records);
 		if (immediate !== undefined) return Promise.resolve(immediate);
 		return new Promise((resolve, reject) => {
-			const waiter = {
-				tryResolve: (records, exitInfo) => {
-					const value = test(records);
-					if (value !== undefined) {
-						clearTimeout(timer);
-						resolve(value);
-						return true;
-					}
-					if (exitInfo && !this.closed) {
-						clearTimeout(timer);
-						reject(new Error(`pi exited (${exitInfo.code ?? exitInfo.signal}) while waiting for: ${description}`));
-						return true;
-					}
-					return false;
-				},
-			};
 			const timer = setTimeout(() => {
 				this.waiters = this.waiters.filter((w) => w !== waiter);
 				reject(
@@ -134,8 +142,43 @@ export class PiRpcSession {
 					),
 				);
 			}, timeoutMs);
+			const waiter = {
+				tryResolve: (records, exitInfo) => {
+					if (this.spawnError) {
+						clearTimeout(timer);
+						reject(this.spawnError);
+						return true;
+					}
+					const value = test(records);
+					if (value !== undefined) {
+						clearTimeout(timer);
+						resolve(value);
+						return true;
+					}
+					if (exitInfo && !this.closed) {
+						clearTimeout(timer);
+						reject(
+							new Error(
+								`pi exited (${exitInfo.code ?? exitInfo.signal}) while waiting for: ${description}` +
+									(this.stderr.join("").trim() ? `\nstderr:\n${this.stderr.join("")}` : ""),
+							),
+						);
+						return true;
+					}
+					return false;
+				},
+			};
 			this.waiters.push(waiter);
 		});
+	}
+
+	writeCommand(command) {
+		if (this.spawnError) throw this.spawnError;
+		try {
+			this.proc.stdin.write(JSON.stringify(command) + "\n");
+		} catch (error) {
+			throw this.spawnError ?? error;
+		}
 	}
 
 	/** Send a prompt (user text, possibly an extension command) and await its response record. */
@@ -145,33 +188,23 @@ export class PiRpcSession {
 			`response for prompt ${id}`,
 			(records) => records.find((r) => r.type === "response" && r.id === id),
 		);
-		this.proc.stdin.write(JSON.stringify({ id, type: "prompt", message }) + "\n");
+		this.writeCommand({ id, type: "prompt", message });
 		return responsePromise;
-	}
-
-	async sendCommand(command) {
-		return this.prompt(command);
 	}
 
 	/** Wait for the n-th agent_settled event (1-based). */
 	async waitForSettled(count = 1) {
-		return this.waitFor(
-			`${count} agent_settled event(s)`,
-			(records) => {
-				const settled = records.filter((r) => r.type === "agent_settled");
-				return settled.length >= count ? settled[count - 1] : undefined;
-			},
-		);
+		return this.waitFor(`${count} agent_settled event(s)`, (records) => {
+			const settled = records.filter((r) => r.type === "agent_settled");
+			return settled.length >= count ? settled[count - 1] : undefined;
+		});
 	}
 
 	/** Wait for a fire-and-forget extension notify whose message matches. */
 	async waitForNotify(matcher) {
-		return this.waitFor("matching extension notify", (records) => {
-			const found = records.find(
-				(r) => r.type === "extension_ui_request" && r.method === "notify" && matcher(r),
-			);
-			return found;
-		});
+		return this.waitFor("matching extension notify", (records) =>
+			records.find((r) => r.type === "extension_ui_request" && r.method === "notify" && matcher(r)),
+		);
 	}
 
 	/** Wait for a tool execution to finish and return its tool_execution_end record. */
@@ -182,6 +215,18 @@ export class PiRpcSession {
 		});
 	}
 
+	async sendSimple(command) {
+		const id = `req-${++nextRequestId}`;
+		const responsePromise = this.waitFor(
+			`response for ${command} ${id}`,
+			(records) => records.find((r) => r.type === "response" && r.id === id),
+		);
+		this.writeCommand({ id, type: command });
+		const response = await responsePromise;
+		if (!response.success) throw new Error(`${command} failed: ${response.error}`);
+		return response.data;
+	}
+
 	async getState() {
 		return this.sendSimple("get_state");
 	}
@@ -190,41 +235,39 @@ export class PiRpcSession {
 		return this.sendSimple("get_commands");
 	}
 
-	async sendSimple(command) {
-		const id = `req-${++nextRequestId}`;
-		const responsePromise = this.waitFor(
-			`response for ${command} ${id}`,
-			(records) => records.find((r) => r.type === "response" && r.id === id),
-		);
-		this.proc.stdin.write(JSON.stringify({ id, type: command }) + "\n");
-		const response = await responsePromise;
-		if (!response.success) throw new Error(`${command} failed: ${response.error}`);
-		return response.data;
+	/** Hard-kill the subprocess without graceful shutdown. */
+	killNow() {
+		if (!this.exitInfo) this.proc.kill("SIGKILL");
 	}
 
-	/** Graceful shutdown; resolves when the process exits. */
+	/** Graceful shutdown; resolves when the process exits. Temp dirs are removed here. */
 	async stop() {
-		if (this.exitInfo || this.closed) {
-			await this.waitForExit(5000).catch(() => this.kill());
-			return;
-		}
-		this.closed = true;
-		this.proc.stdin.end();
 		try {
-			await this.waitForExit(15000);
-		} catch {
-			this.kill();
+			if (this.spawnError) return;
+			if (this.exitInfo || this.closed) {
+				await this.waitForExit(5000).catch(() => this.killNow());
+				return;
+			}
+			this.closed = true;
+			this.proc.stdin.end();
+			try {
+				await this.waitForExit(15000);
+			} catch {
+				this.killNow();
+			}
+		} finally {
+			this.cleanup();
 		}
 	}
 
 	kill() {
-		if (this.exitInfo) return;
-		this.proc.kill("SIGKILL");
+		if (!this.exitInfo) this.proc.kill("SIGKILL");
 	}
 
 	waitForExit(timeoutMs = 10000) {
 		return new Promise((resolve, reject) => {
 			if (this.exitInfo) return resolve(this.exitInfo);
+			if (this.spawnError) return reject(this.spawnError);
 			const timer = setTimeout(() => reject(new Error("pi did not exit in time")), timeoutMs);
 			this.proc.once("exit", (code, signal) => {
 				clearTimeout(timer);
@@ -233,11 +276,30 @@ export class PiRpcSession {
 		});
 	}
 
+	cleanup() {
+		if (this.cleanedUp) return;
+		this.cleanedUp = true;
+		for (const dir of this.ownedTempDirs) {
+			try {
+				rmSync(dir, { recursive: true, force: true });
+			} catch {
+				// best effort
+			}
+		}
+	}
+
 	/** The session .jsonl file path (persistent sessions only). */
 	async sessionFile() {
 		const state = await this.getState();
 		if (!state.sessionFile) throw new Error("No session file (ephemeral session)");
 		return state.sessionFile;
+	}
+
+	/** First session .jsonl file in the (owned or shared) session dir, for use after a hard kill. */
+	findSessionFile() {
+		const files = readdirSync(this.sessionDir).filter((name) => name.endsWith(".jsonl"));
+		if (files.length === 0) throw new Error(`No session file in ${this.sessionDir}`);
+		return join(this.sessionDir, files[0]);
 	}
 
 	extensionErrors() {

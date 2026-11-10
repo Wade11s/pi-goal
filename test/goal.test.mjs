@@ -8,7 +8,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
 import { PiRpcSession, readSessionEntries, lastGoalSnapshot } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
@@ -43,6 +45,8 @@ test("loading the extension exposes /goal and leaves Goal-less sessions unchange
 		const notify = await session.waitForNotify((r) => r.message.includes("No Goal is set"));
 		assert.equal(notify.notifyType, "info");
 		assert.equal(session.records.filter((r) => r.type === "agent_start").length, 1);
+		// Goal-less sessions never report a restored Goal.
+		assert.ok(!session.records.some((r) => r.type === "extension_ui_request" && r.message?.includes("restored")));
 	} finally {
 		await session.stop();
 	}
@@ -81,12 +85,11 @@ test("/goal <objective> stores an active Goal, starts initial work, and get_goal
 		assert.equal(state.usage.totalTokens, null);
 		assert.equal(state.usage.activeSeconds, null);
 
-		// The kickoff custom message carried the objective into model context.
+		// The kickoff user message carried the objective into model context.
 		const kickoffEnd = session.records.find(
-			(r) => r.type === "message_end" && r.message.role === "custom" && r.message.customType === "goal-continuation",
+			(r) => r.type === "message_end" && r.message.role === "user" && JSON.stringify(r.message.content).includes(OBJECTIVE),
 		);
-		assert.ok(kickoffEnd, "kickoff custom message was sent");
-		assert.ok(kickoffEnd.message.content.includes(OBJECTIVE));
+		assert.ok(kickoffEnd, "kickoff user message was sent");
 
 		// The Goal snapshot is persisted as a custom entry outside model context.
 		const entries = readSessionEntries(await session.sessionFile());
@@ -95,6 +98,12 @@ test("/goal <objective> stores an active Goal, starts initial work, and get_goal
 		assert.equal(snapshot.data.version, 1);
 		assert.equal(snapshot.data.goal.objective, OBJECTIVE);
 		assert.equal(snapshot.data.goal.status, "active");
+		assert.ok(
+			entries.some(
+				(e) => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes(OBJECTIVE),
+			),
+			"kickoff user message persisted in the session file",
+		);
 	} finally {
 		await session.stop();
 	}
@@ -133,20 +142,27 @@ test("bare /goal reports objective, lifecycle status, and available usage fields
 });
 
 test("restart and resume reconstruct the Goal without restating it", async () => {
+	// Pi resumes a session in its stored working directory, so both processes
+	// share one test-owned work dir.
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-workdir-"));
 	// Process 1: create the Goal and let the initial work settle.
-	const first = await PiRpcSession.start();
+	const first = await PiRpcSession.start({ cwd: workDir });
 	script([{ text: "On it." }], first);
+	// The session outlives process 1's temp dirs: copy it aside before cleanup.
+	const resumedDir = mkdtempSync(join(tmpdir(), "pi-goal-resumed-"));
 	let sessionFile;
 	try {
 		await first.prompt("/goal Ship the release notes page");
 		await first.waitForSettled(1);
 		sessionFile = await first.sessionFile();
+		copyFileSync(sessionFile, join(resumedDir, basename(sessionFile)));
 	} finally {
 		await first.stop();
 	}
+	sessionFile = join(resumedDir, basename(sessionFile));
 
 	// Process 2: a fresh Pi process resumes the persisted session.
-	const second = await PiRpcSession.start({ sessionDir: first.sessionDir, sessionFile });
+	const second = await PiRpcSession.start({ sessionFile, cwd: workDir });
 	script(
 		[
 			{ toolCalls: [{ name: "get_goal", args: {} }] },
@@ -155,6 +171,10 @@ test("restart and resume reconstruct the Goal without restating it", async () =>
 		second,
 	);
 	try {
+		// Restoration is visible at session start, before any prompt.
+		const restored = await second.waitForNotify((r) => r.message.includes("restored (active)"));
+		assert.match(restored.message, /goal_[0-9a-f]+/);
+
 		const resumed = await second.prompt("Please continue working on the current objective");
 		assert.equal(resumed.data.disposition, "started");
 		const toolEnd = await second.waitForToolResult("get_goal", 1);
@@ -174,6 +194,8 @@ test("restart and resume reconstruct the Goal without restating it", async () =>
 		assert.equal(snapshot.data.goal.id, state.id);
 	} finally {
 		await second.stop();
+		rmSync(resumedDir, { recursive: true, force: true });
+		rmSync(workDir, { recursive: true, force: true });
 	}
 });
 
@@ -184,6 +206,12 @@ test("extension reload reconstructs the Goal (runtime replacement via session sw
 		await session.prompt("/goal Restore me after reload");
 		await session.waitForSettled(1);
 		const sessionFile = await session.sessionFile();
+
+		// No runtime replacement has happened yet: no restored notification exists.
+		assert.ok(
+			!session.records.some((r) => r.type === "extension_ui_request" && r.message?.includes("restored")),
+			"startup had no Goal, so nothing was restored yet",
+		);
 
 		// Switching to the same session file replaces the extension runtime
 		// (session_shutdown -> reload -> session_start), the same reconstruction
@@ -197,6 +225,13 @@ test("extension reload reconstructs the Goal (runtime replacement via session sw
 		const switched = await switchResponse;
 		assert.equal(switched.success, true);
 		assert.equal(switched.data.cancelled, false);
+
+		// The replaced runtime proves it reloaded: the new extension instance
+		// reports the restored Goal from its own session_start handler. The
+		// notification is emitted during the replacement, before the switch
+		// response is sent, so it could not come from the old runtime.
+		const restored = await session.waitForNotify((r) => r.message.includes("restored (active)"));
+		assert.match(restored.message, /Restore me after reload|goal_[0-9a-f]+/);
 
 		// The reloaded extension reports the same Goal.
 		await session.prompt("/goal");
@@ -227,6 +262,144 @@ test("ephemeral sessions return a clear persistence error and create nothing", a
 		assert.equal(session.records.filter((r) => r.type === "message_end" && r.message.role === "custom").length, 0);
 		const state = await session.getState();
 		assert.equal(state.sessionFile, undefined);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a failed session write leaves no phantom Goal and permits a retry", async () => {
+	const session = await PiRpcSession.start();
+	// Step 0 warms up the session; step 1 serves the successful retry's kickoff run.
+	script([{ text: "On it." }, { text: "Retry worked." }], session);
+	let sessionFile;
+	try {
+		// Establish a known session file with one ordinary run.
+		await session.prompt("warm up");
+		await session.waitForSettled(1);
+		sessionFile = await session.sessionFile();
+
+		// Make the session file unwritable so the Goal snapshot cannot be persisted.
+		chmodSync(sessionFile, 0o444);
+		const failed = await session.prompt("/goal This goal cannot be stored");
+		assert.equal(failed.data.disposition, "handled");
+		const error = await session.waitForNotify((r) =>
+			r.message.includes("writing the Goal to the session failed"),
+		);
+		assert.equal(error.notifyType, "error");
+
+		// No phantom Goal in memory: bare /goal reports none and no kickoff ran.
+		await session.prompt("/goal");
+		await session.waitForNotify((r) => r.message.includes("No Goal is set"));
+		assert.equal(session.records.filter((r) => r.type === "agent_start").length, 1);
+
+		// The session file contains no goal-state entry from the failed attempt.
+		const entriesAfterFailure = readSessionEntries(sessionFile);
+		assert.equal(entriesAfterFailure.filter((e) => e.type === "custom" && e.customType === "goal-state").length, 0);
+
+		// Once the write failure is resolved, creating a Goal succeeds.
+		chmodSync(sessionFile, 0o644);
+		const retry = await session.prompt("/goal This goal persists after the write failure");
+		assert.equal(retry.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await session.waitForSettled(2);
+		const snapshot = lastGoalSnapshot(readSessionEntries(sessionFile));
+		assert.ok(snapshot, "goal-state entry persisted after retry");
+		assert.equal(snapshot.data.goal.objective, "This goal persists after the write failure");
+		assert.equal(snapshot.data.goal.status, "active");
+	} finally {
+		// Restore writability so shutdown flushes cleanly.
+		if (sessionFile) {
+			try {
+				chmodSync(sessionFile, 0o644);
+			} catch {
+				// best effort
+			}
+		}
+		await session.stop();
+	}
+});
+
+test("interrupting the kickoff run preserves the durable Goal", async () => {
+	// Fresh persistent session; the provider hangs so the kickoff run never
+	// produces an assistant response. Both processes share one work dir because
+	// Pi resumes a session in its stored working directory.
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-workdir-"));
+	const session = await PiRpcSession.start({ cwd: workDir });
+	script([{ hang: true }], session);
+	// The killed session must outlive process 1's temp-dir cleanup.
+	const resumedDir = mkdtempSync(join(tmpdir(), "pi-goal-resumed-"));
+	let killedSessionFile;
+	try {
+		const response = await session.prompt("/goal Survive an interrupted kickoff");
+		assert.equal(response.data.disposition, "handled");
+
+		// Success is announced only after the snapshot is confirmed on disk.
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		assert.equal(
+			session.records.filter((r) => r.type === "message_end" && r.message.role === "assistant").length,
+			0,
+			"no assistant response was produced before the kill",
+		);
+
+		// Hard-kill Pi mid-run: no graceful shutdown, no atexit flush.
+		session.killNow();
+		await session.waitForExit();
+
+		// The Goal (and the kickoff user message) survived on disk.
+		killedSessionFile = session.findSessionFile();
+		const entries = readSessionEntries(killedSessionFile);
+		const snapshot = lastGoalSnapshot(entries);
+		assert.ok(snapshot, "goal-state entry is on disk after the kill");
+		assert.equal(snapshot.data.goal.objective, "Survive an interrupted kickoff");
+		assert.equal(snapshot.data.goal.status, "active");
+		assert.ok(
+			entries.some(
+				(e) => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes("Survive an interrupted kickoff"),
+			),
+			"kickoff user message is on disk after the kill",
+		);
+		copyFileSync(killedSessionFile, join(resumedDir, basename(killedSessionFile)));
+	} finally {
+		await session.stop();
+	}
+	killedSessionFile = join(resumedDir, basename(killedSessionFile));
+
+	// A later process restores the interrupted Goal from the killed session.
+	const resumed = await PiRpcSession.start({ sessionFile: killedSessionFile, cwd: workDir });
+	try {
+		const restored = await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
+		assert.match(restored.message, /Survive an interrupted kickoff|goal_[0-9a-f]+/);
+		await resumed.prompt("/goal");
+		await resumed.waitForNotify(
+			(r) => r.message.includes("Survive an interrupted kickoff") && r.message.includes("active"),
+		);
+	} finally {
+		await resumed.stop();
+		rmSync(resumedDir, { recursive: true, force: true });
+		rmSync(workDir, { recursive: true, force: true });
+	}
+});
+
+test("objectives that merely begin with a reserved subcommand word are accepted", async () => {
+	const session = await PiRpcSession.start();
+	script([{ text: "On it." }], session);
+	try {
+		const objective = "clear the lint errors and make the build green";
+		const response = await session.prompt(`/goal ${objective}`);
+		assert.equal(response.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await session.waitForSettled(1);
+
+		await session.prompt("/goal");
+		const notify = await session.waitForNotify(
+			(r) => r.message.includes(objective) && r.message.includes("active"),
+		);
+		assert.ok(notify);
+
+		// Exact reserved words are still refused (later-milestone subcommands).
+		await session.prompt("/goal clear");
+		const reserved = await session.waitForNotify((r) => r.message.includes("not implemented in this milestone"));
+		assert.equal(reserved.notifyType, "warning");
 	} finally {
 		await session.stop();
 	}

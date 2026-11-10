@@ -8,6 +8,7 @@
  *   { "text": "...", "usage"?: {input,output,cacheRead?,cacheWrite?} }
  *   { "toolCalls": [{ "name": "get_goal", "args": {} }], "usage"?: {...} }
  *   { "error": "message", "stopReason"?: "error" }
+ *   { "hang": true }   // never completes; for interrupted-run tests
  *
  * No network access or credentials are required, which lets the RPC tests drive
  * real Pi sessions end to end.
@@ -38,6 +39,8 @@ export interface ScriptedStep {
 	usage?: ScriptedUsage;
 	stopReason?: string;
 	error?: string;
+	/** Never complete this response; the agent run hangs until aborted or killed. */
+	hang?: boolean;
 }
 
 function readSteps(): ScriptedStep[] {
@@ -94,6 +97,33 @@ function streamScriptedStep(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		};
 		usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+
+		if (step.hang) {
+			// Emit the start event, then hold the stream open forever so the agent
+			// run never receives a response.
+			const partial: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage,
+				stopReason: "pending",
+				timestamp: Date.now(),
+			};
+			stream.push({ type: "start", partial: { ...partial } });
+			await new Promise<void>((resolve) => {
+				options?.signal?.addEventListener("abort", () => resolve());
+			});
+			const aborted: AssistantMessage = {
+				...partial,
+				stopReason: "aborted",
+				errorMessage: "hang step aborted",
+			};
+			stream.push({ type: "error", reason: "aborted", error: aborted });
+			stream.end(aborted);
+			return;
+		}
 
 		const content: AssistantMessage["content"] = [];
 		for (const call of step.toolCalls ?? []) {

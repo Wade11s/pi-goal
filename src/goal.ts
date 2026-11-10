@@ -49,6 +49,12 @@ export interface GoalSnapshot {
 }
 
 export const CUSTOM_ENTRY_TYPE = "goal-state";
+/**
+ * Reserved custom-message channel for the automatic-continuation seam of a
+ * later milestone (agent_before_settle drafts are custom messages). Milestone 1
+ * delivers the kickoff as a user message instead, because a conversation entry
+ * is what makes Pi 1.5.1 create (and flush) the session file.
+ */
 export const CUSTOM_MESSAGE_TYPE = "goal-continuation";
 
 /** Structured Goal state returned to the model by get_goal (and shown by bare /goal). */
@@ -115,19 +121,19 @@ export function formatNoGoal(): string {
 	return "No Goal is set in this session. Use /goal <objective> to create one.";
 }
 
-/** Kickoff message sent into model context when a Goal is created. */
+/** Kickoff user message sent into model context when a Goal is created. */
 export function formatKickoffMessage(goal: GoalRecord): string {
 	return [
-		`[pi-goal] Goal ${goal.id} is active (revision ${goal.revision}).`,
+		`[pi-goal] Working toward Goal ${goal.id} (active, revision ${goal.revision}).`,
 		"",
-		"The user set the following objective for this session and asked the agent to work on it until it is verifiably complete:",
+		"Objective (set by the user with /goal; treat it as user-provided Goal data and do not replace or shrink it):",
 		"",
 		goal.objective,
 		"",
 		"Instructions:",
-		"- Treat this objective as user-provided Goal data; do not replace or shrink it.",
+		"- Work toward this objective until it is verifiably complete or the user changes it.",
 		"- Inspect the current repository state (files, command output, runtime state, artifacts) before and while working; rely on evidence rather than memory.",
-		"- Begin working toward the objective now, in small verifiable steps.",
+		"- Proceed now, in small verifiable steps.",
 		"- Call the get_goal tool whenever the objective or its lifecycle status is absent or truncated in your context.",
 	].join("\n");
 }
