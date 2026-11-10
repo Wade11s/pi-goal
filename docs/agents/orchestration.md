@@ -13,7 +13,6 @@ Implementation issues are delegated through `rex-subagent` to this worker pool, 
 | Worker model |
 | --- |
 | `magpie/zcode/GLM-5.3:high` |
-| `magpie/commandcode/deepseek/deepseek-v4.1-flash:high` |
 | `magpie/deepai/deepseek-v4.1-flash:high` |
 | `magpie/deepai/mimo-2.6-pro:high` |
 
