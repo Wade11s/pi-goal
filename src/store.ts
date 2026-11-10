@@ -30,14 +30,15 @@ function goalId(): string {
 }
 
 /**
- * Outcome of completing the current Goal. Distinguishes "there was nothing to
- * complete" from "the completion could not be made durable", because the second
- * leaves the Goal active and must be reported as a persistence failure rather
- * than as a lifecycle refusal.
+ * Outcome of a durable Goal transition (completion, pause, resume, clear,
+ * objective edit). Distinguishes lifecycle refusals ("no-goal" / "not-eligible",
+ * with an explanation) from persistence failures, because the second leaves the
+ * previous state in force and must be reported as a durability problem rather
+ * than as a lifecycle refusal. `goal` is `null` for a successful clear.
  */
-export type CompleteGoalResult =
-	| { ok: true; goal: GoalRecord }
-	| { ok: false; reason: "not-active" }
+export type GoalMutationResult =
+	| { ok: true; goal: GoalRecord | null }
+	| { ok: false; reason: "no-goal" | "not-eligible"; message: string }
 	| { ok: false; reason: "persistence"; error: unknown };
 
 export class GoalStore {
@@ -131,6 +132,24 @@ export class GoalStore {
 	}
 
 	/**
+	 * Append a snapshot durably, then make it visible.
+	 *
+	 * `appendEntry` writes through to the session file synchronously and throws on
+	 * failure without changing in-memory state, so returning without throwing
+	 * means the transition is already durable — every caller can announce it.
+	 * This is the shared seam for every lifecycle transition after creation.
+	 */
+	private commitSnapshot(pi: ExtensionAPI, goal: GoalRecord | null): GoalMutationResult {
+		try {
+			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal } satisfies GoalSnapshot);
+		} catch (error) {
+			return { ok: false, reason: "persistence", error };
+		}
+		this.current = goal;
+		return { ok: true, goal };
+	}
+
+	/**
 	 * Mark the current active Goal complete. Increments revision and updates
 	 * timestamp, and stages the snapshot durably through the supplied Pi API.
 	 *
@@ -143,22 +162,117 @@ export class GoalStore {
 	 * untouched and still active, so a retry is possible and no phantom complete
 	 * state is claimed.
 	 */
-	markComplete(pi: ExtensionAPI): CompleteGoalResult {
+	markComplete(pi: ExtensionAPI): GoalMutationResult {
 		const current = this.current;
-		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
-		const updated: GoalRecord = {
+		if (!current) {
+			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
+		}
+		if (current.status !== "active") {
+			return {
+				ok: false,
+				reason: "not-eligible",
+				message: `only an active Goal can be completed (current status: ${current.status})`,
+			};
+		}
+		return this.commitSnapshot(pi, {
 			...current,
 			status: "complete",
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
-		};
-		try {
-			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
-		} catch (error) {
-			return { ok: false, reason: "persistence", error };
+		});
+	}
+
+	/**
+	 * Pause the current active Goal. The transition is durable before it is
+	 * visible, and once visible it immediately stops admission of further
+	 * automatic Goal runs: the continuation seam only continues an `active` Goal.
+	 * The in-flight run (if any) is left to finish on its own — pause never aborts
+	 * work; aborting stays with the user.
+	 */
+	markPaused(pi: ExtensionAPI): GoalMutationResult {
+		const current = this.current;
+		if (!current) {
+			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
-		this.current = updated;
-		return { ok: true, goal: updated };
+		if (current.status !== "active") {
+			return {
+				ok: false,
+				reason: "not-eligible",
+				message: `only an active Goal can be paused (current status: ${current.status})`,
+			};
+		}
+		return this.commitSnapshot(pi, {
+			...current,
+			status: "paused",
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+		});
+	}
+
+	/**
+	 * Resume the current paused Goal. The transition is durable before it is
+	 * visible; restarting work is the caller's job (a resume kickoff message), so
+	 * resuming while a run is in flight can steer instead of waiting for idle.
+	 * The revision bump records the resume as its own transition, giving later
+	 * accounting a fresh baseline at this snapshot.
+	 */
+	markResumed(pi: ExtensionAPI): GoalMutationResult {
+		const current = this.current;
+		if (!current) {
+			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
+		}
+		if (current.status !== "paused") {
+			return {
+				ok: false,
+			reason: "not-eligible",
+				message: `only a paused Goal can be resumed (current status: ${current.status})`,
+			};
+		}
+		return this.commitSnapshot(pi, {
+			...current,
+			status: "active",
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+		});
+	}
+
+	/**
+	 * Edit the objective of the current Goal in place: the identity, creation
+	 * time, origin, budget, and (future) usage history are all preserved, only
+	 * the objective changes and the revision advances. A complete Goal is a
+	 * finished identity and cannot be edited — replacing it is a new Goal.
+	 */
+	editObjective(pi: ExtensionAPI, objective: string): GoalMutationResult {
+		const current = this.current;
+		if (!current) {
+			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
+		}
+		if (current.status === "complete") {
+			return {
+				ok: false,
+				reason: "not-eligible",
+				message: "a complete Goal is finished and cannot be edited; use /goal <objective> to set a new one",
+			};
+		}
+		return this.commitSnapshot(pi, {
+			...current,
+			objective,
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+		});
+	}
+
+	/**
+	 * Clear the current Goal from any status. Writes a durable tombstone
+	 * snapshot (`goal: null`) before the in-memory state is cleared, so
+	 * restoration can never resurrect an older snapshot of the cleared Goal.
+	 */
+	clear(pi: ExtensionAPI): GoalMutationResult {
+		const current = this.current;
+		if (!current) {
+			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
+		}
+		return this.commitSnapshot(pi, null);
 	}
 
 	/**

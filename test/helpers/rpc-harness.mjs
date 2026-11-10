@@ -54,6 +54,7 @@ export class PiRpcSession {
 
 		this.records = [];
 		this.waiters = [];
+		this.answeredUiRequests = new Set();
 		this.exitInfo = null;
 		this.spawnError = null;
 		this.cleanedUp = false;
@@ -231,6 +232,31 @@ export class PiRpcSession {
 		return this.waitFor("matching extension notify", (records) =>
 			records.find((r) => r.type === "extension_ui_request" && r.method === "notify" && matcher(r)),
 		);
+	}
+
+	/**
+	 * Wait for a blocking extension confirm dialog and answer it.
+	 *
+	 * Answers over the RPC extension-UI subprotocol exactly like an interactive or
+	 * RPC host would: wait for the matching `confirm` request, then send an
+	 * `extension_ui_response` with the decision. `confirmed: false` is an
+	 * explicit "No" (the same auto-answer a dialog timeout produces). Requests
+	 * already answered by an earlier call are skipped, so a matcher like
+	 * `() => true` answers the *next* dialog rather than replaying an old one.
+	 */
+	async respondToConfirm(matcher, confirmed) {
+		const request = await this.waitFor("unanswered matching extension confirm dialog", (records) =>
+			records.find(
+				(r) =>
+					r.type === "extension_ui_request" &&
+					r.method === "confirm" &&
+					!this.answeredUiRequests.has(r.id) &&
+					matcher(r),
+			),
+		);
+		this.answeredUiRequests.add(request.id);
+		this.writeCommand({ type: "extension_ui_response", id: request.id, confirmed });
+		return request;
 	}
 
 	/** Wait for a tool execution to finish and return its tool_execution_end record. */
