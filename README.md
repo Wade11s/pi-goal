@@ -1,10 +1,10 @@
 # pi-goal
 
 Codex-style persistent Goals for [Pi](https://github.com/earendil-works/pi): a `/goal`
-command and a `get_goal` model tool that give a session a durable, user-controlled
-objective. This package implements **milestone 1** (create and restore a persistent
-Goal); automatic continuation, lifecycle subcommands, and usage accounting land in
-later milestones.
+command and three model tools (`get_goal`, `create_goal`, `update_goal`) that give a
+session a durable, user-controlled objective. While a Goal is active, work
+continues automatically at Pi's safe settlement boundary until the model verifies
+completion, the run is aborted or fails, or the lifecycle changes.
 
 Requires **Pi 1.5.1 or newer**. The extension uses only public extension APIs and
 does not patch Pi core.
@@ -57,11 +57,54 @@ usage fields that currently exist. Token usage and active time report
 session with a Goal starts, restores, or reloads, a `Goal ... restored (active)`
 notification confirms reconstruction.
 
+### Automatic continuation
+
+While a Goal is **active**, Pi continuing on its own is the normal case:
+
+- Continuation happens at `agent_before_settle`, Pi's final actionable boundary,
+  after Pi has already finished everything it owns — automatic retries,
+  compaction recovery, and queued follow-ups. Nothing is scheduled with timers
+  and nothing loops from `agent_end`, so those mechanisms keep their normal
+  semantics and are never bypassed.
+- Each continuation appends a `goal-continuation` custom message that restates
+  the objective verbatim and asks for an evidence audit of the current state:
+  read the files, command results, runtime state, and artifacts; separate real
+  progress from narration; check every explicit requirement.
+- The continuation requests exactly one further provider request per
+  settlement. If queued work already causes that request, Pi satisfies the
+  decision with it and makes no extra one.
+- Entries proposed by other extensions at the same boundary are chained, never
+  replaced.
+- A run that was aborted or that ended in a provider error is a hard exit: Pi
+  owns retries, so the Goal does not add a retry loop of its own. The Goal stays
+  active and continues on the next successful run.
+
 ### Model tool: `get_goal`
 
 The model can call `get_goal` at any time to retrieve the same structured state
 the command reports (or `goal: null` when no Goal is set). Use it whenever the
 objective is absent or truncated in context.
+
+### Model tool: `create_goal`
+
+`create_goal` lets the model create a Goal, but only for an **explicit user or
+system request** — the tool description and its prompt guidelines say so, and
+nothing in the extension infers a Goal from an ordinary task. It validates the
+objective, refuses when an unfinished Goal already exists (including when two
+calls arrive in the same assistant turn), refuses an ephemeral session that
+could not restore the Goal, and persists the snapshot before reporting success.
+Creating a Goal through the tool does not send a kickoff message: the model is
+already mid-run, and the continuation seam picks the Goal up at the next
+settlement.
+
+### Model tool: `update_goal`
+
+`update_goal` is the completion contract. The model calls it with
+`{ action: "complete" }` only after every explicit requirement of the objective
+is verified against current-state evidence. Completion is terminal: the Goal is
+persisted as `complete` and never continues again, including after a restart or
+reload. Any other action (`pause`, `resume`, `clear`, a blocked conclusion) is
+refused with an explanation, because those transitions stay with the user.
 
 ## Persistence model
 
@@ -75,9 +118,11 @@ objective is absent or truncated in context.
 - The kickoff is delivered as a **user message** carrying the user's own
   objective (attributed as user-provided Goal data). As the session's first
   conversation entry it also makes Pi create and flush the session file, which
-  Pi otherwise defers until a user/assistant message exists. The
-  `goal-continuation` custom-message channel is reserved for the automatic
-  continuation seam of a later milestone.
+  Pi otherwise defers until a user/assistant message exists. Continuation uses
+  the separate `goal-continuation` **custom-message** channel, because
+  `agent_before_settle` drafts are custom messages: they participate in model
+  context while remaining identifiable as extension-authored Goal data rather
+  than human input.
 - Creation is durability-first: the snapshot is written, the kickoff triggers the
   file flush, and only after the snapshot is confirmed on disk is the Goal
   announced (and made visible to `get_goal`). If writing fails (unwritable
@@ -93,17 +138,25 @@ objective is absent or truncated in context.
 - Ephemeral sessions (started with `--no-session`) cannot persist a Goal:
   creating one returns a clear error instead of claiming durable storage.
 - Sessions without a Goal behave exactly as before; installing the extension
-  only adds the command, the tool, and the state they manage.
+  only adds the command, the three tools, and the state they manage.
 
 ## Limitations (later milestones)
 
-- No automatic continuation after a completed run yet; the Goal persists but Pi
-  stops when the initial work settles until you prompt again.
 - No `edit`, `pause`, `resume`, or `clear` lifecycle commands yet (only the bare
-  words are reserved as future subcommands).
-- No `create_goal`/`update_goal` model tools yet; the model can only read state.
-- No token budget, usage accounting, or active-time tracking yet.
-- No completion or blocked audits yet.
+  words are reserved as future subcommands), so an active Goal can only be ended
+  by the model completing it, by the user aborting the run, or by a failure.
+- No token budget, usage accounting, or active-time tracking yet, so unattended
+  work has no token bound.
+- No blocked audit (the same genuine blocker for three consecutive Goal turns),
+  no usage-limit classification, and no anti-loop stop for repeated
+  activity-free automatic responses. Until those land, an active Goal whose runs
+  keep completing will keep being continued; the model is instructed to report a
+  persistent blocker instead of spinning, and aborts and provider errors stop
+  continuation immediately.
+- A third extension loaded after pi-goal can still request its own continuation
+  at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
+  one when it should not continue; it does not veto another extension's request.
+- No status/widget UI yet, and no root `GLOSSARY.md` or `docs/adr/` entries.
 
 ## Development
 
@@ -117,11 +170,13 @@ The automated tests spawn a real `pi --mode rpc` subprocess per test with
 temporary working, session, and agent directories (`PI_CODING_AGENT_DIR` /
 `--session-dir`; the temp directories are removed when each test finishes), a
 scripted test model provider (`test/extensions/scripted-provider.ts`, driven by
-`PI_GOAL_TEST_SCRIPT`, including hanging responses for interrupted-run tests),
-and no network or model credentials. They assert public behavior end to end: RPC
-events, extension notifications, tool results, persisted session entries, and
-survival across hard kills and restarts. Set `PI_BINARY` to run against a
-specific Pi binary; a missing binary fails fast instead of hanging.
+`PI_GOAL_TEST_SCRIPT`, including hanging and delayed responses for
+interrupted-run and queueing tests), an optional second extension
+(`test/extensions/boundary-peer.ts`) for boundary-composition tests, and no
+network or model credentials. They assert public behavior end to end: RPC
+events, extension notifications, tool results, model context, persisted session
+entries, and survival across hard kills and restarts. Set `PI_BINARY` to run
+against a specific Pi binary; a missing binary fails fast instead of hanging.
 
 ### Interactive smoke test
 
@@ -136,11 +191,13 @@ pi -e ./
 #    -> notification "Goal ... created and activated", agent starts working.
 # 2. /goal
 #    -> status report with the objective, "active", revision, timestamps.
-# 3. /reload
+# 3. Let the agent finish a turn.
+#    -> it continues on its own; the continuation prompt restates the objective.
+# 4. /reload
 #    -> "Goal ... restored (active)" notification.
-# 4. /goal
+# 5. /goal
 #    -> the same objective is reported after the extension reload.
-# 5. Exit (Ctrl+D), then: pi -c
-# 6. /goal
+# 6. Exit (Ctrl+D), then: pi -c
+# 7. /goal
 #    -> the Goal survives the restart and is restored on resume.
 ```

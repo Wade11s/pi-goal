@@ -1,7 +1,7 @@
 {
 	"name": "pi-goal",
 	"version": "0.1.0",
-	"description": "Codex-style persistent Goals for Pi: /goal command and get_goal tool (milestone 1)",
+	"description": "Codex-style persistent Goals for Pi: /goal command plus get_goal, create_goal, and update_goal model tools, with automatic continuation at Pi's safe settlement boundary",
 	"type": "module",
 	"license": "MIT",
 	"keywords": ["pi-package"],

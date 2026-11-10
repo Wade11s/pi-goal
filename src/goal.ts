@@ -3,7 +3,11 @@
  */
 import { type Static, Type } from "typebox";
 
-/** Lifecycle statuses from the parent spec. Milestone 1 only produces "active". */
+/**
+ * Lifecycle statuses from the parent spec. This milestone produces "active" and
+ * "complete": an active Goal continues at settlement, a complete one never does.
+ * The remaining statuses arrive with the lifecycle and budget milestones.
+ */
 export const GOAL_STATUSES = [
 	"active",
 	"paused",
@@ -50,10 +54,13 @@ export interface GoalSnapshot {
 
 export const CUSTOM_ENTRY_TYPE = "goal-state";
 /**
- * Reserved custom-message channel for the automatic-continuation seam of a
- * later milestone (agent_before_settle drafts are custom messages). Milestone 1
- * delivers the kickoff as a user message instead, because a conversation entry
- * is what makes Pi 1.5.1 create (and flush) the session file.
+ * Custom-message channel for the automatic-continuation seam. `agent_before_settle`
+ * drafts are custom messages, and a custom message participates in model context
+ * while remaining identifiable as extension-authored Goal data.
+ *
+ * The kickoff is deliberately *not* sent on this channel: it is a user message,
+ * because a conversation entry is what makes Pi 1.5.1 create (and flush) the
+ * session file, and because the objective is user-provided Goal data.
  */
 export const CUSTOM_MESSAGE_TYPE = "goal-continuation";
 
@@ -81,7 +88,7 @@ export const getGoalOutputSchema = Type.Object({
 
 /**
  * Project the public, structured state from a record. One source of truth so the
- * /goal command output and the get_goal tool result always agree.
+ * /goal command output, get_goal, create_goal, and update_goal always agree.
  *
  * Usage accounting (tokens, active time) arrives in a later milestone; the fields
  * report `null` until then rather than guessing from session-wide data.
@@ -119,6 +126,38 @@ export function formatGoalSummary(state: GoalPublicState): string {
 
 export function formatNoGoal(): string {
 	return "No Goal is set in this session. Use /goal <objective> to create one.";
+}
+
+/**
+ * Continuation message drafted at `agent_before_settle` while a Goal is active.
+ *
+ * It restates the objective verbatim on every continuation so the finish line
+ * cannot drift or shrink across turns and compaction, and it asks for an
+ * evidence-based audit of the *current* state rather than a recap of
+ * intentions. The model owns the completion decision; the extension only
+ * enforces the lifecycle rule that a complete Goal stops continuing.
+ */
+export function formatContinuationMessage(goal: GoalRecord): string {
+	return [
+		`[pi-goal] Continue Goal ${goal.id} (active, revision ${goal.revision}).`,
+		"",
+		"Original objective (immutable; do not replace, shrink, or restate it as something easier):",
+		"",
+		goal.objective,
+		"",
+		"Evidence audit before continuing (inspect the current state, not your memory of it):",
+		"- Read the current files, command results, runtime state, and artifacts that bear on the objective.",
+		"- Separate meaningful progress from narration: a status update is not progress.",
+		"- When waiting on real external work, keep the live handle and verify the wait instead of re-describing it.",
+		"- Check every explicit requirement of the objective one by one.",
+		"",
+		"Completion contract:",
+		"- Only when every requirement is verified by current-state evidence, call update_goal with { action: \"complete\" }.",
+		"- Partial progress, unverified claims, and weak evidence keep the Goal active: keep working.",
+		"- If the same genuine blocker persists, report it plainly instead of producing another turn that changes nothing.",
+		"",
+		"Then proceed in small, verifiable steps. Call get_goal if the objective or its status is missing from your context.",
+	].join("\n");
 }
 
 /** Kickoff user message sent into model context when a Goal is created. */

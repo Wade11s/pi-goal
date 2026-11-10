@@ -1,7 +1,8 @@
 /**
- * pi-goal — Codex-style persistent Goals for Pi (milestone 1).
+ * pi-goal — Codex-style persistent Goals for Pi.
  *
- * Registers the /goal command and the get_goal model tool. A Goal is a durable,
+ * Registers the /goal command, the get_goal / create_goal / update_goal model
+ * tools, and the automatic-continuation seam. A Goal is a durable,
  * session-scoped record persisted as custom session entries and reconstructed
  * from the active branch on session start (restart, resume, reload, fork) and
  * after tree navigation.
@@ -11,21 +12,31 @@
  * has a user or assistant message, so the kickoff is delivered as a user
  * message (a conversation entry, via the public sendUserMessage API): staging
  * the snapshot and sending the kickoff flushes the file, and the command
- * confirms durability on disk before announcing success. The custom-message
- * channel (`goal-continuation`) is reserved for the automatic-continuation seam
- * of a later milestone.
+ * confirms durability on disk before announcing success.
  *
- * Later milestones add automatic continuation at agent_before_settle, lifecycle
- * subcommands (edit/pause/resume/clear), create_goal/update_goal, and usage
- * accounting. This milestone intentionally does not implement them.
+ * While a Goal is active, work continues at Pi's safe settlement boundary
+ * (`agent_before_settle`), never from a timer or an `agent_end` self-loop, so
+ * Pi keeps owning retries, compaction recovery, and queued follow-ups. Each
+ * continuation restates the objective verbatim and asks for an evidence audit;
+ * the model ends the loop by calling update_goal, and a complete, paused, or
+ * absent Goal never continues.
+ *
+ * Lifecycle subcommands (edit/pause/resume/clear), blocked and usage-limit
+ * handling, token budgets and usage accounting, status UI, and the final
+ * documentation land in their own later tickets; this milestone deliberately
+ * does not implement them.
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	CUSTOM_MESSAGE_TYPE,
+	formatContinuationMessage,
 	formatGoalSummary,
 	formatKickoffMessage,
 	formatNoGoal,
 	getGoalOutputSchema,
+	MAX_OBJECTIVE_LENGTH,
+	MIN_OBJECTIVE_LENGTH,
 	type GoalPublicState,
 	toPublicState,
 } from "./goal.ts";
@@ -41,6 +52,21 @@ const RESERVED_SUBCOMMANDS = new Set(["edit", "pause", "resume", "clear"]);
 /** How long creation waits for the snapshot to become durable on disk. */
 const DURABILITY_TIMEOUT_MS = 5000;
 const DURABILITY_POLL_MS = 15;
+
+/**
+ * Uniform error result for the model-facing Goal tools. Keeping one shape means
+ * a failed create/update reports the same structured `{ goal }` payload a
+ * success does (null, or the unchanged current Goal), so a caller never has to
+ * guess whether the state moved.
+ */
+function goalToolError(message: string, goal: GoalPublicState | null) {
+	return {
+		content: [{ type: "text" as const, text: message }],
+		isError: true,
+		structuredContent: { goal },
+		details: { goal },
+	};
+}
 
 export default function goalExtension(pi: ExtensionAPI): void {
 	const store = new GoalStore();
@@ -71,6 +97,45 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		store.reconstruct(ctx);
 	});
 
+	/**
+	 * Automatic continuation, at Pi's safe settlement boundary only.
+	 *
+	 * `agent_before_settle` is the one seam where Pi has finished every automatic
+	 * follow-up it owns (retries, final-attempt recovery, compaction retries,
+	 * queued messages) and is about to go idle. Continuing here therefore never
+	 * races or duplicates those mechanisms; continuing from a timer or from
+	 * `agent_end` would.
+	 *
+	 * Guards, all of which must hold:
+	 * - a Goal exists and is active (completed, paused, cleared, and absent Goals
+	 *   never continue), and
+	 * - the run completed (aborted and errored runs are hard exits: Pi owns
+	 *   retries, so re-driving them here would be an unattended retry loop).
+	 *
+	 * Composition: entries proposed by other extensions are chained, never
+	 * replaced, and `continue: true` only *ensures* one further provider request.
+	 * If queued work already causes that request, Pi satisfies the decision with
+	 * it and makes no extra one, so this adds exactly one Goal turn per
+	 * settlement and no more.
+	 */
+	pi.on("agent_before_settle", async (event, _ctx) => {
+		const goal = store.get();
+		if (!goal || goal.status !== "active") return;
+		if (event.outcome !== "completed") return;
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message",
+					customType: CUSTOM_MESSAGE_TYPE,
+					content: formatContinuationMessage(goal),
+					display: true,
+				},
+			],
+			continue: true,
+		};
+	});
+
 	pi.registerTool({
 		name: "get_goal",
 		label: "Get Goal",
@@ -95,6 +160,131 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const state = toPublicState(goal);
 			return {
 				content: [{ type: "text", text: formatGoalSummary(state) }],
+				structuredContent: { goal: state },
+				details: { goal: state },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "create_goal",
+		label: "Create Goal",
+		description:
+			"Create a persistent Goal for an explicit user or system request. " +
+			"Rejects creation when an unfinished Goal already exists.",
+		parameters: Type.Object({
+			objective: Type.String({ minLength: MIN_OBJECTIVE_LENGTH, maxLength: MAX_OBJECTIVE_LENGTH }),
+		}),
+		outputSchema: getGoalOutputSchema,
+		promptSnippet: "Create a persistent session Goal from an explicit user or system request",
+		promptGuidelines: [
+			"Call create_goal only when the user or the system explicitly asked for a Goal. Never infer one because a task looks large.",
+			"Do not call create_goal while another Goal is unfinished; it is refused. Use get_goal to inspect the current Goal instead.",
+		],
+		async execute(_toolCallId: string, params: { objective: string }, _signal, _onUpdate, ctx) {
+			const validation = validateObjective(String(params.objective ?? ""));
+			if (!validation.ok) {
+				return goalToolError(validation.error, null);
+			}
+			// A Goal is durable session state, so it needs a session that persists.
+			// Refuse loudly instead of promising a restart survival that cannot happen.
+			if (!store.isPersistentSession(ctx)) {
+				return goalToolError(
+					"Goal not created: this session is ephemeral (--no-session), so a Goal could not be " +
+						"restored after a restart. Ask the user to start Pi with a persisted session.",
+					null,
+				);
+			}
+			const existing = store.get();
+			if (existing) {
+				return goalToolError(
+					"A Goal is already set for this session; cannot create another unfinished Goal. " +
+						"Use get_goal to inspect it, or update_goal to complete it.",
+					toPublicState(existing),
+				);
+			}
+			const goal = store.create(validation.objective);
+			try {
+				// Stage before announcing: a write failure here abandons creation with no
+				// visible state change, and the attempt can simply be retried.
+				store.stage(pi, goal);
+				store.commit(goal);
+			} catch (error) {
+				store.rollback(pi);
+				const reason = error instanceof Error ? error.message : String(error);
+				return goalToolError(`Goal not created: ${reason}`, null);
+			}
+			// No separate durability poll is needed here, unlike the /goal command whose
+			// kickoff is what creates the session file: a tool call implies a running
+			// session whose file already exists, and appendEntry writes synchronously
+			// and throws on failure. The existing-Goal guard, the stage, and the commit
+			// above also contain no await, so two create_goal calls issued in one
+			// assistant turn cannot both pass the guard.
+			const state = toPublicState(goal);
+			return {
+				content: [{ type: "text", text: `Goal ${goal.id} created and activated.` }],
+				structuredContent: { goal: state },
+				details: { goal: state },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "update_goal",
+		label: "Update Goal",
+		description:
+			"Update the current Goal. The only supported action is marking it complete, which the " +
+			"model may do after verifying every requirement of the objective against " +
+			"current-state evidence. Completing a Goal stops its automatic continuation.",
+		parameters: Type.Object({
+			action: Type.String({
+				description:
+					"Only the value complete is supported. Pause, resume, clear, and blocked transitions are user-owned and arrive in a later milestone.",
+			}),
+		}),
+		outputSchema: getGoalOutputSchema,
+		promptSnippet: "Mark the current Goal complete after an evidence-based completion audit",
+		promptGuidelines: [
+			"Call update_goal with action complete only after every explicit requirement of the objective is verified by current-state evidence.",
+			"Completing a Goal stops its automatic continuation, so never call it to escape a difficult or merely tiring task.",
+		],
+		/**
+		 * Compatibility shim for the spellings a model reaches for when it means
+		 * complete: `{ status: "complete" }` and `{ complete: true }`. Without it a
+		 * drifted call fails schema validation, the model sees only an arguments
+		 * error, and the Goal keeps burning turns. Anything else is passed through
+		 * untouched so an unsupported action is refused with a real explanation
+		 * instead of being silently ignored.
+		 */
+		prepareArguments: (args: unknown): { action: string } => {
+			if (typeof args !== "object" || args === null) return { action: "" };
+			const record = args as Record<string, unknown>;
+			if (record.action !== undefined) return { action: String(record.action) };
+			if (record.status === "complete" || record.complete === true) return { action: "complete" };
+			return { action: "" };
+		},
+		async execute(_toolCallId: string, params: { action?: string }) {
+			const goal = store.get();
+			if (!goal) {
+				return goalToolError(formatNoGoal(), null);
+			}
+			if (params?.action !== "complete") {
+				return goalToolError(
+					"update_goal only supports action complete in this milestone of pi-goal. " +
+						"Pause, resume, clear, and blocked transitions stay with the user.",
+					toPublicState(goal),
+				);
+			}
+			const updated = store.markComplete(pi);
+			if (!updated) {
+				return goalToolError(
+					"Goal could not be marked complete (no active Goal to complete).",
+					toPublicState(goal),
+				);
+			}
+			const state = toPublicState(updated);
+			return {
+				content: [{ type: "text", text: `Goal ${updated.id} marked complete.` }],
 				structuredContent: { goal: state },
 				details: { goal: state },
 			};

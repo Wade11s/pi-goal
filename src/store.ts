@@ -59,6 +59,10 @@ export class GoalStore {
 		return this.current;
 	}
 
+	/**
+	 * Whether an unfinished Goal exists (any status). Used to refuse creating a
+	 * second one.
+	 */
 	hasGoal(): boolean {
 		return this.current != null;
 	}
@@ -112,6 +116,34 @@ export class GoalStore {
 	/** Make a staged Goal visible to /goal and get_goal. */
 	commit(goal: GoalRecord): void {
 		this.current = goal;
+	}
+
+	/**
+	 * Mark the current active Goal complete. Increments revision and updates
+	 * timestamp. Returns the updated record, or null when there is no active
+	 * Goal to complete. Stages the snapshot durably through the supplied Pi API.
+	 *
+	 * Only an active Goal can be completed, so a second call (for example two
+	 * update_goal calls in one assistant turn) is refused instead of appending a
+	 * duplicate snapshot. Completion is terminal for this Goal identity: the
+	 * continuation seam never restarts a complete Goal.
+	 */
+	markComplete(pi: ExtensionAPI): GoalRecord | null {
+		const current = this.current;
+		if (!current || current.status !== "active") return null;
+		const updated: GoalRecord = {
+			...current,
+			status: "complete",
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+		};
+		try {
+			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
+		} catch {
+			return null;
+		}
+		this.current = updated;
+		return updated;
 	}
 
 	/**

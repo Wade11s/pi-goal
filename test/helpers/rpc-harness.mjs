@@ -13,7 +13,7 @@
  * immediately instead of hanging until the timeout.
  */
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,12 @@ export class PiRpcSession {
 		this.scriptPath = options.scriptPath ?? join(this.cwd, "provider-script.json");
 		this.noSession = options.noSession ?? false;
 		this.resumeSessionFile = options.sessionFile;
+		// Extra extensions loaded after the scripted provider, for tests that need a
+		// second extension composing with pi-goal (for example boundary entries).
+		this.extraExtensions = options.extraExtensions ?? [];
+		// User-level settings written to <agent-dir>/settings.json before the spawn,
+		// for tests that need deterministic retry or compaction behavior.
+		this.settings = options.settings ?? undefined;
 
 		// Only remove directories this session created; dirs passed in via options
 		// (shared cwd, shared session dir) outlive this instance and are the
@@ -56,6 +62,9 @@ export class PiRpcSession {
 	}
 
 	start() {
+		if (this.settings) {
+			writeFileSync(join(this.agentDir, "settings.json"), JSON.stringify(this.settings), "utf8");
+		}
 		const args = [
 			"--mode",
 			"rpc",
@@ -68,6 +77,7 @@ export class PiRpcSession {
 			"--model",
 			"scripted-1",
 		];
+		for (const extension of this.extraExtensions) args.push("-e", extension);
 		if (this.noSession) args.push("--no-session");
 		else if (this.resumeSessionFile) args.push("--session", this.resumeSessionFile);
 		else args.push("--session-dir", this.sessionDir);
@@ -189,6 +199,17 @@ export class PiRpcSession {
 			(records) => records.find((r) => r.type === "response" && r.id === id),
 		);
 		this.writeCommand({ id, type: "prompt", message });
+		return responsePromise;
+	}
+
+	/** Queue a follow-up message while the agent runs; returns its response record. */
+	async followUp(message) {
+		const id = `req-${++nextRequestId}`;
+		const responsePromise = this.waitFor(
+			`response for follow_up ${id}`,
+			(records) => records.find((r) => r.type === "response" && r.id === id),
+		);
+		this.writeCommand({ id, type: "follow_up", message });
 		return responsePromise;
 	}
 
@@ -322,4 +343,19 @@ export function lastGoalSnapshot(entries) {
 		if (entry.type === "custom" && entry.customType === "goal-state") snapshot = entry;
 	}
 	return snapshot;
+}
+
+/** Every goal-continuation custom-message entry, in append order. */
+export function continuationEntries(entries) {
+	return entries.filter((e) => e.type === "custom_message" && e.customType === "goal-continuation");
+}
+
+/** Every entry of one custom-message channel, in append order. */
+export function customMessageEntries(entries, customType) {
+	return entries.filter((e) => e.type === "custom_message" && e.customType === customType);
+}
+
+/** Count agent runs that started, from the accumulated RPC event records. */
+export function runCount(session) {
+	return session.records.filter((r) => r.type === "agent_start").length;
 }

@@ -9,6 +9,7 @@
  *   { "toolCalls": [{ "name": "get_goal", "args": {} }], "usage"?: {...} }
  *   { "error": "message", "stopReason"?: "error" }
  *   { "hang": true }   // never completes; for interrupted-run tests
+ *   { "delayMs": 400 } // holds the response open; gives a test a busy window
  *
  * No network access or credentials are required, which lets the RPC tests drive
  * real Pi sessions end to end.
@@ -41,6 +42,12 @@ export interface ScriptedStep {
 	error?: string;
 	/** Never complete this response; the agent run hangs until aborted or killed. */
 	hang?: boolean;
+	/**
+	 * Hold the response open for this long before streaming it. Gives a test a
+	 * deterministic window in which the agent is provably busy, so queued
+	 * steering or follow-up messages can be exercised without a race.
+	 */
+	delayMs?: number;
 }
 
 function readSteps(): ScriptedStep[] {
@@ -125,6 +132,18 @@ function streamScriptedStep(
 			return;
 		}
 
+		// Hold the response open so a test has a deterministic window in which the
+		// agent is provably busy (for queueing steering or follow-up messages).
+		if (step.delayMs !== undefined) {
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, step.delayMs);
+				options?.signal?.addEventListener("abort", () => {
+					clearTimeout(timer);
+					resolve();
+				});
+			});
+		}
+
 		const content: AssistantMessage["content"] = [];
 		for (const call of step.toolCalls ?? []) {
 			content.push({
@@ -160,11 +179,15 @@ function streamScriptedStep(
 		}
 
 		const partial: AssistantMessage = { ...message, content: [], stopReason: "pending" };
+		// Accumulated content for the partial snapshots: each event must carry every
+		// block streamed so far, because `contentIndex` addresses that array.
+		const streamed: AssistantMessage["content"] = [];
 		stream.push({ type: "start", partial: { ...partial } });
 		for (let contentIndex = 0; contentIndex < content.length; contentIndex++) {
 			if (options?.signal?.aborted) break;
 			const block = content[contentIndex]!;
-			const partialContent = [...partial.content, block];
+			streamed.push(block);
+			const partialContent = [...streamed];
 			if (block.type === "text") {
 				stream.push({ type: "text_start", contentIndex, partial: { ...partial, content: partialContent } });
 				stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: { ...partial, content: partialContent } });
