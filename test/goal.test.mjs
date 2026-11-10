@@ -430,8 +430,8 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 	const session = await PiRpcSession.start();
 	// Step 0 hangs the ordinary run; step 1 answers the winner's kickoff.
 	// The hanging run is aborted; the winner's kickoff and its continuation each
-	// need a step.
-	script([{ hang: true }, { text: "Kickoff done." }, { text: "Continuing." }], session);
+	// need a step, and the last one is held so the loop stops deliberately.
+	script([{ hang: true }, { text: "Kickoff done." }, { text: "Continuing." }, { hang: true }], session);
 	try {
 		// Start an ordinary run that never settles.
 		const started = await session.prompt("start something slow");
@@ -454,14 +454,23 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 		// Abort the hanging run: idle returns, both queued creations run.
 		session.writeCommand({ id: "abort-1", type: "abort" });
 
-		// Exactly one creation succeeds and exactly one refusal warns.
+		// Exactly one creation succeeds.
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await session.waitForNotify((r) => r.message.includes("already set"));
 		assert.equal(
 			session.records.filter((r) => r.type === "extension_ui_request" && r.message?.includes("created and activated")).length,
 			1,
 			"exactly one Goal was created",
 		);
+
+		// The loser's handler is serialized behind the winner's, and it waits for
+		// idle — which the new active Goal keeps busy. So the continuation loop has
+		// to be stopped deliberately before the refusal can be reached, and that
+		// stop is also what releases the loser. Runs so far: the aborted hang, the
+		// kickoff, its continuation, and a held response.
+		await abortActiveLoop(session, 4);
+
+		// Now the loser refuses, and both command handlers complete.
+		await session.waitForNotify((r) => r.message.includes("already set"));
 		assert.equal(
 			session.records.filter((r) => r.type === "extension_ui_request" && r.message?.includes("already set")).length,
 			1,
@@ -472,7 +481,6 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 		// extension error from the loser's sendUserMessage while streaming).
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 
-		// Both command handlers completed.
 		const first = await session.waitFor(
 			"goal-1 response",
 			(records) => records.find((r) => r.type === "response" && r.id === "goal-1"),
@@ -483,9 +491,6 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 		);
 		assert.equal(first.data.disposition, "handled");
 		assert.equal(second.data.disposition, "handled");
-
-		// The kickoff run finished and the session settled.
-		await session.waitForSettled(2); // aborted hanging run + kickoff
 
 		// Exactly one Goal snapshot was persisted: the first command's.
 		const entries = readSessionEntries(await session.sessionFile());
@@ -504,6 +509,9 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 			(r) => r.message.includes("First concurrent objective") && r.message.includes("active"),
 		);
 		assert.ok(status);
+		// Two deliberate stops: the aborted ordinary run and the aborted
+		// continuation loop. No provider error anywhere.
+		assertOnlyFailures(session, [{ stopReason: "aborted" }, { stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
 	}
@@ -511,14 +519,15 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 
 test("objectives that merely begin with a reserved subcommand word are accepted", async () => {
 	const session = await PiRpcSession.start();
-	// Kickoff plus the continuation it triggers; both need a step.
-	script([{ text: "On it." }, { text: "Continuing." }], session);
+	// Kickoff, its continuation, and a held response so the loop stops
+	// deliberately with the Goal still active.
+	script([{ text: "On it." }, { text: "Continuing." }, { hang: true }], session);
 	try {
 		const objective = "clear the lint errors and make the build green";
 		const response = await session.prompt(`/goal ${objective}`);
 		assert.equal(response.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await session.waitForSettled(1);
+		await abortActiveLoop(session, 3);
 
 		await session.prompt("/goal");
 		const notify = await session.waitForNotify(
@@ -530,6 +539,7 @@ test("objectives that merely begin with a reserved subcommand word are accepted"
 		await session.prompt("/goal clear");
 		const reserved = await session.waitForNotify((r) => r.message.includes("not implemented in this milestone"));
 		assert.equal(reserved.notifyType, "warning");
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
 	}
@@ -537,8 +547,9 @@ test("objectives that merely begin with a reserved subcommand word are accepted"
 
 test("create rejects invalid objectives and refuses to replace an existing Goal", async () => {
 	const session = await PiRpcSession.start();
-	// Kickoff plus the continuation it triggers; both need a step.
-	script([{ text: "On it." }, { text: "Continuing." }], session);
+	// Kickoff, its continuation, and a held response so the loop stops
+	// deliberately with the Goal still active.
+	script([{ text: "On it." }, { text: "Continuing." }, { hang: true }], session);
 	try {
 		// Too short (validation).
 		await session.prompt("/goal ab");
@@ -555,7 +566,7 @@ test("create rejects invalid objectives and refuses to replace an existing Goal"
 
 		// Create one Goal, then attempt to replace it.
 		await session.prompt(`/goal ${OBJECTIVE}`);
-		await session.waitForSettled(1);
+		await abortActiveLoop(session, 3);
 		await session.prompt("/goal A different objective entirely");
 		const guard = await session.waitForNotify((r) => r.message.includes("already set"));
 		assert.equal(guard.notifyType, "warning");
@@ -566,6 +577,7 @@ test("create rejects invalid objectives and refuses to replace an existing Goal"
 		assert.ok(notify);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(lastGoalSnapshot(entries).data.goal.objective, OBJECTIVE);
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
 	}

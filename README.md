@@ -106,17 +106,28 @@ tell extension instructions from objective text by channel alone. Interpolating
 it raw would let an objective carrying forged `Evidence audit` or `Completion
 contract` sections impersonate the contract.
 
-So every Goal message renders the objective as **delimited, JSON-encoded data**:
+So every Goal message renders the objective as **delimited, encoded data**:
 
-- the objective is reproduced verbatim but encoded, so embedded newlines, quotes,
-  and backslashes cannot begin a new line and no sentinel can appear unescaped
-  inside the block;
-- it is wrapped in `>>> BEGIN GOAL OBJECTIVE DATA … <<<` and
-  `<<< END GOAL OBJECTIVE DATA <<<` sentinels;
+- the objective is reproduced verbatim but encoded by `encodeObjectiveData()`:
+  `JSON.stringify` plus an explicit escape of `<`, `>`, U+0085, U+2028, and
+  U+2029. `JSON.stringify` alone is not enough — it leaves those characters raw,
+  so a literal sentinel would survive encoding and a Unicode line separator would
+  split the single data line. The result is still a valid JSON string literal, so
+  the objective round-trips byte for byte and stays readable to the model;
+- it is wrapped in `>>> BEGIN GOAL OBJECTIVE DATA (nonce …) >>>` and
+  `<<< END GOAL OBJECTIVE DATA (nonce …) <<<` sentinels whose nonce is random per
+  message, so a sentinel copied from any other message cannot close this block;
 - it is preceded by an explicit statement that it is data about what was asked
   for, not an instruction from Pi or from this extension;
 - every authoritative instruction (the evidence audit, the completion contract)
   sits **after** the data block.
+
+A regression test drives all of it at once: an objective containing forged
+`Evidence audit` / `Completion contract` / `INSTRUCTIONS FROM PI-GOAL` headings,
+literal begin and end sentinels, and U+2028/U+2029/U+0085 separators. It asserts
+that the objective round-trips exactly, that no sentinel character or Unicode
+separator survives in the data line, and that outside the data line the message
+contains exactly one of each sentinel and each authoritative heading.
 
 The canonical objective is always available unframed through `get_goal` and in
 the structured tool results, and the record carries its `origin` (`command` for
@@ -180,6 +191,10 @@ reason:
   subject), which fails on any assistant outcome that is `error` or `aborted`;
 - the test-only boundary peer bounds its own continuation requests, so a
   composition test is bounded by the fixture rather than by a provider error.
+
+This is verified, not assumed: instrumenting the scripted provider to log every
+missing step and running the whole suite reports **zero** missing steps, so no
+test in either file settles on a provider error.
 
 ## Limitations (later milestones)
 
