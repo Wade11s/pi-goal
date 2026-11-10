@@ -13,8 +13,7 @@ Implementation issues are delegated through `rex-subagent` to this worker pool, 
 | Worker model |
 | --- |
 | `magpie/zcode/GLM-5.3:high` |
-| `magpie/deepai/deepseek-v4.1-flash:high` |
-| `magpie/deepai/mimo-2.6-pro:high` |
+| `magpie/stepfun-cn/step-5-preview:high` |
 
 Balance assignments across the pool by active workload, issue size, and relevant experience. Do not assign all tickets to one model. Keep each issue assignment and result traceable to its subagent handle.
 
