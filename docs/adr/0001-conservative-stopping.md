@@ -45,18 +45,25 @@ observable Pi events, with thresholds that are constants rather than settings.
    exit code. A command that ran and ended in any of the ways Pi reports as an
    ordinary outcome (a non-zero exit code, a timeout, no exit code, an abort)
    carries that text and is normal work, so it never counts. The chain is only
-   broken by a shell command that actually ran: a successful `get_goal` or `read`
-   says nothing about whether the shell works, and the continuation contract tells
-   the model to read state, so that mix is the ordinary shape of a broken shell
-   rather than a rare one. Three unavailable turns in a row stop the Goal.
+   broken by a shell command that actually ran, which Pi marks with a measured
+   duration: a successful `get_goal` or `read` says nothing about whether the shell
+   works, and the continuation contract tells the model to read state, so that mix
+   is the ordinary shape of a broken shell rather than a rare one. A shell call
+   that never ran — invalid arguments, a permission block, an abort before start —
+   carries no duration and is ignored entirely, because it is neither an execution
+   failure nor evidence that the shell works, and counting it either way would let
+   it hide a genuine spawn failure in the same Goal turn. Three unavailable turns in
+   a row stop the Goal.
 4. **Provider failures are classified from Pi's evidence, and only definitive
    exhaustion evidence counts.** A terminal provider error becomes `usage_limited`
    only when the error text or a provider diagnostic pairs a quota, usage-limit,
    credit, billing, or account-budget noun with an exhaustion verb, or names a
    provider error code whose meaning is a plan usage limit. Bare account
-   vocabulary, internal budgets, negated statements, and lookups are all excluded,
-   because `usage_limited` is terminal and a false positive would wedge the
-   session's Goal. Exhaustion evidence is evaluated before anything else, so a
+   vocabulary, internal and per-request budgets, negated statements, and lookups
+   are all excluded, because `usage_limited` is terminal and a false positive would
+   wedge the session's Goal. Negation is checked inside the matched phrase as well
+   as in front of it, since "quota is not exceeded" and "not exceeded your quota"
+   are equally clear statements that the plan is fine. Exhaustion evidence is evaluated before anything else, so a
    failure that reports both a throttle and an exhausted quota is classified by the
    quota. Anything else stops the continuation for that run, is surfaced to the
    user, and leaves the Goal active so the next successful run resumes it.

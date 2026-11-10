@@ -196,11 +196,16 @@ which is the only place a Goal turn is known to be over.
   user can resume one, and resume arrives with the lifecycle milestone.
 - An **ordinary command failure** — the command ran and exited non-zero, timed
   out, died without an exit code, or was aborted — is normal work. It never counts
-  toward the execution-unavailable stop. A command that never ran at all (blocked
-  by permissions, invalid arguments) does not count either.
+  toward the execution-unavailable stop.
 - Only a **shell command that actually ran** may break an execution-failure chain.
-  A successful `get_goal`, `read`, or `grep` says nothing about whether the shell
-  works, so reading state next to a shell that cannot start does not hide it.
+  Two things that look like shell outcomes prove nothing either way and are
+  ignored: a successful `get_goal`, `read`, or `grep` (which says nothing about
+  whether the shell works — and the continuation contract tells the model to read
+  state, so that mix is the ordinary shape of a broken shell), and a shell call
+  that never ran at all (invalid arguments, a permission block, an abort before
+  start), which Pi reports as an error result with no measured duration. A call
+  that never ran neither counts as an execution failure nor stands in for a shell
+  that worked, so it cannot hide a genuine spawn failure in the same Goal turn.
 - Only **automatic** continuations count toward the anti-loop bounds. The kickoff
   and any run the user started are attended work, so an empty kickoff followed by
   two empty automatic responses is two activity-free turns, not three.
@@ -223,9 +228,14 @@ which is the only place a Goal turn is known to be over.
   - internal budgets (`retry budget exhausted after 3 attempts`, `token budget
     exceeded for this request`) are Pi's or the request's own limits, so a budget
     must name an account, plan, or period;
-  - a negated statement (`You have not exceeded your quota`) or a lookup (`The
-    quota service reached a timeout while checking your account`) says the plan is
-    fine or that a service was contacted.
+  - a negated statement (`You have not exceeded your quota`, `Your quota is not
+    exceeded`, `Your usage limit has not been reached`) says the plan is fine — the
+    negation is checked both inside the matched phrase and just in front of it;
+  - a lookup (`The quota service reached a timeout while checking your account`)
+    says a service was contacted;
+  - an unqualified or per-request budget (`The request is out of budget for this
+    call`, `token budget exceeded for this request`) describes this request's own
+    allowance, not the account's plan.
   A rate limit is never a usage limit on its own, because Pi retries those itself
   — but when the same failure also carries explicit quota-exhaustion evidence
   (`429 rate limit reached; insufficient_quota: current quota exhausted`), the

@@ -265,12 +265,21 @@ export class GoalSafetyMonitor {
 	 *
 	 * A shell command that actually ran — successfully, or with an ordinary
 	 * failure — proves execution was available, so it is the only thing that
-	 * resets the execution-unavailable chain. A successful *non-shell* tool says
-	 * nothing about whether the shell works, so reading files or inspecting the
-	 * Goal must not hide a shell that cannot start.
+	 * resets the execution-unavailable chain. Two things that look like shell
+	 * outcomes prove nothing either way and are ignored:
+	 *
+	 * - a *non-shell* tool, because a successful `get_goal` or `read` says nothing
+	 *   about whether the shell works, and the continuation contract tells the
+	 *   model to read state;
+	 * - a shell call that never ran, because Pi reports a call rejected before
+	 *   execution — invalid arguments, a permission block, an abort before start —
+	 *   as an error result with no measured duration. Such a call is neither an
+	 *   execution failure nor evidence that the shell works, so it must not hide a
+	 *   genuine spawn failure in the same Goal turn.
 	 */
 	noteToolExecutionEnd(event: ToolExecutionEndLike): void {
 		if (!EXECUTION_TOOLS.has(event.toolName)) return;
+		if (event.durationMs === undefined) return;
 		if (!event.isError) {
 			this.sawShellRan = true;
 			return;
@@ -424,21 +433,37 @@ const USAGE_LIMIT_PATTERNS: RegExp[] = [
 	/(?:billing|plan|spending|account|subscription)[ _-]?(?:hard[ _-]?)?limit[^.\n]{0,30}EXHAUSTION_VERB/i,
 	// An account, plan, or period budget that has been used up.
 	/(?:spending|account|plan|monthly|weekly|daily|organization|org)[ _-]?budget[^.\n]{0,30}EXHAUSTION_VERB/i,
-	// Explicit exhaustion of a credit or balance pool.
-	/out of (?:budget|credits)/i,
+	// Explicit exhaustion of a credit pool. `budget` is deliberately absent here: an
+	// unqualified "out of budget" is at least as likely to describe this request's
+	// own allowance ("The request is out of budget for this call") as the account's
+	// plan, and only a qualified account, plan, or period budget matches above.
+	/out of credits/i,
 	/credit balance (?:is )?too low/i,
 ].map((pattern) => new RegExp(pattern.source.replace("EXHAUSTION_VERB", EXHAUSTION_VERB), pattern.flags));
 
 /**
- * Wording that negates a match.
+ * Wording that negates a statement.
  *
- * "You have not exceeded your quota" is a provider saying the plan is fine, so a
- * negation in front of the verb turns exhaustion into its opposite. The window is
- * short and stops at a sentence boundary, so "This is not a rate limit. Your
- * quota is exceeded." keeps its second, unnegated statement.
+ * "You have not exceeded your quota" and "Your quota is not exceeded" are a
+ * provider saying the plan is fine, so a negation turns exhaustion into its
+ * opposite. It is checked in two places, because the negation can sit on either
+ * side of the verb:
+ *
+ * - inside the matched phrase, which is what catches "quota is not exceeded";
+ * - in the short window in front of the match, which catches "not exceeded your
+ *   quota". That window stops at a sentence boundary, so "This is not a rate
+ *   limit. Your quota is exceeded." keeps its second, unnegated statement.
  */
+const NEGATION_WORD = "(?:not|never|cannot|can't|couldn't|won't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|without|unable)";
 const NEGATION_WINDOW = 40;
-const NEGATION_PATTERN = /\b(?:not|never|cannot|can't|couldn't|won't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|without|unable)\b[^.\n]{0,30}$/i;
+/** Negation anywhere inside the matched phrase, as in "quota is not exceeded". */
+const NEGATION_PATTERN = new RegExp(`\\b${NEGATION_WORD}\\b`, "i");
+/**
+ * Negation in the window in front of the match, as in "not exceeded your quota".
+ * The window stops at a sentence boundary, so a negated sentence does not suppress
+ * an unnegated one that follows it.
+ */
+const NEGATION_BEFORE_PATTERN = new RegExp(`\\b${NEGATION_WORD}\\b[^.\\n]{0,30}$`, "i");
 
 /**
  * Wording that makes "reached" describe a lookup or a timeout rather than an
@@ -495,17 +520,19 @@ const REACHED_VERB = /\breached\b/i;
 /**
  * The exhaustion evidence in a provider failure, or null when there is none.
  *
- * A pattern match is only evidence when it survives both guards: it is not
- * negated, and a match that leans on `reached` does not sit in timeout or
- * throttling wording. The stronger verbs — exceeded, exhausted, depleted — are
- * unambiguous and only the negation guard applies to them.
+ * A pattern match is only evidence when it survives every guard: it is not
+ * negated, either inside the matched phrase or just in front of it, and a match
+ * that leans on `reached` does not sit in timeout or throttling wording. The
+ * stronger verbs — exceeded, exhausted, depleted — are unambiguous and only the
+ * negation guards apply to them.
  */
 function matchExhaustionEvidence(text: string): string | null {
 	for (const pattern of USAGE_LIMIT_PATTERNS) {
 		const match = pattern.exec(text);
 		if (!match) continue;
+		if (NEGATION_PATTERN.test(match[0])) continue;
 		const before = text.slice(Math.max(0, match.index - NEGATION_WINDOW), match.index);
-		if (NEGATION_PATTERN.test(before)) continue;
+		if (NEGATION_BEFORE_PATTERN.test(before)) continue;
 		if (REACHED_VERB.test(match[0]) && LOOKUP_CONTEXT_PATTERN.test(text)) continue;
 		return match[0];
 	}

@@ -701,6 +701,77 @@ test("a blocker reported by Pi's retry of a Goal turn keeps the audit chain", as
 	}
 });
 
+test("a shell call that never ran does not hide a spawn failure in the same Goal turn", async () => {
+	// Each Goal turn makes one invalid bash call (missing `command`, rejected before
+	// execution, no measured duration) and one valid call that fails to spawn the
+	// shell. The invalid call proves nothing either way, so it must neither count as
+	// an execution failure nor stand in for a shell that worked.
+	const session = await PiRpcSession.start({ settings: { shellPath: "/definitely/not/a/shell" } });
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{
+				toolCalls: [
+					{ name: "bash", args: {} },
+					{ name: "bash", args: { command: "echo one" } },
+				],
+			},
+			{ text: "The shell would not start." },
+			{
+				toolCalls: [
+					{ name: "bash", args: {} },
+					{ name: "bash", args: { command: "echo two" } },
+				],
+			},
+			{ text: "The shell would not start." },
+			{
+				toolCalls: [
+					{ name: "bash", args: {} },
+					{ name: "bash", args: { command: "echo three" } },
+				],
+			},
+			{ text: "The shell would not start." },
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const bashResults = toolResults(session, "bash");
+		assert.equal(bashResults.length, 6, "two shell calls per Goal turn");
+		// Every call failed, but only the valid ones ever ran.
+		const neverRan = bashResults.filter((r) => r.durationMs === undefined);
+		assert.equal(neverRan.length, 3, "the invalid calls never ran");
+		assert.ok(
+			neverRan.every((r) => r.isError && /Validation failed|required|command/i.test(String(r.result.content[0].text))),
+			"the invalid calls were rejected before execution",
+		);
+		const spawned = bashResults.filter((r) => r.durationMs !== undefined);
+		assert.equal(spawned.length, 3, "the valid calls ran");
+		assert.ok(
+			spawned.every((r) => r.isError && /not a shell|not found|ENOENT|spawn/i.test(String(r.result.content[0].text))),
+			"every valid call failed to spawn the shell",
+		);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries).data.goal;
+		assert.equal(snapshot.status, "blocked", "the invalid calls did not hide the broken shell");
+		assert.equal(snapshot.blockedAudit.turns, 3);
+		assert.match(snapshot.blockedAudit.blocker, /could not execute a command/);
+		const stopped = await session.waitForNotify((r) => r.message.includes("stopped and is now blocked"));
+		assert.ok(stopped.message.includes("execution-unavailable"));
+		assert.equal(continuationEntries(entries).length, 3, "exactly three Goal turns ran");
+		assert.equal(runCount(session), 4);
+		assertStepsConsumed(session, 7);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
 test("a non-zero exit code is ordinary work and never stops the Goal", async () => {
 	const session = await PiRpcSession.start();
 	// The command runs and fails, three Goal turns in a row: that is a failing
@@ -1577,7 +1648,12 @@ test("provider failures are classified from what the evidence actually says", as
 		// A lookup or a throttle is not an exhausted plan.
 		["The quota service reached a timeout while checking your account", "active"],
 		["You have not exceeded your quota", "active"],
+		["Your quota is not exceeded", "active"],
+		["Your usage limit has not been reached", "active"],
 		["429 rate limit exceeded, please slow down", "active"],
+		// An unqualified or per-request budget is not the account's plan.
+		["The request is out of budget for this call", "active"],
+		["spending budget exhausted", "usage_limited"],
 	];
 	for (const [message, expectedStatus] of cases) {
 		// Retries are disabled so the failure reaches the boundary as the reviewer's
