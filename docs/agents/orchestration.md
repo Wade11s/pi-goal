@@ -24,7 +24,9 @@ Pull requests are reviewed through `rex-subagent` by this reviewer pool, using h
 | Reviewer model |
 | --- |
 | `magpie/kimi/k3.1-pro:high` |
-| `workbuddy/hy4free:high` |
+| `magpie/grok/grok-4.7@500k:high` |
+
+Grok temporarily replaces `workbuddy/hy4free:high` until that reviewer's usage limit resets. Completed hy4free reviews remain valid; new or unfinished review assignments use Grok.
 
 The orchestrator dispatches reviews, routes requested changes back to the implementation worker, and verifies the resulting updates.
 
