@@ -16,11 +16,14 @@ import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	BLOCKED_AUDIT_THRESHOLD,
 	CUSTOM_ENTRY_TYPE,
 	type GoalRecord,
 	type GoalSnapshot,
 	type GoalOrigin,
+	MAX_BLOCKER_LENGTH,
 	MAX_OBJECTIVE_LENGTH,
+	MIN_BLOCKER_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 } from "./goal.ts";
 
@@ -40,9 +43,58 @@ export type CompleteGoalResult =
 	| { ok: false; reason: "not-active" }
 	| { ok: false; reason: "persistence"; error: unknown };
 
+/**
+ * Outcome of the model reporting a blocker through `update_goal`.
+ *
+ * `thresholdMet` is the only case that transitions the Goal: before that the
+ * report is recorded and refused, so the Goal keeps working instead of stopping
+ * on a blocker that has not persisted.
+ */
+export type BlockedReportResult =
+	| {
+		ok: true;
+		goal: GoalRecord;
+		/** Consecutive Goal turns that have now reported this same blocker. */
+		turns: number;
+		/** Whether the three-consecutive-turn audit is satisfied. */
+		thresholdMet: boolean;
+		/** True when this call repeated a report already counted for the same Goal turn. */
+		repeat: boolean;
+	}
+	| { ok: false; reason: "not-active" }
+	| { ok: false; reason: "persistence"; error: unknown };
+
+/** Outcome of an extension-initiated conservative stop or usage-limit transition. */
+export type StopGoalResult =
+	| { ok: true; goal: GoalRecord }
+	| { ok: false; reason: "not-active" }
+	| { ok: false; reason: "persistence"; error: unknown };
+
+/**
+ * How a blocker description is compared across Goal turns.
+ *
+ * "Equivalent blockers" have to count as the same condition, or a model that
+ * reworded its report would restart the audit forever and the Goal would never
+ * reach the threshold. Only case, whitespace, and trailing sentence punctuation
+ * are normalized: the wording itself stays meaningful, so a genuinely different
+ * blocker still restarts the audit at one.
+ */
+export function normalizeBlocker(blocker: string): string {
+	return blocker.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!?;,]+$/, "");
+}
+
 export class GoalStore {
 	/** undefined = not reconstructed yet; null = no Goal (or tombstone); record = present. */
 	private current: GoalRecord | null | undefined = undefined;
+
+	/**
+	 * The Goal turn of the last counted blocker report.
+	 *
+	 * Several `update_goal` calls can arrive inside one Goal turn (a model that
+	 * retries its own tool call, or a batch that repeats it). Only the first one
+	 * counts: the audit is about consecutive *turns*, not calls.
+	 */
+	private lastBlockerTurn: number | undefined = undefined;
 
 	/** Rebuild state from the active branch. Called on session_start and session_tree. */
 	reconstruct(ctx: ExtensionContext): void {
@@ -55,15 +107,20 @@ export class GoalStore {
 				if (!snapshot || typeof snapshot !== "object" || snapshot.version !== 1) continue;
 				if (!isGoalRecord(snapshot.goal)) continue;
 				seen = true;
-				restored = snapshot.goal;
+				restored = snapshot.goal === null ? null : withSanitizedAudit(snapshot.goal);
 			}
 		} catch (error) {
 			// Never break the session on corrupt entries; report and keep absent state.
 			console.error("[pi-goal] failed to reconstruct Goal state:", error);
 			this.current = null;
+			this.lastBlockerTurn = undefined;
 			return;
 		}
 		this.current = seen ? restored : null;
+		// The audit itself is durable, but which Goal turn it belongs to is not:
+		// a fresh runtime has no turn to match, so the next report starts a new
+		// turn rather than being swallowed as a repeat.
+		this.lastBlockerTurn = undefined;
 	}
 
 	/** Current record, or undefined when not yet reconstructed. */
@@ -149,6 +206,9 @@ export class GoalStore {
 		const updated: GoalRecord = {
 			...current,
 			status: "complete",
+			// A complete Goal has no blocker, so a stale audit is dropped rather
+			// than reported as if it were still stopping the Goal.
+			blockedAudit: undefined,
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		};
@@ -158,6 +218,7 @@ export class GoalStore {
 			return { ok: false, reason: "persistence", error };
 		}
 		this.current = updated;
+		this.lastBlockerTurn = undefined;
 		return { ok: true, goal: updated };
 	}
 
@@ -168,11 +229,125 @@ export class GoalStore {
 	 */
 	rollback(pi: ExtensionAPI): void {
 		this.current = null;
+		this.lastBlockerTurn = undefined;
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
 		} catch {
 			// Nothing more we can do; the staged entry was never confirmed durable.
 		}
+	}
+
+	/**
+	 * Record the model reporting a blocker, and enforce the blocked audit.
+	 *
+	 * The audit counts consecutive Goal turns that reported the *same* blocker
+	 * (compared by `normalizeBlocker`, so a reworded repetition still advances
+	 * it). The Goal becomes `blocked` only when the count reaches
+	 * `BLOCKED_AUDIT_THRESHOLD`; before that the report is persisted and refused,
+	 * which keeps a transient blocker from stopping useful work while still
+	 * making the audit durable across compaction and a session restore.
+	 *
+	 * A write failure leaves the Goal active and untouched, so the model can
+	 * simply report again.
+	 */
+	markBlockedReport(
+		pi: ExtensionAPI,
+		params: { blocker: string; turn: number },
+	): BlockedReportResult {
+		const current = this.current;
+		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
+		const blocker = params.blocker.trim();
+		const previous = current.blockedAudit;
+
+		// A repeated report inside the same Goal turn is idempotent: it must not
+		// advance the audit, or a model that retries its own tool call could
+		// satisfy the threshold inside one turn.
+		if (this.lastBlockerTurn === params.turn && previous) {
+			return {
+				ok: true,
+				goal: current,
+				turns: previous.turns,
+				thresholdMet: previous.turns >= BLOCKED_AUDIT_THRESHOLD,
+				repeat: true,
+			};
+		}
+		this.lastBlockerTurn = params.turn;
+
+		const sameBlocker =
+			previous !== undefined && normalizeBlocker(previous.blocker) === normalizeBlocker(blocker);
+		const turns = sameBlocker ? previous.turns + 1 : 1;
+		const thresholdMet = turns >= BLOCKED_AUDIT_THRESHOLD;
+		const updated: GoalRecord = {
+			...current,
+			...(thresholdMet ? { status: "blocked" as const } : {}),
+			blockedAudit: { blocker, turns },
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+		};
+		try {
+			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
+		} catch (error) {
+			this.lastBlockerTurn = undefined;
+			return { ok: false, reason: "persistence", error };
+		}
+		this.current = updated;
+		return { ok: true, goal: updated, turns, thresholdMet, repeat: false };
+	}
+
+	/**
+	 * Stop the Goal with an extension-owned reason: a conservative anti-loop stop
+	 * (`blocked`) or a provider usage limit (`usage_limited`).
+	 *
+	 * Both are terminal for continuation, exactly like completion, and both are
+	 * recorded with the reason that produced them so `get_goal` and bare `/goal`
+	 * can explain why the Goal is not working.
+	 */
+	stopGoal(
+		pi: ExtensionAPI,
+		stop: { status: "blocked" | "usage_limited"; blocker: string; turns?: number },
+	): StopGoalResult {
+		const current = this.current;
+		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
+		const updated: GoalRecord = {
+			...current,
+			status: stop.status,
+			blockedAudit: { blocker: stop.blocker, turns: stop.turns ?? 0 },
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+		};
+		try {
+			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
+		} catch (error) {
+			return { ok: false, reason: "persistence", error };
+		}
+		this.current = updated;
+		this.lastBlockerTurn = undefined;
+		return { ok: true, goal: updated };
+	}
+
+	/**
+	 * Forget the blocked audit.
+	 *
+	 * A user action (a prompt the user typed, an abort) or a replacement Goal
+	 * means the loop is no longer unattended and the old audit is stale, so the
+	 * next report has to start at one. The reset is persisted when there is an
+	 * audit to clear — which can only happen after a report, so this is bounded
+	 * and never fires on an ordinary prompt — because otherwise a reload could
+	 * resurrect a count the user already invalidated.
+	 */
+	resetBlockedAudit(pi: ExtensionAPI): void {
+		this.lastBlockerTurn = undefined;
+		const current = this.current;
+		if (!current || current.status !== "active" || current.blockedAudit === undefined) return;
+		const { blockedAudit: _dropped, ...rest } = current;
+		const updated: GoalRecord = { ...rest, updatedAt: Date.now(), revision: current.revision + 1 };
+		try {
+			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
+		} catch {
+			// The in-memory reset still holds; the durable copy is at worst stale
+			// until the next report overwrites it.
+		}
+		this.current = updated;
 	}
 
 	/** Build a new active Goal record (revision 0). Pure: no state is changed. */
@@ -203,6 +378,19 @@ export function validateObjective(raw: string): { ok: true; objective: string } 
 	return { ok: true, objective };
 }
 
+export function validateBlocker(raw: string): { ok: true; blocker: string } | { ok: false; error: string } {
+	const blocker = raw.trim();
+	if (blocker.length < MIN_BLOCKER_LENGTH || blocker.length > MAX_BLOCKER_LENGTH) {
+		return {
+			ok: false,
+			error:
+				`Blocker not recorded: describe the blocker in ${MIN_BLOCKER_LENGTH} to ${MAX_BLOCKER_LENGTH} ` +
+				"characters after trimming.",
+		};
+	}
+	return { ok: true, blocker };
+}
+
 function isGoalRecord(value: unknown): value is GoalRecord | null {
 	if (value === null) return true; // tombstone
 	if (typeof value !== "object" || value === null) return false;
@@ -222,4 +410,28 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 		typeof record.updatedAt === "number" &&
 		typeof record.revision === "number"
 	);
+}
+
+/**
+ * Drop a malformed `blockedAudit` instead of trusting it.
+ *
+ * The audit is written by this extension, but a snapshot can be hand-edited or
+ * written by a future version. A malformed one would break blocker comparison,
+ * so it is dropped and the Goal keeps working with a fresh audit.
+ */
+function withSanitizedAudit(goal: GoalRecord): GoalRecord {
+	const audit = goal.blockedAudit;
+	if (audit === undefined) return goal;
+	if (
+		audit === null ||
+		typeof audit !== "object" ||
+		typeof audit.blocker !== "string" ||
+		typeof audit.turns !== "number" ||
+		!Number.isFinite(audit.turns) ||
+		audit.turns < 0
+	) {
+		const { blockedAudit: _dropped, ...rest } = goal;
+		return rest;
+	}
+	return goal;
 }

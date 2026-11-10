@@ -459,7 +459,7 @@ test("concurrent create_goal calls in one turn create exactly one Goal", async (
 	}
 });
 
-test("update_goal only completes an active Goal and refuses other transitions", async () => {
+test("update_goal only completes or blocks an active Goal and refuses other transitions", async () => {
 	const session = await PiRpcSession.start();
 	// An unsupported action, then a call with no action at all, then completion,
 	// then a refused repeat once the Goal is already complete.
@@ -481,10 +481,11 @@ test("update_goal only completes an active Goal and refuses other transitions", 
 
 		const results = toolResults(session, "update_goal");
 		assert.equal(results.length, 3);
+		// Pause stays user-owned: the model cannot reach it through the tool.
 		assert.equal(results[0].isError, true);
-		assert.match(String(results[0].result.content[0].text), /only supports action complete/);
+		assert.match(String(results[0].result.content[0].text), /only supports the actions complete and blocked/);
 		assert.equal(results[1].isError, true);
-		assert.match(String(results[1].result.content[0].text), /only supports action complete/);
+		assert.match(String(results[1].result.content[0].text), /only supports the actions complete and blocked/);
 
 		// The refusals left the Goal active; the third call completed it, and the
 		// session settled without ever continuing.

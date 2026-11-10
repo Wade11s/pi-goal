@@ -4,7 +4,9 @@ Codex-style persistent Goals for [Pi](https://github.com/earendil-works/pi): a `
 command and three model tools (`get_goal`, `create_goal`, `update_goal`) that give a
 session a durable, user-controlled objective. While a Goal is active, work
 continues automatically at Pi's safe settlement boundary until the model verifies
-completion, the run is aborted or fails, or the lifecycle changes.
+completion, a genuine blocker persists, a provider usage limit or terminal failure
+stops the run, a conservative anti-loop bound is reached, the run is aborted, or
+the lifecycle changes.
 
 Requires **Pi 1.5.1 or newer**. The extension uses only public extension APIs and
 does not patch Pi core.
@@ -70,6 +72,12 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   the objective verbatim and asks for an evidence audit of the current state:
   read the files, command results, runtime state, and artifacts; separate real
   progress from narration; check every explicit requirement.
+- The same message carries the no-progress contract: classify the previous Goal
+  turn as **progress** (authoritative state changed, work completed, or evidence
+  that changes the next action), a **verified wait** (a specific live handle was
+  polled), or **no progress** (status narration and unexecuted plans). It states
+  that equivalent blockers count as one condition across turns, and it states the
+  three-consecutive-Goal-turn blocked audit the extension enforces.
 - The continuation requests exactly one further provider request per
   settlement. If queued work already causes that request, Pi satisfies the
   decision with it and makes no extra one.
@@ -135,12 +143,59 @@ the structured tool results, and the record carries its `origin` (`command` for
 
 ### Model tool: `update_goal`
 
-`update_goal` is the completion contract. The model calls it with
+`update_goal` is the completion and blocked contract. The model calls it with
 `{ action: "complete" }` only after every explicit requirement of the objective
-is verified against current-state evidence. Completion is terminal: the Goal is
-persisted as `complete` and never continues again, including after a restart or
-reload. Any other action (`pause`, `resume`, `clear`, a blocked conclusion) is
-refused with an explanation, because those transitions stay with the user.
+is verified against current-state evidence, or with
+`{ action: "blocked", blocker: "…" }` once the same genuine blocker has persisted
+for at least **three consecutive Goal turns**. Both are terminal: the Goal is
+persisted as `complete` or `blocked` and never continues again, including after a
+restart or reload. Any other action (`pause`, `resume`, `clear`, a usage-limit or
+budget-limit transition) is refused with an explanation, because those
+transitions stay with the user.
+
+The extension, not the model, decides when the blocked audit is satisfied:
+
+- a report is recorded per **Goal turn**, so several calls inside one turn count
+  once and cannot satisfy the threshold on their own;
+- blockers are compared after normalizing case, whitespace, and trailing
+  punctuation, so a reworded repetition still advances the audit while a genuinely
+  different blocker restarts it at one;
+- below the threshold the report is persisted and refused with the current count,
+  which is what keeps a transient failure from stopping useful work. The audit is
+  durable, so compaction and a session restore do not hand the model three fresh
+  turns to spend on a blocker it already reported twice.
+
+### Stopping safely on blockers and failures
+
+A Goal can also be stopped without the model asking for it. Every rule is
+deterministic, and every one of them is narrow enough that ordinary work is never
+mistaken for a malfunction.
+
+| Stop | Status | Why it is not ordinary work |
+| --- | --- | --- |
+| Same genuine blocker for three consecutive Goal turns | `blocked` | reported by the model through `update_goal`, enforced by the extension |
+| Three consecutive activity-free automatic Goal turns | `blocked` | no tool call, no output, and no reasoning: the continuation loop is malfunctioning |
+| Three consecutive turns in which commands could not be executed | `blocked` | the shell itself failed to run, which is not the same as a non-zero exit code |
+| Provider usage limit | `usage_limited` | the error says the account, plan, or budget is exhausted |
+
+- A **blocked** or **usage_limited** Goal never continues automatically. Only the
+  user can resume one, and resume arrives with the lifecycle milestone.
+- An **ordinary command failure** — the command ran and exited non-zero — is
+  normal work. It never counts toward the execution-unavailable stop.
+- An **aborted** run is a hard exit Pi already owns. It is not counted as a Goal
+  malfunction, and it resets the counters.
+- A **terminal provider error** that is not a usage limit stops the continuation
+  for that run and is surfaced as a warning, while the Goal stays active and
+  continues on the next successful run. Pi's own retries are untouched.
+- A **usage-limit** error is only classified as one when Pi exposes enough
+  evidence: the error text or a provider diagnostic has to say the quota, budget,
+  billing, or subscription usage limit is exhausted. A plain rate limit is not
+  enough, because Pi retries those itself.
+- Every stop is explained to the user through a notification and recorded on the
+  Goal, so `get_goal` and bare `/goal` report the blocker and the audit count.
+- **User actions reset the counters.** A prompt the user types (including one
+  queued while the agent is busy) and an abort both restart the blocked audit and
+  the anti-loop counters, and a replacement Goal starts from a fresh record.
 
 ## Persistence model
 
@@ -151,6 +206,11 @@ refused with an explanation, because those transitions stay with the user.
   restating the objective. Reconstruction also runs after `session_tree`
   navigation and on forked sessions; dedicated branch-navigation coverage lands
   with the branch-state ticket.
+- A snapshot carries the optional `blockedAudit` (`{ blocker, turns }`): the
+  blocker that stopped the Goal, or that is accumulating toward the blocked
+  threshold, and how many consecutive Goal turns reported it. It is durable for
+  the same reason the audit has to survive compaction, and a malformed one is
+  dropped during reconstruction rather than trusted.
 - The kickoff is delivered as a **user message** carrying the user's own
   objective (attributed as user-provided Goal data). As the session's first
   conversation entry it also makes Pi create and flush the session file, which
@@ -183,39 +243,45 @@ refused with an explanation, because those transitions stay with the user.
 
 A scripted-provider step that runs out throws, and that failure would also stop
 an active Goal — so a test that settles on a missing step proves the error path,
-not the Goal lifecycle. Two rules keep the suite from passing for the wrong
+not the Goal lifecycle. Three rules keep the suite from passing for the wrong
 reason:
 
 - every script is sized through the last natural post-tool turn, and every test
   ends with `assertCleanRun()` (or `assertOnlyFailures()` when a failure is the
   subject), which fails on any assistant outcome that is `error` or `aborted`;
+- every anti-loop test asserts the number of provider responses it asked for
+  (`assertStepsConsumed`) together with the exact continuation and run counts, so
+  a stop is proved to be the Goal lifecycle and not an exhausted script;
 - the test-only boundary peer bounds its own continuation requests, so a
   composition test is bounded by the fixture rather than by a provider error.
 
 This is verified, not assumed: instrumenting the scripted provider to log every
 missing step and running the whole suite reports **zero** missing steps, so no
-test in either file settles on a provider error.
+test settles on a provider error.
 
 ## Limitations (later milestones)
 
 - No `edit`, `pause`, `resume`, or `clear` lifecycle commands yet (only the bare
   words are reserved as future subcommands), so an active Goal can only be ended
-  by the model completing it, by the user aborting the run, or by a failure.
-- `create_goal` refuses while **any** Goal exists, including a complete one,
-  because replacement and clearing arrive with the lifecycle ticket. The tool
-  description, its error message, and this section all say so.
+  by the model completing it, by the model reporting a persistent blocker, by a
+  conservative stop, by the user aborting the run, or by a failure.
+- `create_goal` refuses while **any** Goal exists, including a complete, blocked,
+  or usage-limited one, because replacement and clearing arrive with the
+  lifecycle ticket. The tool description, its error message, and this section all
+  say so. Because of that, a blocked or usage-limited Goal currently waits for the
+  user: the model cannot complete it either, so it does not quietly resume work
+  the user was told had stopped.
 - No token budget, usage accounting, or active-time tracking yet, so unattended
-  work has no token bound.
-- No blocked audit (the same genuine blocker for three consecutive Goal turns),
-  no usage-limit classification, and no anti-loop stop for repeated
-  activity-free automatic responses. Until those land, an active Goal whose runs
-  keep completing will keep being continued; the model is instructed to report a
-  persistent blocker instead of spinning, and aborts and provider errors stop
-  continuation immediately.
+  work has no token bound. The anti-loop stops bound a malfunctioning loop, not a
+  healthy one: an active Goal whose runs keep completing keeps being continued.
+- The activity-free and execution-unavailable counters are per session, not
+  durable. A restart or an extension reload gives a malfunctioning loop up to
+  three more empty turns before it is stopped again; the blocked audit is durable
+  and does not reset that way.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.
-- No status/widget UI yet, and no root `GLOSSARY.md` or `docs/adr/` entries.
+- No status/widget UI yet.
 
 ## Development
 
@@ -251,7 +317,8 @@ pi -e ./
 # 2. /goal
 #    -> status report with the objective, "active", revision, timestamps.
 # 3. Let the agent finish a turn.
-#    -> it continues on its own; the continuation prompt restates the objective.
+#    -> it continues on its own; the continuation prompt restates the objective
+#       and carries the no-progress and blocked-audit contract.
 # 4. /reload
 #    -> "Goal ... restored (active)" notification.
 # 5. /goal
@@ -260,3 +327,9 @@ pi -e ./
 # 7. /goal
 #    -> the Goal survives the restart and is restored on resume.
 ```
+
+To see a conservative stop interactively, give the agent a Goal it cannot make
+progress on — for example an objective that needs a credential the environment does
+not have — and let it run. After the same blocker has been reported for three
+consecutive Goal turns the Goal becomes `blocked`, bare `/goal` reports the blocker
+and the audit count, and no further turn starts on its own.
