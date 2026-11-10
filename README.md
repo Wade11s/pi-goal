@@ -40,10 +40,39 @@ runtime dependencies, and uses Pi's host-provided packages.
   before announcing success.
 - Sends the objective into the model context as a user message and starts initial
   work immediately.
-- Refuses to replace an existing Goal (replacement confirmation and `edit`
-  arrive in a later milestone). The words `edit`, `pause`, `resume`, and `clear`
-  are refused only when they are the *entire* argument — objectives that merely
-  begin with one of them (for example "clear the lint errors") are accepted.
+- When an **unfinished** Goal already exists, asks for confirmation first (see
+  *Replace a Goal* below); the words `pause`, `resume`, and `clear` are
+  subcommands only when they are the *entire* argument, and `edit` is a
+  subcommand whenever it is the first word — objectives that merely begin with
+  one of the other words (for example "clear the lint errors") are accepted.
+
+### Replace a Goal
+
+Setting a new objective while an unfinished Goal exists is a *replacement*: the
+old Goal is discarded (fresh identity, no retained history) and a new one
+starts. A replacement never happens silently — `/goal <objective>` shows a
+confirmation dialog first, and a declined (or timed-out, or dismissed) dialog
+keeps the current Goal untouched. The dialog is answered over the RPC
+extension-UI subprotocol in RPC mode, so headless hosts confirm the same way an
+interactive user does. Modes without any UI cannot confirm and keep the current
+Goal (use `/goal clear` then `/goal <objective>` there). Replacing a **complete**
+Goal asks nothing, because nothing unfinished is discarded.
+
+### Edit the objective
+
+```
+/goal edit Ship the release notes page instead
+```
+
+Changes the objective **in place**: the Goal keeps its identity, creation time,
+and revision history (the edit is the next revision), so no usage history is
+erased. If the Goal is active and a run is in flight, the new objective is
+delivered into that run through Pi's steering mechanism (after the current
+turn's tool calls, before the next model request), so the live work is
+redirected safely instead of being interrupted; if the session is idle, editing
+restarts work with a kickoff message. A paused Goal can be edited too — it stays
+paused until resumed. A complete Goal is finished and cannot be edited; replace
+it instead.
 
 ### Inspect the current Goal
 
@@ -56,6 +85,40 @@ usage fields that currently exist. Token usage and active time report
 `not tracked yet` until usage accounting lands in a later milestone. When a
 session with a Goal starts, restores, or reloads, a `Goal ... restored (active)`
 notification confirms reconstruction.
+
+### The lifecycle: pause, resume, clear
+
+Every lifecycle transition is **durable before it is announced**: Pi's
+`appendEntry` writes the snapshot through to the session file synchronously, and
+only a successful write is reported (a failed write keeps the previous state
+and is reported as a persistence error).
+
+```
+/goal pause
+/goal resume
+/goal clear
+```
+
+- `/goal pause` immediately stops admission of further automatic Goal runs: the
+  continuation seam only continues an `active` Goal, so whatever run is in
+  flight finishes on its own and its settlement admits no continuation. Pause
+  never aborts work — interrupting a run stays with the user, through Pi's
+  normal abort.
+- `/goal resume` restarts eligible (paused) work: the transition is durable,
+  then a resume kickoff message restates the objective and asks for a fresh
+  evidence audit of the retained progress. Resuming while another run is in
+  flight steers the resume message into it rather than waiting for idle.
+- `/goal clear` removes the Goal from any status by writing a durable tombstone
+  snapshot, so restarts and reloads cannot resurrect it, and the session returns
+  to ordinary prompt-by-prompt behavior.
+
+These commands are **usable while work is running** and never wait for the
+agent to become idle — an active Goal's own continuation loop keeps Pi busy
+almost continuously, so a lifecycle command that waited for idle could never
+run. Pause and clear answer immediately and take effect at the next settlement;
+edit, resume, and a confirmed replacement deliver their work message through
+Pi's steering when a run is in flight. None of them require abandoning the
+session, and none of them cancel the user's run.
 
 ### Automatic continuation
 
@@ -135,12 +198,32 @@ the structured tool results, and the record carries its `origin` (`command` for
 
 ### Model tool: `update_goal`
 
-`update_goal` is the completion contract. The model calls it with
-`{ action: "complete" }` only after every explicit requirement of the objective
-is verified against current-state evidence. Completion is terminal: the Goal is
-persisted as `complete` and never continues again, including after a restart or
-reload. Any other action (`pause`, `resume`, `clear`, a blocked conclusion) is
-refused with an explanation, because those transitions stay with the user.
+`update_goal` supports two actions. `complete` is the completion contract: the
+model calls it with `{ action: "complete" }` only after every explicit
+requirement of the objective is verified against current-state evidence, and a
+complete Goal never continues again, including after a restart or reload.
+
+`pause` is accepted **only after an explicit user request**. The call must
+quote the user's exact words — `{ action: "pause", userRequest: "please pause
+the goal" }` — and the extension corroborates the quote against the most recent
+human-authored user messages on the session branch. The quote must appear
+verbatim and must name pausing; the clause containing it must be an affirmative
+instruction to pause (an imperative or a direct request such as "please pause",
+"can you pause", "I want you to pause", or "the goal should be paused"). A
+negated instruction ("do not pause the goal", including a trailing "do not"
+anywhere in the same message), a whole negated sentence quoted verbatim, a
+keep-working or resume instruction, a deferral ("pause, not now"), a mere
+mention, an unrelated verb ("park the car" is not pausing the Goal), and a
+common word such as "the" are all refused. A newer human message that contradicts
+the request supersedes it.
+
+A missing quote, a paraphrase, a quote the user never wrote, or a quote that
+only appears inside pi-goal's own messages (the kickoff, steering, and resume
+messages, or an objective's encoded data block — a forged objective cannot
+authorize its own pause) is refused, and the Goal keeps running. The model
+cannot resume, clear, replace, or budget-limit a Goal through the tool at all:
+those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
+<objective>`).
 
 ## Persistence model
 
@@ -162,18 +245,34 @@ refused with an explanation, because those transitions stay with the user.
   alone cannot mark a message as extension-authored — which is why each message
   on the channel states its own authority and frames the objective as delimited
   data (see *The objective's trust boundary* above).
-- Creation is durability-first: the snapshot is written, the kickoff triggers the
-  file flush, and only after the snapshot is confirmed on disk is the Goal
-  announced (and made visible to `get_goal`). If writing fails (unwritable
-  session file or storage), creation reports a clear persistence error, leaves
-  no Goal behind, retracts any in-memory state with a durable tombstone
-  snapshot, and `/goal <objective>` can simply be retried.
+- Creation is durability-first: the snapshot is written and made visible, the
+  kickoff triggers the file flush, and only after that snapshot is the **last**
+  `goal-state` entry on disk is success announced. Visibility comes first so a
+  `/goal clear`, `edit`, `pause`, or `resume` issued while creation waits for
+  idle acts on the same record the creation captured; every wait revalidates
+  the exact id and revision, and a changed record suppresses the queued stale
+  kickoff. A tombstone written during the wait therefore counts as *not* durable
+  and cannot be overridden by a pre-tombstone entry exhibiting the same id. The
+  continuation seam also declines to adopt the run that creation is waiting for
+  for as long as that staged Goal identity is the pending creation, including
+  after an edit bumps its revision, so the wait ends at idle instead of
+  consuming the creation's own kickoff.
+  If writing fails (unwritable session file or storage) for a brand-new Goal,
+  creation reports a clear persistence error and retracts any in-memory state
+  with a durable tombstone snapshot. A failed **replacement** write leaves the
+  existing Goal untouched in memory and on disk (no tombstone, no resurrection
+  on restart), and `/goal <objective>` can simply be retried.
 - Interrupting the kickoff (Ctrl+C, killing the process, a hung model) does not
   lose the Goal: the snapshot and kickoff are already on disk and are restored
   by the next session.
 - Concurrent `/goal` commands (for example two issued while Pi is busy with a
-  run) are serialized: exactly one Goal is created and the losing command is
-  refused with the already-set warning — a silent replacement cannot happen.
+  run) are serialized: the Goal slot is decided exclusively, and a second
+  command that would replace an unfinished Goal has to be confirmed before
+  anything is discarded — a silent replacement cannot happen.
+- Lifecycle transitions (pause, resume, clear, edit) append their snapshot
+  through the same write-through path, so a transition is on disk before its
+  notification is emitted, and a failed write leaves the previous state in
+  force with a retryable error instead of a phantom transition.
 - Ephemeral sessions (started with `--no-session`) cannot persist a Goal:
   creating one returns a clear error instead of claiming durable storage.
 - Sessions without a Goal behave exactly as before; installing the extension
@@ -194,16 +293,28 @@ reason:
 
 This is verified, not assumed: instrumenting the scripted provider to log every
 missing step and running the whole suite reports **zero** missing steps, so no
-test in either file settles on a provider error.
+test in any file settles on a provider error.
 
 ## Limitations (later milestones)
 
-- No `edit`, `pause`, `resume`, or `clear` lifecycle commands yet (only the bare
-  words are reserved as future subcommands), so an active Goal can only be ended
-  by the model completing it, by the user aborting the run, or by a failure.
-- `create_goal` refuses while **any** Goal exists, including a complete one,
-  because replacement and clearing arrive with the lifecycle ticket. The tool
-  description, its error message, and this section all say so.
+- `create_goal` (the model tool) refuses while **any** Goal exists, including a
+  complete one: replacing is a user-owned action, confirmed through `/goal
+  <objective>`. The tool description, its error message, and this section all
+  say so.
+- A model-requested pause is corroborated by exact-quote matching plus a
+  conservative lexical check that the newer human message contains an
+  affirmative pause instruction. The extension does not semantically understand
+  the request: unusual phrasing can be refused, and a pause request delivered
+  only as an image, or one whose exact words were never sent as text, cannot be
+  corroborated. The user can always pause directly with `/goal pause`.
+- No token budget, usage accounting, or active-time tracking yet, so
+  "preserved usage history" currently means the Goal identity, creation time,
+  and revision chain survive an edit; there are no token/second totals to
+  preserve until the accounting milestone lands, and `/goal resume`'s fresh
+  runtime baseline similarly has no accumulated usage to reset yet.
+- Replacement of an unfinished Goal discards the old Goal entirely (fresh
+  identity, fresh revisions). Refining the finish line without discarding
+  anything is what `/goal edit` is for.
 - No token budget, usage accounting, or active-time tracking yet, so unattended
   work has no token bound.
 - No blocked audit (the same genuine blocker for three consecutive Goal turns),
@@ -252,11 +363,20 @@ pi -e ./
 #    -> status report with the objective, "active", revision, timestamps.
 # 3. Let the agent finish a turn.
 #    -> it continues on its own; the continuation prompt restates the objective.
-# 4. /reload
-#    -> "Goal ... restored (active)" notification.
-# 5. /goal
-#    -> the same objective is reported after the extension reload.
-# 6. Exit (Ctrl+D), then: pi -c
-# 7. /goal
-#    -> the Goal survives the restart and is restored on resume.
+# 4. /goal edit Write the haiku and a limerick about steering
+#    -> "objective updated"; the running work is steered to the new objective.
+# 5. /goal pause
+#    -> "Goal ... paused"; the current turn finishes and nothing continues.
+# 6. /goal
+#    -> status "paused" with the paused-state hint line.
+# 7. /goal resume
+#    -> "Goal ... resumed"; work restarts from retained progress.
+# 8. /goal Write a sonnet instead
+#    -> confirmation dialog; answer No -> "Replacement cancelled".
+# 9. /goal clear
+#    -> "Goal ... cleared"; the session is back to ordinary prompts.
+# 10. /reload
+#     -> no "restored" notification: the tombstone means no Goal comes back.
+# 11. /goal
+#     -> "No Goal is set in this session."
 ```

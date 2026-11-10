@@ -469,12 +469,14 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 		// kickoff, its continuation, and a held response.
 		await abortActiveLoop(session, 4);
 
-		// Now the loser refuses, and both command handlers complete.
-		await session.waitForNotify((r) => r.message.includes("already set"));
+		// Now the loser confirms: replacing an existing Goal needs the user's
+		// explicit confirmation, and the test declines on the user's behalf.
+		await session.respondToConfirm(() => true, false);
+		await session.waitForNotify((r) => r.message.includes("Replacement cancelled"));
 		assert.equal(
-			session.records.filter((r) => r.type === "extension_ui_request" && r.message?.includes("already set")).length,
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
 			1,
-			"exactly one command was refused as a replacement",
+			"exactly one replacement confirmation was asked",
 		);
 
 		// No kickoff delivery was rejected (the original defect surfaced as an
@@ -535,10 +537,17 @@ test("objectives that merely begin with a reserved subcommand word are accepted"
 		);
 		assert.ok(notify);
 
-		// Exact reserved words are still refused (later-milestone subcommands).
+		// Exact reserved words are now real subcommands: /goal clear clears the
+		// active Goal (durably — a tombstone snapshot), and the session reports
+		// that no Goal is set anymore.
 		await session.prompt("/goal clear");
-		const reserved = await session.waitForNotify((r) => r.message.includes("not implemented in this milestone"));
-		assert.equal(reserved.notifyType, "warning");
+		const cleared = await session.waitForNotify((r) => r.message.includes("cleared"));
+		assert.equal(cleared.notifyType, "info");
+		assert.match(cleared.message, /back to ordinary prompt behavior/);
+		await session.prompt("/goal");
+		await session.waitForNotify((r) => r.message.includes("No Goal is set"));
+		const clearedEntries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(clearedEntries).data.goal, null, "clear wrote a tombstone snapshot");
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
@@ -556,20 +565,31 @@ test("create rejects invalid objectives and refuses to replace an existing Goal"
 		const invalid = await session.waitForNotify((r) => r.message.includes("must be between"));
 		assert.equal(invalid.notifyType, "error");
 
-		// Reserved later-milestone subcommands are refused rather than treated as objectives.
+		// Subcommands with no Goal to act on report that clearly instead of
+		// pretending a Goal exists.
 		await session.prompt("/goal pause");
-		const reserved = await session.waitForNotify((r) => r.message.includes("not implemented in this milestone"));
-		assert.equal(reserved.notifyType, "warning");
+		const noGoal = await session.waitForNotify((r) => r.message.includes("No Goal is set"));
+		assert.equal(noGoal.notifyType, "info");
 
 		// Nothing was created so far.
 		assert.equal(session.records.filter((r) => r.type === "agent_start").length, 0);
 
-		// Create one Goal, then attempt to replace it.
+		// Create one Goal, then attempt to replace it: confirmation is required.
+		// The command's response only arrives after the dialog is answered, so the
+		// prompt is submitted without awaiting it and the dialog is answered first.
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await abortActiveLoop(session, 3);
-		await session.prompt("/goal A different objective entirely");
-		const guard = await session.waitForNotify((r) => r.message.includes("already set"));
-		assert.equal(guard.notifyType, "warning");
+		const replaceId = "replace-objective";
+		const replaceResponse = session.waitFor(
+			"response for the replacement attempt",
+			(records) => records.find((r) => r.type === "response" && r.id === replaceId),
+		);
+		session.writeCommand({ id: replaceId, type: "prompt", message: "/goal A different objective entirely" });
+		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), false);
+		const replaced = await replaceResponse;
+		assert.equal(replaced.data.disposition, "handled");
+		const kept = await session.waitForNotify((r) => r.message.includes("Replacement cancelled"));
+		assert.equal(kept.notifyType, "info");
 
 		// The original objective is intact.
 		await session.prompt("/goal");
