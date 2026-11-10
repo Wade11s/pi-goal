@@ -76,14 +76,18 @@ observable Pi events, with thresholds that are constants rather than settings.
 
 - Stopping needs no model cooperation and no judge service: the same events Pi
   already emits (`message_start`, `message_end`, `tool_execution_end`,
-  `agent_start`, `agent_end`, `agent_before_settle`) are enough, and the rules are
-  unit-testable and reproducible. Observations are aggregated per Goal turn and
-  evaluated once, at the settlement boundary, because a Goal turn can span several
-  runs — Pi retries a failed provider request with `agent.continue()`, which starts
-  a new run — and only the whole turn says whether the Goal could act. Evaluating
-  at an intermediate `agent_end` would judge a run Pi is about to retry and then
-  misread the retry as a fresh user run, which is exactly what wiped a blocked
-  audit on a transient error before this was fixed.
+  `agent_start`, `agent_end`, `agent_before_settle`, `session_compact`) are enough,
+  and the rules are unit-testable and reproducible. Observations are aggregated per
+  Goal turn and evaluated once, at the settlement boundary, because a Goal turn can
+  span several runs — Pi retries a failed provider request with `agent.continue()`,
+  and it compacts for overflow recovery and retries the same response — and only
+  the whole turn says whether the Goal could act. Evaluating at an intermediate
+  `agent_end` would judge a run Pi is about to retry and then misread the retry as a
+  fresh user run, which is exactly what wiped a blocked audit on a transient error
+  before this was fixed. The recoverable-length case needs the `session_compact`
+  signal, because that run *completed*: an error outcome alone would classify its
+  retry as a user run, and a Goal turn whose response was truncated, compacted, and
+  retried empty would never reach an anti-loop bound.
 - A Goal that stops is never silently restarted. `blocked` and `usage_limited` are
   terminal for continuation, and only a user decision resumes them — which is why
   resume is deliberately not a model tool.

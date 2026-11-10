@@ -31,6 +31,7 @@ import {
 	assertOnlyFailures,
 	assistantOutcomes,
 	continuationEntries,
+	failedAssistantOutcomes,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
@@ -641,6 +642,128 @@ test("a Goal turn that Pi retries stays one Goal turn for the activity-free boun
 			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
 			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
 			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
+		]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a Goal turn that Pi compacts and retries stays one Goal turn", async () => {
+	const session = await PiRpcSession.start({
+		// Keep almost nothing recent, so a tiny session still has history to
+		// summarize and the overflow-compaction path runs deterministically.
+		settings: { compaction: { keepRecentTokens: 1 } },
+	});
+	// Each Goal turn answers with a truncated, empty response. Pi classifies that as
+	// recoverable, compacts, and retries the same Goal turn — two runs, one Goal
+	// turn. Three of them reach the activity-free bound without any user run in
+	// between; the fourth and fifth scripted steps are never requested.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ stopReason: "length" },
+			{ text: "Compaction summary A." },
+			{ text: "Compaction summary B." },
+			{},
+			{ stopReason: "length" },
+			{ text: "Compaction summary C." },
+			{ text: "Compaction summary D." },
+			{},
+			{ stopReason: "length" },
+			{ text: "Compaction summary E." },
+			{ text: "Compaction summary F." },
+			{},
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		// Pi compacted on its own, for the overflow reason, once per Goal turn.
+		const compactions = session.records.filter((r) => r.type === "compaction_start");
+		assert.equal(compactions.length, 3, "one overflow compaction per Goal turn");
+		assert.ok(
+			compactions.every((c) => c.reason === "overflow"),
+			`expected overflow compactions, got ${JSON.stringify(compactions.map((c) => c.reason))}`,
+		);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries).data.goal;
+		assert.equal(snapshot.status, "blocked", "the compacted Goal turns still counted");
+		assert.equal(snapshot.blockedAudit.turns, 3);
+		assert.match(snapshot.blockedAudit.blocker, /3 consecutive automatic Goal turns produced no activity/);
+		const stopped = await session.waitForNotify((r) => r.message.includes("stopped and is now blocked"));
+		assert.ok(stopped.message.includes("activity-free"));
+
+		// Each Goal turn is one continuation across its two runs.
+		assert.equal(continuationEntries(entries).length, 3, "three Goal turns ran");
+		assert.equal(runCount(session), 7, "kickoff plus three two-run Goal turns");
+		// Three truncated responses, and nothing errored or aborted.
+		const outcomes = assistantOutcomes(session);
+		assert.equal(outcomes.filter((o) => o.stopReason === "length").length, 3, "the recovery trigger ran");
+		assert.equal(failedAssistantOutcomes(session).length, 0);
+		// Seven agent-loop responses; the rest of the script fed the summarizer.
+		assertStepsConsumed(session, 7);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a Goal turn that Pi compacts after a context-overflow error also stays one Goal turn", async () => {
+	const session = await PiRpcSession.start({
+		settings: { compaction: { keepRecentTokens: 1 } },
+	});
+	// The same shape through the other overflow door: each Goal turn fails with a
+	// context-overflow error, Pi compacts and retries it, and the retry answers with
+	// nothing. Three of them reach the activity-free bound.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ error: "context length exceeded" },
+			{ text: "Compaction summary A." },
+			{ text: "Compaction summary B." },
+			{},
+			{ error: "context length exceeded" },
+			{ text: "Compaction summary C." },
+			{ text: "Compaction summary D." },
+			{},
+			{ error: "context length exceeded" },
+			{ text: "Compaction summary E." },
+			{ text: "Compaction summary F." },
+			{},
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const compactions = session.records.filter((r) => r.type === "compaction_start");
+		assert.equal(compactions.length, 3, "one overflow compaction per Goal turn");
+		assert.ok(compactions.every((c) => c.reason === "overflow"), "the compactions were overflow recoveries");
+
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries).data.goal;
+		assert.equal(snapshot.status, "blocked", "the compacted Goal turns still counted");
+		assert.equal(snapshot.blockedAudit.turns, 3);
+		assert.match(snapshot.blockedAudit.blocker, /3 consecutive automatic Goal turns produced no activity/);
+		assert.equal(continuationEntries(entries).length, 3, "three Goal turns ran");
+		assert.equal(runCount(session), 7, "kickoff plus three two-run Goal turns");
+		// The overflow errors are what triggered the recoveries; nothing else failed.
+		assert.equal(failedAssistantOutcomes(session).length, 3);
+		assert.ok(
+			failedAssistantOutcomes(session).every((o) => o.errorMessage === "context length exceeded"),
+			"the only failures are the overflow triggers",
+		);
+		assertStepsConsumed(session, 7, [
+			{ stopReason: "error", errorMessage: "context length exceeded" },
+			{ stopReason: "error", errorMessage: "context length exceeded" },
+			{ stopReason: "error", errorMessage: "context length exceeded" },
 		]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -1653,6 +1776,12 @@ test("provider failures are classified from what the evidence actually says", as
 		["429 rate limit exceeded, please slow down", "active"],
 		// An unqualified or per-request budget is not the account's plan.
 		["The request is out of budget for this call", "active"],
+		// Negation can sit on either side of the verb, and can lead with "no".
+		["Your quota has not been exceeded", "active"],
+		["Your plan limit has not been reached", "active"],
+		["No quota exceeded", "active"],
+		// A lookup or a throttle in the same sentence is not plan exhaustion.
+		["The quota service reached a rate limit while checking your account", "active"],
 		["spending budget exhausted", "usage_limited"],
 	];
 	for (const [message, expectedStatus] of cases) {

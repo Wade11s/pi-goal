@@ -118,15 +118,23 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	/** What started the run that just ended, so its retry can be recognized. */
 	let lastRunKind: GoalRunKind = "user";
 	/**
-	 * Whether the next run may be Pi's retry of the run that just failed.
+	 * Whether the next run continues the Goal turn that just ended.
 	 *
-	 * Cleared by anything that means the next run is *not* a retry: the settlement
-	 * boundary (the Goal turn is over), user input (Pi is delivering queued work, not
-	 * retrying), or the run itself once it has started. Without those clears, a
-	 * message the user queued during a failing run would inherit the Goal turn's
-	 * identity and count as unattended Goal work.
+	 * Pi can turn one Goal turn into several runs in two ways, and both of them must
+	 * keep the Goal turn's identity and its accumulated observations:
+	 *
+	 * - it retries a failed provider request (`agent_end` with an error outcome);
+	 * - it compacts for overflow recovery and retries the same response
+	 *   (`session_compact` with `willRetry`), which follows a *completed* run, so
+	 *   the error signal alone would miss it.
+	 *
+	 * Cleared by anything that means the next run does *not* continue the turn: the
+	 * settlement boundary (the Goal turn is over), user input (Pi is delivering
+	 * queued work, not retrying), or the run itself once it has started. Without
+	 * those clears, a message the user queued during a failing run would inherit the
+	 * Goal turn's identity and count as unattended Goal work.
 	 */
-	let mayRetry = false;
+	let continuesGoalTurn = false;
 
 	/**
 	 * Whether a blocker report was counted during the current Goal turn.
@@ -168,12 +176,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 
 	/**
+	 * A compaction that recovers an overflow retries the response that triggered it,
+	 * so the run that follows continues the Goal turn rather than starting a fresh
+	 * one. This is the only signal for the recoverable-length case, because that run
+	 * *completed*: without it, a Goal turn whose response was truncated and retried
+	 * empty would be read as a user run and would never reach an anti-loop bound.
+	 *
+	 * A compaction that does not retry (manual, or the context threshold) leaves the
+	 * flag alone, so the next run is a fresh Goal turn or a user run as usual.
+	 */
+	pi.on("session_compact", (event) => {
+		if (event.willRetry) continuesGoalTurn = true;
+	});
+
+	/**
 	 * A prompt the user typed is a user action: the loop is no longer unattended,
 	 * so every anti-loop counter starts over. Extension commands (`/goal ...`) do
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
 	pi.on("input", (_event, ctx) => {
-		mayRetry = false;
+		continuesGoalTurn = false;
 		safety.reset();
 		reportAuditResetFailure("the prompt you just sent", ctx);
 	});
@@ -189,13 +211,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (pendingRunKind !== undefined) {
 			safety.beginRun(pendingRunKind);
 			pendingRunKind = undefined;
-		} else if (mayRetry) {
-			// Pi continues a run it is about to retry: same Goal turn, same identity.
+		} else if (continuesGoalTurn) {
+			// Pi is retrying the Goal turn that just ended: same turn, same identity,
+			// and the failed attempt's observations still count.
 			safety.beginRun(lastRunKind, true);
 		} else {
 			safety.beginRun("user");
 		}
-		mayRetry = false;
+		continuesGoalTurn = false;
 		providerFailure = undefined;
 		runOutcome = undefined;
 	});
@@ -210,7 +233,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// A run with no assistant message never reached the model; treat it as
 		// neutral rather than as a completed, activity-free Goal turn.
 		const outcome = runOutcome ?? "aborted";
-		mayRetry = outcome === "error";
+		continuesGoalTurn = outcome === "error";
 	});
 
 	/**
@@ -219,7 +242,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	pi.on("agent_settled", (event, ctx) => {
 		pendingRunKind = undefined;
-		mayRetry = false;
+		continuesGoalTurn = false;
 		if (!event.aborted) return;
 		// An abort is the strongest possible user action: the Goal turn the user
 		// stopped must not be counted as a Goal malfunction, and it never reached
@@ -293,7 +316,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("agent_before_settle", async (event, ctx) => {
 		// Reaching this boundary means Pi is not retrying, so nothing that follows
 		// can be a retry of the run that just ended.
-		mayRetry = false;
+		continuesGoalTurn = false;
 		const goal = store.get();
 		if (!goal || goal.status !== "active") {
 			closeGoalTurn(ctx);

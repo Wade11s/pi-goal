@@ -454,7 +454,7 @@ const USAGE_LIMIT_PATTERNS: RegExp[] = [
  *   quota". That window stops at a sentence boundary, so "This is not a rate
  *   limit. Your quota is exceeded." keeps its second, unnegated statement.
  */
-const NEGATION_WORD = "(?:not|never|cannot|can't|couldn't|won't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|without|unable)";
+const NEGATION_WORD = "(?:no|none|not|never|cannot|can't|couldn't|won't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|without|unable)";
 const NEGATION_WINDOW = 40;
 /** Negation anywhere inside the matched phrase, as in "quota is not exceeded". */
 const NEGATION_PATTERN = new RegExp(`\\b${NEGATION_WORD}\\b`, "i");
@@ -466,15 +466,28 @@ const NEGATION_PATTERN = new RegExp(`\\b${NEGATION_WORD}\\b`, "i");
 const NEGATION_BEFORE_PATTERN = new RegExp(`\\b${NEGATION_WORD}\\b[^.\\n]{0,30}$`, "i");
 
 /**
- * Wording that makes "reached" describe a lookup or a timeout rather than an
+ * Wording that makes "reached" describe a lookup or a throttle rather than an
  * exhausted plan.
  *
- * "The quota service reached a timeout while checking your account" contacted the
- * service and did not exhaust anything. `reached` is the weakest of the four verbs
- * — a service can reach a timeout, and only a limit can be reached — so a match
- * that leans on it needs a context free of timeout wording.
+ * "The quota service reached a timeout while checking your account" and "The quota
+ * service reached a rate limit while checking your account" both contacted a
+ * service and exhausted nothing. `reached` is the weakest of the four verbs — a
+ * service can reach a timeout or a rate limit, and only a limit can be reached — so
+ * a match that leans on it needs a sentence free of that wording.
  */
-const LOOKUP_CONTEXT_PATTERN = /\b(?:timeout|timed out|time limit|deadline|latency|throttl\w*)\b/i;
+const LOOKUP_CONTEXT_PATTERN = /\b(?:timeout|timed out|time limit|deadline|latency|throttl\w*|rate[ _-]?limit)\b/i;
+
+/**
+ * The sentence containing `index`, so a lookup or a throttle mentioned *elsewhere*
+ * in the message cannot mask genuine exhaustion in this one.
+ */
+function sentenceAt(text: string, index: number): string {
+	const lineStart = Math.max(text.lastIndexOf(".", index), text.lastIndexOf("\n", index)) + 1;
+	const period = text.indexOf(".", index);
+	const newline = text.indexOf("\n", index);
+	const lineEnd = Math.min(period === -1 ? text.length : period, newline === -1 ? text.length : newline);
+	return text.slice(lineStart, lineEnd);
+}
 
 /** Everything Pi exposes about one provider failure, flattened for matching. */
 function evidenceText(evidence: ProviderFailureEvidence): string {
@@ -522,9 +535,9 @@ const REACHED_VERB = /\breached\b/i;
  *
  * A pattern match is only evidence when it survives every guard: it is not
  * negated, either inside the matched phrase or just in front of it, and a match
- * that leans on `reached` does not sit in timeout or throttling wording. The
- * stronger verbs — exceeded, exhausted, depleted — are unambiguous and only the
- * negation guards apply to them.
+ * that leans on `reached` does not sit in timeout or throttling wording in its own
+ * sentence. The stronger verbs — exceeded, exhausted, depleted — are unambiguous
+ * and only the negation guards apply to them.
  */
 function matchExhaustionEvidence(text: string): string | null {
 	for (const pattern of USAGE_LIMIT_PATTERNS) {
@@ -533,7 +546,7 @@ function matchExhaustionEvidence(text: string): string | null {
 		if (NEGATION_PATTERN.test(match[0])) continue;
 		const before = text.slice(Math.max(0, match.index - NEGATION_WINDOW), match.index);
 		if (NEGATION_BEFORE_PATTERN.test(before)) continue;
-		if (REACHED_VERB.test(match[0]) && LOOKUP_CONTEXT_PATTERN.test(text)) continue;
+		if (REACHED_VERB.test(match[0]) && LOOKUP_CONTEXT_PATTERN.test(sentenceAt(text, match.index))) continue;
 		return match[0];
 	}
 	return null;

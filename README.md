@@ -184,13 +184,16 @@ mistaken for a malfunction.
 
 The unit of counting is the **Goal turn**, and a Goal turn is a *chain* of runs.
 One run can contain several provider requests (a tool call and its follow-up, a
-steering message), and Pi can turn one Goal turn into several runs by retrying a
-failed provider request. So three failing shell attempts inside one continuation
-are one Goal turn, a Goal turn that Pi retries is still one Goal turn, and a Goal
-turn that answers without running a command breaks an execution-failure chain.
-Everything Pi owns — retries, final-attempt recovery, compaction retries, queued
-messages — finishes before a Goal turn is evaluated at the settlement boundary,
-which is the only place a Goal turn is known to be over.
+steering message), and Pi can turn one Goal turn into several runs in two more
+ways: by retrying a failed provider request, and by compacting for overflow
+recovery — a recoverable length stop or a context-overflow error — and retrying the
+same response. All of them keep the Goal turn's identity and its accumulated
+observations, so three failing shell attempts inside one continuation are one Goal
+turn, and a Goal turn whose response was truncated, compacted, and retried empty is
+still one activity-free Goal turn. Everything Pi owns — retries, final-attempt
+recovery, compaction retries, queued messages — finishes before a Goal turn is
+evaluated at the settlement boundary, which is the only place a Goal turn is known
+to be over.
 
 - A **blocked** or **usage_limited** Goal never continues automatically. Only the
   user can resume one, and resume arrives with the lifecycle milestone.
@@ -229,10 +232,12 @@ which is the only place a Goal turn is known to be over.
     exceeded for this request`) are Pi's or the request's own limits, so a budget
     must name an account, plan, or period;
   - a negated statement (`You have not exceeded your quota`, `Your quota is not
-    exceeded`, `Your usage limit has not been reached`) says the plan is fine — the
-    negation is checked both inside the matched phrase and just in front of it;
-  - a lookup (`The quota service reached a timeout while checking your account`)
-    says a service was contacted;
+    exceeded`, `Your usage limit has not been reached`, `No quota exceeded`) says
+    the plan is fine — the negation is checked inside the matched phrase, in the
+    window in front of it, and includes a leading `no`;
+  - a lookup or a throttle in the same sentence (`The quota service reached a
+    timeout while checking your account`, `The quota service reached a rate limit
+    while checking your account`) says a service was contacted;
   - an unqualified or per-request budget (`The request is out of budget for this
     call`, `token budget exceeded for this request`) describes this request's own
     allowance, not the account's plan.
