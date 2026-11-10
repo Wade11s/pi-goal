@@ -395,6 +395,6 @@ export function formatKickoffMessage(goal: GoalRecord): string {
 		"- Inspect the current repository state (files, command output, runtime state, artifacts) before and while working; rely on evidence rather than memory.",
 		"- Proceed now, in small verifiable steps.",
 		"- Call the get_goal tool whenever the objective or its lifecycle status is absent or truncated in your context.",
-		`- Classify each of your turns as progress, a verified wait, or no progress, and report a genuine blocker with update_goal action "blocked" only once the same blocker has persisted for ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns.`,
+		`- Classify each of your turns as progress, a verified wait, or no progress. When a genuine blocker persists, report it with update_goal action "blocked" on every Goal turn it persists: pi-goal counts the consecutive Goal turns that reported it and only marks the Goal blocked on the ${BLOCKED_AUDIT_THRESHOLD}rd, so an early report is recorded rather than acted on.`,
 	].join("\n");
 }

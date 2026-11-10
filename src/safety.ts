@@ -32,11 +32,14 @@
  * settings because an unattended safety bound must not be something a drifting
  * configuration silently widens.
  *
- * The unit of counting is the **Goal run**, not the provider request. One Goal
- * run can contain many provider requests (a tool call and its follow-up, a
- * steering message, a retry inside the run), and only the run as a whole says
- * whether the Goal made progress or could act at all. Observations are therefore
- * aggregated across a run and evaluated once, when the run ends.
+ * The unit of counting is the **Goal turn**, and a Goal turn is a *chain* of runs,
+ * not a single run. One run can contain many provider requests (a tool call and
+ * its follow-up, a steering message), and Pi can turn one Goal turn into several
+ * runs by retrying a failed provider request with `agent.continue()`. Observations
+ * are therefore aggregated across the whole chain and evaluated once, when Pi has
+ * finished retrying and reaches the settlement boundary — never at an
+ * intermediate `agent_end`, which would evaluate a run Pi is about to retry and
+ * then misread the retry as a fresh user run.
  */
 import type { AgentActivityOutcome } from "@earendil-works/pi-coding-agent";
 import { ACTIVITY_FREE_TURN_LIMIT, EXECUTION_UNAVAILABLE_TURN_LIMIT } from "./goal.ts";
@@ -201,7 +204,8 @@ export class GoalSafetyMonitor {
 	private kind: GoalRunKind = "user";
 
 	private sawActivity = false;
-	private sawSuccessfulTool = false;
+	/** Whether a shell command actually ran in this Goal turn, whatever its outcome. */
+	private sawShellRan = false;
 	private sawExecutionFailure = false;
 
 	private activityFreeTurns = 0;
@@ -222,57 +226,82 @@ export class GoalSafetyMonitor {
 		return this.kind;
 	}
 
-	/** Called when a run starts, with whatever started it. */
-	beginRun(kind: GoalRunKind): void {
-		this.turnKey += 1;
+	/**
+	 * Called when a run starts.
+	 *
+	 * `continuesPreviousTurn` marks Pi's retry of the run that just failed. A retry
+	 * is the same Goal turn, so it neither advances the turn identity nor clears
+	 * what the failed attempt observed: the Goal turn is judged on everything that
+	 * happened in it, including the attempts that failed.
+	 */
+	beginRun(kind: GoalRunKind, continuesPreviousTurn = false): void {
+		if (!continuesPreviousTurn) this.turnKey += 1;
 		this.kind = kind;
-		this.sawActivity = false;
-		this.sawSuccessfulTool = false;
-		this.sawExecutionFailure = false;
 	}
 
-	/** Called when a run ends, so a stray observation cannot leak into the next one. */
-	endRun(): void {
+	/**
+	 * Forget the observations of the Goal turn that was just evaluated.
+	 *
+	 * Called at the settlement boundary, which is the only place a Goal turn is
+	 * known to be over: Pi may still retry the run that just ended, and an aborted
+	 * run never reaches the boundary at all.
+	 */
+	endTurn(): void {
 		this.kind = "user";
 		this.sawActivity = false;
-		this.sawSuccessfulTool = false;
+		this.sawShellRan = false;
 		this.sawExecutionFailure = false;
 	}
 
-	/** Observe the finalized assistant message of a turn inside the current run. */
+	/** Observe the finalized assistant message of a provider request in the current Goal turn. */
 	noteAssistantMessage(message: AssistantMessageLike): void {
 		if (hasMeaningfulText(message.content) || hasToolCall(message.content)) {
 			this.sawActivity = true;
 		}
 	}
 
-	/** Observe one finalized tool call inside the current run. */
+	/**
+	 * Observe one finalized tool call in the current Goal turn.
+	 *
+	 * A shell command that actually ran — successfully, or with an ordinary
+	 * failure — proves execution was available, so it is the only thing that
+	 * resets the execution-unavailable chain. A successful *non-shell* tool says
+	 * nothing about whether the shell works, so reading files or inspecting the
+	 * Goal must not hide a shell that cannot start.
+	 */
 	noteToolExecutionEnd(event: ToolExecutionEndLike): void {
+		if (!EXECUTION_TOOLS.has(event.toolName)) return;
 		if (!event.isError) {
-			this.sawSuccessfulTool = true;
+			this.sawShellRan = true;
 			return;
 		}
-		if (isExecutionUnavailable(event)) this.sawExecutionFailure = true;
+		if (isExecutionUnavailable(event)) {
+			this.sawExecutionFailure = true;
+			return;
+		}
+		// An ordinary command failure: the shell ran the command, so execution was
+		// available even though the command failed.
+		this.sawShellRan = true;
 	}
 
 	/**
-	 * Evaluate the finished Goal run and advance the counters.
+	 * Evaluate the finished Goal turn and advance the counters.
 	 *
-	 * Returns a stop when a limit was reached by this run, which is the moment the
-	 * caller transitions the Goal to `blocked` — before the next settlement could
-	 * ask for another continuation. Returns null for every run that is still
-	 * inside the bounds, including runs that merely reset a counter.
+	 * Returns a stop when a limit was reached by this Goal turn, which is the
+	 * moment the caller transitions the Goal to `blocked` — before the boundary
+	 * could ask for another continuation. Returns null for every Goal turn that is
+	 * still inside the bounds, including turns that merely reset a counter.
 	 *
-	 * Only an `automatic` run that Pi finished cleanly can count. A kickoff or a
-	 * user-started run is attended work, and an aborted or errored run is a hard
-	 * exit Pi already owns; all of them reset the counters instead of advancing
-	 * them, because none of them is an unattended Goal turn that malfunctioned.
+	 * Only an `automatic` Goal turn that Pi finished cleanly can count. A kickoff
+	 * or a user-started turn is attended work, and an aborted or errored turn is a
+	 * hard exit Pi already owns; all of them reset the counters instead of
+	 * advancing them, because none of them is an unattended Goal turn that
+	 * malfunctioned.
 	 */
 	evaluateRun(outcome: AgentActivityOutcome): SafetyStop | null {
 		if (outcome !== "completed" || this.kind !== "automatic") {
 			this.activityFreeTurns = 0;
 			this.executionUnavailableTurns = 0;
-			this.resetObservations();
 			return null;
 		}
 
@@ -282,27 +311,19 @@ export class GoalSafetyMonitor {
 			this.activityFreeTurns += 1;
 		}
 
-		if (this.sawSuccessfulTool) {
+		if (this.sawShellRan) {
+			// Execution was available in this Goal turn, whatever the command did.
 			this.executionUnavailableTurns = 0;
 		} else if (this.sawExecutionFailure) {
 			this.executionUnavailableTurns += 1;
 		} else {
 			// A Goal turn that ran no command at all — it answered, or it used
-			// another tool successfully — is not an execution failure, so it breaks
-			// the chain rather than leaving it to be continued later.
+			// another tool — is not an execution failure, so it breaks the chain
+			// rather than leaving it to be continued later.
 			this.executionUnavailableTurns = 0;
 		}
 
-		const stop = this.stopForCurrentCounts();
-		this.resetObservations();
-		return stop;
-	}
-
-	/** Forget the observations of the run that was just evaluated. */
-	private resetObservations(): void {
-		this.sawActivity = false;
-		this.sawSuccessfulTool = false;
-		this.sawExecutionFailure = false;
+		return this.stopForCurrentCounts();
 	}
 
 	/** The stop the current counters imply, or null while they are inside the bounds. */
@@ -339,7 +360,7 @@ export class GoalSafetyMonitor {
 	reset(): void {
 		this.activityFreeTurns = 0;
 		this.executionUnavailableTurns = 0;
-		this.resetObservations();
+		this.endTurn();
 	}
 }
 
@@ -361,18 +382,28 @@ export interface ProviderFailureClassification {
 	evidence: string;
 }
 
+/** The verbs that mean a limit, quota, or budget is used up. */
+const EXHAUSTION_VERB = "(?:exceeded|exhausted|depleted|reached)";
+
 /**
  * Wording that means the account, plan, or budget is *exhausted*, as opposed to a
- * transient throttle or an unrelated account problem.
+ * transient throttle, an internal technical budget, or an unrelated account
+ * problem.
  *
- * Every entry pairs a quota / usage-limit / budget / credit noun with an
- * exhaustion verb, or names a provider error code whose meaning is a plan usage
- * limit. Bare account vocabulary is deliberately absent: "billing address could
- * not be verified", "billing service temporarily unavailable", "payment method
- * declined", and "available balance" all describe an account problem or a
- * transient condition, not an exhausted plan, and classifying one of those as a
- * usage limit would stop the Goal permanently on evidence that does not support
- * it.
+ * Every entry pairs a quota / usage-limit / credit noun with an exhaustion verb,
+ * pairs a billing or plan limit with one, or names a provider error code whose
+ * meaning is a plan usage limit. Three kinds of look-alike are deliberately
+ * excluded, because each of them would stop a Goal permanently on evidence that
+ * does not support it:
+ *
+ * - bare account vocabulary ("billing address could not be verified", "billing
+ *   service temporarily unavailable", "payment method declined", "available
+ *   balance") describes an account problem or a transient condition;
+ * - internal budgets ("retry budget exhausted", "token budget exceeded for this
+ *   request") are Pi's or the request's own limits, not the account's plan, so
+ *   the budget noun must name an account, plan, or period;
+ * - a *billing or plan limit* that has been reached is exhaustion, which is why
+ *   those nouns are matched explicitly.
  *
  * The narrowness is the point. `usage_limited` is terminal for continuation and
  * resuming it is a user decision, so a false positive wedges the session's Goal;
@@ -384,26 +415,41 @@ const USAGE_LIMIT_PATTERNS: RegExp[] = [
 	/(?:go|free)usagelimiterror/i,
 	/"code"\s*:\s*"?1308(?![0-9])/,
 	/subscription_sharing_[a-z_]*usage_limit_exceeded/i,
-	// A usage limit, quota, or budget that has been reached, in either word order.
-	/usage[ _-]?limit[^.\n]{0,30}(?:reached|exceeded|exhausted|depleted)/i,
-	/(?:reached|exceeded|exhausted|depleted)[^.\n]{0,30}usage[ _-]?limit/i,
-	/quota[^.\n]{0,30}(?:exceeded|exhausted|reached|depleted)/i,
-	/(?:exceeded|exhausted|reached|depleted)[^.\n]{0,30}quota/i,
-	/budget[^.\n]{0,30}(?:exceeded|exhausted|depleted)/i,
+	// A usage limit or quota that has been reached, in either word order.
+	/usage[ _-]?limit[^.\n]{0,30}EXHAUSTION_VERB/i,
+	/EXHAUSTION_VERB[^.\n]{0,30}usage[ _-]?limit/i,
+	/quota[^.\n]{0,30}EXHAUSTION_VERB/i,
+	/EXHAUSTION_VERB[^.\n]{0,30}quota/i,
+	// An explicit billing or plan limit that has been reached.
+	/(?:billing|plan|spending|account|subscription)[ _-]?(?:hard[ _-]?)?limit[^.\n]{0,30}EXHAUSTION_VERB/i,
+	// An account, plan, or period budget that has been used up.
+	/(?:spending|account|plan|monthly|weekly|daily|organization|org)[ _-]?budget[^.\n]{0,30}EXHAUSTION_VERB/i,
 	// Explicit exhaustion of a credit or balance pool.
 	/out of (?:budget|credits)/i,
 	/credit balance (?:is )?too low/i,
-];
+].map((pattern) => new RegExp(pattern.source.replace("EXHAUSTION_VERB", EXHAUSTION_VERB), pattern.flags));
 
 /**
- * Wording that means a throttle rather than an exhausted plan.
+ * Wording that negates a match.
  *
- * Pi retries rate limits itself, so one that reached this boundary survived those
- * retries — and it is still a throttle that clears on its own, not a quota that
- * needs a user decision. Classifying it as a usage limit would stop a Goal that
- * is merely being slowed down.
+ * "You have not exceeded your quota" is a provider saying the plan is fine, so a
+ * negation in front of the verb turns exhaustion into its opposite. The window is
+ * short and stops at a sentence boundary, so "This is not a rate limit. Your
+ * quota is exceeded." keeps its second, unnegated statement.
  */
-const RATE_LIMIT_PATTERN = /rate[ _-]?limit/i;
+const NEGATION_WINDOW = 40;
+const NEGATION_PATTERN = /\b(?:not|never|cannot|can't|couldn't|won't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|without|unable)\b[^.\n]{0,30}$/i;
+
+/**
+ * Wording that makes "reached" describe a lookup or a timeout rather than an
+ * exhausted plan.
+ *
+ * "The quota service reached a timeout while checking your account" contacted the
+ * service and did not exhaust anything. `reached` is the weakest of the four verbs
+ * — a service can reach a timeout, and only a limit can be reached — so a match
+ * that leans on it needs a context free of timeout wording.
+ */
+const LOOKUP_CONTEXT_PATTERN = /\b(?:timeout|timed out|time limit|deadline|latency|throttl\w*)\b/i;
 
 /** Everything Pi exposes about one provider failure, flattened for matching. */
 function evidenceText(evidence: ProviderFailureEvidence): string {
@@ -430,16 +476,40 @@ function evidenceText(evidence: ProviderFailureEvidence): string {
  */
 export function classifyProviderFailure(evidence: ProviderFailureEvidence): ProviderFailureClassification {
 	const text = evidenceText(evidence);
-	if (RATE_LIMIT_PATTERN.test(text)) {
-		return { kind: "terminal-error", evidence: terminalEvidence(evidence) };
-	}
-	for (const pattern of USAGE_LIMIT_PATTERNS) {
-		const match = pattern.exec(text);
-		if (match) {
-			return { kind: "usage-limit", evidence: match[0] };
-		}
+	// Definitive exhaustion evidence is evaluated first, and nothing else can
+	// suppress it: a provider can report a throttle and an exhausted quota in the
+	// same failure ("429 rate limit reached; insufficient_quota: current quota
+	// exhausted"), and it is the quota that needs a user decision. A plain rate
+	// limit matches none of the patterns above — no quota, usage-limit, billing, or
+	// account-budget noun — so it stays a terminal error on its own.
+	const exhausted = matchExhaustionEvidence(text);
+	if (exhausted !== null) {
+		return { kind: "usage-limit", evidence: exhausted };
 	}
 	return { kind: "terminal-error", evidence: terminalEvidence(evidence) };
+}
+
+/** `reached`, the weakest of the exhaustion verbs. */
+const REACHED_VERB = /\breached\b/i;
+
+/**
+ * The exhaustion evidence in a provider failure, or null when there is none.
+ *
+ * A pattern match is only evidence when it survives both guards: it is not
+ * negated, and a match that leans on `reached` does not sit in timeout or
+ * throttling wording. The stronger verbs — exceeded, exhausted, depleted — are
+ * unambiguous and only the negation guard applies to them.
+ */
+function matchExhaustionEvidence(text: string): string | null {
+	for (const pattern of USAGE_LIMIT_PATTERNS) {
+		const match = pattern.exec(text);
+		if (!match) continue;
+		const before = text.slice(Math.max(0, match.index - NEGATION_WINDOW), match.index);
+		if (NEGATION_PATTERN.test(before)) continue;
+		if (REACHED_VERB.test(match[0]) && LOOKUP_CONTEXT_PATTERN.test(text)) continue;
+		return match[0];
+	}
+	return null;
 }
 
 /** The error text to surface for a failure that is not a usage limit. */

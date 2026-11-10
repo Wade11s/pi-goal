@@ -547,6 +547,160 @@ test("three execution-unavailable Goal turns stop the Goal, but ordinary command
 	}
 });
 
+test("a successful non-shell tool does not hide a shell that cannot start", async () => {
+	// The continuation contract tells the model to read state and call get_goal, so
+	// a broken shell usually shows up next to successful non-shell tools. Only a
+	// shell command that actually ran may break the execution-unavailable chain.
+	const session = await PiRpcSession.start({ settings: { shellPath: "/definitely/not/a/shell" } });
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "get_goal", args: {} }, { name: "bash", args: { command: "echo one" } }] },
+			{ text: "The shell would not start." },
+			{ toolCalls: [{ name: "get_goal", args: {} }, { name: "bash", args: { command: "echo two" } }] },
+			{ text: "The shell would not start." },
+			{ toolCalls: [{ name: "get_goal", args: {} }, { name: "bash", args: { command: "echo three" } }] },
+			{ text: "The shell would not start." },
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const goalResults = toolResults(session, "get_goal");
+		assert.equal(goalResults.length, 3, "the model inspected the Goal in every Goal turn");
+		assert.ok(goalResults.every((r) => !r.isError), "every get_goal call succeeded");
+
+		const bashResults = toolResults(session, "bash");
+		assert.equal(bashResults.length, 3, "the model tried to run a command in every Goal turn");
+		assert.ok(
+			bashResults.every((r) => r.isError && /not a shell|not found|ENOENT|spawn/i.test(String(r.result.content[0].text))),
+			"every command failed to spawn the shell",
+		);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries).data.goal;
+		assert.equal(snapshot.status, "blocked", "the successful reads did not hide the broken shell");
+		assert.equal(snapshot.blockedAudit.turns, 3);
+		assert.match(snapshot.blockedAudit.blocker, /could not execute a command/);
+		const stopped = await session.waitForNotify((r) => r.message.includes("stopped and is now blocked"));
+		assert.ok(stopped.message.includes("execution-unavailable"));
+		assert.equal(continuationEntries(entries).length, 3, "exactly three Goal turns ran");
+		assert.equal(runCount(session), 4);
+		assertStepsConsumed(session, 7);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a Goal turn that Pi retries stays one Goal turn for the activity-free bound", async () => {
+	const session = await PiRpcSession.start({
+		settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 } },
+	});
+	// Four cycles of a transient provider error followed by Pi's retry answering
+	// with nothing. Each cycle is one Goal turn, so the empty answers accumulate
+	// and the third one reaches the bound. The fourth cycle is never requested.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ error: "503 upstream overloaded" },
+			EMPTY_RESPONSE,
+			{ error: "503 upstream overloaded" },
+			EMPTY_RESPONSE,
+			{ error: "503 upstream overloaded" },
+			EMPTY_RESPONSE,
+			{ error: "503 upstream overloaded" },
+			EMPTY_RESPONSE,
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		// Pi retried inside each Goal turn rather than between Goal turns.
+		const retries = session.records.filter((r) => r.type === "auto_retry_start");
+		assert.equal(retries.length, 3, "one retry per Goal turn that failed");
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries).data.goal;
+		assert.equal(snapshot.status, "blocked", "the retried Goal turns still counted");
+		assert.equal(snapshot.blockedAudit.turns, 3);
+		assert.match(snapshot.blockedAudit.blocker, /3 consecutive automatic Goal turns produced no activity/);
+		assert.equal(continuationEntries(entries).length, 3, "three Goal turns ran");
+		assert.equal(runCount(session), 7, "kickoff plus three two-run Goal turns");
+		// The eighth and ninth scripted steps were never requested: the loop stopped
+		// on the third Goal turn rather than by exhausting the script. The three
+		// provider errors are the transient attempts Pi retried, not failures of the
+		// Goal lifecycle under test.
+		assertStepsConsumed(session, 7, [
+			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
+			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
+			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
+		]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a blocker reported by Pi's retry of a Goal turn keeps the audit chain", async () => {
+	const session = await PiRpcSession.start({
+		settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 } },
+	});
+	// Two consecutive Goal turns report the blocker, then a Goal turn whose first
+	// response fails transiently and whose retry reports the same blocker. The
+	// transient failure is not a Goal turn that reported nothing, so the chain
+	// survives to its third consecutive turn.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ error: "503 upstream overloaded" },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Reporting the blocker." },
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		assert.equal(session.records.filter((r) => r.type === "auto_retry_start").length, 1, "Pi retried once");
+		const results = toolResults(session, "update_goal");
+		assert.equal(results.length, 3);
+		assert.match(String(results[0].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
+		assert.match(String(results[1].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
+		assert.equal(
+			results[2].isError,
+			false,
+			"the retry's report is the third consecutive Goal turn, not a fresh audit",
+		);
+		assert.equal(structuredGoal(results[2].result).status, "blocked");
+		assert.equal(structuredGoal(results[2].result).blockedTurns, 3);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.deepEqual(lastAudit(entries), { blocker: BLOCKER, turns: 3 });
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "blocked");
+		assert.equal(continuationEntries(entries).length, 3, "three Goal turns ran");
+		assert.equal(runCount(session), 5, "kickoff, two Goal turns, and one two-run Goal turn");
+		assertStepsConsumed(session, 8, [
+			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
+		]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
 test("a non-zero exit code is ordinary work and never stops the Goal", async () => {
 	const session = await PiRpcSession.start();
 	// The command runs and fails, three Goal turns in a row: that is a failing
@@ -1332,7 +1486,9 @@ test("an empty kickoff plus three empty automatic responses does stop the Goal",
 });
 
 test("billing and balance wording without exhaustion is a surfaced terminal error, not a usage limit", async () => {
-	const session = await PiRpcSession.start();
+	// Retries off, so the classification is what is under test rather than a retry
+	// that happens to succeed on a later scripted step.
+	const session = await PiRpcSession.start({ settings: { retry: { enabled: false } } });
 	// Account problems and transient billing faults: neither says the plan is
 	// exhausted, so neither may stop the Goal permanently.
 	script(
@@ -1371,7 +1527,7 @@ test("billing and balance wording without exhaustion is a surfaced terminal erro
 });
 
 test("a transient billing outage is a surfaced terminal error, not a usage limit", async () => {
-	const session = await PiRpcSession.start();
+	const session = await PiRpcSession.start({ settings: { retry: { enabled: false } } });
 	script(
 		[
 			{ text: "Kickoff answer." },
@@ -1399,17 +1555,36 @@ test("a transient billing outage is a surfaced terminal error, not a usage limit
 	}
 });
 
-test("credible quota and credit evidence still becomes usage_limited", async () => {
-	// The phrasings a provider actually uses when a plan is exhausted, each of
-	// which must still stop the Goal: only bare account vocabulary was excluded.
-	const exhausted = [
-		"You exceeded your current quota for this organization",
-		"Monthly usage limit reached",
-		"Your credit balance is too low to access the Anthropic API",
-		" spending budget exhausted ",
+test("provider failures are classified from what the evidence actually says", async () => {
+	// One terminal provider error per case, retries disabled so the failure reaches
+	// the boundary exactly as the reviewer's probes did. `usage_limited` is terminal
+	// for continuation, so every row is a decision the extension has to get right.
+	const cases = [
+		// Exhaustion: the plan or budget is used up, so the Goal must stop.
+		["429 insufficient_quota: you exceeded your current quota for this organization", "usage_limited"],
+		["You exceeded your current quota for this organization", "usage_limited"],
+		["Monthly usage limit reached", "usage_limited"],
+		["Your credit balance is too low to access the Anthropic API", "usage_limited"],
+		["billing hard limit has been reached", "usage_limited"],
+		["You have reached your usage limit for this billing period", "usage_limited"],
+		// A throttle and an exhausted quota in one failure: the quota decides.
+		["429 rate limit reached; insufficient_quota: current quota exhausted", "usage_limited"],
+		// Negation and sentence boundaries must not be read past.
+		["This is not a rate limit. Your quota is exceeded.", "usage_limited"],
+		// Internal and per-request budgets are not the account's plan.
+		["Retry budget exhausted after 3 attempts", "active"],
+		["token budget exceeded for this request", "active"],
+		// A lookup or a throttle is not an exhausted plan.
+		["The quota service reached a timeout while checking your account", "active"],
+		["You have not exceeded your quota", "active"],
+		["429 rate limit exceeded, please slow down", "active"],
 	];
-	for (const [index, message] of exhausted.entries()) {
-		const session = await PiRpcSession.start();
+	for (const [message, expectedStatus] of cases) {
+		// Retries are disabled so the failure reaches the boundary as the reviewer's
+		// probes did. With Pi's retries on, a retryable error would consume the next
+		// scripted step, succeed, and the run would complete — hiding the very
+		// classification under test.
+		const session = await PiRpcSession.start({ settings: { retry: { enabled: false } } });
 		script([{ text: "Kickoff answer." }, { error: message }, { text: "Unrequested." }], session);
 		try {
 			await startGoal(session);
@@ -1417,16 +1592,14 @@ test("credible quota and credit evidence still becomes usage_limited", async () 
 			const entries = readSessionEntries(await session.sessionFile());
 			assert.equal(
 				lastGoalSnapshot(entries).data.goal.status,
-				"usage_limited",
-				`"${message.trim()}" is exhaustion evidence`,
+				expectedStatus,
+				`"${message}" must leave the Goal ${expectedStatus}`,
 			);
-			assert.match(lastGoalSnapshot(entries).data.goal.blockedAudit.blocker, /provider reported a usage limit/);
 			assertStepsConsumed(session, 2, [{ stopReason: "error", errorMessage: message }]);
 			assert.equal(session.extensionErrors().length, 0);
 		} finally {
 			await session.stop();
 		}
-		void index;
 	}
 });
 
