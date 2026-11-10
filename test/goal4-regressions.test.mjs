@@ -699,3 +699,123 @@ test("/goal issued during an ordinary run starts its own kickoff after that run 
 		await session.stop();
 	}
 });
+
+test("an edit while initial creation waits ends naturally instead of adopting the run", async () => {
+	const session = await PiRpcSession.start();
+	const gate = join(session.cwd, "provider-gate");
+	script(
+		[
+			{ text: "Ordinary answer.", waitForFile: gate },
+			{ text: "Edited objective answer." },
+			{ text: "Unbounded Goal continuation after the ordinary run was adopted." },
+			{ hang: true },
+		],
+		session,
+	);
+	try {
+		const ordinary = await session.prompt("ordinary request");
+		assert.equal(ordinary.data.disposition, "started");
+		await waitForTurns(session, 1);
+
+		const createPromise = submitCommand(session, "create-edit-natural", "/goal Creation that must not adopt the run");
+		const staged = await waitForStoredGoal(
+			session,
+			(goal) => goal.objective === "Creation that must not adopt the run" && goal.status === "active",
+			"staged creation",
+		);
+		const edited = await session.prompt("/goal edit Edited while creation waited");
+		assert.equal(edited.data.disposition, "handled");
+		const editNotify = await session.waitForNotify((r) => r.message.includes("objective updated"));
+		assert.match(editNotify.message, /revision 1/);
+
+		// Release the ordinary run. It must settle naturally; the edit must not
+		// turn it into an unbounded continuation or leave the create command
+		// waiting for idle forever.
+		writeFileSync(gate, "", "utf8");
+		const createResponse = await createPromise;
+		assert.equal(createResponse.data.disposition, "handled");
+		const warning = await session.waitForNotify((r) => r.message.includes("was not started"));
+		assert.equal(warning.notifyType, "warning");
+		assert.match(warning.message, /changed while creation waited/);
+		await session.waitForSettled(1);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		const goal = lastGoalSnapshot(entries).data.goal;
+		assert.equal(goal.id, staged.id);
+		assert.equal(goal.objective, "Edited while creation waited");
+		assert.equal(goal.status, "active", "the edited Goal remains active but controlled");
+		assert.equal(goal.revision, 1);
+		assert.equal(runCount(session), 1, "the ordinary run was never restarted as Goal work");
+		assert.equal(continuationEntries(entries).length, 0, "the ordinary run was not adopted");
+		assert.ok(
+			!entries.some(
+				(e) =>
+					e.type === "message" &&
+					e.message.role === "user" &&
+					JSON.stringify(e.message.content).includes("Creation that must not adopt the run"),
+			),
+			"the stale creation kickoff was never delivered",
+		);
+			assert.ok(
+			!session.records.some(
+				(r) => r.type === "extension_ui_request" && r.method === "notify" && r.message.includes("created and activated"),
+			),
+			"the superseded creation was never announced",
+		);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("model pause rejects trailing negation and an unrelated park verb", async () => {
+	const session = await PiRpcSession.start();
+	script(
+		[
+			{ text: "Okay; no pause." },
+			{ text: "The car is parked; no pause." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "pause", user_request: "please pause the goal" } }] },
+			{ toolCalls: [{ name: "update_goal", args: { action: "pause", user_request: "please pause the goal, do not" } }] },
+			{ toolCalls: [{ name: "update_goal", args: { action: "pause", user_request: "please park the car" } }] },
+			{ text: "No pause was authorized; continuing." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await session.prompt("please pause the goal, do not");
+		await session.waitForSettled(1);
+		await session.prompt("please park the car");
+		await session.waitForSettled(2);
+
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await session.waitForToolResult("update_goal", 3);
+		await session.waitForSettled(3);
+
+		const attempts = toolResults(session, "update_goal");
+		assert.equal(attempts.length, 4, "three pause attempts then completion");
+		assert.equal(attempts[0].isError, true, "the clause before a trailing negation is refused");
+		assert.match(String(attempts[0].result.content[0].text), /not an affirmative pause instruction/);
+		assert.equal(attempts[1].isError, true, "quoting the trailing negation is refused");
+		assert.match(String(attempts[1].result.content[0].text), /not an affirmative pause instruction/);
+		assert.equal(attempts[2].isError, true, "parking a car is not pausing the Goal");
+		assert.match(String(attempts[2].result.content[0].text), /not itself a pause request/);
+		assert.equal(attempts[3].isError, false);
+		assert.equal(structuredGoal(attempts[3].result).status, "complete");
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.ok(
+			goalSnapshots(entries).every((s) => s.data.goal.status !== "paused"),
+			"the model never persisted a paused status",
+		);
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete");
+		assert.equal(continuationEntries(entries).length, 1);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});

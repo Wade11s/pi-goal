@@ -210,10 +210,12 @@ human-authored user messages on the session branch. The quote must appear
 verbatim and must name pausing; the clause containing it must be an affirmative
 instruction to pause (an imperative or a direct request such as "please pause",
 "can you pause", "I want you to pause", or "the goal should be paused"). A
-negated instruction ("do not pause the goal"), a whole negated sentence quoted
-verbatim, a keep-working or resume instruction, a deferral ("pause, not now"),
-a mere mention, and a common word such as "the" are all refused. A newer human
-message that contradicts the request supersedes it.
+negated instruction ("do not pause the goal", including a trailing "do not"
+anywhere in the same message), a whole negated sentence quoted verbatim, a
+keep-working or resume instruction, a deferral ("pause, not now"), a mere
+mention, an unrelated verb ("park the car" is not pausing the Goal), and a
+common word such as "the" are all refused. A newer human message that contradicts
+the request supersedes it.
 
 A missing quote, a paraphrase, a quote the user never wrote, or a quote that
 only appears inside pi-goal's own messages (the kickoff, steering, and resume
@@ -252,8 +254,9 @@ those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
   kickoff. A tombstone written during the wait therefore counts as *not* durable
   and cannot be overridden by a pre-tombstone entry exhibiting the same id. The
   continuation seam also declines to adopt the run that creation is waiting for
-  while the record is unchanged, so that wait ends at idle instead of consuming
-  the creation's own kickoff.
+  for as long as that staged Goal identity is the pending creation, including
+  after an edit bumps its revision, so the wait ends at idle instead of
+  consuming the creation's own kickoff.
   If writing fails (unwritable session file or storage) for a brand-new Goal,
   creation reports a clear persistence error and retracts any in-memory state
   with a durable tombstone snapshot. A failed **replacement** write leaves the

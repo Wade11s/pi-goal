@@ -143,10 +143,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * An initial Goal staged by `/goal <objective>` while that command waits for
 	 * an ordinary (non-Goal) run to finish. The continuation seam must not adopt
 	 * that run before the command has sent the kickoff: otherwise the run the
-	 * command is waiting for continues as Goal work, `waitForIdle` may not resolve
-	 * until the Goal completes, and the creation announcement races its own
-	 * objective. Cleared as soon as the wait ends; a concurrent edit/pause/resume
-	 * changes the revision and therefore stops matching this binding.
+	 * command is waiting for continues as Goal work, `waitForIdle` may never
+	 * resolve (an edit keeps the Goal active), and the creation announcement
+	 * races its own objective. Cleared as soon as the wait ends; the gate covers
+	 * this Goal identity for the whole pending lifecycle, including a concurrent
+	 * edit/pause/resume, not merely the revision captured before the wait.
 	 */
 	let pendingInitialKickoff: GoalBinding | null = null;
 
@@ -206,14 +207,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("agent_before_settle", async (event, _ctx) => {
 		const goal = store.get();
 		if (!goal || goal.status !== "active") return;
-		if (
-			pendingInitialKickoff &&
-			goal.id === pendingInitialKickoff.id &&
-			goal.revision === pendingInitialKickoff.revision
-		) {
+		if (pendingInitialKickoff && goal.id === pendingInitialKickoff.id) {
 			// `/goal <objective>` has not sent its kickoff yet. Let the ordinary
 			// run settle so the command can start work itself (or observe a
-			// user clear/edit/pause and cancel the stale kickoff).
+			// user clear/edit/pause and cancel the stale kickoff). Gate by Goal
+			// identity, not by the captured revision: an edit keeps the Goal
+			// active and would otherwise let this seam adopt the run the create
+			// command is waiting for, forever.
 			return;
 		}
 		if (event.outcome !== "completed") return;

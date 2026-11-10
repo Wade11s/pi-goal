@@ -241,11 +241,11 @@ function normalizeWhitespace(text: string): string {
  * fragment of an unrelated sentence is not an instruction.
  */
 const PAUSE_REQUEST_KEYWORD =
-	/\b(?:pause|pauses|paused|pausing|halt|halts|halted|halting|shelve|shelves|shelved|shelving|park|parked|parking|suspend|suspends|suspended|suspending|hold\s+off|take\s+a\s+break)\b/i;
+	/\b(?:pause|pauses|paused|pausing|halt|halts|halted|halting|shelve|shelves|shelved|shelving|suspend|suspends|suspended|suspending|hold\s+off|take\s+a\s+break)\b/i;
 
 /** Pause verbs/nouns, used to find a negation that governs the quoted words. */
 const PAUSE_ACTION =
-	/\b(?:pause\w*|halt\w*|shelv\w*|park\w*|suspend\w*|hold\s+off|take\s+a\s+break)\b/gi;
+	/\b(?:pause\w*|halt\w*|shelv\w*|suspend\w*|hold\s+off|take\s+a\s+break)\b/gi;
 
 /**
  * Affirmative keep-working or resume vocabulary. One of these in the same
@@ -257,7 +257,15 @@ const KEEP_WORKING =
 
 /** A deferral such as "pause it, not now" is not an explicit pause request. */
 const PAUSE_DEFERRAL =
-	/\b(?:pause\w*|halt\w*|shelv\w*|park\w*|suspend\w*)\b[\s\S]{0,30}?\bnot\s+(?:now|yet|today|anymore)\b/i;
+	/\b(?:pause\w*|halt\w*|shelv\w*|suspend\w*)\b[\s\S]{0,30}?\bnot\s+(?:now|yet|today|anymore)\b/i;
+
+/**
+ * Any negation anywhere in the same user message. A trailing negated request
+ * ("please pause the goal, do not") negates the preceding clause even though it
+ * is not within four words before the verb, so negation is not clause-local.
+ */
+const NEGATION_ANYWHERE =
+	/\b(?:not|never|no|none|without|avoid|avoids|avoiding|refuse|refuses|refused|don'?t|dont|doesn'?t|didn'?t|won'?t|wouldn'?t|can'?t|couldn'?t|shouldn'?t|isn'?t|aren'?t|wasn'?t|weren'?t|hasn'?t|haven'?t|hadn'?t)\b/i;
 
 /**
  * A negation up to four words before a pause/continue word: "do not pause",
@@ -272,8 +280,9 @@ function hasNegationBefore(text: string, index: number): boolean {
 	);
 }
 
-/** Whether text contradicts pausing: a negated pause, a keep-working word, or a deferral. */
+/** Whether text contradicts pausing: a negation, keep-working word, or deferral. */
 function contradictsPause(text: string): boolean {
+	if (NEGATION_ANYWHERE.test(text)) return true;
 	for (const match of text.matchAll(PAUSE_ACTION)) {
 		if (hasNegationBefore(text, match.index)) return true;
 	}
@@ -293,11 +302,11 @@ const REQUEST_LEAD =
 
 /** Base-form pause verbs that start an imperative request. */
 const IMPERATIVE_PAUSE =
-	/^(?:pause|halt|shelve|park|suspend|hold\s+off|take\s+a\s+break)\b/i;
+	/^(?:pause|halt|shelve|suspend|hold\s+off|take\s+a\s+break)\b/i;
 
 /** A passive but still direct instruction: "the goal should be paused". */
 const PASSIVE_PAUSE_REQUEST =
-	/^(?:(?:the|this|that)\s+)?(?:goal|work|task|run|session)\s+(?:should|must|can|could|may|will|needs?\s+to|has\s+to|is\s+to)\s+(?:be\s+)?(?:paused|halted|shelved|suspended|parked)\b/i;
+	/^(?:(?:the|this|that)\s+)?(?:goal|work|task|run|session)\s+(?:should|must|can|could|may|will|needs?\s+to|has\s+to|is\s+to)\s+(?:be\s+)?(?:paused|halted|shelved|suspended)\b/i;
 
 /**
  * A noun/mention after which "pause" is not an imperative verb. Keeps
