@@ -452,17 +452,31 @@ const QUOTA_EXHAUSTION_PATTERNS: RegExp[] = [
 	withVerb("EXHAUSTION_VERB[^.\n]{0,30}quota"),
 ];
 
+/** The weakest of the exhaustion verbs, and the only one an object can clarify. */
+const REACHED_VERB = /\breached\b/i;
+
 /**
- * Wording that makes an exhaustion verb describe a lookup or a rate dimension
- * rather than a used-up plan.
+ * What `reached` reached, within the same clause: a lookup, a service, a check, or
+ * a throttle, rather than a limit.
  *
- * "The quota service reached a timeout while checking your account" and "The quota
- * service reached a rate limit while checking your account" both contacted a
- * service and exhausted nothing, and "Quota exceeded for quota metric ... requests
- * per minute" describes an allowance that resets within a minute. `reached` is the
- * weakest of the four verbs — a service can reach a timeout or a rate limit, and
- * only a limit can be reached — but a per-minute quota metric can be *exceeded*
- * too, so the whole bare-quota tier is guarded, not just `reached`.
+ * "The account quota service reached a timeout while checking your account" and
+ * "The billing limit check reached a timeout" both describe a *check that timed
+ * out*. Qualifying the noun does not change that, so this guard applies to the
+ * account/plan tier as well as to a bare quota: what decides is the verb's object,
+ * not how the subject was named. The clause boundary matters — "You have reached
+ * your usage limit; please check your plan" is genuine exhaustion with a remark
+ * after it, so only the text up to the next `;`, `.`, or newline counts.
+ */
+const REACHED_OBJECT_PATTERN =
+	/\b(?:timeout|timed out|deadline|latency|throttl\w*|rate[ _-]?limit|quota[ _-]?metric|service|services|check|checking|lookup|verification|verify|api|endpoint|server|status)\b/i;
+
+/**
+ * Wording that makes an exhaustion verb describe a rate dimension rather than a
+ * used-up plan.
+ *
+ * "Quota exceeded for quota metric ... requests per minute" describes an allowance
+ * that resets within a minute, and a per-minute metric can be *exceeded* as easily
+ * as reached, so this guard covers the whole bare-quota tier, not just `reached`.
  */
 const NON_EXHAUSTION_CONTEXT_PATTERN =
 	/\b(?:timeout|timed out|time limit|deadline|latency|throttl\w*|rate[ _-]?limit|quota[ _-]?metric|requests?[ _-]?per[ _-]?(?:minute|second|hour)|per[ _-]?(?:minute|second|hour)|rpm|tpm|tokens?[ _-]?per[ _-]?(?:minute|second))\b/i;
@@ -477,6 +491,21 @@ function sentenceAt(text: string, index: number): string {
 	const newline = text.indexOf("\n", index);
 	const lineEnd = Math.min(period === -1 ? text.length : period, newline === -1 ? text.length : newline);
 	return text.slice(lineStart, lineEnd);
+}
+
+/**
+ * Whether a `reached`-based match says a limit was reached or that a lookup was.
+ *
+ * Only the verb's own clause is inspected, and only for `reached`: the stronger
+ * verbs — exceeded, exhausted, depleted — name the outcome directly, and a provider
+ * usage-limit error code carries no verb at all.
+ */
+function reachedALookup(text: string, matchIndex: number, matched: string): boolean {
+	const verb = REACHED_VERB.exec(matched);
+	if (!verb) return false;
+	const clauseStart = matchIndex + (verb.index ?? 0) + verb[0].length;
+	const clause = text.slice(clauseStart).split(/[.;\n]/)[0] ?? "";
+	return REACHED_OBJECT_PATTERN.test(clause);
 }
 
 /**
@@ -563,6 +592,10 @@ function firstEvidence(text: string, patterns: RegExp[], guardRateContext: boole
 			if (NEGATION_PATTERN.test(matched)) continue;
 			const before = text.slice(Math.max(0, index - NEGATION_WINDOW), index);
 			if (NEGATION_BEFORE_PATTERN.test(before)) continue;
+			// "reached" is the weakest verb in both tiers: whatever it reached decides
+			// whether a limit was hit or a lookup was, and a qualified noun does not
+			// change that.
+			if (reachedALookup(text, index, matched)) continue;
 			if (guardRateContext && NON_EXHAUSTION_CONTEXT_PATTERN.test(sentenceAt(text, index))) continue;
 			return matched;
 		}

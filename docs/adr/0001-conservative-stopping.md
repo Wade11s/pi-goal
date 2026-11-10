@@ -62,7 +62,11 @@ observable Pi events, with thresholds that are constants rather than settings.
      usage limit, a billing or plan limit, an account/plan/period quota or budget,
      or an empty credit pool. This tier survives throttle wording in the same
      failure, because it says the plan itself is used up rather than that a rate
-     was hit;
+     was hit, but not a `reached` whose object is a lookup: "The account quota
+     service reached a timeout" is a check that timed out, and qualifying the noun
+     changes nothing. What decides is the verb's object within its own clause, which
+     is also why "You have reached your usage limit; please check your plan" stays
+     genuine exhaustion;
    - a bare quota plus an exhaustion verb, which is *not* decisive on its own,
      because that is also exactly how a provider describes a per-minute quota
      metric that resets within a minute. It only counts when its sentence is not

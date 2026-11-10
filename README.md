@@ -227,7 +227,11 @@ to be over.
     is too low`). This tier survives throttle wording in the same failure, because
     it says the plan itself is used up rather than that a rate was hit —
     `429 rate limit reached; insufficient_quota: current quota exhausted` is a usage
-    limit, not a throttle.
+    limit, not a throttle. It does not survive a `reached` whose object is a lookup:
+    `The account quota service reached a timeout while checking your account` is a
+    check that timed out, and qualifying the noun does not change that. Only the
+    clause the verb owns is inspected, so `You have reached your usage limit; please
+    check your plan` stays genuine exhaustion.
   - **A bare quota plus an exhaustion verb is not decisive.** That is also exactly
     how a provider describes a *per-minute quota metric*, which resets within a
     minute, so it only counts when its sentence is not about a rate dimension.
@@ -240,7 +244,7 @@ to be over.
   | Look-alike | Example |
   | --- | --- |
   | A transient throttle described with quota vocabulary | `Rate limit exceeded; quota is not exhausted.`, `429 rate limit exceeded for quota metric requests per minute`, `Quota exceeded for quota metric 'Generate Content API requests per minute'` |
-  | A lookup or a throttle in the same sentence | `The quota service reached a timeout while checking your account`, `The quota service reached a rate limit while checking your account` |
+  | A lookup or a throttle, including a *qualified* one — what decides is the verb's object, not how the subject was named | `The quota service reached a timeout while checking your account`, `The account quota service reached a timeout while checking your account`, `The billing limit check reached a timeout…`, `The spending limit lookup reached a timeout…`, `The monthly budget service reached a timeout…`, `The quota service reached a rate limit while checking your account` |
   | A negated statement | `You have not exceeded your quota`, `Your quota is not exceeded`, `Your quota has not been exceeded`, `Your plan limit has not been reached`, `No quota exceeded` |
   | An internal or per-request budget | `Retry budget exhausted after 3 attempts`, `token budget exceeded for this request`, `The request is out of budget for this call` |
   | Bare account vocabulary | `Your billing address could not be verified; update your account details`, `Billing service temporarily unavailable; please retry later` |

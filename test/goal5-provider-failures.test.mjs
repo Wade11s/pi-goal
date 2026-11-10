@@ -84,8 +84,20 @@ test("provider failures are classified from what the evidence actually says", as
 		["Your quota has not been exceeded", "active"],
 		["Your plan limit has not been reached", "active"],
 		["No quota exceeded", "active"],
-		// A lookup or a throttle in the same sentence is not plan exhaustion.
+		// A lookup or a throttle in the same sentence is not plan exhaustion, and
+		// qualifying the noun does not change that: what decides is the verb's
+		// object, not how the subject was named.
 		["The quota service reached a rate limit while checking your account", "active"],
+		["The account quota service reached a timeout while checking your account", "active"],
+		["The billing limit check reached a timeout while checking your account", "active"],
+		["The spending limit lookup reached a timeout while checking your account", "active"],
+		["The monthly budget service reached a timeout while checking your account", "active"],
+		// ...while a genuine exhaustion keeps its clause: the remark after it is not
+		// what the verb reached.
+		["You have reached your usage limit; please check your plan", "usage_limited"],
+		["You have reached your usage limit. Please check your account settings.", "usage_limited"],
+		["Monthly usage limit reached. Contact the billing service for details.", "usage_limited"],
+		["Your account quota was exceeded after the service check", "usage_limited"],
 		// A transient throttle that the provider describes with quota vocabulary: a
 		// per-minute quota metric resets within a minute, so it is a throttle, and a
 		// negated quota statement is a provider saying the plan is fine.
@@ -106,27 +118,38 @@ test("provider failures are classified from what the evidence actually says", as
 		["The quota service reached a timeout while checking your account. Your quota is exceeded.", "usage_limited"],
 		["Quota is not exceeded for this request. The account quota has been exhausted.", "usage_limited"],
 	];
-	for (const [message, expectedStatus] of cases) {
-		// Retries are disabled so the failure reaches the boundary as the reviewer's
-		// probes did. With Pi's retries on, a retryable error would consume the next
-		// scripted step, succeed, and the run would complete — hiding the very
-		// classification under test.
-		const session = await PiRpcSession.start({ settings: { retry: { enabled: false } } });
-		script([{ text: "Kickoff answer." }, { error: message }, { text: "Unrequested." }], session);
-		try {
-			await startGoal(session);
-			await session.waitForSettled(1);
-			const entries = readSessionEntries(await session.sessionFile());
-			assert.equal(
-				lastGoalSnapshot(entries).data.goal.status,
-				expectedStatus,
-				`"${message}" must leave the Goal ${expectedStatus}`,
-			);
-			assertStepsConsumed(session, 2, [{ stopReason: "error", errorMessage: message }]);
-			assert.equal(session.extensionErrors().length, 0);
-		} finally {
-			await session.stop();
-		}
+	// Rows run in small batches rather than one at a time: each spawns a real Pi
+	// subprocess, and forty sequential spawns dominate the suite's wall time. Each
+	// row owns its own session and temporary directories, so the rows are
+	// independent, and a failing row still names its own evidence in the message.
+	const BATCH_SIZE = 4;
+	for (let start = 0; start < cases.length; start += BATCH_SIZE) {
+		await Promise.all(
+			cases.slice(start, start + BATCH_SIZE).map(([message, expectedStatus]) => classifyOne(message, expectedStatus)),
+		);
 	}
 });
 
+/** Drive one provider failure through a real session and assert the Goal's status. */
+async function classifyOne(message, expectedStatus) {
+	// Retries are disabled so the failure reaches the boundary as the reviewer's
+	// probes did. With Pi's retries on, a retryable error would consume the next
+	// scripted step, succeed, and the run would complete — hiding the very
+	// classification under test.
+	const session = await PiRpcSession.start({ settings: { retry: { enabled: false } } });
+	script([{ text: "Kickoff answer." }, { error: message }, { text: "Unrequested." }], session);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(
+			lastGoalSnapshot(entries).data.goal.status,
+			expectedStatus,
+			`"${message}" must leave the Goal ${expectedStatus}`,
+		);
+		assertStepsConsumed(session, 2, [{ stopReason: "error", errorMessage: message }]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+}
