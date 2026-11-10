@@ -24,19 +24,26 @@ observable Pi events, with thresholds that are constants rather than settings.
 
 1. **The blocked audit is enforced, not requested.** `update_goal` accepts
    `blocked` with a blocker description, but the Goal only becomes `blocked` once
-   the same blocker has been reported for three consecutive Goal turns. Reports
+   the same blocker has been reported for three *consecutive* Goal turns. Reports
    are counted per Goal turn, compared after normalizing case, whitespace, and
    trailing punctuation, and persisted on the Goal record so compaction and a
-   session restore cannot hand the model three fresh turns.
-2. **Activity-free turns are bounded.** A Goal turn with no tool call, no output,
-   and no reasoning is a malfunctioning continuation. Three in a row stop the Goal
-   as `blocked`. Any activity resets the counter.
+   session restore cannot hand the model three fresh turns. A Goal turn that
+   reports no blocker — it made progress, verified a wait, or simply had nothing to
+   report — breaks the chain, and that break is persisted too, because an
+   in-memory-only reset would let a reload resurrect a count the model already
+   invalidated.
+2. **Activity-free turns are bounded.** An *automatic* Goal turn with no tool call,
+   no output, and no reasoning is a malfunctioning continuation. Three in a row
+   stop the Goal as `blocked`. Any activity resets the counter, and a kickoff or a
+   user-started run never counts, because the user is watching those.
 3. **Execution-unavailable turns are bounded, and ordinary command failures are
    excluded.** A turn counts only when a shell tool ran and failed for an
    infrastructure reason — the executable is missing, the process could not be
    spawned — which Pi reports as an error result with a measured duration and no
-   exit code. A command that ran and exited non-zero carries an exit code and is
-   normal work, so it never counts. Three unavailable turns in a row stop the Goal.
+   exit code. A command that ran and ended in any of the ways Pi reports as an
+   ordinary outcome (a non-zero exit code, a timeout, no exit code, an abort)
+   carries that text and is normal work, so it never counts. Three unavailable
+   turns in a row stop the Goal.
 4. **Provider failures are classified from Pi's evidence.** A terminal provider
    error becomes `usage_limited` only when the error text or a provider diagnostic
    says the quota, budget, billing, or subscription usage limit is exhausted.
@@ -50,9 +57,11 @@ observable Pi events, with thresholds that are constants rather than settings.
 ## Consequences
 
 - Stopping needs no model cooperation and no judge service: the same events Pi
-  already emits (`message_end`, `tool_execution_end`, `turn_end`,
+  already emits (`message_end`, `tool_execution_end`, `agent_end`,
   `agent_before_settle`) are enough, and the rules are unit-testable and
-  reproducible.
+  reproducible. Observations are aggregated per run and evaluated once, when the
+  run ends, because a Goal run can contain many provider requests and only the run
+  as a whole says whether the Goal could act.
 - A Goal that stops is never silently restarted. `blocked` and `usage_limited` are
   terminal for continuation, and only a user decision resumes them — which is why
   resume is deliberately not a model tool.
@@ -68,5 +77,11 @@ observable Pi events, with thresholds that are constants rather than settings.
 - Because a shell tool's failure is read from Pi's result shape, a provider or Pi
   version that changes how shell failures are reported could make an ordinary
   failure look like an execution failure. The classification is deliberately narrow
-  (shell tools only, error results only, measured duration only, no exit code) to
-  keep that risk small, and it is covered by a negative-control test.
+  (shell tools only, error results only, measured duration only, no exit code, and
+  none of the ordinary-outcome texts) to keep that risk small, and it is covered by
+  negative-control tests for both a non-zero exit and a timeout.
+- Usage-limit classification has the mirror-image risk: a false positive is
+  terminal for continuation and needs a user decision to undo, so the evidence bar
+  is an exhaustion verb next to a quota, usage-limit, budget, or credit noun —
+  never bare account vocabulary. A false negative only costs one more surfaced
+  terminal error.

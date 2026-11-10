@@ -34,6 +34,7 @@
  * milestones; this milestone deliberately does not implement them.
  */
 import type {
+	AgentActivityOutcome,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
@@ -60,7 +61,9 @@ import { GoalStore, validateBlocker, validateObjective } from "./store.ts";
 import {
 	classifyProviderFailure,
 	GoalSafetyMonitor,
+	type GoalRunKind,
 	type ProviderFailureEvidence,
+	type SafetyStop,
 } from "./safety.ts";
 
 /**
@@ -98,15 +101,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	const safety = new GoalSafetyMonitor();
 
 	/**
-	 * Set when the next run is Goal work: the kickoff the /goal command sends, or
-	 * a continuation this extension just requested. Consumed by `agent_start`, so
-	 * the anti-loop counters can tell an unattended Goal turn from a run the user
-	 * started themselves.
+	 * What started the next run, set by whoever starts it: the kickoff the /goal
+	 * command sends, or a continuation this extension just requested. Consumed by
+	 * `agent_start`, and cleared by `agent_settled` so a continuation Pi rejected
+	 * (an invalid boundary continuation, a run it refused to start) cannot leak
+	 * into the next user-started run.
 	 */
-	let goalTurnPending = false;
+	let pendingRunKind: GoalRunKind | undefined = undefined;
 
 	/** Evidence of the provider failure that ended the current run, if any. */
 	let providerFailure: ProviderFailureEvidence | undefined = undefined;
+
+	/** How the last assistant message of the current run ended. */
+	let runOutcome: AgentActivityOutcome | undefined = undefined;
+
+	/**
+	 * Whether a blocker report was counted during the current Goal turn.
+	 *
+	 * The blocked audit counts *consecutive* Goal turns, so a Goal turn that ends
+	 * without a report has to break the chain even though nothing in that turn
+	 * said so.
+	 */
+	let blockerCountedThisRun = false;
 
 	/**
 	 * Serializes Goal creation across concurrent /goal commands. Commands that
@@ -143,47 +159,74 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * so every anti-loop counter starts over. Extension commands (`/goal ...`) do
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
-	pi.on("input", () => {
+	pi.on("input", (_event, ctx) => {
 		safety.reset();
-		store.resetBlockedAudit(pi);
+		reportAuditResetFailure("the prompt you just sent", ctx);
 	});
 
 	pi.on("agent_start", () => {
-		safety.beginRun(goalTurnPending);
-		goalTurnPending = false;
+		safety.beginRun(pendingRunKind ?? "user");
+		pendingRunKind = undefined;
 		providerFailure = undefined;
+		runOutcome = undefined;
+		blockerCountedThisRun = false;
 	});
-	pi.on("agent_end", () => {
+
+	/**
+	 * The end of one Goal run, which is the unit every anti-loop counter counts.
+	 *
+	 * The stop is applied here rather than at the next settlement so the Goal is
+	 * already `blocked` before the boundary could ask for another continuation: a
+	 * malfunctioning loop gets exactly one more run to finish what it was doing,
+	 * and no more.
+	 */
+	pi.on("agent_end", (_event, ctx) => {
+		// A run with no assistant message never reached the model; treat it as
+		// neutral rather than as a completed, activity-free Goal turn.
+		const outcome = runOutcome ?? "aborted";
+		const wasGoalTurn = safety.currentRunKind !== "user";
+		const stop = safety.evaluateRun(outcome);
+		if (stop) {
+			applySafetyStop(stop, ctx);
+		}
+		if (wasGoalTurn && !blockerCountedThisRun) {
+			// A Goal turn that reported no blocker breaks the blocked audit, so the
+			// next report starts a fresh chain instead of resuming an old one.
+			reportAuditResetFailure("a Goal turn that reported no blocker", ctx);
+		}
 		safety.endRun();
 	});
 
 	/**
-	 * An abort is the strongest possible user action: the run the user stopped
-	 * must not be counted as a Goal malfunction, and a continuation Pi suppressed
-	 * because of the abort must not mark the next run as a Goal turn.
+	 * Settlement is the end of the whole session-level run. Whatever was pending
+	 * is either consumed or moot, so nothing may leak into the next run.
 	 */
-	pi.on("agent_settled", (event) => {
+	pi.on("agent_settled", (event, ctx) => {
+		pendingRunKind = undefined;
 		if (!event.aborted) return;
-		goalTurnPending = false;
+		// An abort is the strongest possible user action: the run the user stopped
+		// must not be counted as a Goal malfunction.
 		safety.reset();
-		store.resetBlockedAudit(pi);
+		reportAuditResetFailure("the abort", ctx);
 	});
 
 	/**
 	 * Observe the finalized assistant message: it is what "activity" means for a
-	 * Goal turn, and a failed one is the evidence a provider failure is
-	 * classified from.
+	 * Goal run, and the last one also says how the run ended.
 	 */
 	pi.on("message_end", (event) => {
 		const message = event.message;
 		if (message.role !== "assistant") return;
 		safety.noteAssistantMessage(message);
-		if (message.stopReason === "error") {
-			providerFailure = {
-				errorMessage: message.errorMessage,
-				diagnostics: message.diagnostics,
-			};
-		}
+		// Pi maps a turn's stop reason onto the run outcome, so the last assistant
+		// message of a run is authoritative — including when an earlier attempt in
+		// the same run failed and a later one recovered.
+		runOutcome =
+			message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
+		providerFailure =
+			message.stopReason === "error"
+				? { errorMessage: message.errorMessage, diagnostics: message.diagnostics }
+				: undefined;
 	});
 
 	/** Observe every finalized tool call, so execution failures can be told apart from ordinary ones. */
@@ -194,36 +237,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			durationMs: event.durationMs,
 			result: event.result,
 		});
-	});
-
-	/**
-	 * Evaluate one finished turn against the anti-loop bounds.
-	 *
-	 * The stop is applied here rather than at the next settlement so the Goal is
-	 * already `blocked` before the boundary could ask for another continuation:
-	 * a malfunctioning loop gets exactly one more turn to finish what it was
-	 * doing, and no more.
-	 */
-	pi.on("turn_end", (event, ctx) => {
-		const stop = safety.evaluateTurn(event.outcome);
-		if (!stop) return;
-		const goal = store.get();
-		if (!goal || goal.status !== "active") return;
-		const result = store.stopGoal(pi, { status: "blocked", blocker: stop.blocker, turns: stop.turns });
-		if (result.ok) {
-			ctx.ui.notify(
-				`Goal ${result.goal.id} stopped and is now blocked (${stop.kind}): ${stop.blocker} ` +
-					"Automatic continuation has stopped; the Goal needs a user decision to continue.",
-				"warning",
-			);
-			return;
-		}
-		ctx.ui.notify(
-			`Goal ${goal.id} reached a conservative stop (${stop.kind}) but could not be persisted as blocked ` +
-				`(${describeError(result.reason === "persistence" ? result.error : undefined)}). The Goal stays ` +
-				"active; fix the cause and it will stop again.",
-			"error",
-		);
 	});
 
 	/**
@@ -261,7 +274,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (event.outcome !== "completed") return;
 		// The next run is Goal work, whether Pi starts it for our continuation or
 		// for queued work that already satisfies the decision.
-		goalTurnPending = true;
+		pendingRunKind = "automatic";
 		return {
 			entries: [
 				...event.entries,
@@ -275,6 +288,50 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			continue: true,
 		};
 	});
+
+	/**
+	 * Apply a conservative stop: persist the Goal as blocked and tell the user why.
+	 *
+	 * Called at the end of the Goal run that reached a bound, so the Goal is already
+	 * blocked before the settlement boundary could ask for another continuation.
+	 */
+	function applySafetyStop(stop: SafetyStop, ctx: ExtensionContext): void {
+		const goal = store.get();
+		if (!goal || goal.status !== "active") return;
+		const result = store.stopGoal(pi, { status: "blocked", blocker: stop.blocker, turns: stop.turns });
+		if (result.ok) {
+			ctx.ui.notify(
+				`Goal ${result.goal.id} stopped and is now blocked (${stop.kind}): ${stop.blocker} ` +
+					"Automatic continuation has stopped; the Goal needs a user decision to continue.",
+				"warning",
+			);
+			return;
+		}
+		ctx.ui.notify(
+			`Goal ${goal.id} reached a conservative stop (${stop.kind}) but could not be persisted as blocked ` +
+				`(${describeError(result.reason === "persistence" ? result.error : undefined)}). The Goal stays ` +
+				"active; fix the cause and it will stop again.",
+			"error",
+		);
+	}
+
+	/**
+	 * Reset the blocked audit after a user action or a Goal turn that reported no
+	 * blocker, and surface a write failure instead of silently dropping the reset.
+	 *
+	 * Silently keeping a stale audit would let a reload resurrect a count the user
+	 * already invalidated, which is exactly what the durable reset exists to
+	 * prevent.
+	 */
+	function reportAuditResetFailure(cause: string, ctx: ExtensionContext): void {
+		const result = store.resetBlockedAudit(pi);
+		if (result.ok) return;
+		ctx.ui.notify(
+			`pi-goal could not record the blocked-audit reset after ${cause}: ` +
+				`${describeError(result.error)}. The audit stays as it was until the write succeeds.`,
+			"error",
+		);
+	}
 
 	/**
 	 * Classify the terminal provider failure that just ended a run.
@@ -532,6 +589,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			blocker: validation.blocker,
 			turn: safety.currentTurn,
 		});
+		if (result.ok && !result.repeat) blockerCountedThisRun = true;
 		if (!result.ok) {
 			const message =
 				result.reason === "persistence"
@@ -654,12 +712,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						// Make the Goal visible to get_goal for the kickoff run
 						// that starts now.
 						store.commit(goal);
-						// A new Goal identity starts every audit from zero, and the
-						// kickoff is the first Goal turn, so the anti-loop counters
-						// treat it as unattended Goal work rather than as a run the
-						// user started.
+						// A new Goal identity starts every audit from zero. The kickoff
+						// is a Goal turn for the blocked audit, but it is attended
+						// work: the user just typed /goal, so it must not consume
+						// one of the three automatic turns an anti-loop bound allows.
 						safety.reset();
-						goalTurnPending = true;
+						pendingRunKind = "kickoff";
 						// Start initial work. The kickoff is a user message: it
 						// carries the objective into model context as
 						// user-provided Goal data and, as the session's first

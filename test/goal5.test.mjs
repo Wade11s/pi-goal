@@ -22,8 +22,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
 	PiRpcSession,
 	assertCleanRun,
@@ -50,6 +51,8 @@ const FAILING_COMMAND = { command: "exit 7" };
 const USAGE_LIMIT_ERROR = "429 insufficient_quota: you exceeded your current quota for this organization";
 /** A terminal provider failure that is not a usage limit. */
 const TERMINAL_ERROR = "invalid api key";
+/** A shell command that runs and is then killed by its own timeout. */
+const TIMING_OUT_COMMAND = { command: "sleep 1", timeout: 0.05 };
 
 function script(steps, session) {
 	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
@@ -137,12 +140,15 @@ test("the continuation contract distinguishes progress, verified waits, and no p
 			/Treat equivalent blockers as the same condition across turns even when their wording or stated next step changes\./,
 		);
 
-		// The blocked audit states the threshold and its consequences.
+		// The blocked audit states the threshold, and the prompt agrees with what the
+		// extension enforces: report every turn the blocker persists, and the
+		// extension counts the consecutive turns.
 		assert.match(message, /Blocked audit \(3 consecutive Goal turns with the same genuine blocker\):/);
-		assert.match(message, /Do not report a blocker the first time it appears/);
+		assert.match(message, /Report the blocker on every Goal turn it persists/);
+		assert.match(message, /only marks the Goal blocked on the 3rd/);
 		assert.match(
 			message,
-			/at least 3 consecutive Goal turns, counting the turn the user started and every automatic continuation since/,
+			/a Goal turn that makes progress, verifies a wait, or reports no blocker breaks it and the count starts again/,
 		);
 		assert.match(message, /a reworded repetition still advances the audit; a genuinely different blocker restarts it at one/);
 		assert.match(message, /A blocked Goal never continues automatically and only the user can resume it/);
@@ -152,7 +158,10 @@ test("the continuation contract distinguishes progress, verified waits, and no p
 		assert.match(message, /Conservative stops pi-goal enforces by itself/);
 		assert.match(message, /3 consecutive activity-free automatic Goal turns/);
 		assert.match(message, /3 consecutive turns in which commands could not be executed at all/);
-		assert.match(message, /An ordinary command failure \(a non-zero exit code\) is normal work, not an execution failure/);
+		assert.match(
+			message,
+			/An ordinary command failure — a non-zero exit code, a timeout, or an aborted command — is normal work, not an execution failure/,
+		);
 
 		// And the objective data block still precedes every authoritative line.
 		assert.ok(
@@ -847,6 +856,607 @@ test("a queued user prompt restarts the blocked audit at one", async () => {
 		assert.equal(runCount(session), 4, "kickoff plus three Goal turns");
 		assertStepsConsumed(session, 8);
 		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a Goal turn without a blocker report breaks the blocked audit", async () => {
+	const session = await PiRpcSession.start();
+	// The reviewer's reproduction: report B, a Goal turn that reports nothing,
+	// report B, another Goal turn that reports nothing, report B. The audit is about
+	// *consecutive* Goal turns, so the intervening turns restart the chain instead
+	// of being skipped over.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			// A productive Goal turn: it inspects state and reports no blocker.
+			{ toolCalls: [{ name: "get_goal", args: {} }] },
+			{ text: "I inspected the repository and kept working." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			// Another Goal turn that reports nothing.
+			{ toolCalls: [{ name: "get_goal", args: {} }] },
+			{ text: "I kept working." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const results = toolResults(session, "update_goal");
+		assert.equal(results.length, 4);
+		for (const [index, result] of results.slice(0, 3).entries()) {
+			assert.equal(result.isError, true, `report ${index + 1} is below the threshold`);
+			assert.match(
+				String(result.result.content[0].text),
+				/Blocker recorded \(1 of 3 consecutive Goal turns\)/,
+				`report ${index + 1} started a fresh chain`,
+			);
+			assert.equal(structuredGoal(result.result).status, "active");
+		}
+		assert.equal(results[3].isError, false, "the Goal completed normally");
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete", "the Goal was never blocked");
+		assert.equal(lastGoalSnapshot(entries).data.goal.blockedAudit, undefined);
+		// The resets are durable: snapshots without the audit sit between the reports,
+		// so a reload cannot resurrect a chain the intervening turns already broke.
+		const snapshots = entries.filter((e) => e.customType === "goal-state");
+		assert.ok(
+			snapshots.filter((e) => e.data.goal.blockedAudit === undefined && e.data.goal.status === "active").length >=
+				2,
+			"each broken chain was persisted as a reset",
+		);
+		assert.equal(runCount(session), 7, "kickoff plus six Goal turns");
+		assertStepsConsumed(session, 13);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("three consecutive reports after a broken chain still reach the threshold", async () => {
+	const session = await PiRpcSession.start();
+	// The complement of the test above: once the chain restarts, three consecutive
+	// Goal turns with the same blocker do reach the threshold.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "get_goal", args: {} }] },
+			{ text: "I inspected the repository and kept working." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Reporting the blocker." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const results = toolResults(session, "update_goal");
+		assert.equal(results.length, 4);
+		assert.match(String(results[0].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
+		assert.match(
+			String(results[1].result.content[0].text),
+			/Blocker recorded \(1 of 3 consecutive Goal turns\)/,
+			"the productive turn restarted the audit",
+		);
+		assert.match(String(results[2].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
+		assert.equal(results[3].isError, false, "the third consecutive report satisfies the audit");
+		assert.equal(structuredGoal(results[3].result).status, "blocked");
+		assert.deepEqual(lastAudit(readSessionEntries(await session.sessionFile())), {
+			blocker: BLOCKER,
+			turns: 3,
+		});
+		assert.equal(runCount(session), 6, "kickoff plus five Goal turns");
+		assertStepsConsumed(session, 11);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a partial blocked audit survives a restart", async () => {
+	// A test-owned session dir and working directory, so both processes see the
+	// same session file and the same stored cwd the way a real restart does.
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-audit-"));
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-audit-work-"));
+	const session = await PiRpcSession.start({ sessionDir, cwd: workDir });
+	// Two consecutive Goal turns report the blocker, then the process is killed
+	// mid-run: the durable record has to carry the partial audit on its own.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ hang: true },
+		],
+		session,
+	);
+	let sessionFile;
+	try {
+		await startGoal(session);
+		// Kickoff plus both reporting Goal turns have started; the sixth turn is the
+		// hanging one, so nothing further can be written while this holds.
+		await session.waitFor(
+			"the third Goal turn started",
+			(records) => (records.filter((r) => r.type === "turn_start").length >= 6 ? true : undefined),
+		);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "active");
+		// Both reports are on disk, in order, as one durable chain.
+		const audits = entries
+			.filter((e) => e.customType === "goal-state")
+			.map((e) => e.data.goal.blockedAudit?.turns)
+			.filter((turns) => turns !== undefined);
+		assert.deepEqual(audits, [1, 2], "the partial audit is durable, not just in memory");
+
+		// Hard-kill Pi mid-run: no graceful shutdown, so whatever is on disk is all
+		// the next process gets.
+		session.killNow();
+		await session.waitForExit();
+		sessionFile = session.findSessionFile();
+		assert.deepEqual(lastAudit(readSessionEntries(sessionFile)), { blocker: BLOCKER, turns: 2 });
+	} finally {
+		await session.stop();
+	}
+
+	// A fresh process reconstructs the partial audit. Bare /goal is an extension
+	// command, so it reports state without starting a run: nothing here is a user
+	// action that would reset the audit.
+	const restarted = await PiRpcSession.start({ sessionFile, sessionDir, cwd: workDir });
+	try {
+		await restarted.prompt("/goal");
+		const reported = await restarted.waitForNotify(
+			(r) => r.message.includes(OBJECTIVE) && r.message.includes("active"),
+		);
+		assert.ok(reported.message.includes(`Blocker: ${BLOCKER}`), "the blocker was restored");
+		assert.ok(
+			reported.message.includes("Blocked audit: 2 of 3 consecutive Goal turns reported this blocker"),
+			"the partial count was restored",
+		);
+		assert.equal(runCount(restarted), 0, "reporting status starts no run");
+	} finally {
+		await restarted.stop();
+		rmSync(sessionDir, { recursive: true, force: true });
+		rmSync(workDir, { recursive: true, force: true });
+	}
+});
+
+test("a durable audit reset survives a restart, so an invalidated chain cannot resume", async () => {
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-reset-"));
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-reset-work-"));
+	const session = await PiRpcSession.start({ sessionDir, cwd: workDir });
+	// One report, then a Goal turn that reports nothing: the chain breaks and the
+	// reset is persisted. The missing third response settles the session while the
+	// Goal is still active.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "get_goal", args: {} }] },
+			{ text: "I kept working instead." },
+		],
+		session,
+	);
+	let sessionFile;
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "active");
+		assert.equal(
+			lastGoalSnapshot(entries).data.goal.blockedAudit,
+			undefined,
+			"the broken chain was reset in the durable record",
+		);
+		assertStepsConsumed(session, 6, [
+			{ stopReason: "error", errorMessage: "scripted provider: no step at index 5 in PI_GOAL_TEST_SCRIPT" },
+		]);
+		sessionFile = await session.sessionFile();
+	} finally {
+		await session.stop();
+	}
+
+	const restarted = await PiRpcSession.start({ sessionFile, sessionDir, cwd: workDir });
+	script(
+		[
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		restarted,
+	);
+	try {
+		// The prompt that starts the run is itself a user action, so the report after
+		// it is turn one of a fresh audit either way — and the reload must not have
+		// resurrected the count the productive Goal turn already invalidated.
+		await restarted.prompt("carry on");
+		await restarted.waitForSettled(1);
+		const [report] = toolResults(restarted, "update_goal");
+		assert.match(
+			String(report.result.content[0].text),
+			/Blocker recorded \(1 of 3 consecutive Goal turns\)/,
+			"the invalidated chain did not resume",
+		);
+		assert.equal(structuredGoal(report.result).status, "active");
+		assert.equal(lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal.status, "complete");
+		assertStepsConsumed(restarted, 4);
+		assertCleanRun(restarted);
+	} finally {
+		await restarted.stop();
+		rmSync(sessionDir, { recursive: true, force: true });
+		rmSync(workDir, { recursive: true, force: true });
+	}
+});
+
+test("one Goal run with three failing shell attempts is one Goal turn, not three", async () => {
+	// A shell that cannot be spawned at all, so every attempt is a real
+	// execution-unavailable failure rather than an ordinary one.
+	const session = await PiRpcSession.start({ settings: { shellPath: "/definitely/not/a/shell" } });
+	// All three attempts belong to a single Goal run: three provider requests
+	// inside one continuation.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "bash", args: { command: "echo one" } }] },
+			{ toolCalls: [{ name: "bash", args: { command: "echo two" } }] },
+			{ toolCalls: [{ name: "bash", args: { command: "echo three" } }] },
+			{ text: "The shell would not start." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const bashResults = toolResults(session, "bash");
+		assert.equal(bashResults.length, 3, "three attempts ran inside one Goal turn");
+		assert.ok(bashResults.every((r) => r.isError));
+		assert.ok(
+			bashResults.every((r) => /not a shell|not found|ENOENT|spawn/i.test(String(r.result.content[0].text))),
+			"each attempt failed to spawn the shell",
+		);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(continuationEntries(entries).length, 2, "the attempt run plus the completing run");
+		assert.equal(runCount(session), 3, "kickoff plus two Goal turns");
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete", "the Goal was never stopped");
+		assert.equal(lastGoalSnapshot(entries).data.goal.blockedAudit, undefined);
+		assert.ok(
+			!session.records.some(
+				(r) => r.type === "extension_ui_request" && String(r.message).includes("execution-unavailable"),
+			),
+			"three provider requests inside one Goal turn are not three Goal turns",
+		);
+		assertStepsConsumed(session, 7);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a Goal run that does not try to execute breaks the execution-unavailable chain", async () => {
+	const session = await PiRpcSession.start({ settings: { shellPath: "/definitely/not/a/shell" } });
+	// Failure, then a Goal run that answers without running a command, then two
+	// more failures. The answering run is neutral, so the chain restarts and two
+	// failures are not three.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "bash", args: { command: "echo one" } }] },
+			{ text: "The shell would not start." },
+			{ text: "I will reason about it instead of running a command." },
+			{ toolCalls: [{ name: "bash", args: { command: "echo two" } }] },
+			{ text: "The shell would not start." },
+			{ toolCalls: [{ name: "bash", args: { command: "echo three" } }] },
+			{ text: "The shell would not start." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete", "the Goal was never stopped");
+		assert.equal(lastGoalSnapshot(entries).data.goal.blockedAudit, undefined);
+		assert.equal(continuationEntries(entries).length, 5, "every settlement continued");
+		assert.equal(runCount(session), 6);
+		assert.ok(
+			!session.records.some(
+				(r) => r.type === "extension_ui_request" && String(r.message).includes("execution-unavailable"),
+			),
+			"a run that did not execute a command broke the chain",
+		);
+		assertStepsConsumed(session, 10);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a command that times out is ordinary work, not an unavailable shell", async () => {
+	const session = await PiRpcSession.start();
+	// The shell spawns every time; the command is simply too slow for its timeout.
+	// A timeout proves execution was available, so it must not stop the Goal.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "bash", args: TIMING_OUT_COMMAND }] },
+			{ text: "The command timed out." },
+			{ toolCalls: [{ name: "bash", args: TIMING_OUT_COMMAND }] },
+			{ text: "The command timed out." },
+			{ toolCalls: [{ name: "bash", args: TIMING_OUT_COMMAND }] },
+			{ text: "The command timed out." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const bashResults = toolResults(session, "bash");
+		assert.equal(bashResults.length, 3);
+		assert.ok(bashResults.every((r) => r.isError), "each command hit its timeout");
+		assert.ok(
+			bashResults.every((r) => /Command timed out after/.test(String(r.result.content[0].text))),
+			"the shell ran the command and the command was too slow",
+		);
+		assert.ok(
+			bashResults.every((r) => r.result.structuredContent?.exit_code === undefined),
+			"a timeout carries no exit code, which is the shape this rule must not match",
+		);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete", "the Goal was never stopped");
+		assert.equal(lastGoalSnapshot(entries).data.goal.blockedAudit, undefined);
+		assert.equal(continuationEntries(entries).length, 4, "every settlement continued");
+		assert.ok(
+			!session.records.some(
+				(r) => r.type === "extension_ui_request" && String(r.message).includes("execution-unavailable"),
+			),
+			"a timeout is not an execution failure",
+		);
+		assertStepsConsumed(session, 9);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("an empty kickoff does not consume one of the three activity-free automatic turns", async () => {
+	const session = await PiRpcSession.start();
+	// An empty kickoff followed by only two empty automatic responses: the kickoff
+	// is attended work, so the loop has seen two activity-free automatic turns.
+	script(
+		[
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const results = toolResults(session, "update_goal");
+		assert.equal(results.length, 1);
+		assert.equal(results[0].isError, false, "the Goal completed normally");
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete", "the Goal was never stopped");
+		assert.equal(lastGoalSnapshot(entries).data.goal.blockedAudit, undefined);
+		assert.equal(continuationEntries(entries).length, 3, "the kickoff plus two continuations");
+		assert.equal(runCount(session), 4);
+		assert.ok(
+			!session.records.some((r) => r.type === "extension_ui_request" && String(r.message).includes("activity-free")),
+			"the kickoff did not count toward the activity-free bound",
+		);
+		assertStepsConsumed(session, 5);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("an empty kickoff plus three empty automatic responses does stop the Goal", async () => {
+	const session = await PiRpcSession.start();
+	// The same kickoff, now with three empty automatic responses: the third one is
+	// the one that reaches the bound.
+	script(
+		[
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries).data.goal;
+		assert.equal(snapshot.status, "blocked", "the third automatic empty turn stopped the Goal");
+		assert.equal(snapshot.blockedAudit.turns, 3);
+		assert.match(snapshot.blockedAudit.blocker, /3 consecutive automatic Goal turns produced no activity/);
+		assert.equal(continuationEntries(entries).length, 3, "exactly three automatic Goal turns ran");
+		assert.equal(runCount(session), 4, "kickoff plus three automatic Goal turns");
+		const stopped = await session.waitForNotify((r) => r.message.includes("stopped and is now blocked"));
+		assert.ok(stopped.message.includes("activity-free"));
+		assertStepsConsumed(session, 4);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("billing and balance wording without exhaustion is a surfaced terminal error, not a usage limit", async () => {
+	const session = await PiRpcSession.start();
+	// Account problems and transient billing faults: neither says the plan is
+	// exhausted, so neither may stop the Goal permanently.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ error: "Your billing address could not be verified; update your account details" },
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(
+			lastGoalSnapshot(entries).data.goal.status,
+			"active",
+			"an account problem is not an exhausted plan",
+		);
+		assert.equal(continuationEntries(entries).length, 1, "the failed run added no continuation");
+		const surfaced = await session.waitForNotify((r) => r.message.includes("automatic continuation stopped for this run"));
+		assert.ok(surfaced.message.includes("billing address"), "the provider error is surfaced");
+		assert.ok(surfaced.message.includes("is still active"));
+		assert.ok(
+			!session.records.some((r) => r.type === "extension_ui_request" && String(r.message).includes("usage_limited")),
+			"no usage-limit transition happened",
+		);
+		assertStepsConsumed(session, 2, [
+			{ stopReason: "error", errorMessage: "Your billing address could not be verified; update your account details" },
+		]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a transient billing outage is a surfaced terminal error, not a usage limit", async () => {
+	const session = await PiRpcSession.start();
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ error: "Billing service temporarily unavailable; please retry later" },
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "active");
+		assert.ok(
+			!session.records.some((r) => r.type === "extension_ui_request" && String(r.message).includes("usage_limited")),
+			"a transient billing outage is not an exhausted plan",
+		);
+		assertStepsConsumed(session, 2, [
+			{ stopReason: "error", errorMessage: "Billing service temporarily unavailable; please retry later" },
+		]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("credible quota and credit evidence still becomes usage_limited", async () => {
+	// The phrasings a provider actually uses when a plan is exhausted, each of
+	// which must still stop the Goal: only bare account vocabulary was excluded.
+	const exhausted = [
+		"You exceeded your current quota for this organization",
+		"Monthly usage limit reached",
+		"Your credit balance is too low to access the Anthropic API",
+		" spending budget exhausted ",
+	];
+	for (const [index, message] of exhausted.entries()) {
+		const session = await PiRpcSession.start();
+		script([{ text: "Kickoff answer." }, { error: message }, { text: "Unrequested." }], session);
+		try {
+			await startGoal(session);
+			await session.waitForSettled(1);
+			const entries = readSessionEntries(await session.sessionFile());
+			assert.equal(
+				lastGoalSnapshot(entries).data.goal.status,
+				"usage_limited",
+				`"${message.trim()}" is exhaustion evidence`,
+			);
+			assert.match(lastGoalSnapshot(entries).data.goal.blockedAudit.blocker, /provider reported a usage limit/);
+			assertStepsConsumed(session, 2, [{ stopReason: "error", errorMessage: message }]);
+			assert.equal(session.extensionErrors().length, 0);
+		} finally {
+			await session.stop();
+		}
+		void index;
+	}
+});
+
+test("a rate limit that survived Pi's retries is a surfaced terminal error, not a usage limit", async () => {
+	const session = await PiRpcSession.start({
+		settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 } },
+	});
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ error: "429 rate limit exceeded, please slow down" },
+			{ error: "429 rate limit exceeded, please slow down" },
+			{ text: "Unrequested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "active", "a throttle is not an exhausted plan");
+		assert.ok(
+			!session.records.some((r) => r.type === "extension_ui_request" && String(r.message).includes("usage_limited")),
+			"no usage-limit transition happened",
+		);
+		assertStepsConsumed(session, 3, [
+			{ stopReason: "error", errorMessage: "429 rate limit exceeded, please slow down" },
+			{ stopReason: "error", errorMessage: "429 rate limit exceeded, please slow down" },
+		]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();

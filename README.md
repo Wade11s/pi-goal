@@ -157,13 +157,15 @@ The extension, not the model, decides when the blocked audit is satisfied:
 
 - a report is recorded per **Goal turn**, so several calls inside one turn count
   once and cannot satisfy the threshold on their own;
+- the chain is **consecutive**: a Goal turn that makes progress, verifies a wait,
+  or reports no blocker breaks it, and the count starts again;
 - blockers are compared after normalizing case, whitespace, and trailing
   punctuation, so a reworded repetition still advances the audit while a genuinely
   different blocker restarts it at one;
 - below the threshold the report is persisted and refused with the current count,
-  which is what keeps a transient failure from stopping useful work. The audit is
-  durable, so compaction and a session restore do not hand the model three fresh
-  turns to spend on a blocker it already reported twice.
+  which is what keeps a transient failure from stopping useful work. Both the audit
+  and every break in it are durable, so compaction and a session restore neither
+  hand the model three fresh turns nor resurrect a chain it already invalidated.
 
 ### Stopping safely on blockers and failures
 
@@ -173,24 +175,42 @@ mistaken for a malfunction.
 
 | Stop | Status | Why it is not ordinary work |
 | --- | --- | --- |
-| Same genuine blocker for three consecutive Goal turns | `blocked` | reported by the model through `update_goal`, enforced by the extension |
-| Three consecutive activity-free automatic Goal turns | `blocked` | no tool call, no output, and no reasoning: the continuation loop is malfunctioning |
-| Three consecutive turns in which commands could not be executed | `blocked` | the shell itself failed to run, which is not the same as a non-zero exit code |
-| Provider usage limit | `usage_limited` | the error says the account, plan, or budget is exhausted |
+| Same genuine blocker for three **consecutive** Goal turns | `blocked` | reported by the model through `update_goal`, enforced by the extension |
+| Three consecutive activity-free **automatic** Goal turns | `blocked` | no tool call, no output, and no reasoning: the continuation loop is malfunctioning |
+| Three consecutive automatic turns in which commands could not be executed | `blocked` | the shell itself failed to run |
+| Provider usage limit | `usage_limited` | the error says the plan or budget is exhausted |
+
+The unit of counting is the **Goal run**, not the provider request: one Goal run
+can contain several requests (a tool call and its follow-up, a steering message),
+and only the run as a whole says whether the Goal could act. So three failing shell
+attempts inside one continuation are one Goal turn, and a Goal run that answers
+without running a command breaks an execution-failure chain.
 
 - A **blocked** or **usage_limited** Goal never continues automatically. Only the
   user can resume one, and resume arrives with the lifecycle milestone.
-- An **ordinary command failure** — the command ran and exited non-zero — is
-  normal work. It never counts toward the execution-unavailable stop.
+- An **ordinary command failure** — the command ran and exited non-zero, timed
+  out, died without an exit code, or was aborted — is normal work. It never counts
+  toward the execution-unavailable stop. A command that never ran at all (blocked
+  by permissions, invalid arguments) does not count either.
+- Only **automatic** continuations count toward the anti-loop bounds. The kickoff
+  and any run the user started are attended work, so an empty kickoff followed by
+  two empty automatic responses is two activity-free turns, not three.
 - An **aborted** run is a hard exit Pi already owns. It is not counted as a Goal
   malfunction, and it resets the counters.
 - A **terminal provider error** that is not a usage limit stops the continuation
   for that run and is surfaced as a warning, while the Goal stays active and
   continues on the next successful run. Pi's own retries are untouched.
 - A **usage-limit** error is only classified as one when Pi exposes enough
-  evidence: the error text or a provider diagnostic has to say the quota, budget,
-  billing, or subscription usage limit is exhausted. A plain rate limit is not
-  enough, because Pi retries those itself.
+  evidence: the error text or a provider diagnostic has to pair a quota,
+  usage-limit, budget, or credit noun with an exhaustion verb (`insufficient
+  quota`, `quota exceeded`, `usage limit reached`, `out of credits`, `credit
+  balance is too low`, provider error codes whose meaning is a plan usage limit).
+  Bare account vocabulary is deliberately not enough — `billing address could not
+  be verified` and `billing service temporarily unavailable` stay surfaced
+  terminal errors with the Goal active — and a rate limit is never a usage limit,
+  because Pi retries those itself. The bar is high on purpose: `usage_limited` is
+  terminal and needs a user decision to undo, so a false positive would wedge the
+  session's Goal.
 - Every stop is explained to the user through a notification and recorded on the
   Goal, so `get_goal` and bare `/goal` report the blocker and the audit count.
 - **User actions reset the counters.** A prompt the user types (including one
@@ -251,7 +271,9 @@ reason:
   subject), which fails on any assistant outcome that is `error` or `aborted`;
 - every anti-loop test asserts the number of provider responses it asked for
   (`assertStepsConsumed`) together with the exact continuation and run counts, so
-  a stop is proved to be the Goal lifecycle and not an exhausted script;
+  a stop is proved to be the Goal lifecycle and not an exhausted script. Two tests
+  deliberately let the script run out, because a terminal provider error is what
+  settles a session whose Goal is still active; both assert that exact failure;
 - the test-only boundary peer bounds its own continuation requests, so a
   composition test is bounded by the fixture rather than by a provider error.
 
@@ -277,7 +299,8 @@ test settles on a provider error.
 - The activity-free and execution-unavailable counters are per session, not
   durable. A restart or an extension reload gives a malfunctioning loop up to
   three more empty turns before it is stopped again; the blocked audit is durable
-  and does not reset that way.
+  and does not reset that way. A user prompt after a restart is itself a user
+  action, so it starts a fresh blocked audit.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.

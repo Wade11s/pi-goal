@@ -64,6 +64,17 @@ export type BlockedReportResult =
 	| { ok: false; reason: "not-active" }
 	| { ok: false; reason: "persistence"; error: unknown };
 
+/**
+ * Outcome of forgetting the blocked audit.
+ *
+ * `reset: false` means there was nothing to forget, which is the common case and
+ * not an error. A persistence failure keeps the audit in memory rather than
+ * dropping it, so the in-memory state never claims a reset that is not durable.
+ */
+export type ResetAuditResult =
+	| { ok: true; reset: boolean }
+	| { ok: false; reason: "persistence"; error: unknown };
+
 /** Outcome of an extension-initiated conservative stop or usage-limit transition. */
 export type StopGoalResult =
 	| { ok: true; goal: GoalRecord }
@@ -271,10 +282,20 @@ export class GoalStore {
 				repeat: true,
 			};
 		}
+
+		// The audit is about *consecutive* Goal turns, so a report that does not
+		// follow the previous one immediately starts a new chain: the turns in
+		// between made progress, verified a wait, or reported nothing, and none of
+		// those is the same blocker persisting. `lastBlockerTurn` is unknown after a
+		// reload, where the durable audit is the only evidence of the chain.
+		const followsPreviousTurn =
+			this.lastBlockerTurn === undefined || this.lastBlockerTurn === params.turn - 1;
 		this.lastBlockerTurn = params.turn;
 
 		const sameBlocker =
-			previous !== undefined && normalizeBlocker(previous.blocker) === normalizeBlocker(blocker);
+			followsPreviousTurn &&
+			previous !== undefined &&
+			normalizeBlocker(previous.blocker) === normalizeBlocker(blocker);
 		const turns = sameBlocker ? previous.turns + 1 : 1;
 		const thresholdMet = turns >= BLOCKED_AUDIT_THRESHOLD;
 		const updated: GoalRecord = {
@@ -328,26 +349,36 @@ export class GoalStore {
 	/**
 	 * Forget the blocked audit.
 	 *
-	 * A user action (a prompt the user typed, an abort) or a replacement Goal
-	 * means the loop is no longer unattended and the old audit is stale, so the
-	 * next report has to start at one. The reset is persisted when there is an
-	 * audit to clear — which can only happen after a report, so this is bounded
-	 * and never fires on an ordinary prompt — because otherwise a reload could
-	 * resurrect a count the user already invalidated.
+	 * Three things make an existing audit stale, and all of them mean the next
+	 * report has to start at one:
+	 * - a user action (a prompt the user typed, an abort), because the loop is no
+	 *   longer unattended;
+	 * - a Goal turn that reported no blocker, because the audit is about
+	 *   *consecutive* turns;
+	 * - a replacement Goal, which is a new identity.
+	 *
+	 * The reset is persisted whenever there is an audit to clear. That can only
+	 * happen after a report, so it is bounded and never fires on an ordinary prompt,
+	 * and it is what stops a reload from resurrecting a count the model or the user
+	 * already invalidated.
 	 */
-	resetBlockedAudit(pi: ExtensionAPI): void {
+	resetBlockedAudit(pi: ExtensionAPI): ResetAuditResult {
 		this.lastBlockerTurn = undefined;
 		const current = this.current;
-		if (!current || current.status !== "active" || current.blockedAudit === undefined) return;
+		if (!current || current.status !== "active" || current.blockedAudit === undefined) {
+			return { ok: true, reset: false };
+		}
 		const { blockedAudit: _dropped, ...rest } = current;
 		const updated: GoalRecord = { ...rest, updatedAt: Date.now(), revision: current.revision + 1 };
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
-		} catch {
-			// The in-memory reset still holds; the durable copy is at worst stale
-			// until the next report overwrites it.
+		} catch (error) {
+			// Keep the audit rather than dropping it: an in-memory reset that is not
+			// durable would let a reload resurrect a count the user invalidated.
+			return { ok: false, reason: "persistence", error };
 		}
 		this.current = updated;
+		return { ok: true, reset: true };
 	}
 
 	/** Build a new active Goal record (revision 0). Pure: no state is changed. */
@@ -426,9 +457,13 @@ function withSanitizedAudit(goal: GoalRecord): GoalRecord {
 		audit === null ||
 		typeof audit !== "object" ||
 		typeof audit.blocker !== "string" ||
+		audit.blocker.trim().length === 0 ||
 		typeof audit.turns !== "number" ||
-		!Number.isFinite(audit.turns) ||
-		audit.turns < 0
+		!Number.isInteger(audit.turns) ||
+		// A legitimate audit can never exceed the threshold: reaching it transitions
+		// the Goal, so a larger count is a hand-edited or corrupt snapshot.
+		audit.turns < 0 ||
+		audit.turns > BLOCKED_AUDIT_THRESHOLD
 	) {
 		const { blockedAudit: _dropped, ...rest } = goal;
 		return rest;
