@@ -9,11 +9,12 @@
  *   { "toolCalls": [{ "name": "get_goal", "args": {} }], "usage"?: {...} }
  *   { "error": "message", "stopReason"?: "error" }
  *   { "hang": true }   // never completes; for interrupted-run tests
+ *   { "waitForFile": "/abs/path" } // holds the response until the file exists
  *
  * No network access or credentials are required, which lets the RPC tests drive
  * real Pi sessions end to end.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
@@ -41,6 +42,13 @@ export interface ScriptedStep {
 	error?: string;
 	/** Never complete this response; the agent run hangs until aborted or killed. */
 	hang?: boolean;
+	/**
+	 * Hold the response until this absolute path exists (polled every 5ms, and
+	 * released by an abort). Unlike a fixed delay this is race-free: the test
+	 * knows the agent is provably busy, and releases the response only once it
+	 * has queued whatever it wanted to queue.
+	 */
+	waitForFile?: string;
 }
 
 function readSteps(): ScriptedStep[] {
@@ -125,6 +133,24 @@ function streamScriptedStep(
 			return;
 		}
 
+		// Hold the response until the test releases it, so a test has a
+		// deterministic window in which the agent is provably busy (for queueing
+		// steering or follow-up messages) without depending on wall-clock timing.
+		if (step.waitForFile !== undefined) {
+			const gate = step.waitForFile;
+			await new Promise<void>((resolve) => {
+				const poll = () => {
+					if (existsSync(gate)) {
+						resolve();
+						return;
+					}
+					setTimeout(poll, 5);
+				};
+				options?.signal?.addEventListener("abort", () => resolve());
+				poll();
+			});
+		}
+
 		const content: AssistantMessage["content"] = [];
 		for (const call of step.toolCalls ?? []) {
 			content.push({
@@ -160,11 +186,15 @@ function streamScriptedStep(
 		}
 
 		const partial: AssistantMessage = { ...message, content: [], stopReason: "pending" };
+		// Accumulated content for the partial snapshots: each event must carry every
+		// block streamed so far, because `contentIndex` addresses that array.
+		const streamed: AssistantMessage["content"] = [];
 		stream.push({ type: "start", partial: { ...partial } });
 		for (let contentIndex = 0; contentIndex < content.length; contentIndex++) {
 			if (options?.signal?.aborted) break;
 			const block = content[contentIndex]!;
-			const partialContent = [...partial.content, block];
+			streamed.push(block);
+			const partialContent = [...streamed];
 			if (block.type === "text") {
 				stream.push({ type: "text_start", contentIndex, partial: { ...partial, content: partialContent } });
 				stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: { ...partial, content: partialContent } });

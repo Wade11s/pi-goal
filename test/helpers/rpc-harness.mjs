@@ -13,10 +13,11 @@
  * immediately instead of hanging until the timeout.
  */
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import assert from "node:assert/strict";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 
@@ -33,6 +34,16 @@ export class PiRpcSession {
 		this.scriptPath = options.scriptPath ?? join(this.cwd, "provider-script.json");
 		this.noSession = options.noSession ?? false;
 		this.resumeSessionFile = options.sessionFile;
+		// Extensions loaded *before* the pi-goal package. Boundary handlers run in
+		// extension load order, so a pre-extension's `agent_before_settle` handler
+		// sees pi-goal's proposal in `event.entries` only when it runs first.
+		this.preExtensions = options.preExtensions ?? [];
+		// Extra extensions loaded after the scripted provider, for tests that need a
+		// second extension composing with pi-goal (for example boundary entries).
+		this.extraExtensions = options.extraExtensions ?? [];
+		// User-level settings written to <agent-dir>/settings.json before the spawn,
+		// for tests that need deterministic retry or compaction behavior.
+		this.settings = options.settings ?? undefined;
 
 		// Only remove directories this session created; dirs passed in via options
 		// (shared cwd, shared session dir) outlive this instance and are the
@@ -56,9 +67,12 @@ export class PiRpcSession {
 	}
 
 	start() {
-		const args = [
-			"--mode",
-			"rpc",
+		if (this.settings) {
+			writeFileSync(join(this.agentDir, "settings.json"), JSON.stringify(this.settings), "utf8");
+		}
+		const args = ["--mode", "rpc"];
+		for (const extension of this.preExtensions) args.push("-e", extension);
+		args.push(
 			"-e",
 			join(repoRoot), // load the pi-goal package via its package.json pi manifest
 			"-e",
@@ -67,7 +81,8 @@ export class PiRpcSession {
 			"scripted",
 			"--model",
 			"scripted-1",
-		];
+		);
+		for (const extension of this.extraExtensions) args.push("-e", extension);
 		if (this.noSession) args.push("--no-session");
 		else if (this.resumeSessionFile) args.push("--session", this.resumeSessionFile);
 		else args.push("--session-dir", this.sessionDir);
@@ -189,6 +204,17 @@ export class PiRpcSession {
 			(records) => records.find((r) => r.type === "response" && r.id === id),
 		);
 		this.writeCommand({ id, type: "prompt", message });
+		return responsePromise;
+	}
+
+	/** Queue a follow-up message while the agent runs; returns its response record. */
+	async followUp(message) {
+		const id = `req-${++nextRequestId}`;
+		const responsePromise = this.waitFor(
+			`response for follow_up ${id}`,
+			(records) => records.find((r) => r.type === "response" && r.id === id),
+		);
+		this.writeCommand({ id, type: "follow_up", message });
 		return responsePromise;
 	}
 
@@ -322,4 +348,73 @@ export function lastGoalSnapshot(entries) {
 		if (entry.type === "custom" && entry.customType === "goal-state") snapshot = entry;
 	}
 	return snapshot;
+}
+
+/** Every goal-continuation custom-message entry, in append order. */
+export function continuationEntries(entries) {
+	return entries.filter((e) => e.type === "custom_message" && e.customType === "goal-continuation");
+}
+
+/** Every entry of one custom-message channel, in append order. */
+export function customMessageEntries(entries, customType) {
+	return entries.filter((e) => e.type === "custom_message" && e.customType === customType);
+}
+
+/** Count agent runs that started, from the accumulated RPC event records. */
+export function runCount(session) {
+	return session.records.filter((r) => r.type === "agent_start").length;
+}
+
+/**
+ * Every finalized assistant outcome, in order.
+ *
+ * A test must be able to tell a clean settle from a settle that only happened
+ * because the scripted provider ran out of steps: the provider throws when a
+ * step is missing, which surfaces as `stopReason: "error"` and lets an active
+ * Goal stop for the wrong reason.
+ */
+export function assistantOutcomes(session) {
+	return session.records
+		.filter((r) => r.type === "message_end" && r.message.role === "assistant")
+		.map((r) => ({ stopReason: r.message.stopReason, errorMessage: r.message.errorMessage }));
+}
+
+/** Assistant outcomes that ended the run as a failure (errored or aborted). */
+export function failedAssistantOutcomes(session) {
+	return assistantOutcomes(session).filter((o) => o.stopReason === "error" || o.stopReason === "aborted");
+}
+
+/**
+ * Fail unless every assistant response completed cleanly.
+ *
+ * Used at the end of every Goal test so a green result can only come from the
+ * Goal lifecycle (completion, abort, refusal) and never from a scripted-provider
+ * error such as "no step at index N".
+ */
+export function assertCleanRun(session) {
+	assertOnlyFailures(session, []);
+}
+
+/**
+ * Fail unless the run's only non-clean assistant outcomes are exactly `expected`.
+ *
+ * Used when a failure is the subject of the test (an aborted run, a terminal
+ * provider error) so the expectation is explicit rather than implied.
+ */
+export function assertOnlyFailures(session, expected) {
+	const failed = failedAssistantOutcomes(session);
+	assert.equal(
+		failed.length,
+		expected.length,
+		`expected exactly ${expected.length} failed assistant outcome(s), got ${JSON.stringify(failed)}`,
+	);
+	for (const [index, want] of expected.entries()) {
+		assert.equal(failed[index].stopReason, want.stopReason, `outcome ${index}`);
+		if (want.errorMessage !== undefined) {
+			assert.ok(
+				String(failed[index].errorMessage).includes(want.errorMessage),
+				`outcome ${index} message: expected ${want.errorMessage}, got ${failed[index].errorMessage}`,
+			);
+		}
+	}
 }
