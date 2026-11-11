@@ -65,6 +65,10 @@ test("provider failures are classified from what the evidence actually says", as
 		["Your credit balance is too low to access the Anthropic API", "usage_limited"],
 		["billing hard limit has been reached", "usage_limited"],
 		["You have reached your usage limit for this billing period", "usage_limited"],
+		// Naming the API or the service as the *scope* of a limit does not make the
+		// verb's object a lookup: the usage limit is what was reached.
+		["You have reached your usage limit for the Anthropic API", "usage_limited"],
+		["Monthly usage limit reached for this service", "usage_limited"],
 		// A throttle and an exhausted quota in one failure: the quota decides.
 		["429 rate limit reached; insufficient_quota: current quota exhausted", "usage_limited"],
 		// Negation and sentence boundaries must not be read past.
@@ -92,6 +96,10 @@ test("provider failures are classified from what the evidence actually says", as
 		["The billing limit check reached a timeout while checking your account", "active"],
 		["The spending limit lookup reached a timeout while checking your account", "active"],
 		["The monthly budget service reached a timeout while checking your account", "active"],
+		// ...and the same holds when the limit is the thing that was qualified: the
+		// verb still reached a timeout, not the limit the subject is named after.
+		["The usage limit check reached a timeout while checking your account", "active"],
+		["The billing service reached its rate limit while checking your account", "active"],
 		// ...while a genuine exhaustion keeps its clause: the remark after it is not
 		// what the verb reached.
 		["You have reached your usage limit; please check your plan", "usage_limited"],

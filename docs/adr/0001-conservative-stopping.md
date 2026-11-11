@@ -64,9 +64,12 @@ observable Pi events, with thresholds that are constants rather than settings.
      failure, because it says the plan itself is used up rather than that a rate
      was hit, but not a `reached` whose object is a lookup: "The account quota
      service reached a timeout" is a check that timed out, and qualifying the noun
-     changes nothing. What decides is the verb's object within its own clause, which
-     is also why "You have reached your usage limit; please check your plan" stays
-     genuine exhaustion;
+     changes nothing. What decides is the head of the noun phrase the verb governs,
+     which is also why "You have reached your usage limit; please check your plan"
+     stays genuine exhaustion, and so does naming the API or the service as the
+     scope of the limit — "You have reached your usage limit for the Anthropic API"
+     and "Monthly usage limit reached for this service" reached a usage limit, not a
+     lookup;
    - a bare quota plus an exhaustion verb, which is *not* decisive on its own,
      because that is also exactly how a provider describes a per-minute quota
      metric that resets within a minute. It only counts when its sentence is not
