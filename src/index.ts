@@ -35,16 +35,25 @@
  * verbatim (the quote is corroborated against recent human-authored user
  * messages). Resuming, clearing, and replacing are user-owned.
  *
- * Token budgets, usage accounting, blocked audits, status UI, and the final
- * documentation pass land in their own later tickets.
+ * Usage is accounted durably from finalized Pi messages and reported nested
+ * usage, with stable deduplication (see `accounting.ts`). A Goal with a token
+ * budget transitions to `budget_limited` when its accounted usage reaches the
+ * budget, receives exactly one bounded wrap-up, and then stops continuing —
+ * budget exhaustion is never completion.
+ *
+ * Blocked audits, usage-limit handling, and branch hardening land in their own
+ * later tickets; this milestone deliberately does not implement them.
  */
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	CUSTOM_MESSAGE_TYPE,
+	CUSTOM_WRAPUP_MESSAGE_TYPE,
 	corroboratePauseRequest,
+	formatBudgetWrapUpMessage,
 	formatContinuationMessage,
 	formatEditMessage,
+	formatGoalStatusLine,
 	formatGoalSummary,
 	formatKickoffMessage,
 	formatNoGoal,
@@ -60,14 +69,65 @@ import {
 	toPublicState,
 } from "./goal.ts";
 import { GoalStore, validateObjective, type GoalMutationFailure } from "./store.ts";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	ACCOUNTING_CHECKPOINT_MS,
+	MIN_TOKEN_BUDGET,
+	type BudgetSettings,
+	parseBudgetSettings,
+	resolveGoalTokenBudget,
+} from "./accounting.ts";
 
 /** Auto-decline a replacement confirmation after this long (safe default: no discard). */
 const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
 
+/**
+ * Parsed `/goal` arguments: the objective plus an optional budget request.
+ *
+ * Budget flags are only recognized as a *leading* prefix (`/goal --budget 5000
+ * <objective>`), so an objective that merely contains the word `--budget` is never
+ * silently truncated. `--no-budget` creates an unbounded Goal even when an
+ * extension default is configured, which is why it is a distinct request kind
+ * rather than "no request".
+ */
+export type GoalBudgetRequest =
+	/** No flag given: use the extension default. */
+	| { kind: "default" }
+	/** `--no-budget`: explicitly unbounded. */
+	| { kind: "none" }
+	/** `--budget <n>`: an explicit budget. */
+	| { kind: "value"; value: number };
+
+function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequest } {
+	let rest = raw.trim();
+	let budget: GoalBudgetRequest = { kind: "default" };
+	for (;;) {
+		const match = /^--(budget|no-budget)(?:=(\S+))?(?:\s+|$)/.exec(rest);
+		if (!match) break;
+		const flag = match[1]!;
+		const inline = match[2];
+		rest = rest.slice(match[0].length);
+		if (flag === "no-budget") {
+			budget = { kind: "none" };
+			continue;
+		}
+		if (inline !== undefined) {
+			budget = { kind: "value", value: Number(inline) };
+			continue;
+		}
+		const value = /^(\S+)(?:\s+|$)/.exec(rest);
+		if (!value) break;
+		rest = rest.slice(value[0].length);
+		budget = { kind: "value", value: Number(value[1]) };
+	}
+	return { objective: rest.trim(), budget };
+}
+
 /** How long creation waits for the snapshot to become durable on disk. */
 const DURABILITY_TIMEOUT_MS = 5000;
 const DURABILITY_POLL_MS = 15;
+
+/** Status-bar key used for the compact Goal indicator. */
+const STATUS_KEY = "goal";
 
 /**
  * Uniform error result for the model-facing Goal tools. Keeping one shape means
@@ -156,6 +216,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	let pendingInitialKickoff: GoalBinding | null = null;
 
+	/**
+	 * Extension-level budget configuration, read from Pi's effective settings at
+	 * every session start (so a reload picks up a changed configuration).
+	 */
+	let budgetSettings: BudgetSettings = {
+		defaultTokenBudget: undefined,
+		maxTokenBudget: undefined,
+		problems: [],
+	};
+
 	pi.on("turn_start", () => {
 		const goal = store.get();
 		turnGoal = goal ? { id: goal.id, revision: goal.revision } : null;
@@ -177,12 +247,70 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		return run;
 	}
 
+	/** Compact status line for Pi's footer/status bar, when a UI exists. */
+	function updateStatus(ctx: ExtensionContext): void {
+		const goal = store.get();
+		try {
+			ctx.ui.setStatus(STATUS_KEY, goal ? formatGoalStatusLine(toPublicState(goal)) : undefined);
+		} catch {
+			// Status is a convenience surface; never break a lifecycle event for it.
+		}
+	}
+
+	/**
+	 * Notify from a *lifecycle* handler without ever letting a UI problem break the
+	 * event: accounting and enforcement must survive a status-bar or notification
+	 * failure. Command handlers notify through `ctx.ui.notify` directly — the `/goal`
+	 * handler already wraps everything it does in a try/catch, and a command is
+	 * user-initiated rather than part of Pi's event stream.
+	 */
+	function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void {
+		try {
+			ctx.ui.notify(message, type);
+		} catch {
+			// best effort
+		}
+	}
+
+	/**
+	 * After any accounted usage: enforce the token budget immediately.
+	 *
+	 * The transition is made in memory here so the rest of *this* run stops doing
+	 * Goal work right away, and `budgetGateActive` arms the tool gate for the
+	 * remainder of the run. Nothing is written to the session: Pi appends the
+	 * message that triggered this *after* dispatching `message_end`, so a durable
+	 * write here would land ahead of it and be replayed twice. `flushAccounting`
+	 * persists at a post-persistence boundary instead.
+	 */
+	function afterAccounting(ctx: ExtensionContext): void {
+		const goal = store.get();
+		if (!goal) return;
+		if (goal.status === "active" && store.isBudgetExhausted()) {
+			const limited = store.markBudgetLimited();
+			if (limited.ok) {
+				budgetGateActive = true;
+				notify(
+					ctx,
+					`Goal ${limited.goal.id} reached its token budget of ${limited.goal.tokenBudget} tokens ` +
+						`(${store.getUsage().totalTokens} accounted) and is now budget_limited. ` +
+						"No further Goal work runs; one wrap-up summary follows. " +
+						"Budget exhaustion is not completion.",
+					"warning",
+				);
+			}
+		}
+		updateStatus(ctx);
+	}
+
 	pi.on("session_start", (_event, ctx) => {
+		budgetSettings = parseBudgetSettings(pi.getSettings());
+		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
 		const goal = store.get();
 		if (goal) {
-			ctx.ui.notify(`Goal ${goal.id} restored (${goal.status}).`, "info");
+			notify(ctx, `Goal ${goal.id} restored (${goal.status}).`, "info");
 		}
+		updateStatus(ctx);
 	});
 	/** Whether two reconstructed states are observably the same Goal state. */
 	function sameBranchGoal(
@@ -257,10 +385,174 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
 		notifyBranchChange(ctx, before, after);
+		// The status line follows the selected branch too, and the accounting
+		// baseline is rebuilt with it.
+		updateStatus(ctx);
 	});
 
 	/**
-	 * Automatic continuation, at Pi's safe settlement boundary only.
+	 * Whether the turn currently in flight was Goal work.
+	 *
+	 * Set when a turn's assistant response ends. The distinction matters because a
+	 * lifecycle transition happens *inside* tool execution, which is after
+	 * `message_end`: the turn that completes a Goal (or exhausts its budget) is
+	 * still Goal work and must be accounted, while an ordinary run after the Goal is
+	 * finished is not.
+	 */
+	let turnWasGoalWork = false;
+
+	/**
+	 * Assistant messages already charged, by object identity.
+	 *
+	 * `message_end` is the seam where a turn's usage becomes known, and it runs
+	 * *before* that turn's tool calls — which is what makes the turn that performs a
+	 * lifecycle transition (completion, budget exhaustion) accountable. The charge
+	 * key is therefore a process-local sequence number rather than the session entry
+	 * id, which does not exist yet at this point. That is sound because the ledger is
+	 * rebuilt from the branch on every reconstruction, and a checkpoint is always
+	 * appended *after* the entries it covers: replaying the branch after a restart or
+	 * a tree navigation therefore charges each entry exactly once, never twice.
+	 */
+	const chargedMessages = new WeakSet<object>();
+	let modelMessageSeq = 0;
+
+	/**
+	 * Token accounting, at the only seams where Pi reports finalized usage.
+	 *
+	 * - `message_end` for an assistant response charges the model call.
+	 * - `message_end` for a tool result charges nested model work, keyed by the tool
+	 *   call id. Pi merges nested usage into the calling tool result, so charging the
+	 *   result once is what keeps it from being counted twice.
+	 *
+	 * Both are guarded by the ledger, so a duplicate event, a reconstruction
+	 * replay, or concurrent tool calls inside one turn cannot double-charge.
+	 */
+	pi.on("message_end", (event, ctx) => {
+		const message = event.message;
+		if (message.role === "user") {
+			// A genuine user turn is not Goal work: the budget gate must not block the
+			// tools the user's own request needs, even inside a gated run.
+			budgetGateActive = false;
+			return;
+		}
+		if (message.role === "assistant") {
+			const goal = store.get();
+			turnWasGoalWork = goal != null && goal.status !== "complete";
+			if (!turnWasGoalWork) return;
+			if (chargedMessages.has(message)) return;
+			chargedMessages.add(message);
+			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model");
+			afterAccounting(ctx);
+			return;
+		}
+		if (message.role !== "toolResult") return;
+		if (!turnWasGoalWork) return;
+		store.accountUsage(`toolResult:${message.toolCallId}`, message.usage, "nested");
+		afterAccounting(ctx);
+	});
+
+	/**
+	 * Summarization usage (compaction, branch summaries) is reported on the
+	 * session entry rather than on an assistant message, so it is charged here.
+	 */
+	pi.on("session_compact", (event, ctx) => {
+		const goal = store.get();
+		if (!goal || goal.status === "complete") return;
+		store.accountUsage(event.compactionEntry.id, event.compactionEntry.usage, "nested");
+		afterAccounting(ctx);
+	});
+
+	/**
+	 * Stop the active-time clock when the session runtime goes away, and make the
+	 * accounted time durable so a later resume continues from it instead of
+	 * silently restarting the clock.
+	 */
+	pi.on("session_shutdown", () => {
+		if (!store.get()) return;
+		store.stopClock();
+		// Forced: this is the last chance to make a pending transition and the
+		// accounted active time durable.
+		store.flushAccounting(pi, true);
+	});
+
+	/**
+	 * Budget gate bookkeeping.
+	 *
+	 * `budgetGateActive` blocks tool calls while a run must not do Goal work. It is
+	 * armed in two situations and cleared in exactly one place:
+	 *
+	 * - the run that *crosses* the budget (so its remaining turns cannot do
+	 *   substantive work), and
+	 * - the run that delivers the one bounded wrap-up.
+	 *
+	 * It is cleared only at `agent_settled`, because Pi's `agent_end` is explicitly
+	 * *not* final: retry backoff and final-attempt recovery still happen after it, and
+	 * so does a compaction retry. Clearing earlier would let a retried wrap-up run
+	 * tools and produce extra model turns. Clearing at settlement is also what stops a
+	 * stale flag from blocking a later, unrelated run — including the case where an
+	 * abort during `agent_before_settle` commits the entries but suppresses the
+	 * requested continuation.
+	 *
+	 * `wrapUpArmed` is the hand-off between delivering the wrap-up and the run it
+	 * requests actually starting.
+	 */
+	let wrapUpArmed = false;
+	let budgetGateActive = false;
+
+	pi.on("agent_start", () => {
+		if (!wrapUpArmed) return;
+		wrapUpArmed = false;
+		budgetGateActive = true;
+	});
+
+	/**
+	 * Persist accounting now that this turn's entries are on the branch.
+	 *
+	 * Pi appends a message *after* dispatching its `message_end` handlers, so a write
+	 * made there would sit ahead of the entry it already accounts for and be replayed
+	 * twice after a crash. `turn_end` is the first boundary where the assistant
+	 * message and every tool result of the turn are already durable, so checkpoints and
+	 * pending lifecycle transitions are written here.
+	 */
+	pi.on("turn_end", () => {
+		store.flushAccounting(pi);
+	});
+
+	/** Refresh the status line and persist accounting once Pi will not continue. */
+	pi.on("agent_settled", (_event, ctx) => {
+		budgetGateActive = false;
+		wrapUpArmed = false;
+		store.flushAccounting(pi);
+		updateStatus(ctx);
+	});
+
+	/**
+	 * Enforcement seam for the budget boundary and the wrap-up.
+	 *
+	 * Asking the model not to call tools is not a bound: a model that reaches for a
+	 * tool would otherwise execute it and drive a further model request. So while
+	 * the gate is armed every tool call is blocked *and* the batch is terminated, which
+	 * is Pi's documented mechanism for stopping after the current tool batch. The
+	 * result is no substantive work and no additional model turn.
+	 *
+	 * The gate returns nothing while disarmed, so other extensions' `tool_call`
+	 * decisions are completely untouched outside a gated run.
+	 */
+	pi.on("tool_call", () => {
+		if (!budgetGateActive) return;
+		return {
+			block: true,
+			terminate: true,
+			reason:
+				`Goal ${store.get()?.id ?? ""} exhausted its token budget, so this run may not call tools. ` +
+				"Answer in text only: for the wrap-up, verified progress, remaining work, blockers, and the " +
+				"single next useful action.",
+		};
+	});
+
+	/**
+	 * Automatic continuation and the one bounded budget wrap-up, at Pi's safe
+	 * settlement boundary only.
 	 *
 	 * `agent_before_settle` is the one seam where Pi has finished every automatic
 	 * follow-up it owns (retries, final-attempt recovery, compaction retries,
@@ -268,11 +560,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * races or duplicates those mechanisms; continuing from a timer or from
 	 * `agent_end` would.
 	 *
-	 * Guards, all of which must hold:
-	 * - a Goal exists and is active (completed, paused, cleared, and absent Goals
-	 *   never continue), and
+	 * Guards, all of which must hold for an ordinary continuation:
+	 * - a Goal exists and is active (completed, budget-limited, paused, cleared,
+	 *   and absent Goals never continue), and
 	 * - the run completed (aborted and errored runs are hard exits: Pi owns
 	 *   retries, so re-driving them here would be an unattended retry loop).
+	 *
+	 * A budget-limited Goal with a pending wrap-up gets exactly one bounded
+	 * wrap-up message and one further request, and then nothing: the flag is
+	 * durable, so neither a duplicate boundary event nor a restart can deliver a
+	 * second one. Like an ordinary continuation it is only requested after a
+	 * completed run, so a provider error never turns into an unattended retry. The
+	 * run it requests is *enforced* as a single response: see the `tool_call` gate
+	 * above, which blocks and terminates any tool call the wrap-up attempts.
 	 *
 	 * Composition: entries proposed by other extensions are chained, never
 	 * replaced, and `continue: true` only *ensures* one further provider request.
@@ -282,7 +582,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	pi.on("agent_before_settle", async (event, _ctx) => {
 		const goal = store.get();
-		if (!goal || goal.status !== "active") return;
+		if (!goal) return;
 		if (pendingInitialKickoff && goal.id === pendingInitialKickoff.id) {
 			// `/goal <objective>` has not sent its kickoff yet. Let the ordinary
 			// run settle so the command can start work itself (or observe a
@@ -293,6 +593,31 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (event.outcome !== "completed") return;
+
+		// Every entry this run produced is durable by now, so a pending transition is
+		// written before the wrap-up snapshot that follows it.
+		store.flushAccounting(pi);
+
+		if (store.isWrapUpPending()) {
+			// Exactly one bounded wrap-up, then the Goal stops for good.
+			const delivered = store.consumeWrapUp(pi);
+			if (!delivered.ok) return;
+			wrapUpArmed = true;
+			return {
+				entries: [
+					...event.entries,
+					{
+						type: "custom_message",
+						customType: CUSTOM_WRAPUP_MESSAGE_TYPE,
+						content: formatBudgetWrapUpMessage(delivered.goal),
+						display: true,
+					},
+				],
+				continue: true,
+			};
+		}
+
+		if (goal.status !== "active") return;
 		return {
 			entries: [
 				...event.entries,
@@ -311,13 +636,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		name: "get_goal",
 		label: "Get Goal",
 		description:
-			"Get the current session Goal: objective, lifecycle status, revision, token budget, " +
-			"and the usage fields that are currently available. Returns goal: null when no Goal is set.",
+			"Get the current session Goal: objective, lifecycle status, revision, token budget, accounted " +
+			"usage, remaining capacity, and active time. Returns goal: null when no Goal is set.",
 		parameters: Type.Object({}),
 		outputSchema: getGoalOutputSchema,
-		promptSnippet: "Fetch the current session Goal objective and lifecycle status",
+		promptSnippet: "Fetch the current session Goal objective, lifecycle status, and budget",
 		promptGuidelines: [
 			"Use get_goal when the session Goal objective or its lifecycle status is absent or truncated in the current context.",
+			"Check get_goal's usage.remainingTokens before starting expensive work: a Goal that reaches its token budget becomes budget_limited and stops continuing.",
 		],
 		async execute() {
 			const goal = store.get();
@@ -342,20 +668,33 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Create Goal",
 		description:
 			"Create a persistent Goal for an explicit user or system request. " +
-			"Refuses when this session already has a Goal.",
+			"Refuses when this session already has a Goal, and refuses a token budget above the configured maximum.",
 		parameters: Type.Object({
 			objective: Type.String({ minLength: MIN_OBJECTIVE_LENGTH, maxLength: MAX_OBJECTIVE_LENGTH }),
+			tokenBudget: Type.Optional(
+				Type.Integer({
+					minimum: MIN_TOKEN_BUDGET,
+					description:
+						"Optional token budget for this Goal. Omit it to use the extension default. " +
+						"Reaching it makes the Goal budget_limited, which stops continuation and is not completion.",
+				}),
+			),
 		}),
 		outputSchema: getGoalOutputSchema,
 		promptSnippet: "Create a persistent session Goal from an explicit user or system request",
 		promptGuidelines: [
 			"Call create_goal only when the user or the system explicitly asked for a Goal. Never infer one because a task looks large.",
 			"Do not call create_goal while this session already has a Goal; it is refused. Use get_goal to inspect the current Goal instead.",
+			"Only set tokenBudget when the user asked for a specific budget; otherwise omit it and let the configured default apply.",
 		],
-		async execute(_toolCallId: string, params: { objective: string }, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId: string, params: { objective: string; tokenBudget?: number }, _signal, _onUpdate, ctx) {
 			const validation = validateObjective(String(params.objective ?? ""));
 			if (!validation.ok) {
 				return goalToolError(validation.error, null);
+			}
+			const budget = resolveGoalTokenBudget(params.tokenBudget, budgetSettings);
+			if (!budget.ok) {
+				return goalToolError(budget.error, null);
 			}
 			// A Goal is durable session state, so it needs a session that persists.
 			// Refuse loudly instead of promising a restart survival that cannot happen.
@@ -379,7 +718,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					toPublicState(existing),
 				);
 			}
-			const goal = store.create(validation.objective, "tool");
+			const goal = store.create(validation.objective, "tool", { tokenBudget: budget.tokenBudget });
 			try {
 				// Stage before announcing: a write failure here abandons creation with no
 				// visible state change, and the attempt can simply be retried.
@@ -805,7 +1144,21 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	async function createOrReplaceGoal(rawObjective: string, ctx: ExtensionCommandContext): Promise<void> {
-		const validation = validateObjective(rawObjective);
+		// Budget flags are a leading prefix of a create (`/goal --budget 5000 <objective>`),
+		// so an objective that merely contains the word `--budget` is never truncated.
+		// `--no-budget` asks for an unbounded Goal even when a default is configured.
+		const parsed = parseGoalArgs(rawObjective);
+		// `resolveGoalTokenBudget` owns the request kinds, so an explicit unbounded
+		// request is refused (never clamped) while a maximum is configured.
+		const budget = resolveGoalTokenBudget(
+			parsed.budget.kind === "none" ? "none" : parsed.budget.kind === "value" ? parsed.budget.value : undefined,
+			budgetSettings,
+		);
+		if (!budget.ok) {
+			ctx.ui.notify(budget.error, "error");
+			return;
+		}
+		const validation = validateObjective(parsed.objective);
 		if (!validation.ok) {
 			ctx.ui.notify(validation.error, "error");
 			return;
@@ -858,7 +1211,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const previous = store.get();
 			const replacing = previous != null;
 
-			const goal = store.create(validation.objective, "command");
+			const goal = store.create(validation.objective, "command", { tokenBudget: budget.tokenBudget });
 			const sameRecord = (candidate: GoalRecord | null | undefined) =>
 				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
 			try {

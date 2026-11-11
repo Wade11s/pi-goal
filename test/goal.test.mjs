@@ -111,8 +111,16 @@ test("/goal <objective> stores an active Goal, starts initial work, and get_goal
 		assert.equal(state.revision, 0);
 		assert.ok(state.id.startsWith("goal_"));
 		assert.equal(state.tokenBudget, null);
-		assert.equal(state.usage.totalTokens, null);
-		assert.equal(state.usage.activeSeconds, null);
+		assert.equal(state.remainingTokens, null);
+		assert.equal(state.budgetExhausted, false);
+		// Usage is charged when the response that produced this call ends, so the
+		// tool already sees this turn's own usage (120 input + 8 output) but nothing
+		// from later turns.
+		assert.equal(state.usage.totalTokens, 128);
+		assert.equal(state.usage.activeSeconds, 0);
+		assert.equal(state.usage.cachedReadTokens, 0);
+		assert.equal(state.usage.reasoningTokens, 0);
+		assert.equal(state.usage.nestedTokens, 0);
 
 		// The kickoff user message carried the objective into model context.
 		const kickoffEnd = session.records.find(
@@ -139,7 +147,7 @@ test("/goal <objective> stores an active Goal, starts initial work, and get_goal
 	}
 });
 
-test("bare /goal reports objective, lifecycle status, and available usage fields", async () => {
+test("bare /goal reports objective, lifecycle status, accounted usage, and remaining capacity", async () => {
 	const session = await PiRpcSession.start();
 	// Kickoff, its continuation, and a held response so the loop can be stopped
 	// deliberately with the Goal still active.
@@ -155,8 +163,11 @@ test("bare /goal reports objective, lifecycle status, and available usage fields
 		assert.equal(notify.notifyType, "info");
 		assert.match(notify.message, /active/);
 		assert.match(notify.message, /Revision: 0/);
-		assert.match(notify.message, /Token usage: not tracked yet/);
-		assert.match(notify.message, /Active time: not tracked yet/);
+		assert.match(notify.message, /Token budget: none \(unbounded\)/);
+		assert.match(notify.message, /Token usage: 45 tokens \(input 30, output 15 including reasoning 0/);
+		assert.match(notify.message, /cached read 0 excluded as reuse/);
+		assert.match(notify.message, /Active time: \d+s/);
+		assert.match(notify.message, /Remaining capacity: unlimited/);
 
 		// Status reporting never starts an agent run by itself.
 		assert.equal(session.records.filter((r) => r.type === "agent_start").length, runsBefore);
@@ -167,6 +178,7 @@ test("bare /goal reports objective, lifecycle status, and available usage fields
 			const state = toolEnd.result.structuredContent?.goal ?? toolEnd.result.details?.goal;
 			assert.equal(state.objective, OBJECTIVE);
 			assert.equal(state.status, "active");
+			assert.equal(state.usage.totalTokens, 45);
 		}
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
@@ -281,9 +293,22 @@ test("extension reload reconstructs the Goal (runtime replacement via session sw
 			(r) => r.message.includes("Restore me after reload") && r.message.includes("active"),
 		);
 		assert.ok(notify);
+		// 15 per completed run plus the 15 Pi reports for the aborted request.
+		// Reconstruction replays the branch from after the last checkpoint, so the
+		// accounted usage is the same value, not double the value.
+		assert.match(notify.message, /Token usage: 45 tokens/);
 
 		const entries = readSessionEntries(sessionFile);
-		assert.equal(lastGoalSnapshot(entries).data.goal.objective, "Restore me after reload");
+		const snapshot = lastGoalSnapshot(entries);
+		assert.equal(snapshot.data.goal.objective, "Restore me after reload");
+		// The live accounting view is never written back into the persisted entry: the
+		// durable snapshot still carries the zeroed totals it was created with, and the
+		// accounted usage lives in the goal-usage checkpoints and the branch replay.
+		assert.equal(snapshot.data.goal.usage.totalTokens, 0);
+		assert.equal(
+			entries.filter((e) => e.type === "custom" && e.customType === "goal-usage").at(-1)?.data.usage.totalTokens,
+			45,
+		);
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();

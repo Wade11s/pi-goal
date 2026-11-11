@@ -16,10 +16,25 @@
  * visible, and `rollback()` retracts it with a durable tombstone. Pi 1.5.1
  * defers creating the session file until the first user/assistant message, so
  * durability is confirmed separately (`isDurable`) before success is reported.
+ *
+ * Usage accounting lives here too, because it is durable state with the same
+ * reconstruction rules:
+ *
+ * - **Tokens** are charged from finalized Pi messages and reported nested usage,
+ *   keyed so that each report is charged exactly once (see `accounting.ts`). A
+ *   checkpoint (`goal-usage`) records the accounted totals plus the active time;
+ *   on reconstruction the branch is replayed from after the newest checkpoint or
+ *   snapshot, so usage accrued since the last durable write is recovered instead
+ *   of lost, and a reload can never charge it twice.
+ * - **Active time** runs on a monotonic clock while a Goal is active in a live
+ *   session. Folding a segment into the record is exact, so lifecycle boundaries
+ *   neither lose nor double-count time, and a stopped Goal (complete,
+ *   budget-limited) or a shut-down process stops the clock.
  */
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
 import {
 	CUSTOM_ENTRY_TYPE,
 	GOAL_STATUSES,
@@ -29,13 +44,38 @@ import {
 	type GoalBinding,
 	MAX_OBJECTIVE_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
+	USAGE_ENTRY_TYPE,
 } from "./goal.ts";
+import {
+	ACCOUNTING_CHECKPOINT_MS,
+	ActiveTimeTracker,
+	type GoalUsage,
+	isBudgetExhausted,
+	normalizeUsage,
+	UsageLedger,
+	type UsageSource,
+	zeroGoalUsage,
+} from "./accounting.ts";
 
 const GOAL_STATUS_SET = new Set<string>(GOAL_STATUSES);
 
 function goalId(): string {
 	// 8 hex chars from a UUID; stable across continuation, compaction, and restore.
 	return `goal_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+}
+
+/** Payload persisted in `goal-usage` custom session entries. */
+export interface UsageCheckpoint {
+	version: 1;
+	/** The Goal these totals belong to; a checkpoint for another Goal is ignored. */
+	goalId: string;
+	usage: GoalUsage;
+}
+
+function isUsageCheckpoint(value: unknown): value is UsageCheckpoint {
+	if (!value || typeof value !== "object") return false;
+	const record = value as Record<string, unknown>;
+	return record.version === 1 && typeof record.goalId === "string" && typeof record.usage === "object";
 }
 
 /**
@@ -54,9 +94,53 @@ export type GoalMutationResult =
 /** The failure side of {@link GoalMutationResult}. */
 export type GoalMutationFailure = Extract<GoalMutationResult, { ok: false }>;
 
+/**
+ * Outcome of exhausting the token budget.
+ *
+ * There is no `persistence` outcome because nothing is written here: the
+ * transition is made in memory so enforcement is immediate, and
+ * `flushAccounting` persists it later (see `pendingTransition`).
+ */
+export type BudgetLimitedResult = { ok: true; goal: GoalRecord } | { ok: false; reason: "not-active" };
+
+/** Outcome of delivering the one bounded budget wrap-up. */
+export type WrapUpResult =
+	| { ok: true; goal: GoalRecord }
+	| { ok: false; reason: "not-pending" }
+	| { ok: false; reason: "persistence"; error: unknown };
+
+/** Options accepted when creating a Goal record. */
+export interface CreateGoalOptions {
+	/** Explicit token budget; undefined means "use the configured default". */
+	tokenBudget?: number;
+}
+
 export class GoalStore {
 	/** undefined = not reconstructed yet; null = no Goal (or tombstone); record = present. */
 	private current: GoalRecord | null | undefined = undefined;
+
+	/** Token ledger with stable deduplication. */
+	private readonly ledger = new UsageLedger();
+
+	/** Monotonic active-time clock for the current Goal. */
+	private readonly clock = new ActiveTimeTracker();
+
+	/**
+	 * An in-memory lifecycle transition that is not durable yet.
+	 *
+	 * Pi dispatches `message_end` to extensions *before* it appends the message that
+	 * triggered it, so a snapshot written from inside that handler would sit on the
+	 * branch *ahead* of the entry it already accounts for — and a reconstruction would
+	 * replay that entry and charge it a second time. The budget transition is therefore
+	 * made in memory immediately (so enforcement and status are instant) and persisted
+	 * later, at a boundary where the triggering entry is already on the branch
+	 * (`turn_end`, `agent_before_settle`, `agent_settled`, shutdown).
+	 *
+	 * Every other transition writes durably through `commitSnapshot` before it is
+	 * visible, and each of those writes supersedes a transition still waiting here:
+	 * the newer snapshot carries the current status, revision, and totals.
+	 */
+	private pendingTransition: GoalRecord | undefined;
 
 	/**
 	 * Rebuild state from the active branch. Called on session_start (startup,
@@ -72,32 +156,157 @@ export class GoalStore {
 	 * Returns the reconstructed state so the caller can observe what changed;
 	 * never throws for bad entry data (reconstruction failures are logged and
 	 * leave the Goal absent) because a broken entry must not break the session.
+	 *
+	 * Usage accounting is rebuilt here too, because it is durable state with the
+	 * same reconstruction rules: the branch is replayed from after the newest
+	 * snapshot so usage accrued since the last durable write is recovered rather
+	 * than lost, and the accounting checkpoints met on the way are verified
+	 * against the replay instead of being trusted outright (see `replayBranch`).
 	 */
 	reconstruct(ctx: ExtensionContext): GoalRecord | null {
 		let restored: GoalRecord | null = null;
 		let seen = false;
+		let usage = zeroGoalUsage();
+		// Branch index of the newest entry that carries accounted totals for the
+		// restored Goal. Everything after it is replayed, everything up to it is
+		// already inside `usage`.
+		let baselineIndex = -1;
 		try {
-			for (const entry of ctx.sessionManager.getBranch()) {
-				if (entry.type !== "custom" || entry.customType !== CUSTOM_ENTRY_TYPE) continue;
-				const snapshot = entry.data as GoalSnapshot | undefined;
-				if (!snapshot || typeof snapshot !== "object" || snapshot.version !== 1) continue;
-				if (!isGoalRecord(snapshot.goal)) continue;
-				seen = true;
-				restored = snapshot.goal;
+			const branch = ctx.sessionManager.getBranch();
+			for (let index = 0; index < branch.length; index++) {
+				const entry = branch[index]!;
+				if (entry.type !== "custom") continue;
+				if (entry.customType === CUSTOM_ENTRY_TYPE) {
+					const snapshot = entry.data as GoalSnapshot | undefined;
+					if (!snapshot || typeof snapshot !== "object" || snapshot.version !== 1) continue;
+					if (!isGoalRecord(snapshot.goal)) continue;
+					seen = true;
+					// A `null` goal is the durable tombstone: it clears the Goal and resets
+					// the accounting baseline with it.
+					// The record is copied, never adopted: the session manager owns the entry
+					// object, and publishing the live accounting view onto it (see
+					// `refreshUsage`) would leak in-memory state into durable state.
+					restored = snapshot.goal ? { ...snapshot.goal } : null;
+					usage = snapshot.goal ? normalizeUsage(snapshot.goal.usage) : zeroGoalUsage();
+					baselineIndex = index;
+					continue;
+				}
+				if (entry.customType === USAGE_ENTRY_TYPE) {
+					const checkpoint = entry.data as UsageCheckpoint | undefined;
+					if (!isUsageCheckpoint(checkpoint)) continue;
+					// A checkpoint only counts for the Goal that is current at that
+					// point on the branch, and only if it is newer than the baseline.
+					if (!restored || checkpoint.goalId !== restored.id) continue;
+					if (index < baselineIndex) continue;
+					usage = normalizeUsage(checkpoint.usage);
+					baselineIndex = index;
+				}
 			}
 		} catch (error) {
 			// Never break the session on corrupt entries; report and keep absent state.
 			console.error("[pi-goal] failed to reconstruct Goal state:", error);
 			this.current = null;
+			this.ledger.restore(zeroGoalUsage());
+			this.clock.reset();
 			return null;
 		}
 		this.current = seen ? restored : null;
+		this.pendingTransition = undefined;
+		this.ledger.restore(usage);
+		this.clock.reset();
+		this.clock.persisted(usage.activeMs);
+		// Replay everything after the baseline so usage accrued since the last
+		// durable write is recovered, not lost, and cannot be charged twice.
+		//
+		// A *complete* Goal is terminal, so nothing after its snapshot is Goal work:
+		// the live path excludes those responses (the completing turn is charged at
+		// `message_end`, before the tool that completes it), and the replay must draw
+		// the same line. Without this, an unclean restart would reclassify the
+		// post-completion response as Goal usage and inflate the total.
+		if (this.current && this.current.status !== "complete") {
+			this.replayBranch(ctx, baselineIndex);
+			// The replay may have adopted a checkpoint's accounted active time, so the
+			// clock resumes from the newest durable value rather than the snapshot's.
+			this.clock.persisted(this.ledger.usage.activeMs);
+		}
+		if (this.current?.status === "active") this.clock.start();
 		return this.current;
+	}
+
+	/**
+	 * Charge every usage-bearing session entry after `afterIndex`, verifying the
+	 * accounting checkpoints found on the way.
+	 *
+	 * This is the recovery half of the ledger: it makes a restart, a reload, or a
+	 * tree navigation converge on the totals the live event path produced, because
+	 * both charge each entry exactly once — the live path while the entry is created,
+	 * the replay for everything the newest durable baseline does not already cover.
+	 */
+	private replayBranch(ctx: ExtensionContext, afterIndex: number): void {
+		let branch;
+		try {
+			branch = ctx.sessionManager.getBranch();
+		} catch (error) {
+			console.error("[pi-goal] failed to replay Goal usage:", error);
+			return;
+		}
+		for (let index = afterIndex + 1; index < branch.length; index++) {
+			const entry = branch[index]!;
+			if (entry.type === "message") {
+				const message = entry.message;
+				if (message.role === "assistant") {
+					this.ledger.account(entry.id, message.usage, "model");
+				} else if (message.role === "toolResult") {
+					// Nested usage arrives merged into the tool result's own `usage`,
+					// so charging the result once is what keeps it from being counted
+					// twice.
+					this.ledger.account(`toolResult:${message.toolCallId}`, message.usage, "nested");
+				}
+				continue;
+			}
+			if (entry.type !== "compaction" && entry.type !== "branch_summary") continue;
+			if (!entry.usage) continue;
+			this.ledger.account(entry.id, entry.usage, "nested");
+		}
 	}
 
 	/** Current record, or undefined when not yet reconstructed. */
 	get(): GoalRecord | null | undefined {
+		this.refreshUsage();
 		return this.current;
+	}
+
+	/**
+	 * Current accounted usage (a copy): the ledger's token totals plus the live
+	 * active time.
+	 *
+	 * This is the same view `get()` publishes onto the record, so the two can never
+	 * disagree: the ledger itself only carries tokens, and the active time always
+	 * comes from the clock (the ledger's own `activeMs` would be whatever the last
+	 * restore happened to carry).
+	 */
+	getUsage(): GoalUsage {
+		this.refreshUsage();
+		return this.liveUsage();
+	}
+
+	/** Live accounting view: ledger totals plus the currently running active time. */
+	private liveUsage(): GoalUsage {
+		return { ...this.ledger.usage, activeMs: this.clock.activeMs };
+	}
+
+	/**
+	 * Publish the live accounting view onto the in-memory record.
+	 *
+	 * The durable snapshot freezes usage at the moment it is written; the record in
+	 * memory always carries the live view, so `/goal`, `get_goal`, and the status
+	 * line report what has been accounted *now* rather than what the last snapshot
+	 * happened to capture. The record this writes to is always a private copy (see
+	 * `adopt`), so in-memory accounting never leaks into durable state.
+	 */
+	private refreshUsage(): void {
+		if (!this.current) return;
+		this.current.usage = this.liveUsage();
 	}
 
 	/**
@@ -118,13 +327,35 @@ export class GoalStore {
 	}
 
 	/**
+	 * Append a snapshot of a *copy* of `goal`.
+	 *
+	 * Pi's session manager retains the object it is given, so handing it the live
+	 * record would let in-memory accounting (see `refreshUsage`) leak into durable
+	 * state — and a later same-process reconstruction would then read a polluted
+	 * baseline and charge the same entries twice. Copying here is what keeps the
+	 * durable snapshot and the live record independent objects.
+	 */
+	private persistSnapshot(pi: ExtensionAPI, goal: GoalRecord): void {
+		pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: { ...goal } } satisfies GoalSnapshot);
+	}
+
+	/**
+	 * Adopt a *copy* of `goal` as the live record, for the same reason
+	 * `persistSnapshot` copies: one object must never be both the live record and a
+	 * persisted entry.
+	 */
+	private adopt(goal: GoalRecord): GoalRecord {
+		return { ...goal };
+	}
+
+	/**
 	 * Write the snapshot as a custom entry. Throws on write failure without
 	 * changing in-memory state, so a failed stage can simply be abandoned.
 	 * The entry participates in the session tree, so forks and tree navigation
 	 * see branch-correct state.
 	 */
 	stage(pi: ExtensionAPI, goal: GoalRecord): void {
-		pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal } satisfies GoalSnapshot);
+		this.persistSnapshot(pi, goal);
 	}
 
 	/**
@@ -160,7 +391,40 @@ export class GoalStore {
 
 	/** Make a staged Goal visible to /goal and get_goal. */
 	commit(goal: GoalRecord): void {
-		this.current = goal;
+		this.current = this.adopt(goal);
+		// A newly created Goal starts its accounting from zero, even when the
+		// session already burned tokens before it existed, and no transition of a
+		// Goal that no longer exists is still waiting to be written.
+		this.pendingTransition = undefined;
+		this.ledger.restore(zeroGoalUsage());
+		this.clock.reset();
+		if (goal.status === "active") this.clock.start();
+	}
+
+	/**
+	 * Charge one usage report exactly once.
+	 *
+	 * `key` is the identity the accounting path guarantees: a sequence number for an
+	 * assistant message, `toolResult:<toolCallId>` for tool-performed nested work, or
+	 * the session entry id of a summarization entry. Returns the contribution when
+	 * the key was new.
+	 */
+	accountUsage(key: string, usage: Usage | undefined, source: UsageSource) {
+		// One rule, enforced here so the live path and the branch replay cannot drift
+		// apart: a tool result that arrives after the Goal was completed belongs to the
+		// suffix the replay deliberately skips (the completion snapshot is the replay
+		// baseline), so it is not Goal work either.
+		if (source === "nested" && this.current?.status === "complete") return undefined;
+		const contribution = this.ledger.account(key, usage, source);
+		if (contribution) this.refreshUsage();
+		return contribution;
+	}
+
+	/** Whether the token budget is exhausted for the current Goal. */
+	isBudgetExhausted(): boolean {
+		const goal = this.current;
+		if (!goal) return false;
+		return isBudgetExhausted(goal.tokenBudget, this.ledger.usage.totalTokens);
 	}
 
 	/**
@@ -170,15 +434,55 @@ export class GoalStore {
 	 * failure without changing in-memory state, so returning without throwing
 	 * means the transition is already durable — every caller can announce it.
 	 * This is the shared seam for every lifecycle transition after creation.
+	 *
+	 * Two accounting rules ride along, and both matter for exactly-once accounting:
+	 *
+	 * - the snapshot carries the **live** accounting view, so every durable write
+	 *   reflects every usage already present on the branch when it is made — not the
+	 *   totals some earlier decision froze; and
+	 * - it supersedes any transition still waiting to be written (see
+	 *   `pendingTransition`), because this snapshot is newer and complete.
+	 *
+	 * Both the appended entry and the adopted record are copies: Pi's session
+	 * manager retains the object it is handed, so one object must never be both the
+	 * live record and a persisted entry.
 	 */
-	private commitSnapshot(pi: ExtensionAPI, goal: GoalRecord | null): GoalMutationResult {
+	private commitSnapshot(
+		pi: ExtensionAPI,
+		goal: GoalRecord,
+	): { ok: true; goal: GoalRecord } | { ok: false; reason: "persistence"; error: unknown } {
+		// Every durable snapshot carries the live accounting view, so it reflects every
+		// usage already present on the branch when it is written rather than the totals
+		// some earlier decision froze.
+		const record: GoalRecord = { ...goal, usage: this.liveUsage() };
 		try {
-			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal } satisfies GoalSnapshot);
+			this.persistSnapshot(pi, record);
 		} catch (error) {
 			return { ok: false, reason: "persistence", error };
 		}
-		this.current = goal;
-		return { ok: true, goal };
+		this.current = this.adopt(record);
+		// This snapshot is newer and complete, so a transition still waiting to be
+		// written (see `pendingTransition`) is superseded by it.
+		this.pendingTransition = undefined;
+		return { ok: true, goal: record };
+	}
+
+	/**
+	 * Append the durable tombstone (`goal: null`) and clear the in-memory Goal.
+	 * Separate from {@link commitSnapshot} because a cleared Goal has no accounting
+	 * left to carry and no transition left waiting.
+	 */
+	private commitTombstone(pi: ExtensionAPI): GoalMutationResult {
+		try {
+			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
+		} catch (error) {
+			return { ok: false, reason: "persistence", error };
+		}
+		this.current = null;
+		this.pendingTransition = undefined;
+		this.ledger.restore(zeroGoalUsage());
+		this.clock.reset();
+		return { ok: true, goal: null };
 	}
 
 	/**
@@ -198,15 +502,16 @@ export class GoalStore {
 
 	/**
 	 * Mark the current active Goal complete. Increments revision and updates
-	 * timestamp, and stages the snapshot durably through the supplied Pi API.
+	 * timestamp, folds the accounted usage into the snapshot, and stages it
+	 * durably through the supplied Pi API.
 	 *
 	 * Only an active Goal can be completed, so a second call (for example two
 	 * update_goal calls in one assistant turn) is refused instead of appending a
 	 * duplicate snapshot. Completion is terminal for this Goal identity: the
-	 * continuation seam never restarts a complete Goal. `expected` binds the
-	 * completion to the Goal revision the model's call was prepared against, so
-	 * a stale held response cannot complete a Goal the user has since edited,
-	 * replaced, paused, or resumed.
+	 * continuation seam never restarts a complete Goal, and its clock stops.
+	 * `expected` binds the completion to the Goal revision the model's call was
+	 * prepared against, so a stale held response cannot complete a Goal the user
+	 * has since edited, replaced, paused, or resumed.
 	 *
 	 * A write failure is reported as `persistence` and leaves the in-memory Goal
 	 * untouched and still active, so a retry is possible and no phantom complete
@@ -226,12 +531,22 @@ export class GoalStore {
 				message: `only an active Goal can be completed (current status: ${current.status})`,
 			};
 		}
-		return this.commitSnapshot(pi, {
+		// Completion is terminal for accounting: the clock stops at the transition and
+		// the snapshot carries the folded value.
+		const activeMs = this.clock.stop();
+		const result = this.commitSnapshot(pi, {
 			...current,
 			status: "complete",
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		});
+		if (!result.ok) {
+			// The Goal is still active, so the clock keeps running.
+			this.clock.start();
+			return result;
+		}
+		this.clock.persisted(activeMs);
+		return result;
 	}
 
 	/**
@@ -242,6 +557,10 @@ export class GoalStore {
 	 * work; aborting stays with the user. `expected` binds the pause to the Goal
 	 * revision the model's call was prepared against (stale held responses are
 	 * refused); user commands omit it and act on the state they just read.
+	 *
+	 * A paused Goal does not accrue active time, so its clock stops here exactly as
+	 * it does for a terminal status, and the snapshot carries the folded value.
+	 * `markResumed` restarts it.
 	 */
 	markPaused(pi: ExtensionAPI, expected?: GoalBinding): GoalMutationResult {
 		const current = this.current;
@@ -257,12 +576,20 @@ export class GoalStore {
 				message: `only an active Goal can be paused (current status: ${current.status})`,
 			};
 		}
-		return this.commitSnapshot(pi, {
+		const activeMs = this.clock.stop();
+		const result = this.commitSnapshot(pi, {
 			...current,
 			status: "paused",
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		});
+		if (!result.ok) {
+			// The Goal is still active, so the clock keeps running.
+			this.clock.start();
+			return result;
+		}
+		this.clock.persisted(activeMs);
+		return result;
 	}
 
 	/**
@@ -270,7 +597,8 @@ export class GoalStore {
 	 * visible; restarting work is the caller's job (a resume kickoff message), so
 	 * resuming while a run is in flight can steer instead of waiting for idle.
 	 * The revision bump records the resume as its own transition, giving later
-	 * accounting a fresh baseline at this snapshot.
+	 * accounting a fresh baseline at this snapshot. Work restarts, so the
+	 * active-time clock restarts with it.
 	 */
 	markResumed(pi: ExtensionAPI): GoalMutationResult {
 		const current = this.current;
@@ -280,22 +608,25 @@ export class GoalStore {
 		if (current.status !== "paused") {
 			return {
 				ok: false,
-			reason: "not-eligible",
+				reason: "not-eligible",
 				message: `only a paused Goal can be resumed (current status: ${current.status})`,
 			};
 		}
-		return this.commitSnapshot(pi, {
+		const result = this.commitSnapshot(pi, {
 			...current,
 			status: "active",
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		});
+		if (!result.ok) return result;
+		this.clock.start();
+		return result;
 	}
 
 	/**
 	 * Edit the objective of the current Goal in place: the identity, creation
-	 * time, origin, budget, and (future) usage history are all preserved, only
-	 * the objective changes and the revision advances. A complete Goal is a
+	 * time, origin, budget, and usage history are all preserved, only the
+	 * objective changes and the revision advances. A complete Goal is a
 	 * finished identity and cannot be edited — replacing it is a new Goal.
 	 */
 	editObjective(pi: ExtensionAPI, objective: string): GoalMutationResult {
@@ -328,7 +659,160 @@ export class GoalStore {
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
-		return this.commitSnapshot(pi, null);
+		return this.commitTombstone(pi);
+	}
+
+	/**
+	 * Exhaust the token budget in memory: transition the active Goal to
+	 * `budget_limited`, stop its active-time clock, and arm the one bounded wrap-up.
+	 *
+	 * Budget exhaustion is never completion: the status is `budget_limited`, the
+	 * `wrapUpPending` flag is armed so the wrap-up is delivered exactly once (even
+	 * across a restart), and the continuation seam treats the Goal as finished for
+	 * continuation purposes.
+	 *
+	 * Nothing is written here. The caller enforces the budget immediately (that is
+	 * the point of doing it in memory), and `flushAccounting` persists the transition
+	 * at a post-persistence boundary so the snapshot never lands ahead of the entry
+	 * it already accounts for. There is no `GoalBinding` to check because the
+	 * transition is extension-triggered from accounted usage, not model-triggered:
+	 * there is no prepared-against revision to bind it to.
+	 *
+	 * The usage recorded here is the in-memory view at the instant of the transition;
+	 * the durable snapshot re-reads the totals when it is actually written, so usage
+	 * that lands afterwards is not lost (see `transitionToPersist`).
+	 */
+	markBudgetLimited(): BudgetLimitedResult {
+		const current = this.current;
+		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
+		const activeMs = this.clock.stop();
+		const updated: GoalRecord = {
+			...current,
+			status: "budget_limited",
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+			usage: { ...this.ledger.usage, activeMs },
+			wrapUpPending: true,
+		};
+		this.current = this.adopt(updated);
+		this.pendingTransition = updated;
+		this.clock.persisted(activeMs);
+		return { ok: true, goal: updated };
+	}
+
+	/** Whether a lifecycle transition is waiting to be made durable. */
+	hasPendingTransition(): boolean {
+		return this.pendingTransition !== undefined;
+	}
+
+	/**
+	 * The durable form of a pending lifecycle transition.
+	 *
+	 * The transition itself (status, revision, timestamp, wrap-up flag) is fixed when
+	 * it happens, but the usage it carries must be re-read at the flush. A snapshot
+	 * that kept the totals frozen at the transition would omit every report charged
+	 * between then and the boundary — an in-flight concurrent tool result that was
+	 * already running when the budget was crossed, or the responses that follow it —
+	 * and because a snapshot is the reconstruction baseline, the branch replay could
+	 * never recover them: they sit *before* the snapshot on the branch, so they are
+	 * neither inside its totals nor replayed after it.
+	 *
+	 * Re-reading is sound precisely because a flush only happens at a boundary where
+	 * Pi has already appended every entry the ledger covers (`turn_end` runs after
+	 * the turn's assistant message and every one of its tool results, and the same
+	 * holds for `agent_settled`, `agent_before_settle`, and shutdown). The totals
+	 * written are therefore exactly the usage already present on the branch, and
+	 * anything charged afterwards lands *after* the snapshot and is recovered by the
+	 * replay — which is what keeps accounting exactly once.
+	 */
+	private transitionToPersist(transition: GoalRecord): GoalRecord {
+		return { ...transition, usage: this.liveUsage() };
+	}
+
+	/**
+	 * Persist accounting at a boundary where every entry it covers is already on the
+	 * session branch.
+	 *
+	 * A pending transition is written first and supersedes a checkpoint; otherwise a
+	 * checkpoint is written when enough unpersisted active time has accrued (or when
+	 * `force` is set, at shutdown). Best-effort by design: a failed write leaves the
+	 * pending state in place so the next boundary retries it, and the tokens are in
+	 * any case recoverable from the branch replay.
+	 */
+	flushAccounting(pi: ExtensionAPI, force = false): void {
+		if (!this.current) return;
+		try {
+			const pending = this.pendingTransition;
+			if (pending) {
+				this.persistSnapshot(pi, this.transitionToPersist(pending));
+				this.pendingTransition = undefined;
+				return;
+			}
+			if (force || this.clock.unpersistedMs >= ACCOUNTING_CHECKPOINT_MS) {
+				this.checkpointAccounting(pi);
+			}
+		} catch {
+			// Leave the pending state for the next boundary to retry.
+		}
+	}
+
+	/**
+	 * Disarm the pending wrap-up after it has been delivered. Durable, so a
+	 * duplicate boundary event, a reload, or a restart cannot deliver it twice.
+	 */
+	consumeWrapUp(pi: ExtensionAPI): WrapUpResult {
+		const current = this.current;
+		if (!current || current.status !== "budget_limited" || !current.wrapUpPending) {
+			return { ok: false, reason: "not-pending" };
+		}
+		const updated: GoalRecord = {
+			...current,
+			// The wrap-up run's own usage is accounted like any other Goal work, and
+			// `commitSnapshot` folds the live view into the snapshot it writes.
+			updatedAt: Date.now(),
+			revision: current.revision + 1,
+			wrapUpPending: false,
+		};
+		const result = this.commitSnapshot(pi, updated);
+		if (!result.ok) return { ok: false, reason: "persistence", error: result.error };
+		return { ok: true, goal: result.goal };
+	}
+
+	/** Whether the one bounded wrap-up is still owed. */
+	isWrapUpPending(): boolean {
+		return this.current?.status === "budget_limited" && this.current.wrapUpPending === true;
+	}
+
+	/**
+	 * Write the accounted totals and the folded active time to a `goal-usage`
+	 * checkpoint.
+	 *
+	 * Tokens are always recoverable from the branch, so checkpoints exist for the
+	 * active time: a process that never transitions loses at most the time since
+	 * the last checkpoint. The clock keeps running across a checkpoint.
+	 */
+	checkpointAccounting(pi: ExtensionAPI): UsageCheckpoint | undefined {
+		const goal = this.current;
+		if (!goal) return undefined;
+		const activeMs = this.clock.fold();
+		const checkpoint: UsageCheckpoint = {
+			version: 1,
+			goalId: goal.id,
+			usage: { ...this.ledger.usage, activeMs },
+		};
+		pi.appendEntry(USAGE_ENTRY_TYPE, checkpoint);
+		this.clock.persisted(activeMs);
+		return checkpoint;
+	}
+
+	/** Accounted milliseconds that are not durable yet. */
+	unpersistedActiveMs(): number {
+		return this.clock.unpersistedMs;
+	}
+
+	/** Stop the active-time clock (terminal statuses and process shutdown). */
+	stopClock(): number {
+		return this.clock.stop();
 	}
 
 	/**
@@ -338,6 +822,9 @@ export class GoalStore {
 	 */
 	rollback(pi: ExtensionAPI): void {
 		this.current = null;
+		this.pendingTransition = undefined;
+		this.ledger.restore(zeroGoalUsage());
+		this.clock.reset();
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
 		} catch {
@@ -355,7 +842,7 @@ export class GoalStore {
 	}
 
 	/** Build a new active Goal record (revision 0). Pure: no state is changed. */
-	create(objective: string, origin: GoalOrigin = "command"): GoalRecord {
+	create(objective: string, origin: GoalOrigin = "command", options: CreateGoalOptions = {}): GoalRecord {
 		const now = Date.now();
 		return {
 			id: goalId(),
@@ -365,6 +852,8 @@ export class GoalStore {
 			createdAt: now,
 			updatedAt: now,
 			revision: 0,
+			...(options.tokenBudget === undefined ? {} : { tokenBudget: options.tokenBudget }),
+			usage: zeroGoalUsage(),
 		};
 	}
 }
@@ -399,6 +888,8 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 	if (typeof record.status !== "string" || !GOAL_STATUS_SET.has(record.status)) {
 		return false;
 	}
+	if (record.tokenBudget !== undefined && typeof record.tokenBudget !== "number") return false;
+	if (record.wrapUpPending !== undefined && typeof record.wrapUpPending !== "boolean") return false;
 	return (
 		typeof record.id === "string" &&
 		record.id !== "" &&
