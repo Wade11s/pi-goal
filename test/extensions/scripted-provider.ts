@@ -69,8 +69,8 @@ export default function scriptedProviderExtension(pi: ExtensionAPI): void {
 		apiKey: "scripted-test-key",
 		models: [
 			{
-				id: "scripted-1",
-				name: "Scripted 1",
+				id: "stepfun-5-preview",
+				name: "StepFun 5 Preview (scripted)",
 				reasoning: false,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
