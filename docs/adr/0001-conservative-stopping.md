@@ -59,17 +59,21 @@ observable Pi events, with thresholds that are constants rather than settings.
    only when the error text or a provider diagnostic carries one of two kinds of
    evidence:
    - *decisive* account or plan depletion — a provider usage-limit error code, a
-     usage limit, a billing or plan limit, an account/plan/period quota or budget,
-     or an empty credit pool. This tier survives throttle wording in the same
+     usage limit, a billing, plan, spending, account, or subscription limit (in
+     either word order), an account/plan/period quota or budget, or an empty credit
+     pool. This tier survives throttle wording in the same
      failure, because it says the plan itself is used up rather than that a rate
      was hit, but not a `reached` whose object is a lookup: "The account quota
      service reached a timeout" is a check that timed out, and qualifying the noun
-     changes nothing. What decides is the head of the noun phrase the verb governs,
-     which is also why "You have reached your usage limit; please check your plan"
-     stays genuine exhaustion, and so does naming the API or the service as the
-     scope of the limit — "You have reached your usage limit for the Anthropic API"
-     and "Monthly usage limit reached for this service" reached a usage limit, not a
-     lookup;
+     changes nothing. What decides is the object the verb governs, read for the
+     limit it names rather than for the first word in front of it, which is also
+     why "You have reached your usage limit; please check your plan" stays genuine
+     exhaustion, and so does naming the API or the service as the scope of the
+     limit — "You have reached your usage limit for the Anthropic API", "Monthly
+     usage limit reached for this service", "You have reached the API usage limit",
+     and "You have reached your service usage limit" all reached a usage limit, not
+     a lookup. A rate dimension is checked first, so "reached a rate limit" and
+     "reached a quota metric" stay throttles whatever else the phrase says;
    - a bare quota plus an exhaustion verb, which is *not* decisive on its own,
      because that is also exactly how a provider describes a per-minute quota
      metric that resets within a minute. It only counts when its sentence is not
@@ -108,7 +112,11 @@ observable Pi events, with thresholds that are constants rather than settings.
   retried empty would never reach an anti-loop bound.
 - A Goal that stops is never silently restarted. `blocked` and `usage_limited` are
   terminal for continuation, and only a user decision resumes them — which is why
-  resume is deliberately not a model tool.
+  resume is deliberately not a model tool. That decision is `/goal resume`, the same
+  command that restarts a paused Goal, so all three non-continuing states end the
+  same way: the identity, creation time, and history are kept, the audit that
+  described the stop is dropped, and a fresh blocked audit starts from one. A
+  `complete` Goal is terminal for its identity and is never resumed, only replaced.
 - The thresholds trade tokens for patience. Three turns is enough for a transient
   failure to clear and small enough that a broken loop costs three turns, not
   thirty. Making them constants rather than settings means a drifted configuration

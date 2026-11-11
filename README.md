@@ -106,10 +106,16 @@ and is reported as a persistence error).
   flight finishes on its own and its settlement admits no continuation. Pause
   never aborts work — interrupting a run stays with the user, through Pi's
   normal abort.
-- `/goal resume` restarts eligible (paused) work: the transition is durable,
-  then a resume kickoff message restates the objective and asks for a fresh
-  evidence audit of the retained progress. Resuming while another run is in
-  flight steers the resume message into it rather than waiting for idle.
+- `/goal resume` restarts eligible work — a **paused**, **blocked**, or
+  **usage_limited** Goal: the transition is durable, then a resume kickoff
+  message restates the objective and asks for a fresh evidence audit of the
+  retained progress. Resuming while another run is in flight steers the resume
+  message into it rather than waiting for idle. Resuming a `blocked` or
+  `usage_limited` Goal is the user decision those stops ask for, so it keeps the
+  same identity, creation time, and history, drops the audit that described the
+  stop, and starts a **fresh** blocked audit: the next blocker report counts from
+  one rather than inheriting the count the user just overruled. A **complete**
+  Goal is terminal for its identity and is refused — replacing it is a new Goal.
 - `/goal clear` removes the Goal from any status by writing a durable tombstone
   snapshot, so restarts and reloads cannot resurrect it, and the session returns
   to ordinary prompt-by-prompt behavior.
@@ -284,7 +290,8 @@ evaluated at the settlement boundary, which is the only place a Goal turn is kno
 to be over.
 
 - A **blocked** or **usage_limited** Goal never continues automatically. Only the
-  user can resume one, and resume arrives with the lifecycle milestone.
+  user can resume one, with `/goal resume`, which restarts it with a fresh audit;
+  a complete Goal is never resumed, only replaced.
 - An **ordinary command failure** — the command ran and exited non-zero, timed
   out, died without an exit code, or was aborted — is normal work. It never counts
   toward the execution-unavailable stop.
@@ -309,20 +316,25 @@ to be over.
   evidence, and the evidence is read in two tiers:
   - **Account or plan depletion is decisive.** A provider error code whose meaning
     is a plan usage limit (`insufficient_quota`, `GoUsageLimitError`, code `1308`,
-    `subscription_sharing_…_usage_limit_exceeded`), a *usage limit*, *billing or
-    plan limit*, *account/plan/period quota*, or *account/plan/period budget* paired
-    with an exhaustion verb, an empty credit pool (`out of credits`, `credit balance
-    is too low`). This tier survives throttle wording in the same failure, because
+    `subscription_sharing_…_usage_limit_exceeded`), a *usage limit*, a *billing,
+    plan, spending, account, or subscription limit*, *account/plan/period quota*, or
+    *account/plan/period budget* paired with an exhaustion verb **in either word
+    order** (`billing hard limit has been reached`, `You have reached your billing
+    limit`), an empty credit pool (`out of credits`, `credit balance is too low`).
+    This tier survives throttle wording in the same failure, because
     it says the plan itself is used up rather than that a rate was hit —
     `429 rate limit reached; insufficient_quota: current quota exhausted` is a usage
     limit, not a throttle. It does not survive a `reached` whose object is a lookup:
     `The account quota service reached a timeout while checking your account` is a
-    check that timed out, and qualifying the noun does not change that. Only the
-    noun phrase the verb governs is inspected, so `You have reached your usage
-    limit; please check your plan` stays genuine exhaustion — and so does naming the
-    API or the service as the *scope* of the limit (`You have reached your usage
-    limit for the Anthropic API`, `Monthly usage limit reached for this service`),
-    because the verb reached a limit, not a lookup.
+    check that timed out, and qualifying the noun does not change that. The noun
+    phrase the verb governs is read for the limit it *names*, not for the first word
+    in front of it, so `You have reached your usage limit; please check your plan`
+    stays genuine exhaustion — and so does naming the API or the service as the
+    *scope* of the limit, before it or after it (`You have reached your usage limit
+    for the Anthropic API`, `Monthly usage limit reached for this service`, `You
+    have reached the API usage limit`, `You have reached your service usage limit`),
+    because the verb reached a limit, not a lookup. A rate dimension is read first,
+    so `reached a rate limit` and `reached a quota metric` stay throttles.
   - **A bare quota plus an exhaustion verb is not decisive.** That is also exactly
     how a provider describes a *per-minute quota metric*, which resets within a
     minute, so it only counts when its sentence is not about a rate dimension.
@@ -335,7 +347,7 @@ to be over.
   | Look-alike | Example |
   | --- | --- |
   | A transient throttle described with quota vocabulary | `Rate limit exceeded; quota is not exhausted.`, `429 rate limit exceeded for quota metric requests per minute`, `Quota exceeded for quota metric 'Generate Content API requests per minute'` |
-  | A lookup or a throttle, including a *qualified* one — what decides is the verb's object, not how the subject was named | `The quota service reached a timeout while checking your account`, `The account quota service reached a timeout while checking your account`, `The billing limit check reached a timeout…`, `The spending limit lookup reached a timeout…`, `The monthly budget service reached a timeout…`, `The quota service reached a rate limit while checking your account`, `The usage limit check reached a timeout while checking your account`, `The billing service reached its rate limit while checking your account` |
+  | A lookup or a throttle, including a *qualified* one — what decides is the verb's object, not how the subject was named | `The quota service reached a timeout while checking your account`, `The account quota service reached a timeout while checking your account`, `The billing limit check reached a timeout…`, `The spending limit lookup reached a timeout…`, `The monthly budget service reached a timeout…`, `The quota service reached a rate limit while checking your account`, `The usage limit check reached a timeout while checking your account`, `The billing service reached its rate limit while checking your account`, `The API check reached a timeout while checking your account`, `You have reached the service timeout` |
   | A negated statement | `You have not exceeded your quota`, `Your quota is not exceeded`, `Your quota has not been exceeded`, `Your plan limit has not been reached`, `No quota exceeded` |
   | An internal or per-request budget | `Retry budget exhausted after 3 attempts`, `token budget exceeded for this request`, `The request is out of budget for this call` |
   | Bare account vocabulary | `Your billing address could not be verified; update your account details`, `Billing service temporarily unavailable; please retry later` |
@@ -431,8 +443,10 @@ test settles on a provider error.
   complete, blocked, or usage-limited one, because replacing and clearing are
   user-owned actions, confirmed through `/goal <objective>`. The tool description,
   its error message, and this section all say so. Because of that, a blocked or
-  usage-limited Goal currently waits for the user: the model cannot complete it
+  usage-limited Goal waits for the user: the model cannot complete or resume it
   either, so it does not quietly resume work the user was told had stopped.
+  Restarting it is the user's `/goal resume`, which keeps the identity and starts
+  a fresh audit.
 - A model-requested pause is corroborated by exact-quote matching plus a
   conservative lexical check that the newer human message contains an
   affirmative pause instruction. The extension does not semantically understand
@@ -503,7 +517,7 @@ pi -e ./
 # 6. /goal
 #    -> status "paused" with the paused-state hint line.
 # 7. /goal resume
-#    -> "Goal ... resumed"; work restarts from retained progress.
+#    -> "Goal ... resumed"; work restarts from retained progress with a fresh audit.
 # 8. /goal Write a sonnet instead
 #    -> confirmation dialog; answer No -> "Replacement cancelled".
 # 9. /goal clear

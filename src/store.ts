@@ -314,27 +314,48 @@ export class GoalStore {
 	}
 
 	/**
-	 * Resume the current paused Goal. The transition is durable before it is
-	 * visible; restarting work is the caller's job (a resume kickoff message), so
-	 * resuming while a run is in flight can steer instead of waiting for idle.
-	 * The revision bump records the resume as its own transition, giving later
-	 * accounting a fresh baseline at this snapshot.
+	 * Resume a Goal the user has decided to continue.
+	 *
+	 * `paused`, `blocked`, and `usage_limited` are all non-continuing states that a
+	 * user decision ends: a pause is the user stopping work themselves, and a
+	 * conservative stop or a provider usage limit is the extension or the provider
+	 * stopping it and telling the user a decision is needed. Resuming is that
+	 * decision, so all three restart the same objective with the same identity and
+	 * history.
+	 *
+	 * The transition is durable before it is visible; restarting work is the
+	 * caller's job (a resume kickoff message), so resuming while a run is in flight
+	 * can steer instead of waiting for idle. The revision bump records the resume as
+	 * its own transition, giving later accounting a fresh baseline at this snapshot.
+	 *
+	 * A `blocked` or `usage_limited` Goal also carries a blocked audit that explains
+	 * why it stopped. That audit belongs to the stop, not to the Goal: it is dropped
+	 * here so the resumed Goal starts a fresh audit rather than inheriting a count
+	 * the user has already overruled, and `lastBlockerTurn` goes with it so the next
+	 * report starts at one instead of continuing the broken chain.
+	 *
+	 * `complete` is terminal for the identity — a finished Goal is replaced, not
+	 * resumed — so it is refused along with every other status.
 	 */
 	markResumed(pi: ExtensionAPI): GoalMutationResult {
 		const current = this.current;
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
-		if (current.status !== "paused") {
+		if (current.status !== "paused" && current.status !== "blocked" && current.status !== "usage_limited") {
 			return {
 				ok: false,
-			reason: "not-eligible",
-				message: `only a paused Goal can be resumed (current status: ${current.status})`,
+				reason: "not-eligible",
+				message: `only a paused, blocked, or usage-limited Goal can be resumed (current status: ${current.status})`,
 			};
 		}
+		this.lastBlockerTurn = undefined;
 		return this.commitSnapshot(pi, {
 			...current,
 			status: "active",
+			// The audit described the stop the user just overruled; a resumed Goal
+			// starts from a clean one.
+			blockedAudit: undefined,
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		});

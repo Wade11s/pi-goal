@@ -241,6 +241,12 @@ export function formatGoalSummary(state: GoalPublicState): string {
 		...(state.status === "paused"
 			? ["Paused: no automatic Goal runs start until /goal resume; /goal edit still works."]
 			: []),
+		...(state.status === "blocked"
+			? ["Blocked: /goal resume restarts this Goal with a fresh blocked audit."]
+			: []),
+		...(state.status === "usage_limited"
+			? ["Usage limited: /goal resume restarts this Goal once the limit is resolved."]
+			: []),
 	];
 	if (state.blocker !== null) {
 		lines.push(`Blocker: ${state.blocker}`);
@@ -629,7 +635,7 @@ export function formatContinuationMessage(goal: GoalRecord): string {
 		"- The chain is consecutive: a Goal turn that makes progress, verifies a wait, or reports no blocker breaks it and the count starts again.",
 		"- Equivalent blockers count as the same condition, so a reworded repetition still advances the audit; a genuinely different blocker restarts it at one.",
 		'- Use "blocked" only at a genuine impasse where no defensible path remains without user input or an external-state change. Never use it because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.',
-		'- A blocked Goal never continues automatically and only the user can resume it, so never reach for "blocked" to escape a difficult or merely tiring task.',
+		'- A blocked Goal never continues automatically and only the user can resume it (/goal resume, which starts a fresh audit), so never reach for "blocked" to escape a difficult or merely tiring task.',
 		"",
 		"Conservative stops pi-goal enforces by itself, without asking the model:",
 		`- ${ACTIVITY_FREE_TURN_LIMIT} consecutive activity-free automatic Goal turns, or ${EXECUTION_UNAVAILABLE_TURN_LIMIT} consecutive turns in which commands could not be executed at all, stop the Goal as blocked.`,

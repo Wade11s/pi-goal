@@ -485,7 +485,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (result.ok) {
 			ctx.ui.notify(
 				`Goal ${result.goal.id} stopped and is now blocked (${stop.kind}): ${stop.blocker} ` +
-					"Automatic continuation has stopped; the Goal needs a user decision to continue.",
+					"Automatic continuation has stopped; /goal resume restarts it with a fresh blocked audit once the " +
+					"blocker is resolved.",
 				"warning",
 			);
 			return;
@@ -538,8 +539,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (result.ok) {
 				ctx.ui.notify(
 					`Goal ${result.goal.id} is now usage_limited: the provider reported a usage limit ` +
-						`(${failure.evidence}). Automatic continuation has stopped; resolving the limit needs a user ` +
-						"decision, because a usage-limited Goal never continues on its own.",
+						`(${failure.evidence}). Automatic continuation has stopped; /goal resume restarts it once the ` +
+						"limit is resolved, because a usage-limited Goal never continues on its own.",
 					"warning",
 				);
 				return;
@@ -910,7 +911,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(
 				`Goal ${result.goal.id} is now blocked: ${validation.blocker} ` +
 					`(the same blocker for ${result.turns} consecutive Goal turns). Automatic continuation has stopped; ` +
-					"resolving the blocker and resuming the Goal is a user decision.",
+					"resolving the blocker and running /goal resume is a user decision, and the resume starts a fresh audit.",
 				"warning",
 			);
 			return {
@@ -920,7 +921,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						text:
 							`Goal ${result.goal.id} is blocked after the same blocker persisted for ${result.turns} ` +
 							"consecutive Goal turns. Automatic continuation has stopped. Report to the user what is " +
-							"blocking the work and what would unblock it; only the user can resume this Goal.",
+							"blocking the work and what would unblock it; /goal resume restarts it with a fresh blocked audit.",
 					},
 				],
 				structuredContent: { goal: state },
@@ -1059,13 +1060,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Goal ${goal.id} is already active; work continues at every settlement.`, "info");
 			return;
 		}
-		if (goal.status !== "paused") {
+		if (goal.status !== "paused" && goal.status !== "blocked" && goal.status !== "usage_limited") {
 			ctx.ui.notify(
 				`Goal ${goal.id} is ${goal.status} and cannot be resumed. A complete Goal is finished — use /goal <objective> to set a new one.`,
 				"warning",
 			);
 			return;
 		}
+		// A stop the user is overruling is a user action, so every anti-loop counter
+		// and the in-memory audit chain start over with the resumed Goal. The durable
+		// audit itself is dropped by the store, so what resumes is the objective and
+		// its retained progress rather than the count that stopped it.
+		safety.reset();
 		const resumed = store.markResumed(pi);
 		if (!resumed.ok) {
 			notifyMutationFailure(ctx, "resumed", resumed);
@@ -1075,8 +1081,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
 		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx);
+		const restarted =
+			goal.status === "paused"
+				? "Work restarted from retained progress."
+				: goal.status === "blocked"
+					? "The blocked audit that ended it is cleared, so work restarts from retained progress with a fresh audit."
+					: "The usage-limit stop that ended it is cleared, so work restarts from retained progress.";
 		ctx.ui.notify(
-			`Goal ${updated.id} resumed (revision ${updated.revision}). Work ${delivery === "started" ? "restarted" : "steered into the running work"} with retained progress.`,
+			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
 			"info",
 		);
 	}

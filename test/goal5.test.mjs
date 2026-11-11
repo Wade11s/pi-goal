@@ -69,6 +69,11 @@ function structuredGoal(result) {
 	return result.structuredContent?.goal ?? result.details?.goal;
 }
 
+/** Every persisted Goal snapshot, in the order the session recorded them. */
+function goalSnapshots(entries) {
+	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
+}
+
 /** The audit of the last persisted snapshot. */
 function lastAudit(entries) {
 	return lastGoalSnapshot(entries).data.goal.blockedAudit;
@@ -1798,6 +1803,193 @@ test("a session without a Goal keeps its ordinary behavior", async () => {
 		assert.equal(entries.filter((e) => e.customType === "goal-state").length, 0);
 		assert.equal(continuationEntries(entries).length, 0);
 		assertStepsConsumed(session, 1);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("/goal resume restarts a blocked Goal with a fresh audit", async () => {
+	const session = await PiRpcSession.start();
+	// Three consecutive reports block the Goal, the user resumes it, and the
+	// resumed work reports the same blocker again: the audit that stopped the Goal
+	// described that stop, so the next report has to start at one.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Reporting the blocker." },
+			{ text: "Resumed work after the blocker was resolved." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		await session.waitFor("the Goal is blocked", async (records) => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "blocked" ? true : undefined;
+		});
+		const blocked = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.deepEqual(blocked.blockedAudit, { blocker: BLOCKER, turns: 3 });
+
+		await session.prompt("/goal resume");
+		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
+		assert.match(resumed.message, /blocked audit that ended it is cleared/, "the notice says what the resume clears");
+		assert.match(resumed.message, /fresh audit/);
+
+		// The chain of automatic runs only idles when the Goal stops continuing, so
+		// waiting for the finished status (and then the idle that follows it) is what
+		// proves the resumed loop ran to its own end rather than being cut short.
+		await session.waitFor("the resumed Goal completes", async (records) => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "complete" ? true : undefined;
+		});
+		await session.waitForSettled(2);
+		const results = toolResults(session, "update_goal");
+		assert.equal(results.length, 5, "three reports that blocked it, one after the resume, and the completion");
+		assert.equal(structuredGoal(results[3].result).status, "active", "the Goal is active again");
+		assert.match(
+			String(results[3].result.content[0].text),
+			/Blocker recorded \(1 of 3 consecutive Goal turns\)/,
+			"the resumed Goal starts a fresh audit rather than inheriting the old count",
+		);
+		// The whole durable sequence, so the stop, the resume, and the fresh audit are
+		// each their own snapshot rather than one state observed at a lucky moment.
+		const snapshots = goalSnapshots(readSessionEntries(await session.sessionFile())).map((s) => s.data.goal);
+		assert.deepEqual(
+			snapshots.map((g) => `${g.status}:${g.revision}:${g.blockedAudit?.turns ?? "-"}`),
+			[
+				"active:0:-",
+				"active:1:1",
+				"active:2:2",
+				"blocked:3:3",
+				"active:4:-",
+				"active:5:1",
+				"complete:6:-",
+			],
+			"the resume is its own transition, it clears the audit, and the next report starts at one",
+		);
+		assert.ok(snapshots.every((g) => g.id === blocked.id), "one Goal identity throughout");
+		assert.equal(runCount(session), 7, "kickoff, three reporting turns, the resume kickoff, and two more turns");
+		assertStepsConsumed(session, 12);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("/goal resume restarts a usage_limited Goal, and a complete Goal is still refused", async () => {
+	const session = await PiRpcSession.start();
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ error: "Your billing limit has been reached" },
+			{ text: "Resumed work after the limit was resolved." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+			{ text: "Never requested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForSettled(1);
+
+		const limited = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(limited.status, "usage_limited", "the provider usage limit stops the Goal");
+
+		await session.prompt("/goal resume");
+		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
+		assert.match(resumed.message, /usage-limit stop/, "the notice names the stop it cleared");
+		assert.match(resumed.message, /revision 2/);
+		assert.match(resumed.message, /usage-limit stop that ended it is cleared/);
+
+		// Work really restarts: the resumed Goal completes on the model's own call,
+		// which a usage-limited Goal could never do.
+		await session.waitForSettled(2);
+		const entries = readSessionEntries(await session.sessionFile());
+		const done = lastGoalSnapshot(entries).data.goal;
+		assert.equal(done.status, "complete");
+		assert.equal(done.id, limited.id, "one Goal identity across the stop and the resume");
+		assert.equal(done.revision, 3, "usage-limit stop, resume, and completion are three revisions");
+		assert.equal(done.blockedAudit, undefined, "no audit is carried out of the usage-limit stop");
+
+		// Completing is still terminal for the identity: a finished Goal is replaced,
+		// never resumed.
+		await session.prompt("/goal resume");
+		const refused = await session.waitForNotify((r) => r.message.includes("cannot be resumed"));
+		assert.match(refused.message, /complete/);
+		assert.equal(lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.status, "complete");
+
+		assert.equal(runCount(session), 4, "kickoff, the failed run, the resume kickoff, and the completion");
+		assertStepsConsumed(session, 5, [{ stopReason: "error", errorMessage: "Your billing limit has been reached" }]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("/goal resume restarts a Goal stopped by an anti-loop bound without re-stopping it", async () => {
+	const session = await PiRpcSession.start();
+	// The activity-free bound stops the Goal, and the resume has to give the loop a
+	// fresh baseline: an inherited count of three would stop the very next automatic
+	// turn again, which would make the resume useless.
+	script(
+		[
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			EMPTY_RESPONSE,
+			{ text: "Resumed and working." },
+			{ text: "Still working." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitFor("the anti-loop bound stopped the Goal", async (records) => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "blocked" ? true : undefined;
+		});
+		const stopped = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(stopped.blockedAudit.turns, 3, "the activity-free bound reached its threshold");
+
+		await session.prompt("/goal resume");
+		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
+		assert.match(resumed.message, /fresh audit/);
+
+		await session.waitFor("the resumed Goal completes", async (records) => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "complete" ? true : undefined;
+		});
+		await session.waitForSettled(2);
+
+		const snapshots = goalSnapshots(readSessionEntries(await session.sessionFile())).map((s) => s.data.goal);
+		assert.deepEqual(
+			snapshots.map((g) => `${g.status}:${g.revision}`),
+			["active:0", "blocked:1", "active:2", "complete:3"],
+			"the resume is its own transition and the loop ran on to its own completion",
+		);
+		assert.ok(snapshots.every((g) => g.id === stopped.id), "one Goal identity throughout");
+		// The continuation after the resume was ordinary work, so it neither stopped
+		// the Goal nor inherited the old count.
+		assert.equal(continuationEntries(readSessionEntries(await session.sessionFile())).length, 5);
+		assert.equal(runCount(session), 7, "kickoff, three empty turns, the resume kickoff, and two working turns");
+		assertStepsConsumed(session, 8);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {

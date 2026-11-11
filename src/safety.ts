@@ -424,8 +424,11 @@ const ACCOUNT_EXHAUSTION_PATTERNS: RegExp[] = [
 	// A usage limit that has been reached, in either word order.
 	withVerb("usage[ _-]?limit[^.\n]{0,30}EXHAUSTION_VERB"),
 	withVerb("EXHAUSTION_VERB[^.\n]{0,30}usage[ _-]?limit"),
-	// An explicit billing or plan limit that has been reached.
+	// An explicit billing, plan, spending, account, or subscription limit that has
+	// been reached, in either word order — "billing hard limit has been reached" and
+	// "You have reached your billing limit" are the same statement about the plan.
 	withVerb("(?:billing|plan|spending|account|subscription)[ _-]?(?:hard[ _-]?)?limit[^.\n]{0,30}EXHAUSTION_VERB"),
+	withVerb("EXHAUSTION_VERB[^.\n]{0,30}(?:billing|plan|spending|account|subscription)[ _-]?(?:hard[ _-]?)?limit"),
 	// A quota that names the account, the plan, or a billing period.
 	withVerb("(?:current|account|plan|billing|monthly|weekly|daily|remaining|total)[ _-]?quota[^.\n]{0,30}EXHAUSTION_VERB"),
 	withVerb("EXHAUSTION_VERB[^.\n]{0,30}(?:current|account|plan|monthly|weekly|daily)[ _-]?quota"),
@@ -456,18 +459,42 @@ const QUOTA_EXHAUSTION_PATTERNS: RegExp[] = [
 const REACHED_VERB = /\breached\b/i;
 
 /**
- * Words that can only introduce the noun phrase a verb governs, so that removing
- * them leaves the noun the verb actually reached.
+ * Where the noun phrase a verb governs ends: the next word is a preposition, a
+ * conjunction, or a subordinator, so the noun is over.
  *
- * "reached a timeout" and "reached your usage limit" have the same shape — an
- * optional determiner or possessive, then the noun — so the introducer has to go
- * before the noun can be read.
+ * "reached a timeout while checking your account" and "reached your usage limit for
+ * the Anthropic API" both have a modifier phrase after the object, and only the
+ * object itself may decide. Cutting here is what keeps "reached a timeout while
+ * checking your usage limit" a lookup rather than reading the limit that follows.
  */
-const OBJECT_INTRODUCER = /^(?:(?:a|an|the|your|my|our|his|her|its|their|this|that|these|those)\s+)+/i;
+const OBJECT_PHRASE_END =
+	/\b(?:for|of|while|when|after|before|because|since|until|during|via|per|with|without|and|but|or|so|if|unless|that|which|please|to|at|from|on|in|into|about|against)\b/i;
 
 /**
- * What `reached` reached, as the head of the noun phrase it governs: a lookup, a
- * service, a check, or a throttle, rather than a limit.
+ * A limit that really is the account's, so reaching it is exhaustion.
+ *
+ * These are the nouns the account tier already pairs with an exhaustion verb. A
+ * bare `limit` is deliberately absent, because "rate limit" is a throttle and not
+ * a plan limit; `quota` is present because a quota that was *reached* is a used-up
+ * allowance, while the per-minute quota metric is caught by
+ * {@link REACHED_THROTTLE_PATTERN} first and by the rate-dimension guard after.
+ */
+const GENUINE_LIMIT_PATTERN =
+	/\b(?:usage[ _-]?limit|(?:billing|plan|spending|account|subscription)[ _-]?(?:hard[ _-]?)?limit|quota|budget)\b/i;
+
+/**
+ * Wording that makes the object a rate dimension rather than a used-up plan.
+ *
+ * Checked before {@link GENUINE_LIMIT_PATTERN}, because "rate limit" and "quota
+ * metric" both contain limit vocabulary while naming a throttle: a per-minute
+ * allowance resets, so reaching it is not exhaustion.
+ */
+const REACHED_THROTTLE_PATTERN =
+	/\b(?:throttl\w*|rate[ _-]?limit|quota[ _-]?metric|requests?[ _-]?per[ _-]?(?:minute|second|hour)|per[ _-]?(?:minute|second|hour)|rpm|tpm|tokens?[ _-]?per[ _-]?(?:minute|second))\b/i;
+
+/**
+ * What `reached` reached, other than a limit: a lookup, a service, a check, an
+ * endpoint, or a throttle.
  *
  * "The account quota service reached a timeout while checking your account" and
  * "The billing limit check reached a timeout" both describe a *check that timed
@@ -476,16 +503,18 @@ const OBJECT_INTRODUCER = /^(?:(?:a|an|the|your|my|our|his|her|its|their|this|th
  * account/plan tier as well as to a bare quota: what decides is the verb's object,
  * not how the subject was named.
  *
- * The head of the object is what counts, and nothing after it. "You have reached
- * your usage limit for the Anthropic API" and "Monthly usage limit reached for
- * this service" name the API or the service as the *scope* of a limit that really
- * was reached — a remark about the limit, not the thing the verb reached — so the
- * noun phrase the verb governs is still `usage limit` and both stay genuine
- * exhaustion. A clause that opens with a preposition rather than a noun
- * ("…reached for this service") has no object at all, which is the same answer.
+ * The object's own noun is what counts, and a modifier in front of it does not
+ * turn a limit into a lookup. "You have reached the API usage limit", "You have
+ * reached the API's usage limit", and "You have reached your service usage limit"
+ * all name the API or the service as the *scope* of a limit that really was
+ * reached, exactly as the trailing form does: the noun the verb governs is still
+ * `usage limit`. Only when the object is not a limit at all — a timeout, a rate, a
+ * lookup, a service, an endpoint — is it a lookup, and a clause that opens with a
+ * preposition ("…reached for this service") has no object at all, which is the
+ * same answer.
  */
 const REACHED_OBJECT_PATTERN =
-	/^(?:checking|timeouts?|timed[ _-]?out|deadlines?|latency|throttl\w*|rate[ _-]?limits?|quota[ _-]?metrics?|services?|checks?|lookups?|verification|verify|apis?|endpoints?|servers?|status)\b/i;
+	/\b(?:checking|timeouts?|timed[ _-]?out|deadlines?|latency|services?|checks?|lookups?|verification|verify|apis?|endpoints?|servers?|status)\b/i;
 
 /**
  * Wording that makes an exhaustion verb describe a rate dimension rather than a
@@ -511,20 +540,39 @@ function sentenceAt(text: string, index: number): string {
 }
 
 /**
+ * The noun phrase the verb governs: the clause it owns, cut where a modifier
+ * phrase begins.
+ */
+function reachedObject(text: string, matchIndex: number, matched: string): string {
+	const verb = REACHED_VERB.exec(matched);
+	if (!verb) return "";
+	const clauseStart = matchIndex + (verb.index ?? 0) + verb[0].length;
+	const clause = text.slice(clauseStart).split(/[.;\n]/)[0] ?? "";
+	const cut = clause.search(OBJECT_PHRASE_END);
+	return (cut === -1 ? clause : clause.slice(0, cut)).trim();
+}
+
+/**
  * Whether a `reached`-based match says a limit was reached or that a lookup was.
  *
- * Only the noun phrase the verb governs is inspected, and only for `reached`: the
+ * Only the object the verb governs is inspected, and only for `reached`: the
  * stronger verbs — exceeded, exhausted, depleted — name the outcome directly, and
  * a provider usage-limit error code carries no verb at all. The clause the verb
  * owns still ends at the next `;`, `.`, or newline, so "You have reached your
  * usage limit; please check your plan" keeps its remark out of the object.
+ *
+ * Three questions, in order. A rate dimension is a throttle whatever else the
+ * phrase says ("reached a rate limit", "reached a quota metric"). A genuine limit
+ * is exhaustion, and a modifier in front of it — an API, a service — is the limit's
+ * scope rather than its identity ("reached the API usage limit"). Only an object
+ * that is neither is a lookup ("reached a timeout", "reached a service"), and no
+ * object at all ("reached for this service") is exhaustion, because there is
+ * nothing that was reached but the limit the subject named.
  */
 function reachedALookup(text: string, matchIndex: number, matched: string): boolean {
-	const verb = REACHED_VERB.exec(matched);
-	if (!verb) return false;
-	const clauseStart = matchIndex + (verb.index ?? 0) + verb[0].length;
-	const clause = text.slice(clauseStart).split(/[.;\n]/)[0] ?? "";
-	const object = clause.replace(/^\s+/, "").replace(OBJECT_INTRODUCER, "");
+	const object = reachedObject(text, matchIndex, matched);
+	if (REACHED_THROTTLE_PATTERN.test(object)) return true;
+	if (GENUINE_LIMIT_PATTERN.test(object)) return false;
 	return REACHED_OBJECT_PATTERN.test(object);
 }
 

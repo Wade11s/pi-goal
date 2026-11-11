@@ -69,6 +69,19 @@ test("provider failures are classified from what the evidence actually says", as
 		// verb's object a lookup: the usage limit is what was reached.
 		["You have reached your usage limit for the Anthropic API", "usage_limited"],
 		["Monthly usage limit reached for this service", "usage_limited"],
+		// A modifier in *front* of the limit is the same thing: the API or the service
+		// scopes the limit, it is not what the verb reached.
+		["You have reached the API usage limit", "usage_limited"],
+		["You have reached the API's usage limit", "usage_limited"],
+		["You have reached your service usage limit", "usage_limited"],
+		// An explicit billing, plan, spending, account, or subscription limit is
+		// exhaustion in either word order.
+		["You have reached your billing limit", "usage_limited"],
+		["You have reached your billing hard limit", "usage_limited"],
+		["You have reached your plan limit", "usage_limited"],
+		["You have reached your spending limit", "usage_limited"],
+		["You have reached your account limit", "usage_limited"],
+		["You have reached your subscription limit", "usage_limited"],
 		// A throttle and an exhausted quota in one failure: the quota decides.
 		["429 rate limit reached; insufficient_quota: current quota exhausted", "usage_limited"],
 		// Negation and sentence boundaries must not be read past.
@@ -100,6 +113,14 @@ test("provider failures are classified from what the evidence actually says", as
 		// verb still reached a timeout, not the limit the subject is named after.
 		["The usage limit check reached a timeout while checking your account", "active"],
 		["The billing service reached its rate limit while checking your account", "active"],
+		// ...and when the *modifier* is the API: a modifier never turns a lookup into
+		// a limit either, so the object still decides.
+		["The API check reached a timeout while checking your account", "active"],
+		["You have reached the service timeout", "active"],
+		// The verb-first order is subject to the same guards as the noun-first one.
+		["You have not reached your billing limit", "active"],
+		["Your billing limit has not been reached", "active"],
+		["reached a quota metric while checking your account", "active"],
 		// ...while a genuine exhaustion keeps its clause: the remark after it is not
 		// what the verb reached.
 		["You have reached your usage limit; please check your plan", "usage_limited"],
