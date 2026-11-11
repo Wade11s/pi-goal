@@ -521,3 +521,103 @@ test("the two public accounting views agree, live time included", async () => {
 		`the two views agree on the live active time (${viaGetter.activeMs} vs ${viaRecord.activeMs})`,
 	);
 });
+
+test("an accounting checkpoint that undercounts the branch never becomes the baseline", () => {
+	// A checkpoint is a shortcut over the replay, not a second source of truth. If the
+	// live path declined a report the replay charges, the checkpoint written
+	// afterwards sits *after* that entry on the branch, so adopting it as the baseline
+	// would seal the omission permanently: the entry is neither inside the
+	// checkpoint's totals nor after it, and no later replay can reach it.
+	const pi = fakePi();
+	const store = new GoalStore();
+	const goal = store.create("Make the full test suite pass", "command");
+	store.stage(pi, goal);
+	store.commit(goal);
+
+	// The live path charged the assistant response and then, for whatever reason,
+	// never charged the tool result that follows it.
+	store.accountUsage("model:1", usage(100, 10), "model");
+	const checkpoint = store.checkpointAccounting(pi);
+	assert.ok(checkpoint);
+	assert.equal(checkpoint.usage.totalTokens, 110);
+
+	const branch = [
+		pi.entries[0],
+		assistantEntry(0, usage(100, 10)),
+		toolResultEntry("call_1", nested()),
+		pi.entries[1],
+	];
+	store.reconstruct(fakeCtx(branch));
+
+	// The replay is the authority: it charges the tool result the live path skipped,
+	// and the undercounting checkpoint is discarded rather than adopted.
+	assert.equal(store.getUsage().totalTokens, 160, "the branch wins over an undercounting checkpoint");
+	assert.equal(store.getUsage().nestedTokens, 50, "the skipped report is recovered");
+	assert.ok(store.getUsage().activeMs > 0, "the discarded checkpoint's active time is still kept");
+});
+
+test("an accounting checkpoint that agrees with the branch is still adopted", () => {
+	// The verification must not cost the shortcut its purpose: in the normal case the
+	// checkpoint records exactly what the live path charged, which is exactly what the
+	// replay charges, so it is adopted and the entries before it are not re-charged.
+	const pi = fakePi();
+	const store = new GoalStore();
+	const goal = store.create("Make the full test suite pass", "command");
+	store.stage(pi, goal);
+	store.commit(goal);
+
+	store.accountUsage("model:1", usage(100, 10), "model");
+	store.accountUsage("toolResult:call_1", nested(), "nested");
+	const checkpoint = store.checkpointAccounting(pi);
+	assert.equal(checkpoint.usage.totalTokens, 160);
+
+	const branch = [
+		pi.entries[0],
+		assistantEntry(0, usage(100, 10)),
+		toolResultEntry("call_1", nested()),
+		pi.entries[1],
+	];
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.getUsage().totalTokens, 160, "the consistent checkpoint is adopted, not replayed past");
+	assert.equal(store.getUsage().nestedTokens, 50);
+});
+
+test("restoring a previous record keeps that record's usage, not the live ledger's", () => {
+	// A durability-timeout rollback restores the Goal that was current before a
+	// replacement. The replacement's `commit()` already zeroed the ledger for the new
+	// Goal, so folding the live view into the restored record would persist the old
+	// identity with the new Goal's near-zero usage — and because the restored snapshot
+	// is the replay baseline, the older entries before it could never be recharged.
+	const pi = fakePi();
+	const store = new GoalStore();
+	const goal = store.create("Make the full test suite pass", "command", { tokenBudget: 500 });
+	store.stage(pi, goal);
+	store.commit(goal);
+	store.accountUsage("model:1", usage(100, 10), "model");
+	store.accountUsage("model:2", usage(30, 5), "model");
+	const previous = store.get();
+	assert.equal(previous.usage.totalTokens, 145);
+
+	// A replacement is staged and committed, which resets the accounting.
+	const replacement = store.create("Make the full test suite pass and document it", "command");
+	store.stage(pi, replacement);
+	store.commit(replacement);
+	assert.equal(store.getUsage().totalTokens, 0, "the replacement starts from zero");
+
+	const restored = store.restore(pi, previous);
+	assert.equal(restored.ok, true);
+	const appended = pi.entries.at(-1).data.goal;
+	assert.equal(appended.id, previous.id, "the previous identity is restored");
+	assert.equal(appended.usage.totalTokens, 145, "with its own accounted usage, not the replacement's zero");
+	assert.equal(store.getUsage().totalTokens, 145, "and the live view agrees");
+
+	// A reconstruction converges on the same total instead of recharging the branch.
+	const branch = [
+		pi.entries[0],
+		assistantEntry(0, usage(100, 10)),
+		assistantEntry(1, usage(30, 5)),
+		pi.entries.at(-1),
+	];
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.getUsage().totalTokens, 145, "the restored snapshot is the baseline for what follows");
+});

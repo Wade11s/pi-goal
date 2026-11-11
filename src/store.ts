@@ -167,40 +167,29 @@ export class GoalStore {
 		let restored: GoalRecord | null = null;
 		let seen = false;
 		let usage = zeroGoalUsage();
-		// Branch index of the newest entry that carries accounted totals for the
-		// restored Goal. Everything after it is replayed, everything up to it is
-		// already inside `usage`.
+		// Branch index of the newest `goal-state` snapshot for the restored Goal. The
+		// replay starts after it; the accounting checkpoints in that range are
+		// verified against the replay rather than trusted outright (see
+		// `replayBranch`).
 		let baselineIndex = -1;
 		try {
 			const branch = ctx.sessionManager.getBranch();
 			for (let index = 0; index < branch.length; index++) {
 				const entry = branch[index]!;
 				if (entry.type !== "custom") continue;
-				if (entry.customType === CUSTOM_ENTRY_TYPE) {
-					const snapshot = entry.data as GoalSnapshot | undefined;
-					if (!snapshot || typeof snapshot !== "object" || snapshot.version !== 1) continue;
-					if (!isGoalRecord(snapshot.goal)) continue;
-					seen = true;
-					// A `null` goal is the durable tombstone: it clears the Goal and resets
-					// the accounting baseline with it.
-					// The record is copied, never adopted: the session manager owns the entry
-					// object, and publishing the live accounting view onto it (see
-					// `refreshUsage`) would leak in-memory state into durable state.
-					restored = snapshot.goal ? { ...snapshot.goal } : null;
-					usage = snapshot.goal ? normalizeUsage(snapshot.goal.usage) : zeroGoalUsage();
-					baselineIndex = index;
-					continue;
-				}
-				if (entry.customType === USAGE_ENTRY_TYPE) {
-					const checkpoint = entry.data as UsageCheckpoint | undefined;
-					if (!isUsageCheckpoint(checkpoint)) continue;
-					// A checkpoint only counts for the Goal that is current at that
-					// point on the branch, and only if it is newer than the baseline.
-					if (!restored || checkpoint.goalId !== restored.id) continue;
-					if (index < baselineIndex) continue;
-					usage = normalizeUsage(checkpoint.usage);
-					baselineIndex = index;
-				}
+				if (entry.customType !== CUSTOM_ENTRY_TYPE) continue;
+				const snapshot = entry.data as GoalSnapshot | undefined;
+				if (!snapshot || typeof snapshot !== "object" || snapshot.version !== 1) continue;
+				if (!isGoalRecord(snapshot.goal)) continue;
+				seen = true;
+				// A `null` goal is the durable tombstone: it clears the Goal and resets
+				// the accounting baseline with it.
+				// The record is copied, never adopted: the session manager owns the entry
+				// object, and publishing the live accounting view onto it (see
+				// `refreshUsage`) would leak in-memory state into durable state.
+				restored = snapshot.goal ? { ...snapshot.goal } : null;
+				usage = snapshot.goal ? normalizeUsage(snapshot.goal.usage) : zeroGoalUsage();
+				baselineIndex = index;
 			}
 		} catch (error) {
 			// Never break the session on corrupt entries; report and keep absent state.
@@ -241,6 +230,16 @@ export class GoalStore {
 	 * tree navigation converge on the totals the live event path produced, because
 	 * both charge each entry exactly once — the live path while the entry is created,
 	 * the replay for everything the newest durable baseline does not already cover.
+	 *
+	 * A checkpoint is a shortcut over that replay, never a second source of truth, so
+	 * it is adopted only when adopting it loses nothing. The branch is the authority:
+	 * if a checkpoint reports fewer tokens than the entries between the baseline and
+	 * it already account for, then the live path declined a report the replay charges,
+	 * and adopting the checkpoint would seal that omission into the durable baseline —
+	 * the tool result a Goal created mid-turn never charged live would be gone for
+	 * good, and no later replay could recover it because it sits *before* the
+	 * checkpoint. In that case the replay keeps its own totals and carries on, keeping
+	 * only the checkpoint's active time, which the branch cannot reconstruct.
 	 */
 	private replayBranch(ctx: ExtensionContext, afterIndex: number): void {
 		let branch;
@@ -252,6 +251,16 @@ export class GoalStore {
 		}
 		for (let index = afterIndex + 1; index < branch.length; index++) {
 			const entry = branch[index]!;
+			if (entry.type === "custom") {
+				if (entry.customType !== USAGE_ENTRY_TYPE) continue;
+				const checkpoint = entry.data as UsageCheckpoint | undefined;
+				if (!isUsageCheckpoint(checkpoint)) continue;
+				// A checkpoint only counts for the Goal it was written for; every
+				// checkpoint here is already after the baseline snapshot.
+				if (checkpoint.goalId !== this.current?.id) continue;
+				this.applyCheckpoint(checkpoint);
+				continue;
+			}
 			if (entry.type === "message") {
 				const message = entry.message;
 				if (message.role === "assistant") {
@@ -268,6 +277,33 @@ export class GoalStore {
 			if (!entry.usage) continue;
 			this.ledger.account(entry.id, entry.usage, "nested");
 		}
+	}
+
+	/**
+	 * Adopt an accounting checkpoint as the replay baseline when adopting it loses
+	 * nothing (see `replayBranch`).
+	 *
+	 * The comparison is against the totals the replay has already accumulated from
+	 * the branch, not against the snapshot: a checkpoint may only ever *raise* the
+	 * baseline, because a lower one would discard usage the branch still accounts
+	 * for. Equality is the normal case — a checkpoint written at a post-persistence
+	 * boundary records exactly what the live path had charged, which is exactly what
+	 * the replay charges — so the shortcut keeps working and only a genuine
+	 * undercount falls through to the replay.
+	 */
+	private applyCheckpoint(checkpoint: UsageCheckpoint): void {
+		const checkpointUsage = normalizeUsage(checkpoint.usage);
+		const replayed = this.ledger.usage;
+		if (checkpointUsage.totalTokens < replayed.totalTokens) {
+			// Undercount: keep the replayed tokens, and keep the checkpoint's active
+			// time, which is the one thing the branch cannot reconstruct.
+			this.ledger.restore({
+				...replayed,
+				activeMs: Math.max(replayed.activeMs, checkpointUsage.activeMs),
+			});
+			return;
+		}
+		this.ledger.restore(checkpointUsage);
 	}
 
 	/** Current record, or undefined when not yet reconstructed. */
@@ -736,8 +772,15 @@ export class GoalStore {
 	 * A pending transition is written first and supersedes a checkpoint; otherwise a
 	 * checkpoint is written when enough unpersisted active time has accrued (or when
 	 * `force` is set, at shutdown). Best-effort by design: a failed write leaves the
-	 * pending state in place so the next boundary retries it, and the tokens are in
-	 * any case recoverable from the branch replay.
+	 * pending state in place so the next boundary retries it.
+	 *
+	 * A checkpoint written here is only ever a *shortcut*: reconstruction verifies it
+	 * against the branch and discards it when it reports fewer tokens than the
+	 * entries before it account for (see `applyCheckpoint`). That is what makes a
+	 * forced shutdown checkpoint safe even if the live path had declined a report —
+	 * without the check, such a checkpoint would seal the undercount permanently,
+	 * because the entry it omits sits before the checkpoint and no later replay can
+	 * reach it.
 	 */
 	flushAccounting(pi: ExtensionAPI, force = false): void {
 		if (!this.current) return;
@@ -787,9 +830,11 @@ export class GoalStore {
 	 * Write the accounted totals and the folded active time to a `goal-usage`
 	 * checkpoint.
 	 *
-	 * Tokens are always recoverable from the branch, so checkpoints exist for the
-	 * active time: a process that never transitions loses at most the time since
-	 * the last checkpoint. The clock keeps running across a checkpoint.
+	 * Tokens are always recoverable from the branch, so a checkpoint exists for the
+	 * active time: a process that never transitions loses at most the time since the
+	 * last checkpoint. It is a shortcut over the replay rather than a record of it,
+	 * which is why reconstruction verifies it (see `applyCheckpoint`) instead of
+	 * trusting it. The clock keeps running across a checkpoint.
 	 */
 	checkpointAccounting(pi: ExtensionAPI): UsageCheckpoint | undefined {
 		const goal = this.current;
@@ -836,9 +881,31 @@ export class GoalStore {
 	 * Restore a previously captured record durably. Used to retract a
 	 * replacement whose durability could not be confirmed: the previous record
 	 * is still the correct current state, and a tombstone would wrongly erase it.
+	 *
+	 * Deliberately *not* through {@link commitSnapshot}: that folds the live
+	 * accounting view into the record it writes, and this path runs after the
+	 * replacement's `commit()` has already zeroed the ledger for the new Goal.
+	 * Persisting the previous record with the new Goal's near-zero usage would lose
+	 * the older Goal's totals *and* make them unrecoverable, because the restored
+	 * snapshot becomes the replay baseline and the older entries sit before it. The
+	 * record therefore carries its own durable usage, and the ledger and the clock are
+	 * rebuilt from it rather than from the discarded replacement.
 	 */
 	restore(pi: ExtensionAPI, previous: GoalRecord): GoalMutationResult {
-		return this.commitSnapshot(pi, previous);
+		const record: GoalRecord = { ...previous };
+		try {
+			this.persistSnapshot(pi, record);
+		} catch (error) {
+			return { ok: false, reason: "persistence", error };
+		}
+		this.current = this.adopt(record);
+		this.pendingTransition = undefined;
+		const usage = normalizeUsage(record.usage);
+		this.ledger.restore(usage);
+		this.clock.reset();
+		this.clock.persisted(usage.activeMs);
+		if (record.status === "active") this.clock.start();
+		return { ok: true, goal: record };
 	}
 
 	/** Build a new active Goal record (revision 0). Pure: no state is changed. */

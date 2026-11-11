@@ -391,17 +391,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 
 	/**
-	 * Whether the turn currently in flight was Goal work.
-	 *
-	 * Set when a turn's assistant response ends. The distinction matters because a
-	 * lifecycle transition happens *inside* tool execution, which is after
-	 * `message_end`: the turn that completes a Goal (or exhausts its budget) is
-	 * still Goal work and must be accounted, while an ordinary run after the Goal is
-	 * finished is not.
-	 */
-	let turnWasGoalWork = false;
-
-	/**
 	 * Assistant messages already charged, by object identity.
 	 *
 	 * `message_end` is the seam where a turn's usage becomes known, and it runs
@@ -426,6 +415,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 *
 	 * Both are guarded by the ledger, so a duplicate event, a reconstruction
 	 * replay, or concurrent tool calls inside one turn cannot double-charge.
+	 *
+	 * Both decide against the Goal that exists *now*, not against the turn the report
+	 * belongs to. A Goal can be created while a tool of an ordinary turn is still in
+	 * flight — `/goal` commits before it waits for idle, and `create_goal` runs inside
+	 * a tool batch — so the turn's own assistant `message_end` predates the Goal while
+	 * its tool results land after it. Those results are Goal work: the branch replay
+	 * charges every entry after the creation snapshot, and a live path that skipped
+	 * them would disagree with the replay it is supposed to converge with (a probe
+	 * measured 17 live against 67 restored). The `complete` guard inside
+	 * `accountUsage` keeps the completing batch aligned with the replay, which skips
+	 * everything after a completion snapshot.
 	 */
 	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
@@ -435,10 +435,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			budgetGateActive = false;
 			return;
 		}
+		const goal = store.get();
+		// A report is Goal work exactly when a non-complete Goal exists as it is
+		// finalized. Completion is terminal for accounting, so the completing turn is
+		// charged at its own `message_end` and nothing after the completion snapshot is.
+		if (!goal || goal.status === "complete") return;
 		if (message.role === "assistant") {
-			const goal = store.get();
-			turnWasGoalWork = goal != null && goal.status !== "complete";
-			if (!turnWasGoalWork) return;
 			if (chargedMessages.has(message)) return;
 			chargedMessages.add(message);
 			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model");
@@ -446,7 +448,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (message.role !== "toolResult") return;
-		if (!turnWasGoalWork) return;
 		store.accountUsage(`toolResult:${message.toolCallId}`, message.usage, "nested");
 		afterAccounting(ctx);
 	});

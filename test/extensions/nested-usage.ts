@@ -12,11 +12,39 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { existsSync } from "node:fs";
 
 /** Leaf tool: reports its own model usage, like a tool that calls a model. */
 export const NESTED_LEAF_TOOL = "nested_usage_leaf";
 /** Outer tool: calls the leaf tool through `ctx.executeTool()`. */
 export const NESTED_OUTER_TOOL = "nested_usage_outer";
+/**
+ * Outer tool that holds its call until a gate file exists, then performs the same
+ * nested model work. It exists to reproduce the ordering that breaks accounting:
+ * a Goal created (by `/goal` or by `create_goal`) while this tool is still in
+ * flight commits its creation snapshot *before* the tool result lands, so the
+ * turn's own assistant `message_end` predates the Goal while its tool result does
+ * not. The gate path comes from `PI_GOAL_TEST_GATE`; without it the tool never
+ * blocks, so an unrelated test that somehow reaches it still terminates.
+ */
+export const NESTED_GATED_TOOL = "nested_usage_gated";
+
+/** Poll for the gate file, released early by an abort. */
+async function waitForGate(signal: AbortSignal | undefined): Promise<void> {
+	const gate = process.env.PI_GOAL_TEST_GATE;
+	if (!gate) return;
+	await new Promise<void>((resolve) => {
+		const poll = () => {
+			if (existsSync(gate)) {
+				resolve();
+				return;
+			}
+			setTimeout(poll, 5);
+		};
+		signal?.addEventListener("abort", () => resolve());
+		poll();
+	});
+}
 
 /** Usage the leaf reports. Cached reads dominate on purpose: they must not count. */
 export const NESTED_LEAF_USAGE: Usage = {
@@ -61,6 +89,21 @@ export default function nestedUsageExtension(pi: ExtensionAPI): void {
 			return {
 				content: [{ type: "text", text: `nested outer done (${outcome.isError ? "error" : "ok"})` }],
 				details: { outer: true },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: NESTED_GATED_TOOL,
+		label: "Nested Usage Gated",
+		description: "Test-only tool that waits for a gate file, then performs nested model work.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			await waitForGate(signal);
+			const outcome = await ctx.executeTool(NESTED_LEAF_TOOL, {});
+			return {
+				content: [{ type: "text", text: `nested gated done (${outcome.isError ? "error" : "ok"})` }],
+				details: { gated: true },
 			};
 		},
 	});

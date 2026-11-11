@@ -238,6 +238,19 @@ not twice. Reconstruction replays the session branch under the same rule, so a
 reload, a restart, or a tree navigation converges on the same totals instead of
 re-charging them.
 
+A report is Goal work when a non-complete Goal exists as the report is *finalized*,
+not when the turn that produced it started. That distinction is load-bearing: a
+Goal can be created while a tool of an ordinary turn is still in flight — `/goal`
+commits its snapshot before it waits for the run to go idle, and `create_goal`
+commits from inside a tool batch — so the turn's own assistant `message_end`
+predates the Goal while its tool results land after it. Those results are Goal
+work: the branch replay charges every entry after the creation snapshot, and a
+live path that latched "was this turn Goal work?" at the assistant `message_end`
+would skip them and disagree with the replay it is supposed to converge with.
+Completion stays the one exception on both paths, which is what keeps the
+completing batch aligned with a replay that skips everything after a completion
+snapshot.
+
 Durable writes happen only at boundaries where every entry they cover is already
 on the branch. The ordering matters: Pi dispatches `message_end` to extensions
 *before* it appends the message that triggered it, so a checkpoint or a lifecycle
@@ -255,6 +268,15 @@ written rather than the totals some earlier decision froze, so usage that lands
 in between — a concurrent nested tool result that was already in flight when the
 budget was crossed — is inside the snapshot instead of falling into the gap in
 front of it, where the replay can reach in neither direction.
+
+A checkpoint is a shortcut over that replay, never a second source of truth: the
+branch is the authority. Reconstruction adopts a checkpoint only when adopting it
+loses nothing, comparing its totals against the entries between the snapshot and
+it. A checkpoint that reports *fewer* tokens than those entries account for means
+the live path declined a report the replay charges, and adopting it would seal the
+omission permanently — the entry sits before the checkpoint, so no later replay can
+reach it. Such a checkpoint is discarded, the replay carries on, and only its
+active time is kept, because that is the one thing the branch cannot reconstruct.
 
 What is *not* counted: Pi's `usage` session entries (cache-warming refreshes),
 which are reported outside the transcript and outside Goal work; and any response
@@ -276,7 +298,8 @@ cannot make accounted time jump or shrink.
 Checkpoints are event-driven, not periodic: an *idle* active Goal accrues active
 time that only becomes durable at its next settlement or shutdown, so an unclean
 exit can lose more than one second of active time. Tokens are never lost that way —
-they are always recoverable from the branch.
+they are always recoverable from the branch, and a checkpoint that disagrees with
+the branch is discarded rather than adopted (see above).
 
 ### Budget exhaustion
 

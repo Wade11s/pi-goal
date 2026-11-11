@@ -45,6 +45,8 @@ const USAGE_ENTRY_TYPE = "goal-usage";
 /** Test-only extension that performs nested model work through ctx.executeTool(). */
 const NESTED_EXTENSION = join(import.meta.dirname, "extensions", "nested-usage.ts");
 const NESTED_OUTER_TOOL = "nested_usage_outer";
+/** Outer tool that holds its call until a gate file exists, then does nested work. */
+const NESTED_GATED_TOOL = "nested_usage_gated";
 /** The leaf's accounted contribution: 40 input + 7 output + 3 cache write. */
 const NESTED_LEAF_ACCOUNTED = 50;
 
@@ -122,6 +124,24 @@ async function reportUsage(session, matcher) {
 		return matches.length > seen ? matches[matches.length - 1] : undefined;
 	});
 	return parseStatus(notify.message);
+}
+
+/**
+ * Wait until a `goal-state` snapshot for this objective is on disk.
+ *
+ * Needed because `/goal` commits its snapshot *before* it waits for the run to go
+ * idle, so the Goal exists on the branch while the run is still in flight — which
+ * is precisely the ordering these probes are about.
+ */
+async function waitForGoalSnapshot(session, objective, timeoutMs = 15000) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries);
+		if (snapshot?.data?.goal?.objective === objective) return snapshot;
+		if (Date.now() > deadline) throw new Error("no creation snapshot reached the session file in time");
+		await sleep(20);
+	}
 }
 
 /** Stop an active Goal's continuation loop deliberately (see goal.test.mjs). */
@@ -638,6 +658,153 @@ test("concurrent nested usage that lands after the budget crossing survives an u
 		rmSync(sessionDir, { recursive: true, force: true });
 		rmSync(workDir, { recursive: true, force: true });
 	}
+});
+
+/**
+ * The script for the mid-turn-creation probes.
+ *
+ * One ordinary assistant response asks for two tools in the same batch:
+ * `create_goal`, which commits the Goal (budget 40) while the batch is still
+ * running, and a gated tool that holds its call until the test releases it and then
+ * reports 50 accounted tokens of nested usage. The response itself predates the
+ * Goal, so it is correctly not Goal work; the gated tool's result lands after the
+ * creation snapshot, so it is.
+ */
+const MID_TURN_STEPS = [
+	{
+		toolCalls: [
+			{ name: "create_goal", args: { objective: OBJECTIVE, tokenBudget: 40 } },
+			{ name: NESTED_GATED_TOOL, args: {} },
+		],
+		usage: { input: 10, output: 5 },
+	},
+	{ text: "Noted.", usage: { input: 5, output: 2 } },
+	{ text: "Wrap-up summary." },
+	{ text: "Never requested." },
+];
+
+/**
+ * Run the mid-turn-creation scenario once, stop the first process the way `stopMode`
+ * says, and return what the live process and a fresh resume each account.
+ *
+ * `stopMode` is `"kill"` (SIGKILL, so no shutdown checkpoint is written and the
+ * branch replay is the only recovery) or `"stop"` (a clean exit, which force-flushes
+ * an accounting checkpoint). Both must land on the same total as the live process:
+ * the tool result belongs to Goal work exactly once, and a checkpoint must never
+ * seal an undercount of it.
+ */
+async function probeMidTurnCreation(stopMode) {
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
+	const resumedDir = mkdtempSync(join(tmpdir(), "pi-goal-resumed-"));
+	const gate = join(workDir, "provider-gate");
+	// Read by the gated tool; a missing value would make it never block.
+	process.env.PI_GOAL_TEST_GATE = gate;
+
+	const first = await PiRpcSession.start({
+		cwd: workDir,
+		sessionDir,
+		extraExtensions: [NESTED_EXTENSION],
+	});
+	script(MID_TURN_STEPS, first);
+	let sessionFile;
+	let live;
+	try {
+		await first.prompt("create a Goal and run the gated tool");
+		await first.waitFor(
+			"the gated tool started",
+			(records) =>
+				records.some((r) => r.type === "tool_execution_start" && r.toolName === NESTED_GATED_TOOL)
+					? true
+					: undefined,
+		);
+		// The Goal is committed before anything waits, so its snapshot is already on
+		// the branch while the tool is still in flight.
+		const created = await waitForGoalSnapshot(first, OBJECTIVE);
+		assert.equal(created.data.goal.usage.totalTokens, 0, "the creation snapshot starts at zero");
+
+		writeFileSync(gate, "", "utf8");
+		await first.waitForSettled(1);
+
+		live = await reportUsage(first, (r) => r.message.includes(OBJECTIVE));
+		assert.equal(live.status, "budget_limited", "the tool's 50 tokens exhaust the 40-token budget");
+		assert.equal(live.nestedTokens, NESTED_LEAF_ACCOUNTED, "the gated tool's nested usage is charged");
+		assert.equal(live.remaining, "0 tokens (budget exhausted)");
+		assertOnlyFailures(first, []);
+		assert.equal(first.extensionErrors().length, 0, JSON.stringify(first.extensionErrors()));
+
+		if (stopMode === "kill") {
+			// Unclean exit: no shutdown checkpoint, so the replay is the only recovery.
+			first.killNow();
+			await first.waitForExit();
+		}
+	} finally {
+		await first.stop();
+	}
+	// The session dir outlives the process, so the file is read *after* the exit: a
+	// clean shutdown writes its accounting checkpoint during it, and that is exactly
+	// what this probe is about.
+	sessionFile = first.findSessionFile();
+	copyFileSync(sessionFile, join(resumedDir, basename(sessionFile)));
+	sessionFile = join(resumedDir, basename(sessionFile));
+
+	const resumed = await PiRpcSession.start({ sessionFile, cwd: workDir });
+	script([{ text: "Nothing to continue." }, { text: "Never requested." }], resumed);
+	try {
+		await resumed.waitForNotify((r) => r.message.includes("restored (budget_limited)"));
+		const restored = await reportUsage(resumed, (r) => r.message.includes(OBJECTIVE));
+		assert.equal(restored.status, "budget_limited");
+		assert.equal(restored.nestedTokens, NESTED_LEAF_ACCOUNTED, "and it is restored, not lost");
+		assert.equal(restored.remaining, "0 tokens (budget exhausted)");
+		assertOnlyFailures(resumed, []);
+		assert.equal(resumed.extensionErrors().length, 0, JSON.stringify(resumed.extensionErrors()));
+		// Read the durable entries before the resumed session's temp dir goes away.
+		return { live, restored, entries: readSessionEntries(sessionFile) };
+	} finally {
+		await resumed.stop();
+		rmSync(resumedDir, { recursive: true, force: true });
+		rmSync(sessionDir, { recursive: true, force: true });
+		rmSync(workDir, { recursive: true, force: true });
+	}
+}
+
+test("a Goal created while a usage-bearing tool is in flight charges that tool exactly once", async () => {
+	// Live, unclean exit, and clean exit must all agree. The tool result belongs to
+	// the turn that requested it but is finalized after the Goal exists, so a live
+	// path that latched "was this turn Goal work?" at the assistant `message_end`
+	// skipped it while the replay charged it — and a clean shutdown then sealed the
+	// undercount into a checkpoint that sits after the result, making it
+	// unrecoverable.
+	const unclean = await probeMidTurnCreation("kill");
+	assert.equal(
+		unclean.restored.totalTokens,
+		unclean.live.totalTokens,
+		`an unclean exit restores the live total (${unclean.restored.totalTokens} vs ${unclean.live.totalTokens})`,
+	);
+	// 50 nested + 7 for the response after the tool + 15 for the wrap-up.
+	assert.equal(unclean.live.totalTokens, 72);
+
+	const clean = await probeMidTurnCreation("stop");
+	assert.equal(
+		clean.restored.totalTokens,
+		clean.live.totalTokens,
+		`a clean exit restores the live total (${clean.restored.totalTokens} vs ${clean.live.totalTokens})`,
+	);
+	assert.equal(clean.live.totalTokens, unclean.live.totalTokens, "both probes account the same work");
+	assert.equal(clean.restored.nestedTokens, NESTED_LEAF_ACCOUNTED);
+
+	// The durable baseline must not have sealed an undercount: the shutdown
+	// checkpoint records what the live path charged, which is exactly what the
+	// replay charges, so adopting it changes nothing.
+	const checkpoints = usageCheckpoints(clean.entries);
+	assert.ok(checkpoints.length >= 1, "the clean exit wrote an accounting checkpoint");
+	const last = checkpoints[checkpoints.length - 1];
+	assert.equal(
+		last.data.usage.totalTokens,
+		clean.live.totalTokens,
+		"the shutdown checkpoint carries the live total, nested usage included",
+	);
+	assert.equal(last.data.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
 });
 
 test("a budget-limited Goal can be edited, keeps its accounted usage, and never continues", async () => {
