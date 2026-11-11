@@ -364,8 +364,12 @@ to be over.
   wins, so restart, resume (`--continue` / `--session`), and extension reload
   (`/reload`, or any runtime replacement) reconstruct the state without the user
   restating the objective. Reconstruction also runs after `session_tree`
-  navigation and on forked sessions; dedicated branch-navigation coverage lands
-  with the branch-state ticket.
+  navigation and on forked sessions: the *selected* branch alone decides the
+  state, so snapshots on an abandoned branch cannot leak into the newly selected
+  one, a cleared Goal stays cleared on the branch that cleared it, and an entry
+  that is not a recognizable snapshot (unknown version, wrong shape, unknown
+  status) is skipped rather than trusted. A branch change is announced only when
+  the reconstructed state observably changed.
 - A snapshot carries the optional `blockedAudit` (`{ blocker, turns }`): the
   blocker that stopped the Goal, or that is accumulating toward the blocked
   threshold, and how many consecutive Goal turns reported it. It is durable for

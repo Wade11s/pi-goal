@@ -235,6 +235,31 @@ export class PiRpcSession {
 	}
 
 	/**
+	 * Wait for a fire-and-forget extension notify that appears strictly after
+	 * `mark` records were accumulated (`mark` is usually a captured
+	 * `session.records.length`).
+	 *
+	 * Branch tests navigate one session through several Goal states, so the same
+	 * message text ("No Goal is set", "restored", ...) can legitimately appear
+	 * many times in one record stream; an unscoped wait would keep matching the
+	 * oldest occurrence and hide exactly the state change under test.
+	 */
+	async notifyAfter(mark, matcher) {
+		return this.waitFor("matching extension notify after marker", (records) => {
+			for (let index = mark; index < records.length; index++) {
+				const record = records[index];
+				if (record.type === "extension_ui_request" && record.method === "notify" && matcher(record)) return record;
+			}
+			return undefined;
+		});
+	}
+
+	/** All session entries in append order plus the current leaf id (RPC get_entries). */
+	async getEntries() {
+		return this.sendSimple("get_entries");
+	}
+
+	/**
 	 * Wait for a blocking extension confirm dialog and answer it.
 	 *
 	 * Answers over the RPC extension-UI subprotocol exactly like an interactive or
