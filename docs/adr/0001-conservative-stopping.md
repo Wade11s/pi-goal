@@ -96,7 +96,13 @@ observable Pi events, with thresholds that are constants rather than settings.
    earlier lookup cannot hide a later explicit statement of exhaustion. Exhaustion evidence is evaluated before anything else, so a
    failure that reports both a throttle and an exhausted quota is classified by the
    quota. Anything else stops the continuation for that run, is surfaced to the
-   user, and leaves the Goal active so the next successful run resumes it.
+   user, and leaves the Goal active so the next successful run resumes it. That
+   description is of an *active* Goal, and only an active Goal is classified or
+   transitioned: a Goal that has already stopped has no continuation to stop, so a
+   provider failure on it is reported against its real status rather than as an
+   active Goal or as a failed write — the store refuses a non-active record with
+   `not-active`, which is not a persistence failure and must never be printed as
+   one with an empty detail.
 5. **User actions reset everything.** A prompt the user types (including one
    queued while the agent is busy) and an abort both end the unattended phase, so
    the counters and the blocked audit start over. A replacement Goal starts from a

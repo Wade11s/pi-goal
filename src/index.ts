@@ -919,9 +919,21 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			);
 			return;
 		}
+		if (result.reason === "not-active") {
+			// The Goal stopped between this boundary's check and the write. Nothing was
+			// attempted and nothing failed, so the status is reported rather than a
+			// write error — and never with an empty detail.
+			const now = store.get();
+			ctx.ui.notify(
+				`Goal ${goal.id} is ${now?.status ?? "no longer set"}, so the conservative stop (${stop.kind}) ` +
+					"changes nothing: a Goal that is not active does not continue automatically.",
+				"warning",
+			);
+			return;
+		}
 		ctx.ui.notify(
 			`Goal ${goal.id} reached a conservative stop (${stop.kind}) but could not be persisted as blocked ` +
-				`(${describeError(result.reason === "persistence" ? result.error : undefined)}). The Goal stays ` +
+				`(${describeError(result.error)}). The Goal stays ` +
 				"active; fix the cause and it will stop again.",
 			"error",
 		);
@@ -953,9 +965,31 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * for continuation. Anything else is surfaced as a warning while the Goal
 	 * stays active, so the next successful run resumes it instead of the
 	 * extension driving its own retry loop.
+	 *
+	 * All of that describes an *active* Goal, and only an active Goal reaches it.
+	 * A Goal that has already stopped — `blocked`, `usage_limited`,
+	 * `budget_limited`, `paused`, `complete` — has no continuation to stop and no
+	 * transition to make, so a provider error changes nothing about it. Reporting
+	 * such a failure as if the Goal were active would contradict the stop: the Goal
+	 * does not "continue on the next successful run", and a usage-limit error on it
+	 * is not a failed write, because the store refuses a non-active record with
+	 * `not-active` rather than with `persistence`. The status is reported as it is.
+	 *
+	 * The `budget_limited` case is the one that reaches this path in ordinary use:
+	 * the run that failed may be the one bounded wrap-up, and the Goal stays
+	 * `budget_limited` whether or not that run completed.
 	 */
 	function handleProviderFailure(goal: GoalRecord, ctx: ExtensionContext): void {
 		const failure = classifyProviderFailure(providerFailure ?? {});
+		if (goal.status !== "active") {
+			ctx.ui.notify(
+				`Goal ${goal.id} is ${goal.status}, so the provider failure (${failure.evidence}) changes nothing: ` +
+					"a Goal that is not active does not continue automatically, and this one keeps its status. " +
+					"Nothing was written and nothing was lost.",
+				"warning",
+			);
+			return;
+		}
 		if (failure.kind === "usage-limit") {
 			const result = store.stopGoal(pi, {
 				status: "usage_limited",
@@ -973,10 +1007,23 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
+			if (result.reason === "not-active") {
+				// The Goal stopped between this boundary's check and the write — a
+				// lifecycle command landed in between. Nothing was attempted and nothing
+				// failed, so the status is reported rather than a write error.
+				const now = store.get();
+				ctx.ui.notify(
+					`Goal ${goal.id} is ${now?.status ?? "no longer set"}, so the provider usage limit ` +
+						`(${failure.evidence}) changes nothing: a Goal that is not active does not continue ` +
+						"automatically.",
+					"warning",
+				);
+				return;
+			}
 			ctx.ui.notify(
-				`Goal ${goal.id} hit a provider usage limit (${failure.evidence}) but could not be persisted as ` +
-						`usage_limited (${describeError(result.reason === "persistence" ? result.error : undefined)}). The ` +
-					"Goal stays active; fix the cause and it will stop again on the next failure.",
+				`Goal ${goal.id} hit a provider usage limit (${failure.evidence}) but the Goal could not be ` +
+						`persisted as usage_limited (${describeError(result.error)}). The Goal stays ` +
+					"active; fix the cause and it will stop again on the next failure.",
 				"error",
 			);
 			return;

@@ -1810,6 +1810,18 @@ test("a session without a Goal keeps its ordinary behavior", async () => {
 	}
 });
 
+/** The extension notice whose text contains every `needle`, once it appears. */
+async function noticeMatching(session, ...needles) {
+	return session.waitFor(`a notice mentioning ${needles.join(" and ")}`, (records) =>
+		records.find(
+			(r) =>
+				r.type === "extension_ui_request" &&
+				r.method === "notify" &&
+				needles.every((needle) => String(r.message).includes(needle)),
+		),
+	);
+}
+
 test("/goal resume restarts a blocked Goal with a fresh audit", async () => {
 	const session = await PiRpcSession.start();
 	// Three consecutive reports block the Goal, the user resumes it, and the
@@ -2056,6 +2068,131 @@ test("/goal resume restarts a blocked Goal with a budget, and refuses a budget-l
 		assert.equal(stillLimited.status, "budget_limited");
 		assert.equal(stillLimited.revision, limited.revision, "the refused resume persisted nothing");
 
+		assert.ok(session.extensionErrors().length === 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a provider error on a budget-limited Goal's wrap-up run reports the status, not an active Goal", async () => {
+	const session = await PiRpcSession.start();
+	// The kickoff crosses the budget, so the one bounded wrap-up is the next run —
+	// and that run fails at the provider. The Goal is already budget_limited, so the
+	// failure changes nothing about it and must not be described as if it were active.
+	script(
+		[
+			{ text: "Kickoff answer.", usage: { input: 10, output: 5 } },
+			{ error: "invalid api key" },
+			{ text: "Never requested." },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal --budget 1 ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("reached its token budget"));
+
+		// The wrap-up run's own failure is what the notice describes.
+		const notice = await noticeMatching(session, "budget_limited", "invalid api key");
+		assert.ok(notice, "the provider failure is surfaced against the real status");
+		assert.match(notice.message, /invalid api key/, "the evidence is still reported");
+		// The Goal is not active and does not continue, so neither claim may appear.
+		assert.ok(!notice.message.includes("still active"), `notice called the Goal active: ${notice.message}`);
+		assert.ok(
+			!notice.message.includes("continues on the next successful run"),
+			`notice promised a continuation: ${notice.message}`,
+		);
+		assert.ok(!notice.message.includes("could not be persisted"), `notice claimed a failed write: ${notice.message}`);
+
+		const after = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(after.status, "budget_limited", "the failure changed nothing");
+		assert.equal(after.wrapUpPending, false, "the one bounded wrap-up was already requested");
+		assert.equal(runCount(session), 2, "kickoff plus the failed wrap-up run");
+		assertStepsConsumed(session, 2, [{ stopReason: "error", errorMessage: "invalid api key" }]);
+		assert.ok(session.extensionErrors().length === 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a usage-limit error on an already budget-limited Goal is not reported as a failed write", async () => {
+	const session = await PiRpcSession.start();
+	// The same shape, but the wrap-up run fails with a usage-limit error. The Goal is
+	// already budget_limited, so the usage limit is reported against that status
+	// rather than as a transition that could not be persisted.
+	script(
+		[
+			{ text: "Kickoff answer.", usage: { input: 10, output: 5 } },
+			{ error: "Your billing limit has been reached" },
+			{ text: "Never requested." },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal --budget 1 ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("reached its token budget"));
+
+		const notice = await noticeMatching(session, "budget_limited", "billing limit has been reached");
+		assert.ok(notice, "the usage-limit evidence is surfaced against the real status");
+		assert.match(notice.message, /billing limit has been reached/);
+		// `stopGoal` refuses a non-active record with `not-active`, which used to be
+		// reported as a persistence failure with an empty detail.
+		assert.ok(
+			!notice.message.includes("could not be persisted"),
+			`notice claimed a failed write: ${notice.message}`,
+		);
+		assert.ok(!notice.message.includes("(undefined)"), `notice printed an empty detail: ${notice.message}`);
+		assert.ok(!notice.message.includes("stays active"), `notice called the Goal active: ${notice.message}`);
+		assert.ok(!notice.message.includes("is now usage_limited"), `notice claimed a transition: ${notice.message}`);
+
+		const after = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(after.status, "budget_limited", "a usage limit does not override the budget stop");
+		assert.equal(runCount(session), 2, "kickoff plus the failed wrap-up run");
+		assertStepsConsumed(session, 2, [
+			{ stopReason: "error", errorMessage: "Your billing limit has been reached" },
+		]);
+		assert.ok(session.extensionErrors().length === 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a provider error on an already usage-limited Goal does not promise a continuation", async () => {
+	const session = await PiRpcSession.start();
+	// The Goal is usage_limited, then a later user turn fails at the provider. That
+	// Goal does not continue until /goal resume, so the notice may not say it does.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ error: "Your billing limit has been reached" },
+			{ error: "invalid api key" },
+			{ text: "Never requested." },
+		],
+		session,
+	);
+	try {
+		await startGoal(session);
+		await session.waitForNotify((r) => r.message.includes("is now usage_limited"));
+		const limited = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(limited.status, "usage_limited");
+
+		await session.prompt("keep going");
+		const notice = await noticeMatching(session, "usage_limited", "invalid api key");
+		assert.ok(notice, "the provider failure is still surfaced");
+		assert.ok(!notice.message.includes("still active"), `notice called the Goal active: ${notice.message}`);
+		assert.ok(
+			!notice.message.includes("continues on the next successful run"),
+			`notice promised a continuation: ${notice.message}`,
+		);
+		assert.ok(!notice.message.includes("could not be persisted"), `notice claimed a failed write: ${notice.message}`);
+
+		const after = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(after.status, "usage_limited", "the failure changed nothing");
+		assert.equal(after.revision, limited.revision, "nothing was written");
+		assert.equal(after.id, limited.id);
+		assertStepsConsumed(session, 3, [
+			{ stopReason: "error", errorMessage: "Your billing limit has been reached" },
+			{ stopReason: "error", errorMessage: "invalid api key" },
+		]);
 		assert.ok(session.extensionErrors().length === 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();

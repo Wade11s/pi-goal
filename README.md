@@ -500,7 +500,11 @@ to be over.
   malfunction, and it resets the counters.
 - A **terminal provider error** that is not a usage limit stops the continuation
   for that run and is surfaced as a warning, while the Goal stays active and
-  continues on the next successful run. Pi's own retries are untouched.
+  continues on the next successful run. Pi's own retries are untouched. A Goal
+  that has already stopped (`blocked`, `usage_limited`, `budget_limited`,
+  `paused`, `complete`) has no continuation to stop, so the same failure is
+  reported against that status: it changes nothing, and it is never described as
+  an active Goal or as a write that failed.
 - A **usage-limit** error is only classified as one when Pi exposes enough
   evidence, and the evidence is read in two tiers:
   - **Account or plan depletion is decisive.** A provider error code whose meaning
