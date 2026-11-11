@@ -284,6 +284,28 @@ export class PiRpcSession {
 		return request;
 	}
 
+	/**
+	 * Wait for a blocking extension editor dialog and answer it with `value`.
+	 *
+	 * Mirrors `respondToConfirm` for the `editor` method, which carries the
+	 * prefilled objective in `prefill` and returns the edited text in `value`.
+	 * `cancelled: true` dismisses the dialog (the extension receives undefined).
+	 */
+	async respondToEditor(matcher, value) {
+		const request = await this.waitFor("unanswered matching extension editor dialog", (records) =>
+			records.find(
+				(r) =>
+					r.type === "extension_ui_request" &&
+					r.method === "editor" &&
+					!this.answeredUiRequests.has(r.id) &&
+					matcher(r),
+			),
+		);
+		this.answeredUiRequests.add(request.id);
+		this.writeCommand({ type: "extension_ui_response", id: request.id, value });
+		return request;
+	}
+
 	/** Wait for a tool execution to finish and return its tool_execution_end record. */
 	async waitForToolResult(toolName, count = 1) {
 		return this.waitFor(`completion of ${count}. ${toolName} tool call`, (records) => {

@@ -700,9 +700,16 @@ test("lifecycle subcommands without a Goal report clearly and start nothing", as
 		const noEdit = await session.waitForNotify((r) => r.message.includes("no Goal to edit"));
 		assert.equal(noEdit.notifyType, "warning");
 
+		// Bare `/goal edit` is the interactive editing entry point. With no Goal
+		// there is nothing to edit, so it reports that and opens no dialog.
 		await session.prompt("/goal edit");
-		const usage = await session.waitForNotify((r) => r.message.includes("Usage: /goal edit"));
-		assert.equal(usage.notifyType, "error");
+		const noGoal = await session.waitForNotify((r) => r.message.includes("no Goal to edit"));
+		assert.equal(noGoal.notifyType, "warning");
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "editor").length,
+			0,
+			"no editor dialog was opened",
+		);
 
 		// Case-insensitive subcommand recognition.
 		await session.prompt("/goal EDIT reworded objective");

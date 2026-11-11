@@ -11,13 +11,29 @@ lifecycle changes, or the Goal's token budget runs out.
 Requires **Pi 1.5.1 or newer**. The extension uses only public extension APIs and
 does not patch Pi core.
 
+## Supported Pi versions
+
+pi-goal targets Pi **1.5.1 and newer**. It is developed against the public
+extension APIs available in 1.5.1; `package.json` pins
+`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.5.1 for
+typechecking, and the automated suite runs against the installed `pi` CLI
+(1.5.1 or newer; verified on 1.5.2). Pi loads the TypeScript entry point through
+its `jiti` loader, so no build step is required.
+
 ## Install
 
-From a checkout of this repository:
+The package follows Pi's documented package workflow. From a checkout of this
+repository:
 
 ```sh
-pi install ./            # add to personal settings
+pi install ./            # add to personal settings (~/.pi/agent/settings.json)
 pi install --local ./    # or project-local (.pi/settings.json, after project trust)
+```
+
+Confirm the installation:
+
+```sh
+pi list                  # the checkout appears under User/Project packages
 ```
 
 Or try it once without installing:
@@ -26,8 +42,10 @@ Or try it once without installing:
 pi -e ./
 ```
 
-The package declares its entry point in `package.json` (`pi.extensions`), has no
-runtime dependencies, and uses Pi's host-provided packages.
+The package declares its entry point in `package.json` (`pi.extensions`), is
+discoverable through the `pi-package` keyword, has no runtime dependencies, and
+uses Pi's host-provided packages (`peerDependencies` only). Installed packages
+can be updated with `pi update --extensions` and removed with `pi remove <source>`.
 
 ## Usage
 
@@ -76,6 +94,14 @@ restarts work with a kickoff message. A paused Goal can be edited too — it sta
 paused until resumed. A complete Goal is finished and cannot be edited; replace
 it instead.
 
+Bare `/goal edit` opens Pi's multi-line editor prefilled with the current
+objective. Saving applies the edit in place; cancelling leaves it unchanged.
+The editor is a dialog-capable UI surface: TUI and RPC hosts support it through
+Pi's extension-UI subprotocol, while print/JSON mode (`ctx.hasUI` false) prints
+guidance to use the typed form instead of blocking on a terminal-only dialog.
+Pi's editor dialog has no timeout option, so pi-goal auto-cancels the command
+after 120 seconds if the host never answers; the objective is unchanged.
+
 ### Inspect the current Goal
 
 ```
@@ -101,9 +127,23 @@ Remaining capacity: 201790 tokens
 ```
 
 When a session with a Goal starts, restores, or reloads, a `Goal ... restored
-(active)` notification confirms reconstruction. A compact one-line indicator
-(`goal_1a2b3c4d · active · 48210 tok · 201790 left · 5m 12s`) is published to
-Pi's status/footer surface whenever it exists.
+(active)` notification confirms reconstruction.
+
+### Status indicator
+
+When a UI exists, pi-goal publishes a compact one-line indicator under the
+`goal` status key:
+
+```
+goal_1a2b3c4d · active · 48210 tok · 201790 left · 5m 12s
+```
+
+The indicator exposes every lifecycle state — `active`, `paused`, `blocked`,
+`usage_limited`, `budget_limited`, and `complete` — and is refreshed on session
+start/restore, after every lifecycle transition (create, edit, pause, resume,
+clear, complete, blocked, usage-limit, budget-limit), and after accounted usage.
+Clearing a Goal removes the indicator. The full breakdown is always one `/goal`
+away.
 
 ### Token budgets
 
@@ -706,6 +746,11 @@ test settles on a provider error.
   an unfinished Goal instead discards the old Goal entirely (fresh identity,
   fresh revisions). Refining the finish line without discarding anything is what
   `/goal edit` is for.
+- Bare `/goal edit` needs a dialog-capable UI. TUI and RPC hosts that implement
+  Pi's extension-UI subprotocol can answer the editor dialog; print/JSON mode and
+  hosts without a dialog-capable UI get guidance to use
+  `/goal edit <objective>` instead of blocking. A dialog that is never answered
+  auto-cancels after 120 seconds and leaves the objective unchanged.
 - Budget enforcement happens when a turn's usage is accounted, not inside the
   provider loop: the extension cannot preempt a model call Pi has already
   started, so a run in flight can overshoot the budget before it stops. It
@@ -734,6 +779,16 @@ test settles on a provider error.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.
+
+## Attribution
+
+pi-goal is MIT-licensed. Portions of the Goal lifecycle model and the
+continuation, completion, blocked-audit, no-progress, and budget wrap-up prompt
+structure are adapted from the OpenAI Codex Goal extension, which is licensed
+under the Apache License, Version 2.0. See [NOTICE.md](NOTICE.md) and
+[LICENSE-APACHE-2.0.txt](LICENSE-APACHE-2.0.txt) for the attribution and license
+text. The Pi-specific implementation is original and uses Pi's public extension
+APIs.
 
 ## Development
 
@@ -769,53 +824,31 @@ a graceful and an unclean restart.
 
 ### Interactive smoke test
 
-Deterministic RPC tests are the automated gate; this manual procedure verifies
-interactive installation and rendering:
+Deterministic RPC tests are the automated gate. The manual real-Pi procedure —
+installation, creation, automatic continuation, interactive editing, pause,
+resume, status, restart persistence, clear, and the clear tombstone — is in
+[docs/smoke-test.md](docs/smoke-test.md).
+
+## Verification
 
 ```sh
-cd /path/to/this/checkout
-pi -e ./
-# In Pi:
-# 1. /goal Write a haiku about persistent sessions in a file called haiku.txt
-#    -> notification "Goal ... created and activated", agent starts working.
-# 2. /goal
-#    -> status report with the objective, "active", revision, timestamps, token
-#       usage, active time, and remaining capacity.
-# 3. Let the agent finish a turn.
-#    -> it continues on its own; the continuation prompt restates the objective
-#       and carries the no-progress and blocked-audit contract.
-# 4. /goal edit Write the haiku and a limerick about steering
-#    -> "objective updated"; the running work is steered to the new objective.
-# 5. /goal pause
-#    -> "Goal ... paused"; the current turn finishes and nothing continues.
-# 6. /goal
-#    -> status "paused" with the paused-state hint line.
-# 7. /goal resume
-#    -> "Goal ... resumed"; work restarts from retained progress with a fresh audit.
-# 8. /goal Write a sonnet instead
-#    -> confirmation dialog; answer No -> "Replacement cancelled".
-# 9. /reload
-#    -> "Goal ... restored (active)" notification, and /goal reports the same
-#       objective and the same accounted usage after the reload.
-# 10. Exit (Ctrl+D), then: pi -c
-# 11. /goal
-#     -> the Goal, its usage, and its active time survive the restart.
-# 12. /goal clear
-#     -> "Goal ... cleared"; the session is back to ordinary prompts.
-# 13. /reload
-#     -> no "restored" notification: the tombstone means no Goal comes back.
-# 14. /goal
-#     -> "No Goal is set in this session."
-#
-# Budget check (optional):
-# 15. /goal --budget 1 Write a haiku
-#     -> the Goal is created, the very next accounted turn exhausts the budget,
-#        a warning notification reports it, exactly one wrap-up summary is
-#        produced, and the Goal stops continuing (status: budget_limited).
+npm run typecheck  # tsc --noEmit
+npm test           # deterministic real-Pi RPC suite (requires pi 1.5.1+ on PATH)
 ```
 
-To see a conservative stop interactively, give the agent a Goal it cannot make
-progress on — for example an objective that needs a credential the environment does
-not have — and let it run. After the same blocker has been reported for three
-consecutive Goal turns the Goal becomes `blocked`, bare `/goal` reports the blocker
-and the audit count, and no further turn starts on its own.
+`npm test` runs the complete RPC suite plus unit tests for accounting, the
+store's durability boundaries, the compact status line, the interactive/headless
+editing guard, and the `pi install` package workflow. It needs no model
+credentials or network service.
+
+To verify the package installation and the interactive surface by hand, follow
+[docs/smoke-test.md](docs/smoke-test.md). The smoke test covers:
+
+- [ ] `pi install ./` and `pi list`
+- [ ] `/goal <objective>` creation and immediate work
+- [ ] automatic continuation at settlement
+- [ ] bare `/goal edit` interactive editing
+- [ ] `/goal pause`, `/goal resume`, and `/goal clear`
+- [ ] the compact status indicator for `active`, `paused`, `blocked`,
+      `usage_limited`, `budget_limited`, and `complete`
+- [ ] restart persistence and the clear tombstone

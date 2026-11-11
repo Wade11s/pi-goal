@@ -5,6 +5,14 @@
 	"type": "module",
 	"license": "MIT",
 	"keywords": ["pi-package"],
+	"files": [
+		"src",
+		"docs",
+		"README.md",
+		"LICENSE",
+		"NOTICE.md",
+		"LICENSE-APACHE-2.0.txt"
+	],
 	"pi": {
 		"extensions": ["./src/index.ts"]
 	},
