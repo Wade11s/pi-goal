@@ -30,23 +30,36 @@
  * synchronously) and only then announced, and work-start messages are delivered
  * through Pi's steering when a run is in flight.
  *
- * The model's authority stays bounded: update_goal can complete a Goal, and can
- * pause one only after an explicit user request that the call must quote
- * verbatim (the quote is corroborated against recent human-authored user
+ * The model's authority stays bounded: update_goal can complete a Goal, can report a
+ * blocker (three consecutive Goal turns reporting the same genuine blocker move it to
+ * `blocked`), and can pause one only after an explicit user request that the call must
+ * quote verbatim (the quote is corroborated against recent human-authored user
  * messages). Resuming, clearing, and replacing are user-owned.
+ *
+ * Stopping is conservative and mostly independent of the model
+ * (`./safety.ts`): repeated activity-free automatic Goal turns, repeated turns
+ * in which commands could not be executed at all, and terminal provider
+ * failures all stop automatic continuation deterministically, and a provider
+ * usage limit moves the Goal to `usage_limited`. The model can end the loop
+ * itself by completing the Goal, or by reporting the same genuine blocker for
+ * three consecutive Goal turns. User actions reset every anti-loop counter.
  *
  * Usage is accounted durably from finalized Pi messages and reported nested
  * usage, with stable deduplication (see `accounting.ts`). A Goal with a token
  * budget transitions to `budget_limited` when its accounted usage reaches the
  * budget, receives exactly one bounded wrap-up, and then stops continuing —
  * budget exhaustion is never completion.
- *
- * Blocked audits, usage-limit handling, and branch hardening land in their own
- * later tickets; this milestone deliberately does not implement them.
  */
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentActivityOutcome,
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ExtensionToolContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	BLOCKED_AUDIT_THRESHOLD,
 	CUSTOM_MESSAGE_TYPE,
 	CUSTOM_WRAPUP_MESSAGE_TYPE,
 	corroboratePauseRequest,
@@ -59,7 +72,9 @@ import {
 	formatNoGoal,
 	formatResumeMessage,
 	getGoalOutputSchema,
+	MAX_BLOCKER_LENGTH,
 	MAX_OBJECTIVE_LENGTH,
+	MIN_BLOCKER_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 	MIN_USER_REQUEST_LENGTH,
 	type GoalBinding,
@@ -68,7 +83,7 @@ import {
 	previewObjective,
 	toPublicState,
 } from "./goal.ts";
-import { GoalStore, validateObjective, type GoalMutationFailure } from "./store.ts";
+import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
 import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
@@ -76,6 +91,13 @@ import {
 	parseBudgetSettings,
 	resolveGoalTokenBudget,
 } from "./accounting.ts";
+import {
+	classifyProviderFailure,
+	GoalSafetyMonitor,
+	type GoalRunKind,
+	type ProviderFailureEvidence,
+	type SafetyStop,
+} from "./safety.ts";
 
 /** Auto-decline a replacement confirmation after this long (safe default: no discard). */
 const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
@@ -191,6 +213,52 @@ function parseGoalCommand(args: string): GoalCommand {
 
 export default function goalExtension(pi: ExtensionAPI): void {
 	const store = new GoalStore();
+	const safety = new GoalSafetyMonitor();
+
+	/**
+	 * What started the next run, set by whoever starts it: the kickoff the /goal
+	 * command sends, or a continuation this extension just requested. Consumed by
+	 * `agent_start`, and cleared by `agent_settled` so a continuation Pi rejected
+	 * (an invalid boundary continuation, a run it refused to start) cannot leak
+	 * into the next user-started run.
+	 */
+	let pendingRunKind: GoalRunKind | undefined = undefined;
+
+	/** Evidence of the provider failure that ended the current run, if any. */
+	let providerFailure: ProviderFailureEvidence | undefined = undefined;
+
+	/** How the last assistant message of the current run ended. */
+	let runOutcome: AgentActivityOutcome | undefined = undefined;
+
+	/** What started the run that just ended, so its retry can be recognized. */
+	let lastRunKind: GoalRunKind = "user";
+	/**
+	 * Whether the next run continues the Goal turn that just ended.
+	 *
+	 * Pi can turn one Goal turn into several runs in two ways, and both of them must
+	 * keep the Goal turn's identity and its accumulated observations:
+	 *
+	 * - it retries a failed provider request (`agent_end` with an error outcome);
+	 * - it compacts for overflow recovery and retries the same response
+	 *   (`session_compact` with `willRetry`), which follows a *completed* run, so
+	 *   the error signal alone would miss it.
+	 *
+	 * Cleared by anything that means the next run does *not* continue the turn: the
+	 * settlement boundary (the Goal turn is over), user input (Pi is delivering
+	 * queued work, not retrying), or the run itself once it has started. Without
+	 * those clears, a message the user queued during a failing run would inherit the
+	 * Goal turn's identity and count as unattended Goal work.
+	 */
+	let continuesGoalTurn = false;
+
+	/**
+	 * Whether a blocker report was counted during the current Goal turn.
+	 *
+	 * The blocked audit counts *consecutive* Goal turns, so a Goal turn that ends
+	 * without a report has to break the chain even though nothing in that turn
+	 * said so.
+	 */
+	let blockerCountedThisRun = false;
 
 	/**
 	 * The Goal (identity + revision) the model's current request was prepared
@@ -306,6 +374,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
+		// Runtime-only counters must not survive into a new runtime; the durable
+		// blocked audit is reconstructed with the Goal.
+		safety.reset();
 		const goal = store.get();
 		if (goal) {
 			notify(ctx, `Goal ${goal.id} restored (${goal.status}).`, "info");
@@ -388,6 +459,115 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// The status line follows the selected branch too, and the accounting
 		// baseline is rebuilt with it.
 		updateStatus(ctx);
+		// Navigation selects a different branch's Goal state, so the runtime-only
+		// counters of the branch left behind must not survive into it.
+		safety.reset();
+	});
+
+	/**
+	 * A compaction that recovers an overflow retries the response that triggered it,
+	 * so the run that follows continues the Goal turn rather than starting a fresh
+	 * one. This is the only signal for the recoverable-length case, because that run
+	 * *completed*: without it, a Goal turn whose response was truncated and retried
+	 * empty would be read as a user run and would never reach an anti-loop bound.
+	 *
+	 * A compaction that does not retry (manual, or the context threshold) leaves the
+	 * flag alone, so the next run is a fresh Goal turn or a user run as usual.
+	 */
+	pi.on("session_compact", (event) => {
+		if (event.willRetry) continuesGoalTurn = true;
+	});
+
+	/**
+	 * A prompt the user typed is a user action: the loop is no longer unattended,
+	 * so every anti-loop counter starts over. Extension commands (`/goal ...`) do
+	 * not fire `input`; creating a Goal already starts from a fresh record.
+	 */
+	pi.on("input", (_event, ctx) => {
+		continuesGoalTurn = false;
+		safety.reset();
+		reportAuditResetFailure("the prompt you just sent", ctx);
+	});
+
+	/**
+	 * A run starts. Pi can start several runs for one Goal turn, because it retries
+	 * a failed provider request with `agent.continue()`: that run is the *same*
+	 * Goal turn, so it keeps the turn's identity and everything the failed attempt
+	 * observed. Reading it as a fresh user run would reset the anti-loop counters
+	 * and the blocked audit on a transient error Pi is about to retry.
+	 */
+	pi.on("agent_start", () => {
+		if (pendingRunKind !== undefined) {
+			safety.beginRun(pendingRunKind);
+			pendingRunKind = undefined;
+		} else if (continuesGoalTurn) {
+			// Pi is retrying the Goal turn that just ended: same turn, same identity,
+			// and the failed attempt's observations still count.
+			safety.beginRun(lastRunKind, true);
+		} else {
+			safety.beginRun("user");
+		}
+		continuesGoalTurn = false;
+		providerFailure = undefined;
+		runOutcome = undefined;
+	});
+
+	/**
+	 * A run ended. Nothing is evaluated here: Pi may retry this run, and a Goal
+	 * turn is only over once Pi stops retrying and reaches the settlement boundary.
+	 * All this records is what the next `agent_start` needs to recognize a retry.
+	 */
+	pi.on("agent_end", () => {
+		lastRunKind = safety.currentRunKind;
+		// A run with no assistant message never reached the model; treat it as
+		// neutral rather than as a completed, activity-free Goal turn.
+		const outcome = runOutcome ?? "aborted";
+		continuesGoalTurn = outcome === "error";
+	});
+
+	/**
+	 * Settlement is the end of the whole session-level run. Whatever was pending
+	 * is either consumed or moot, so nothing may leak into the next run.
+	 */
+	pi.on("agent_settled", (event, ctx) => {
+		pendingRunKind = undefined;
+		continuesGoalTurn = false;
+		if (!event.aborted) return;
+		// An abort is the strongest possible user action: the Goal turn the user
+		// stopped must not be counted as a Goal malfunction, and it never reached
+		// the boundary that would otherwise have closed it.
+		safety.reset();
+		blockerCountedThisRun = false;
+		reportAuditResetFailure("the abort", ctx);
+	});
+
+	/**
+	 * Observe the finalized assistant message: it is what "activity" means for a
+	 * Goal turn, and the last one also says how the run ended.
+	 */
+	pi.on("message_end", (event) => {
+		const message = event.message;
+		if (message.role !== "assistant") return;
+		safety.noteAssistantMessage(message);
+		// Pi maps a turn's stop reason onto the run outcome, so the last assistant
+		// message of a run is authoritative — including when an earlier attempt in
+		// the same run failed and a later one recovered.
+		runOutcome =
+			message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
+		providerFailure =
+			message.stopReason === "error"
+				? { errorMessage: message.errorMessage, diagnostics: message.diagnostics }
+				: undefined;
+	});
+
+	/** Observe every finalized tool call, so execution failures can be told apart from ordinary ones. */
+	pi.on("tool_execution_end", (event) => {
+		safety.noteToolExecutionEnd({
+			toolName: event.toolName,
+			isError: event.isError,
+			durationMs: event.durationMs,
+			result: event.result,
+		});
 	});
 
 	/**
@@ -583,11 +763,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * races or duplicates those mechanisms; continuing from a timer or from
 	 * `agent_end` would.
 	 *
-	 * Guards, all of which must hold for an ordinary continuation:
-	 * - a Goal exists and is active (completed, budget-limited, paused, cleared,
-	 *   and absent Goals never continue), and
-	 * - the run completed (aborted and errored runs are hard exits: Pi owns
-	 *   retries, so re-driving them here would be an unattended retry loop).
+	 * Guards, all of which must hold:
+	 * - a Goal exists and is active (completed, paused, blocked, usage-limited,
+	 *   budget-limited, cleared, and absent Goals never continue), and
+	 * - the Goal turn completed (aborted and errored Goal turns are hard exits: Pi
+	 *   owns retries, so re-driving them here would be an unattended retry loop).
+	 *
+	 * This boundary is also where a Goal turn is *closed*. Everything Pi owns has
+	 * finished by now — retries, final-attempt recovery, compaction retries, queued
+	 * messages — so the accumulated observations describe one complete Goal turn,
+	 * and only here can they be evaluated without misreading a run Pi is about to
+	 * retry. A Goal turn that reported no blocker breaks the blocked audit here too,
+	 * for the same reason.
+	 *
+	 * An errored Goal turn is additionally classified from the evidence Pi exposes,
+	 * so a provider usage limit becomes `usage_limited` while any other terminal
+	 * provider error stops the continuation for that run and is surfaced.
 	 *
 	 * A budget-limited Goal with a pending wrap-up gets exactly one bounded
 	 * wrap-up message and one further request, and then nothing: the flag is
@@ -603,19 +794,38 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * it and makes no extra one, so this adds exactly one Goal turn per
 	 * settlement and no more.
 	 */
-	pi.on("agent_before_settle", async (event, _ctx) => {
+	pi.on("agent_before_settle", async (event, ctx) => {
+		// Reaching this boundary means Pi is not retrying, so nothing that follows
+		// can be a retry of the run that just ended.
+		continuesGoalTurn = false;
 		const goal = store.get();
-		if (!goal) return;
+		if (!goal) {
+			// The status check comes later, after the budget wrap-up: a budget-limited
+			// Goal is not active and still has one bounded message to deliver.
+			closeGoalTurn(ctx);
+			return;
+		}
 		if (pendingInitialKickoff && goal.id === pendingInitialKickoff.id) {
 			// `/goal <objective>` has not sent its kickoff yet. Let the ordinary
 			// run settle so the command can start work itself (or observe a
 			// user clear/edit/pause and cancel the stale kickoff). Gate by Goal
 			// identity, not by the captured revision: an edit keeps the Goal
 			// active and would otherwise let this seam adopt the run the create
-			// command is waiting for, forever.
+			// command is waiting for, forever. The run being waited for is not
+			// this Goal's work, so a provider failure in it belongs to the run
+			// that produced it rather than to a Goal that has not started yet.
+			closeGoalTurn(ctx);
 			return;
 		}
-		if (event.outcome !== "completed") return;
+		if (event.outcome === "error") {
+			handleProviderFailure(goal, ctx);
+			closeGoalTurn(ctx);
+			return;
+		}
+		if (event.outcome !== "completed") {
+			closeGoalTurn(ctx);
+			return;
+		}
 
 		// Every entry this run produced is durable by now, so a pending transition is
 		// written before the wrap-up snapshot that follows it.
@@ -640,7 +850,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			};
 		}
 
-		if (goal.status !== "active") return;
+		if (goal.status !== "active") {
+			closeGoalTurn(ctx);
+			return;
+		}
+
+		// The Goal turn is over: evaluate it before deciding whether to continue.
+		const stop = safety.evaluateRun(event.outcome);
+		closeGoalTurn(ctx);
+		if (stop) {
+			applySafetyStop(stop, ctx);
+			return;
+		}
+
+		// The next run is Goal work, whether Pi starts it for our continuation or
+		// for queued work that already satisfies the decision.
+		pendingRunKind = "automatic";
 		return {
 			entries: [
 				...event.entries,
@@ -654,6 +879,161 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			continue: true,
 		};
 	});
+
+	/**
+	 * Close the Goal turn that just finished: evaluate nothing further, forget its
+	 * observations, and break the blocked audit if it reported no blocker.
+	 *
+	 * Called from the settlement boundary, which is the only place a Goal turn is
+	 * known to be over, and from the abort path, where the user has already ended
+	 * it more decisively.
+	 */
+	function closeGoalTurn(ctx: ExtensionContext): void {
+		const wasGoalTurn = safety.currentRunKind !== "user";
+		const reported = blockerCountedThisRun;
+		blockerCountedThisRun = false;
+		safety.endTurn();
+		if (wasGoalTurn && !reported) {
+			// A Goal turn that reported no blocker breaks the blocked audit, so the
+			// next report starts a fresh chain instead of resuming an old one.
+			reportAuditResetFailure("a Goal turn that reported no blocker", ctx);
+		}
+	}
+
+	/**
+	 * Apply a conservative stop: persist the Goal as blocked and tell the user why.
+	 *
+	 * Called at the end of the Goal run that reached a bound, so the Goal is already
+	 * blocked before the settlement boundary could ask for another continuation.
+	 */
+	function applySafetyStop(stop: SafetyStop, ctx: ExtensionContext): void {
+		const goal = store.get();
+		if (!goal || goal.status !== "active") return;
+		const result = store.stopGoal(pi, { status: "blocked", blocker: stop.blocker, turns: stop.turns });
+		if (result.ok) {
+			ctx.ui.notify(
+				`Goal ${result.goal.id} stopped and is now blocked (${stop.kind}): ${stop.blocker} ` +
+					"Automatic continuation has stopped; /goal resume restarts it with a fresh blocked audit once the " +
+					"blocker is resolved.",
+				"warning",
+			);
+			return;
+		}
+		if (result.reason === "not-active") {
+			// The Goal stopped between this boundary's check and the write. Nothing was
+			// attempted and nothing failed, so the status is reported rather than a
+			// write error — and never with an empty detail.
+			const now = store.get();
+			ctx.ui.notify(
+				`Goal ${goal.id} is ${now?.status ?? "no longer set"}, so the conservative stop (${stop.kind}) ` +
+					"changes nothing: a Goal that is not active does not continue automatically.",
+				"warning",
+			);
+			return;
+		}
+		ctx.ui.notify(
+			`Goal ${goal.id} reached a conservative stop (${stop.kind}) but could not be persisted as blocked ` +
+				`(${describeError(result.error)}). The Goal stays ` +
+				"active; fix the cause and it will stop again.",
+			"error",
+		);
+	}
+
+	/**
+	 * Reset the blocked audit after a user action or a Goal turn that reported no
+	 * blocker, and surface a write failure instead of silently dropping the reset.
+	 *
+	 * Silently keeping a stale audit would let a reload resurrect a count the user
+	 * already invalidated, which is exactly what the durable reset exists to
+	 * prevent.
+	 */
+	function reportAuditResetFailure(cause: string, ctx: ExtensionContext): void {
+		const result = store.resetBlockedAudit(pi);
+		if (result.ok) return;
+		ctx.ui.notify(
+			`pi-goal could not record the blocked-audit reset after ${cause}: ` +
+				`${describeError(result.error)}. The audit stays as it was until the write succeeds.`,
+			"error",
+		);
+	}
+
+	/**
+	 * Classify the terminal provider failure that just ended a run.
+	 *
+	 * A usage limit is evidence-based: only an error that says the account, plan,
+	 * or budget is exhausted moves the Goal to `usage_limited`, which is terminal
+	 * for continuation. Anything else is surfaced as a warning while the Goal
+	 * stays active, so the next successful run resumes it instead of the
+	 * extension driving its own retry loop.
+	 *
+	 * All of that describes an *active* Goal, and only an active Goal reaches it.
+	 * A Goal that has already stopped — `blocked`, `usage_limited`,
+	 * `budget_limited`, `paused`, `complete` — has no continuation to stop and no
+	 * transition to make, so a provider error changes nothing about it. Reporting
+	 * such a failure as if the Goal were active would contradict the stop: the Goal
+	 * does not "continue on the next successful run", and a usage-limit error on it
+	 * is not a failed write, because the store refuses a non-active record with
+	 * `not-active` rather than with `persistence`. The status is reported as it is.
+	 *
+	 * The `budget_limited` case is the one that reaches this path in ordinary use:
+	 * the run that failed may be the one bounded wrap-up, and the Goal stays
+	 * `budget_limited` whether or not that run completed.
+	 */
+	function handleProviderFailure(goal: GoalRecord, ctx: ExtensionContext): void {
+		const failure = classifyProviderFailure(providerFailure ?? {});
+		if (goal.status !== "active") {
+			ctx.ui.notify(
+				`Goal ${goal.id} is ${goal.status}, so the provider failure (${failure.evidence}) changes nothing: ` +
+					"a Goal that is not active does not continue automatically, and this one keeps its status. " +
+					"Nothing was written and nothing was lost.",
+				"warning",
+			);
+			return;
+		}
+		if (failure.kind === "usage-limit") {
+			const result = store.stopGoal(pi, {
+				status: "usage_limited",
+				blocker:
+					`The provider reported a usage limit (${failure.evidence}), so this Goal cannot continue until the ` +
+					"limit is resolved and a user resumes it.",
+				turns: 0,
+			});
+			if (result.ok) {
+				ctx.ui.notify(
+					`Goal ${result.goal.id} is now usage_limited: the provider reported a usage limit ` +
+						`(${failure.evidence}). Automatic continuation has stopped; /goal resume restarts it once the ` +
+						"limit is resolved, because a usage-limited Goal never continues on its own.",
+					"warning",
+				);
+				return;
+			}
+			if (result.reason === "not-active") {
+				// The Goal stopped between this boundary's check and the write — a
+				// lifecycle command landed in between. Nothing was attempted and nothing
+				// failed, so the status is reported rather than a write error.
+				const now = store.get();
+				ctx.ui.notify(
+					`Goal ${goal.id} is ${now?.status ?? "no longer set"}, so the provider usage limit ` +
+						`(${failure.evidence}) changes nothing: a Goal that is not active does not continue ` +
+						"automatically.",
+					"warning",
+				);
+				return;
+			}
+			ctx.ui.notify(
+				`Goal ${goal.id} hit a provider usage limit (${failure.evidence}) but the Goal could not be ` +
+						`persisted as usage_limited (${describeError(result.error)}). The Goal stays ` +
+					"active; fix the cause and it will stop again on the next failure.",
+				"error",
+			);
+			return;
+		}
+		ctx.ui.notify(
+			`Goal ${goal.id} is still active, but automatic continuation stopped for this run: the provider failed ` +
+				`and Pi is not retrying it (${failure.evidence}). The Goal continues on the next successful run.`,
+			"warning",
+		);
+	}
 
 	pi.registerTool({
 		name: "get_goal",
@@ -747,6 +1127,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// visible state change, and the attempt can simply be retried.
 				store.stage(pi, goal);
 				store.commit(goal);
+				// A new Goal identity starts every audit from zero: counters left
+				// over from a replaced Goal describe work that no longer exists.
+				safety.reset();
 			} catch (error) {
 				store.rollback(pi);
 				const reason = error instanceof Error ? error.message : String(error);
@@ -771,16 +1154,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		name: "update_goal",
 		label: "Update Goal",
 		description:
-			"Update the current Goal: action complete marks it complete after every requirement " +
-			"of the objective is verified against current-state evidence. action pause is accepted " +
-			"only after an explicit user request, which must be quoted verbatim in user_request. " +
+			"Update the current Goal. Supported actions: \"complete\" after an evidence-based completion audit, " +
+			"\"blocked\" once the same genuine blocker has persisted for at least three consecutive Goal turns, " +
+			"and \"pause\" after an explicit user request, which must be quoted verbatim in user_request. " +
+			"Complete and blocked are terminal: they stop the Goal's automatic continuation. " +
 			"The model cannot resume, clear, replace, or budget-limit a Goal.",
 		parameters: Type.Object({
 			action: Type.String({
 				description:
-					"complete, or pause. Pause requires user_request quoting the user's exact request; " +
+					"complete, blocked, or pause. Pause requires user_request quoting the user's exact request; " +
 					"resume and clear are user-owned (/goal resume, /goal clear).",
 			}),
+			blocker: Type.Optional(
+				Type.String({
+					description:
+						`Required for action blocked: the genuine blocker in plain language (${MIN_BLOCKER_LENGTH}-${MAX_BLOCKER_LENGTH} characters). ` +
+						"Say what is actually blocking the work and what would unblock it.",
+				}),
+			),
 			userRequest: Type.Optional(
 				Type.String({
 					description:
@@ -791,39 +1182,53 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			),
 		}),
 		outputSchema: getGoalOutputSchema,
-		promptSnippet: "Mark the current Goal complete after an evidence audit, or pause it at the user's explicit request",
+		promptSnippet:
+			"Mark the current Goal complete after an evidence audit, blocked after a persistent blocker, or paused at the user's explicit request",
 		promptGuidelines: [
 			"Call update_goal with action complete only after every explicit requirement of the objective is verified by current-state evidence.",
-			"Completing a Goal stops its automatic continuation, so never call it to escape a difficult or merely tiring task.",
+			`Call update_goal with action blocked only when the same genuine blocker has persisted for at least ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns, and never because the work is merely hard, slow, uncertain, or incomplete.`,
+			"Completing or blocking a Goal stops its automatic continuation, so never use either to escape a difficult or merely tiring task.",
 			"Call update_goal with action pause only when the user explicitly asked to pause this Goal, and quote their exact words in user_request. Never pause on your own initiative.",
 			"Never call update_goal to resume or clear a Goal; the user owns those transitions.",
 		],
 		/**
-		 * Compatibility shim for the spellings a model reaches for: `{ status: "complete" }`
-		 * / `{ complete: true }` mean complete, `{ status: "paused" }` / `{ paused: true }`
-		 * mean pause (and still need the corroboration), and the user quote is
-		 * accepted as either `userRequest` or `user_request`. Anything else is passed
-		 * through untouched so an unsupported action is refused with a real
+		 * Compatibility shim for the spellings a model reaches for: `{ status: … }`
+		 * and `{ complete: true }` / `{ blocked: true }` / `{ paused: true }`. Without
+		 * it a drifted call fails schema validation, the model sees only an arguments
+		 * error, and the Goal keeps burning turns. Anything else is passed through
+		 * with an empty action so an unsupported action is refused with a real
 		 * explanation instead of being silently ignored.
 		 */
-		prepareArguments: (args: unknown): { action: string; userRequest?: string } => {
+		prepareArguments: (args: unknown): { action: string; blocker?: string; userRequest?: string } => {
 			if (typeof args !== "object" || args === null) return { action: "" };
 			const record = args as Record<string, unknown>;
+			const blocker = typeof record.blocker === "string" ? record.blocker : undefined;
 			const rawRequest = record.userRequest ?? record.user_request;
 			const userRequest = typeof rawRequest === "string" ? rawRequest : undefined;
-			if (record.action !== undefined) {
-				return { action: String(record.action), ...(userRequest !== undefined ? { userRequest } : {}) };
-			}
-			if (record.status === "complete" || record.complete === true) return { action: "complete" };
-			if (record.status === "paused" || record.paused === true) {
-				return { action: "pause", ...(userRequest !== undefined ? { userRequest } : {}) };
-			}
-			return { action: "" };
+			const withBlocker = (action: string) => ({
+				action,
+				...(blocker === undefined ? {} : { blocker }),
+				...(userRequest === undefined ? {} : { userRequest }),
+			});
+			if (record.action !== undefined) return withBlocker(String(record.action));
+			if (record.status === "complete" || record.complete === true) return withBlocker("complete");
+			if (record.status === "blocked" || record.blocked === true) return withBlocker("blocked");
+			if (record.status === "paused" || record.paused === true) return withBlocker("pause");
+			return withBlocker("");
 		},
-		async execute(_toolCallId: string, params: { action?: string; userRequest?: string }, _signal, _onUpdate, ctx) {
+		async execute(
+			_toolCallId: string,
+			params: { action: string; blocker?: string; userRequest?: string },
+			_signal,
+			_onUpdate,
+			ctx: ExtensionToolContext,
+		) {
 			const goal = store.get();
 			if (!goal) {
 				return goalToolError(formatNoGoal(), null);
+			}
+			if (params?.action === "blocked") {
+				return reportBlocker(goal, params.blocker, ctx);
 			}
 			/**
 			 * Refuse a call whose decision was prepared against a different Goal
@@ -948,13 +1353,89 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				};
 			}
 			return goalToolError(
-				"update_goal supports only action complete, and action pause after an explicit user request " +
-					"(quote it in user_request). Resuming and clearing stay with the user (/goal resume, /goal clear), " +
-					"and blocked conclusions arrive in a later milestone.",
+				"update_goal supports only action complete, action blocked with a plain-language blocker, " +
+					"and action pause after an explicit user request (quote it in user_request). " +
+					"Resuming and clearing stay with the user (/goal resume, /goal clear).",
 				toPublicState(goal),
 			);
 		},
 	});
+
+	/**
+	 * Record a blocker the model reported, and enforce the blocked audit.
+	 *
+	 * The extension — not the model — decides when the audit is satisfied, so an
+	 * eager or drifted `blocked` call cannot end a Goal that has only seen a
+	 * blocker once. Before the threshold the report is persisted (making the audit
+	 * durable across compaction and a session restore) and refused with the
+	 * current count, which is also what tells the model to keep working.
+	 */
+	function reportBlocker(
+		goal: GoalRecord,
+		rawBlocker: string | undefined,
+		ctx: ExtensionToolContext,
+	) {
+		const validation = validateBlocker(String(rawBlocker ?? ""));
+		if (!validation.ok) {
+			return goalToolError(
+				`${validation.error} Call update_goal with action "blocked" and a blocker describing what is ` +
+					"actually preventing progress and what would unblock it.",
+				toPublicState(goal),
+			);
+		}
+		const result = store.markBlockedReport(pi, {
+			blocker: validation.blocker,
+			turn: safety.currentTurn,
+		});
+		if (result.ok && !result.repeat) blockerCountedThisRun = true;
+		if (!result.ok) {
+			const message =
+				result.reason === "persistence"
+					? `Blocker not recorded: writing the Goal to the session failed (${describeError(result.error)}). The Goal is still active; fix the cause and call update_goal again.`
+					: "Blocker not recorded: no active Goal to block.";
+			return goalToolError(message, toPublicState(goal));
+		}
+		const state = toPublicState(result.goal);
+		if (result.thresholdMet) {
+			ctx.ui.notify(
+				`Goal ${result.goal.id} is now blocked: ${validation.blocker} ` +
+					`(the same blocker for ${result.turns} consecutive Goal turns). Automatic continuation has stopped; ` +
+					"resolving the blocker and running /goal resume is a user decision, and the resume starts a fresh audit.",
+				"warning",
+			);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text:
+							`Goal ${result.goal.id} is blocked after the same blocker persisted for ${result.turns} ` +
+							"consecutive Goal turns. Automatic continuation has stopped. Report to the user what is " +
+							"blocking the work and what would unblock it; /goal resume restarts it with a fresh blocked audit.",
+					},
+				],
+				structuredContent: { goal: state },
+				details: { goal: state },
+			};
+		}
+		// A repeat inside the same Goal turn must read as one audit step, not as
+		// progress toward the threshold, or a model that retries its own tool call
+		// could talk itself into a blocked Goal inside a single turn.
+		const counted = result.repeat
+			? `This blocker was already recorded for the current Goal turn (${result.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns), so it was not counted again.`
+			: `Blocker recorded (${result.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns).`;
+		return goalToolError(
+			`${counted} The Goal stays active: the same genuine blocker must persist for at least ` +
+				`${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns before it may be marked blocked, so a transient ` +
+				"failure cannot stop useful work. " +
+				(result.turns > 1
+					? `The blocker on record for this Goal is: ${result.goal.blockedAudit?.blocker ?? validation.blocker}. `
+					: "") +
+				"Re-verify against the current state, take the next available safe action, and report again only if " +
+				"the same blocker persists. Never report a blocker because the work is hard, slow, uncertain, or " +
+				"incomplete.",
+			state,
+		);
+	}
 
 	pi.registerCommand("goal", {
 		description:
@@ -1068,13 +1549,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Goal ${goal.id} is already active; work continues at every settlement.`, "info");
 			return;
 		}
-		if (goal.status !== "paused") {
+		if (goal.status !== "paused" && goal.status !== "blocked" && goal.status !== "usage_limited") {
 			ctx.ui.notify(
 				`Goal ${goal.id} is ${goal.status} and cannot be resumed. A complete Goal is finished — use /goal <objective> to set a new one.`,
 				"warning",
 			);
 			return;
 		}
+		// A stop the user is overruling is a user action, so every anti-loop counter
+		// and the in-memory audit chain start over with the resumed Goal. The durable
+		// audit itself is dropped by the store, so what resumes is the objective and
+		// its retained progress rather than the count that stopped it.
+		safety.reset();
 		const resumed = store.markResumed(pi);
 		if (!resumed.ok) {
 			notifyMutationFailure(ctx, "resumed", resumed);
@@ -1084,8 +1570,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
 		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx);
+		const restarted =
+			goal.status === "paused"
+				? "Work restarted from retained progress."
+				: goal.status === "blocked"
+					? "The blocked audit that ended it is cleared, so work restarts from retained progress with a fresh audit."
+					: "The usage-limit stop that ended it is cleared, so work restarts from retained progress.";
 		ctx.ui.notify(
-			`Goal ${updated.id} resumed (revision ${updated.revision}). Work ${delivery === "started" ? "restarted" : "steered into the running work"} with retained progress.`,
+			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
 			"info",
 		);
 	}
@@ -1296,6 +1788,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					);
 					return;
 				}
+				// A new Goal identity starts every audit and every anti-loop counter
+				// from zero, and the kickoff it is about to send is a Goal turn for
+				// the blocked audit but attended work: the user just typed /goal, so it
+				// must not consume one of the automatic turns an anti-loop bound
+				// allows.
+				safety.reset();
+				pendingRunKind = "kickoff";
 				pi.sendUserMessage(formatKickoffMessage(goal));
 				delivery = "started";
 			}

@@ -777,3 +777,96 @@ test("restart after tree navigation resumes Pi's selected branch and reconstruct
 		rmSync(workDir, { recursive: true, force: true });
 	}
 });
+
+test("a blocked Goal reconstructed from a branch keeps its audit, and /goal resume clears it", async () => {
+	const session = await PiRpcSession.start({ extraExtensions: [TREE_NAV] });
+	// Kickoff, three blocker reports that block the Goal, a get_goal read of the
+	// reconstructed branch, then the resumed work: its kickoff, one continuation,
+	// and the completion.
+	const BLOCKER = "the upstream release API token has not been issued yet";
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Reporting the blocker." },
+			{ toolCalls: [{ name: "get_goal", args: {} }] },
+			{ text: "The Goal is blocked." },
+			{ text: "Resumed work after the blocker was resolved." },
+			{ text: "Still working." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Wrapping up." },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal Make the full test suite pass in this repository`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await session.waitFor("the third report blocked the Goal", async () => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "blocked" ? true : undefined;
+		});
+
+		// Every snapshot of the chain is a branch point, so each is navigable.
+		const states = goalStateEntries(readSessionEntries(await session.sessionFile()));
+		assert.equal(states.length, 4, "create plus the three blocker reports");
+		assert.deepEqual(
+			states.map((s) => `${s.data.goal.status}:${s.data.goal.revision}:${s.data.goal.blockedAudit?.turns}`),
+			["active:0:undefined", "active:1:1", "active:2:2", "blocked:3:3"],
+		);
+
+		// The branch-isolation notices carry the reconstructed status and revision,
+		// so the audit-bearing snapshots are observably reconstructed. The chain tip
+		// is already selected, so the first navigation has to move away from it.
+		const markOne = session.records.length;
+		await navigateTo(session, states[1].id);
+		await session.notifyAfter(markOne, (r) =>
+			r.message.includes("Goal changed with the selected branch") && r.message.includes("active at revision 1"),
+		);
+		const markTwo = session.records.length;
+		await navigateTo(session, states[2].id);
+		await session.notifyAfter(markTwo, (r) => r.message.includes("active at revision 2"));
+		const markBlocked = session.records.length;
+		await navigateTo(session, states[3].id);
+		await session.notifyAfter(markBlocked, (r) => r.message.includes("blocked at revision 3"));
+
+		// The reconstructed Goal is read through the model tool, which reports the
+		// audit as the public state. A blocked Goal is the one status a user prompt
+		// cannot reset (the audit reset only applies to an active Goal), so this
+		// reads the reconstruction itself rather than a reset of it.
+		await session.prompt("what is the current goal?");
+		const read = await session.waitForToolResult("get_goal");
+		const state = read.result.structuredContent?.goal ?? read.result.details?.goal;
+		assert.equal(state.status, "blocked", "the selected branch reconstructs the blocked Goal");
+		assert.equal(state.blockedTurns, 3, "the blocked audit survived branch reconstruction");
+		assert.equal(state.blocker, BLOCKER);
+
+		await session.prompt("/goal resume");
+		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
+		assert.match(resumed.message, /fresh audit/);
+		assert.match(resumed.message, /revision 4/);
+
+		await session.waitFor("the resumed Goal completes", async () => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "complete" ? true : undefined;
+		});
+		await session.waitForSettled(2);
+
+		const snapshots = goalStateEntries(readSessionEntries(await session.sessionFile())).map((s) => s.data.goal);
+		assert.deepEqual(
+			snapshots.map((g) => `${g.status}:${g.revision}:${g.blockedAudit?.turns ?? "-"}`),
+			["active:0:-", "active:1:1", "active:2:2", "blocked:3:3", "active:4:-", "complete:5:-"],
+			"navigation appends nothing, the resume clears the audit, and the loop finishes",
+		);
+		assert.ok(snapshots.every((g) => g.id === states[3].data.goal.id), "one Goal identity throughout");
+		// Three while the audit was accumulating, two more after the resume: the
+		// blocked runs themselves and the completing one continue nothing.
+		assert.equal(continuationEntries(readSessionEntries(await session.sessionFile())).length, 5);
+		assert.ok(session.extensionErrors().length === 0);
+	} finally {
+		await session.stop();
+	}
+});

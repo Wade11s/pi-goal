@@ -459,7 +459,7 @@ test("concurrent create_goal calls in one turn create exactly one Goal", async (
 	}
 });
 
-test("update_goal only completes an active Goal and refuses other transitions", async () => {
+test("update_goal completes, blocks, or pauses an active Goal and refuses other transitions", async () => {
 	const session = await PiRpcSession.start();
 	// An unsupported action, then a call with no action at all, then completion,
 	// then a refused repeat once the Goal is already complete.
@@ -481,7 +481,9 @@ test("update_goal only completes an active Goal and refuses other transitions", 
 
 		const results = toolResults(session, "update_goal");
 		assert.equal(results.length, 3);
-		assert.equal(results[0].isError, true);
+		// Pausing through the tool needs a quoted, corroborated user request, so a
+		// bare pause action is refused; an action the tool does not support at all
+		// is refused with the list of what it does support.
 		assert.match(String(results[0].result.content[0].text), /explicit user request/);
 		assert.equal(results[1].isError, true);
 		assert.match(String(results[1].result.content[0].text), /supports only action complete/);
