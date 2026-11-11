@@ -14,7 +14,7 @@ Implementation issues are delegated through `rex-subagent` to this worker pool, 
 | --- |
 | `magpie/zcode/GLM-5.3:high` |
 | `magpie/stepfun-cn/step-5-preview:high` |
-| `magpie/amd-radeon-cloud/DeepSeek-V4.1-Flash:high` |
+| `magpie/deepai/deepseek-v4.1-flash:high` |
 
 Balance assignments across the pool by active workload, issue size, and relevant experience. Do not assign all tickets to one model. Keep each issue assignment and result traceable to its subagent handle.
 
@@ -26,7 +26,7 @@ Pull requests are reviewed through `rex-subagent` by this reviewer pool, using h
 | --- |
 | `magpie/kimi/k3.1-pro:high` |
 | `magpie/grok/grok-4.7@500k:high` |
-| `magpie/amd-radeon-cloud/DeepSeek-V4.1-Flash:high` |
+| `magpie/deepai/deepseek-v4.1-flash:high` |
 
 Grok temporarily replaces `workbuddy/hy4free:high` until that reviewer's usage limit resets. Completed hy4free reviews remain valid; new or unfinished review assignments use Grok.
 
