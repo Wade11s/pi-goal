@@ -4,7 +4,12 @@
  * Goal snapshots are stored as `goal-state` custom session entries (outside model
  * context). The current state is reconstructed from the last such entry on the
  * active session branch, so restart, resume, reload, fork, and tree navigation
- * all reconstruct the state that belongs to the selected branch.
+ * all reconstruct the state that belongs to the selected branch: Pi copies the
+ * branch path into the new session on fork/clone, `/tree` navigation re-points
+ * the branch inside the same file, and a resume/restart selects the branch Pi
+ * loads (its most recently appended leaf). Entries the branch cannot reach —
+ * including a cleared Goal's snapshots on an abandoned branch — never take part
+ * in reconstruction.
  *
  * Creation is staged before it is announced: `stage()` only writes the snapshot
  * (throwing on write failure without touching memory), `commit()` makes it
@@ -17,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	CUSTOM_ENTRY_TYPE,
+	GOAL_STATUSES,
 	type GoalRecord,
 	type GoalSnapshot,
 	type GoalOrigin,
@@ -24,6 +30,8 @@ import {
 	MAX_OBJECTIVE_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 } from "./goal.ts";
+
+const GOAL_STATUS_SET = new Set<string>(GOAL_STATUSES);
 
 function goalId(): string {
 	// 8 hex chars from a UUID; stable across continuation, compaction, and restore.
@@ -50,8 +58,22 @@ export class GoalStore {
 	/** undefined = not reconstructed yet; null = no Goal (or tombstone); record = present. */
 	private current: GoalRecord | null | undefined = undefined;
 
-	/** Rebuild state from the active branch. Called on session_start and session_tree. */
-	reconstruct(ctx: ExtensionContext): void {
+	/**
+	 * Rebuild state from the active branch. Called on session_start (startup,
+	 * resume, reload, new, fork/clone) and session_tree (branch navigation).
+	 *
+	 * The last *valid* `goal-state` entry on the branch wins, and a tombstone
+	 * (`goal: null`) is a valid entry: a cleared Goal therefore stays cleared on
+	 * the branch that cleared it, no matter how many older snapshots of it the
+	 * same branch still contains. An entry that is not a recognizable snapshot
+	 * (unknown version, wrong shape, unknown status) is skipped rather than
+	 * trusted, so a corrupt line never decides the session's Goal state.
+	 *
+	 * Returns the reconstructed state so the caller can observe what changed;
+	 * never throws for bad entry data (reconstruction failures are logged and
+	 * leave the Goal absent) because a broken entry must not break the session.
+	 */
+	reconstruct(ctx: ExtensionContext): GoalRecord | null {
 		let restored: GoalRecord | null = null;
 		let seen = false;
 		try {
@@ -67,9 +89,10 @@ export class GoalStore {
 			// Never break the session on corrupt entries; report and keep absent state.
 			console.error("[pi-goal] failed to reconstruct Goal state:", error);
 			this.current = null;
-			return;
+			return null;
 		}
 		this.current = seen ? restored : null;
+		return this.current;
 	}
 
 	/** Current record, or undefined when not yet reconstructed. */
@@ -370,12 +393,25 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 	) {
 		return false;
 	}
+	// A snapshot whose status is not a known lifecycle status is not trusted: an
+	// entry hand-edited into the session file (or written by an unknown future
+	// version) must not put the Goal into a state the state machine never issued.
+	if (typeof record.status !== "string" || !GOAL_STATUS_SET.has(record.status)) {
+		return false;
+	}
 	return (
 		typeof record.id === "string" &&
+		record.id !== "" &&
 		typeof record.objective === "string" &&
-		typeof record.status === "string" &&
+		record.objective !== "" &&
 		typeof record.createdAt === "number" &&
+		Number.isFinite(record.createdAt) &&
+		record.createdAt > 0 &&
 		typeof record.updatedAt === "number" &&
-		typeof record.revision === "number"
+		Number.isFinite(record.updatedAt) &&
+		record.updatedAt > 0 &&
+		typeof record.revision === "number" &&
+		Number.isInteger(record.revision) &&
+		record.revision >= 0
 	);
 }
