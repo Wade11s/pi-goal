@@ -26,6 +26,7 @@ import {
 	formatBudgetWrapUpMessage,
 	formatGoalStatusLine,
 	formatGoalSummary,
+	GOAL_STATUSES,
 	toPublicState,
 } from "../src/goal.ts";
 
@@ -402,6 +403,23 @@ test("the status line is compact and always carries the status and the usage", (
 		),
 		/budget exhausted/,
 	);
+});
+
+test("the compact status line exposes every lifecycle status", () => {
+	for (const status of GOAL_STATUSES) {
+		const line = formatGoalStatusLine(
+			toPublicState(
+				record({
+					status,
+					tokenBudget: status === "complete" || status === "paused" ? undefined : 1000,
+					usage: { ...zeroGoalUsage(), totalTokens: 400, activeMs: 5000 },
+				}),
+			),
+		);
+		assert.match(line, new RegExp(`\\b${status}\\b`), `status ${status} is missing from: ${line}`);
+		assert.ok(line.length <= 80, `status line for ${status} is not compact: ${line}`);
+		assert.match(line, /400 tok/, `usage is missing from the ${status} line`);
+	}
 });
 
 test("the budget wrap-up restates the objective as data and forbids false completion", () => {

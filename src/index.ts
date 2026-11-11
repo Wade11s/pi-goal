@@ -103,6 +103,17 @@ import {
 const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
 
 /**
+ * Auto-cancel an interactive objective edit after this long.
+ *
+ * Pi's `editor` dialog has no timeout option of its own, so a host that never
+ * answers the editor request would otherwise leave the command waiting
+ * forever. The timeout is a safety bound only: the dialog itself stays open on
+ * the host, and answering it later is harmless because the command has already
+ * reported the cancellation.
+ */
+const EDIT_TIMEOUT_MS = 120_000;
+
+/**
  * Parsed `/goal` arguments: the objective plus an optional budget request.
  *
  * Budget flags are only recognized as a *leading* prefix (`/goal --budget 5000
@@ -175,6 +186,7 @@ type GoalCommand =
 	| { kind: "status" }
 	| { kind: "create"; objective: string }
 	| { kind: "edit"; objective: string }
+	| { kind: "edit-dialog" }
 	| { kind: "pause" }
 	| { kind: "resume" }
 	| { kind: "clear" }
@@ -201,10 +213,10 @@ function parseGoalCommand(args: string): GoalCommand {
 	}
 	if (word === "edit") {
 		if (remainder === "") {
-			return {
-				kind: "invalid",
-				message: 'Usage: /goal edit <new objective>. Bare "/goal edit" does not say what the new objective is.',
-			};
+			// Bare `/goal edit` opens Pi's multi-line editor prefilled with the
+			// current objective. The typed form stays available for headless modes
+			// and for hosts without a dialog-capable UI.
+			return { kind: "edit-dialog" };
 		}
 		return { kind: "edit", objective: remainder };
 	}
@@ -917,6 +929,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					"blocker is resolved.",
 				"warning",
 			);
+			updateStatus(ctx);
 			return;
 		}
 		if (result.reason === "not-active") {
@@ -1005,6 +1018,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						"limit is resolved, because a usage-limited Goal never continues on its own.",
 					"warning",
 				);
+				updateStatus(ctx);
 				return;
 			}
 			if (result.reason === "not-active") {
@@ -1141,6 +1155,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// and throws on failure. The existing-Goal guard, the stage, and the commit
 			// above also contain no await, so two create_goal calls issued in one
 			// assistant turn cannot both pass the guard.
+			updateStatus(ctx);
 			const state = toPublicState(goal);
 			return {
 				content: [{ type: "text", text: `Goal ${goal.id} created and activated.` }],
@@ -1275,6 +1290,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					return reportMutationFailure("marked complete", completed);
 				}
 				const state = toPublicState(completed.goal!);
+				updateStatus(ctx);
 				return {
 					content: [{ type: "text", text: `Goal ${completed.goal!.id} marked complete.` }],
 					structuredContent: { goal: state },
@@ -1337,6 +1353,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					`Goal ${goal.id} paused at the model's request; the quoted request was verified against the user's messages. No further automatic Goal runs will start.`,
 					"info",
 				);
+				updateStatus(ctx);
 				const state = toPublicState(paused.goal!);
 				return {
 					content: [
@@ -1403,6 +1420,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					"resolving the blocker and running /goal resume is a user decision, and the resume starts a fresh audit.",
 				"warning",
 			);
+			updateStatus(ctx);
 			return {
 				content: [
 					{
@@ -1452,6 +1470,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						return;
 					case "edit":
 						editGoal(command.objective, ctx);
+						return;
+					case "edit-dialog":
+						await editGoalInteractively(ctx);
 						return;
 					case "pause":
 						pauseGoal(ctx);
@@ -1529,6 +1550,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notifyMutationFailure(ctx, "paused", paused);
 			return;
 		}
+		updateStatus(ctx);
 		// The transition is durable (appendEntry wrote through) before this
 		// announcement. The in-flight run, if any, finishes on its own: pause
 		// stops admission of further automatic runs, it never aborts work.
@@ -1566,6 +1588,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notifyMutationFailure(ctx, "resumed", resumed);
 			return;
 		}
+		updateStatus(ctx);
 		const updated = resumed.goal!;
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
@@ -1593,6 +1616,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notifyMutationFailure(ctx, "cleared", cleared);
 			return;
 		}
+		updateStatus(ctx);
 		// The tombstone is durable before this announcement, so a crash right
 		// here still restores "no Goal". Work in flight finishes normally; with
 		// no Goal, its settlement cannot continue.
@@ -1600,6 +1624,66 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			`Goal ${goal.id} cleared (was ${goal.status}). The session is back to ordinary prompt behavior.`,
 			"info",
 		);
+	}
+
+	/**
+	 * Resolve a dialog promise with a fallback when the host does not answer in
+	 * time.
+	 *
+	 * Pi's `editor` dialog has no timeout option of its own, so a host that never
+	 * answers the editor request would otherwise leave the command waiting
+	 * forever. The fallback only affects this command: the dialog request itself
+	 * remains pending on the host, and a later answer is ignored.
+	 */
+	function withDialogTimeout<T>(dialog: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		return Promise.race([
+			dialog,
+			new Promise<T>((resolve) => {
+				timer = setTimeout(() => resolve(fallback), timeoutMs);
+			}),
+		]).finally(() => {
+			if (timer !== undefined) clearTimeout(timer);
+		});
+	}
+
+	/**
+	 * Interactive objective editing.
+	 *
+	 * Bare `/goal edit` opens Pi's multi-line editor prefilled with the current
+	 * objective. The dialog is only opened when a dialog-capable UI exists
+	 * (`ctx.hasUI` is true in TUI and RPC modes); in print/JSON mode there is no
+	 * terminal-only dialog to open, so the command explains the typed form instead
+	 * of blocking. RPC hosts answer the same editor request through the
+	 * extension-UI subprotocol, so headless RPC is not blocked either.
+	 *
+	 * Cancelling (or a dialog that is never answered) leaves the objective
+	 * unchanged.
+	 */
+	async function editGoalInteractively(ctx: ExtensionCommandContext): Promise<void> {
+		const goal = store.get();
+		if (!goal) {
+			ctx.ui.notify("There is no Goal to edit. Create one with /goal <objective> first.", "warning");
+			return;
+		}
+		if (!ctx.hasUI) {
+			ctx.ui.notify(
+				"Interactive objective editing needs a UI, which this Pi mode does not have. " +
+					"Use /goal edit <new objective> to type the new objective instead.",
+				"warning",
+			);
+			return;
+		}
+		const edited = await withDialogTimeout(
+			ctx.ui.editor("Edit Goal objective", goal.objective),
+			EDIT_TIMEOUT_MS,
+			undefined,
+		);
+		if (edited === undefined) {
+			ctx.ui.notify(`Goal ${goal.id} objective edit cancelled; the current objective is unchanged.`, "info");
+			return;
+		}
+		editGoal(edited, ctx);
 	}
 
 	function editGoal(rawObjective: string, ctx: ExtensionCommandContext): void {
@@ -1618,6 +1702,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notifyMutationFailure(ctx, "edited", edited);
 			return;
 		}
+		updateStatus(ctx);
 		const updated = edited.goal!;
 		if (updated.status === "active") {
 			// Redirect the active run through Pi's steering (or start work when
@@ -1735,6 +1820,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// revalidating it after the wait detects exactly that change.
 				store.stage(pi, goal);
 				store.commit(goal);
+				updateStatus(ctx);
 			} catch (error) {
 				if (replacing) {
 					// A failed *replacement* write must not erase the existing
@@ -1753,6 +1839,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// Nothing durable was confirmed for a brand-new Goal: retract it
 				// so no phantom state survives a failed stage.
 				store.rollback(pi);
+				updateStatus(ctx);
 				notifyWriteFailure(ctx, error);
 				return;
 			}
@@ -1786,6 +1873,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 									"Nothing remains active; run /goal <objective> again to start over.",
 						"warning",
 					);
+					updateStatus(ctx);
 					return;
 				}
 				// A new Goal identity starts every audit and every anti-loop counter
@@ -1811,6 +1899,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// away a Goal that was never replaced on disk.
 				if (replacing && previous) store.restore(pi, previous);
 				else store.rollback(pi);
+				updateStatus(ctx);
 				notifyWriteFailure(
 					ctx,
 					new Error("the Goal snapshot did not reach the session file in time"),
@@ -1826,6 +1915,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						"Run /goal <objective> again to start over.",
 					"warning",
 				);
+				updateStatus(ctx);
 				return;
 			}
 

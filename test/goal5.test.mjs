@@ -422,6 +422,13 @@ test("three activity-free automatic Goal turns stop the Goal as blocked", async 
 		const stopped = await session.waitForNotify((r) => r.message.includes("stopped and is now blocked"));
 		assert.ok(stopped.message.includes("activity-free"), "the stop reason is reported");
 
+		// The compact status indicator follows the conservative stop too.
+		const status = session.records
+			.filter((r) => r.type === "extension_ui_request" && r.method === "setStatus" && r.statusKey === "goal")
+			.at(-1);
+		assert.ok(status, "a status update was published");
+		assert.match(status.statusText ?? "", /\bblocked\b/);
+
 		// The fifth scripted step was never requested: the Goal stopped on its own
 		// rather than by exhausting the script, and an empty answer is not an error.
 		assertStepsConsumed(session, 4);
