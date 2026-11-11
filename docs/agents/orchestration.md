@@ -24,7 +24,7 @@ Pull requests are reviewed through `rex-subagent` by this reviewer pool, using h
 
 | Reviewer model |
 | --- |
-| `magpie/kimi/k3.1-pro:high` |
+| `magpie/kimi-code-cn/k3.1-pro:high` |
 | `magpie/grok/grok-4.7@500k:high` |
 | `magpie/deepai/deepseek-v4.1-flash:high` |
 
