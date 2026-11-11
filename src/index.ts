@@ -470,26 +470,32 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	pi.on("session_shutdown", (event, ctx) => {
 		if (!store.get()) return;
-		store.stopClock();
 		// Pi fires this both when the process quits and when a session is *replaced*
-		// (fork, clone, switch, resume, reload), and the two need different things.
+		// (fork, clone, switch, resume, reload). The two are not the same event for a
+		// durable writer, and telling them apart by the destination rather than the
+		// reason string is what makes the difference: `switch_session` onto the same
+		// file reports `resume`, while a fork reports `fork`.
 		//
-		// A pending lifecycle transition is state, not an optimization: it belongs to
-		// the outgoing branch, and losing it would leave a Goal durably `active` with
-		// its budget already exhausted. It is therefore always written, whichever
-		// reason brought us here.
+		// When the destination is another file, this session is being abandoned, and
+		// **nothing at all may be appended to it**. Pi copies the branch for a fork or
+		// a clone *before* this handler runs, so anything written here lands only on
+		// the source: the new session never sees it, and the source has been mutated by
+		// an operation the user performed on a copy. That holds for a forced
+		// checkpoint, for the interval-driven one that folding the open segment would
+		// otherwise make fire, and for a pending lifecycle transition alike — so the
+		// clock is not even stopped on this path.
 		//
-		// A forced accounting checkpoint is only the last chance to make accounted
-		// active time durable, so it is worth writing only when this session's file is
-		// the one that survives. `quit` has no destination at all, and a reload or a
-		// switch back to the same file keeps it, so both force the checkpoint. A fork
-		// or a clone copies its branch *before* this runs, and a switch to another file
-		// abandons this one, so a checkpoint written here would neither reach the new
-		// session nor leave the abandoned one untouched — which is exactly what
-		// "forking leaves the source session unmutated" forbids.
+		// Nothing is lost by writing nothing: the abandoned branch still replays to
+		// the same totals whenever anyone selects it again, and a pending budget
+		// transition self-heals on the next accounted turn exactly as it does after an
+		// unclean exit. Only when this session's file survives — `quit`, or a reload or
+		// switch back to the same file — is this the last chance to make the accounted
+		// active time durable.
 		const currentFile = ctx.sessionManager.getSessionFile();
 		const keepsFile = event.targetSessionFile === undefined || event.targetSessionFile === currentFile;
-		store.flushAccounting(pi, keepsFile);
+		if (!keepsFile) return;
+		store.stopClock();
+		store.flushAccounting(pi, true);
 	});
 
 	/**
