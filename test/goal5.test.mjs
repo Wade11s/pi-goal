@@ -316,9 +316,11 @@ test("update_goal(blocked) requires a blocker description and refuses user-owned
 		assert.equal(results[1].isError, true, "a too-short blocker is refused");
 		assert.equal(results[2].isError, true, "the first real report is still below the threshold");
 		assert.match(String(results[2].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
-		// The model cannot resume, clear, or pause a Goal through the tool.
+		// The model cannot resume or clear a Goal through the tool. Pausing is the
+		// exception #12 added, and it needs a quoted, corroborated user request —
+		// which an action on its own does not carry.
 		assert.equal(results[3].isError, true);
-		assert.match(String(results[3].result.content[0].text), /only supports the actions complete and blocked/);
+		assert.match(String(results[3].result.content[0].text), /supports only action complete/);
 
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete");

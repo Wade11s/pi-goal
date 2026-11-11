@@ -459,7 +459,7 @@ test("concurrent create_goal calls in one turn create exactly one Goal", async (
 	}
 });
 
-test("update_goal only completes or blocks an active Goal and refuses other transitions", async () => {
+test("update_goal completes, blocks, or pauses an active Goal and refuses other transitions", async () => {
 	const session = await PiRpcSession.start();
 	// An unsupported action, then a call with no action at all, then completion,
 	// then a refused repeat once the Goal is already complete.
@@ -481,11 +481,12 @@ test("update_goal only completes or blocks an active Goal and refuses other tran
 
 		const results = toolResults(session, "update_goal");
 		assert.equal(results.length, 3);
-		// Pause stays user-owned: the model cannot reach it through the tool.
-		assert.equal(results[0].isError, true);
-		assert.match(String(results[0].result.content[0].text), /only supports the actions complete and blocked/);
+		// Pausing through the tool needs a quoted, corroborated user request, so a
+		// bare pause action is refused; an action the tool does not support at all
+		// is refused with the list of what it does support.
+		assert.match(String(results[0].result.content[0].text), /explicit user request/);
 		assert.equal(results[1].isError, true);
-		assert.match(String(results[1].result.content[0].text), /only supports the actions complete and blocked/);
+		assert.match(String(results[1].result.content[0].text), /supports only action complete/);
 
 		// The refusals left the Goal active; the third call completed it, and the
 		// session settled without ever continuing.
@@ -503,7 +504,7 @@ test("update_goal only completes or blocks an active Goal and refuses other tran
 		const again = toolResults(session, "update_goal");
 		assert.equal(again.length, 4);
 		assert.equal(again[3].isError, true);
-		assert.match(String(again[3].result.content[0].text), /no active Goal to complete/);
+		assert.match(String(again[3].result.content[0].text), /only an active Goal can be completed/);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -534,7 +535,7 @@ test("update_goal accepts the complete spellings a model drifts into", async () 
 		assert.equal(results[0].isError, false, "the status spelling completes the Goal");
 		assert.equal(structuredGoal(results[0].result).status, "complete");
 		assert.equal(results[1].isError, true);
-		assert.match(String(results[1].result.content[0].text), /no active Goal to complete/);
+		assert.match(String(results[1].result.content[0].text), /only an active Goal can be completed/);
 
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete");
