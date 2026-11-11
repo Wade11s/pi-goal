@@ -471,20 +471,28 @@ const OBJECT_PHRASE_END =
 	/\b(?:for|of|while|when|after|before|because|since|until|during|via|per|with|without|and|but|or|so|if|unless|that|which|please|to|at|from|on|in|into|about|against)\b/i;
 
 /**
- * A limit the object *ends in*, so reaching it is exhaustion.
+ * The particle of the phrasal verb "reach out to", which belongs to the verb
+ * rather than to the noun phrase that follows it.
  *
- * Anchored at the end of the phrase, because the head of a noun phrase is its
- * last word and the head is what the phrase is: "the API usage limit" and "your
- * service usage limit" end in a limit, while "the quota service", "the account
- * quota service", "the billing limit check", and "the usage limit service" all
- * end in a service or a check and are lookups whatever limit vocabulary modifies
- * them. A bare `limit` is a limit head on purpose: it is only reached when a
- * modifier has already been read, and a modifier in front of a limit is the
- * limit's scope. `quota` is present because a quota that was *reached* is a
+ * "You have reached out to the quota service" reaches the service, so the object
+ * is past the particle. Without this the cut at `to` leaves "out" behind, which is
+ * neither a limit nor a lookup, and the match would be read as exhaustion.
+ */
+const REACH_OUT_PARTICLE = /^\s+out\s+to\s+/i;
+
+/**
+ * A limit the object's head noun is, so reaching it is exhaustion.
+ *
+ * The head of a noun phrase is its last noun, and the head is what the phrase is:
+ * "the API usage limit" and "your service usage limit" are limits, while "the quota
+ * service", "the account quota service", "the billing limit check", and "the usage
+ * limit service" are lookups whatever limit vocabulary modifies them. A bare
+ * `limit` is a limit head on purpose, because a modifier in front of a limit is
+ * the limit's scope; `quota` is present because a quota that was *reached* is a
  * used-up allowance, while the per-minute quota metric is caught by
  * {@link REACHED_THROTTLE_PATTERN} first and by the rate-dimension guard after.
  */
-const LIMIT_HEAD_PATTERN = /\b(?:limits?|quotas?|budgets?)\s*$/i;
+const LIMIT_HEAD_WORD = /^(?:limits?|quotas?|budgets?)$/i;
 
 /**
  * Wording that makes the object a rate dimension rather than a used-up plan.
@@ -498,7 +506,8 @@ const REACHED_THROTTLE_PATTERN =
 	/\b(?:throttl\w*|rate[ _-]?limit|quota[ _-]?metric|requests?[ _-]?per[ _-]?(?:minute|second|hour)|per[ _-]?(?:minute|second|hour)|rpm|tpm|tokens?[ _-]?per[ _-]?(?:minute|second))\b/i;
 
 /**
- * A lookup the object *ends in*: a service, a check, an endpoint, or a timeout.
+ * A lookup the object's head noun is: a service, a check, an endpoint, or a
+ * timeout.
  *
  * "The account quota service reached a timeout while checking your account" and
  * "The billing limit check reached a timeout" both describe a *check that timed
@@ -513,13 +522,13 @@ const REACHED_THROTTLE_PATTERN =
  * that really was reached, exactly as the trailing form does, so the head is still
  * `limit`. "You have reached the quota service", "You have reached the account
  * quota service", "You have reached the billing limit check", and "You have
- * reached the usage limit service" all end in a service or a check, so the limit
- * vocabulary in front of them is a modifier and the object is the lookup. A clause
- * that opens with a preposition ("…reached for this service") has no object at
- * all, which is the same answer as a limit.
+ * reached the usage limit service" all have a service or a check as their head, so
+ * the limit vocabulary in front of them is a modifier and the object is the
+ * lookup. A clause that opens with a preposition ("…reached for this service") has
+ * no object at all, which is the same answer as a limit.
  */
-const LOOKUP_HEAD_PATTERN =
-	/\b(?:timeouts?|timed[ _-]?out|deadlines?|latency|services?|checks?|checking|lookups?|verification|verify|apis?|endpoints?|servers?|status)\s*$/i;
+const LOOKUP_HEAD_WORD =
+	/^(?:timeouts?|deadlines?|latency|services?|checks?|checking|lookups?|verification|verify|apis?|endpoints?|servers?|status)$/i;
 
 /**
  * Wording that makes an exhaustion verb describe a rate dimension rather than a
@@ -546,15 +555,30 @@ function sentenceAt(text: string, index: number): string {
 
 /**
  * The noun phrase the verb governs: the clause it owns, cut where a modifier
- * phrase begins.
+ * phrase begins, with the "out to" particle of a phrasal verb removed.
  */
 function reachedObject(text: string, matchIndex: number, matched: string): string {
 	const verb = REACHED_VERB.exec(matched);
 	if (!verb) return "";
 	const clauseStart = matchIndex + (verb.index ?? 0) + verb[0].length;
-	const clause = text.slice(clauseStart).split(/[.;\n]/)[0] ?? "";
+	const clause = (text.slice(clauseStart).split(/[.;\n]/)[0] ?? "").replace(REACH_OUT_PARTICLE, "");
 	const cut = clause.search(OBJECT_PHRASE_END);
 	return (cut === -1 ? clause : clause.slice(0, cut)).trim();
+}
+
+/**
+ * The words of the object phrase, normalized so nothing but a word can end it.
+ *
+ * Punctuation becomes whitespace, and "timed out" is folded into one word, so a
+ * trailing comma, an exclamation mark, or a two-word timeout cannot leave the head
+ * noun looking like something else.
+ */
+function objectWords(phrase: string): string[] {
+	return phrase
+		.replace(/timed[ _-]?out/gi, "timeout")
+		.replace(/[^A-Za-z0-9\s]/g, " ")
+		.split(/\s+/)
+		.filter((word) => word.length > 0);
 }
 
 /**
@@ -568,19 +592,28 @@ function reachedObject(text: string, matchIndex: number, matched: string): strin
  *
  * Three questions, in order. A rate dimension is a throttle whatever else the
  * phrase says ("reached a rate limit", "reached a quota metric"). Then the *head*
- * of the object decides, and the head is its last word: a limit is exhaustion and
- * a modifier in front of it — an API, a service — is the limit's scope ("reached
- * the API usage limit"), while a service, a check, or a lookup is a lookup however
- * much limit vocabulary modifies it ("reached the quota service", "reached the
- * billing limit check"). An object with neither head has nothing that was reached
- * but the limit the subject named ("reached for this service"), which is the same
- * answer as a limit.
+ * of the object decides: the last word the phrase shares with either vocabulary,
+ * because the head of a noun phrase is its last noun and that is what the phrase
+ * is. A limit is exhaustion and a modifier in front of it — an API, a service — is
+ * the limit's scope ("reached the API usage limit"), while a service, a check, or
+ * a lookup is a lookup however much limit vocabulary modifies it ("reached the
+ * quota service", "reached the billing limit check"). Reading the head rather than
+ * the raw end of the phrase is what a trailing comma, an exclamation mark, or a
+ * trailing adverb cannot get past: "the quota service, please retry" and "the
+ * quota service now" are both a service. An object with no head at all has
+ * nothing that was reached but the limit the subject named ("reached for this
+ * service"), which is the same answer as a limit.
  */
 function reachedALookup(text: string, matchIndex: number, matched: string): boolean {
 	const object = reachedObject(text, matchIndex, matched);
 	if (REACHED_THROTTLE_PATTERN.test(object)) return true;
-	if (LIMIT_HEAD_PATTERN.test(object)) return false;
-	return LOOKUP_HEAD_PATTERN.test(object);
+	const words = objectWords(object);
+	for (let i = words.length - 1; i >= 0; i--) {
+		const word = words[i] ?? "";
+		if (LIMIT_HEAD_WORD.test(word)) return false;
+		if (LOOKUP_HEAD_WORD.test(word)) return true;
+	}
+	return false;
 }
 
 /**

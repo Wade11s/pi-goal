@@ -81,6 +81,12 @@ test("provider failures are classified from what the evidence actually says", as
 		// when the phrase ends in a limit and a lookup when it ends in a service.
 		["You have reached the usage limit; the service timed out", "usage_limited"],
 		["You have reached the usage limit, and the service timed out", "usage_limited"],
+		// Trailing punctuation, a retry clause, or a trailing adverb cannot hide the
+		// head, and the phrasal verb "reached out to" reaches what follows it.
+		["You have reached your usage limit, please upgrade", "usage_limited"],
+		["You have reached your usage limit now", "usage_limited"],
+		["You have reached your usage limit!", "usage_limited"],
+		["You have reached out to your usage limit", "usage_limited"],
 		// An explicit billing, plan, spending, account, or subscription limit is
 		// exhaustion in either word order.
 		["You have reached your billing limit", "usage_limited"],
@@ -135,6 +141,15 @@ test("provider failures are classified from what the evidence actually says", as
 		["You have reached the billing limit lookup", "active"],
 		["You have reached the usage limit service", "active"],
 		["You have reached the quota service while checking your account", "active"],
+		// ...and neither can trailing punctuation, a retry clause, a trailing adverb,
+		// or the phrasal verb "reached out to": the head noun is still the service,
+		// the check, or the lookup the verb reached.
+		["You have reached the quota service, please retry", "active"],
+		["You have reached the account quota service, please retry", "active"],
+		["You have reached the billing limit check, please retry", "active"],
+		["You have reached the quota service!", "active"],
+		["You have reached the quota service now", "active"],
+		["You have reached out to the quota service", "active"],
 		// The verb-first order is subject to the same guards as the noun-first one.
 		["You have not reached your billing limit", "active"],
 		["Your billing limit has not been reached", "active"],

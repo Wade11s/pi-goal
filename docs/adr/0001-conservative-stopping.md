@@ -65,8 +65,9 @@ observable Pi events, with thresholds that are constants rather than settings.
      failure, because it says the plan itself is used up rather than that a rate
      was hit, but not a `reached` whose object is a lookup: "The account quota
      service reached a timeout" is a check that timed out, and qualifying the noun
-     changes nothing. What decides is the *head* of the object the verb governs —
-     the last word of the noun phrase, which is what the phrase is — which is also
+     changes nothing. What decides is the *head noun* of the object the verb governs
+     — the last noun in the phrase, which is what the phrase is, and which a
+     trailing comma, an exclamation mark, or a trailing adverb cannot hide — which is also
      why "You have reached your usage limit; please check your plan" stays genuine
      exhaustion, and so does naming the API or the service as the scope of the
      limit — "You have reached your usage limit for the Anthropic API", "Monthly
@@ -74,9 +75,12 @@ observable Pi events, with thresholds that are constants rather than settings.
      and "You have reached your service usage limit" all reached a usage limit, not
      a lookup. The head cuts both ways: "You have reached the quota service", "You
      have reached the account quota service", "You have reached the billing limit
-     check", and "You have reached the usage limit service" all end in a service or
-     a check, so the limit vocabulary in front of them is a modifier and the object
-     is the lookup. A rate dimension is checked first, so "reached a rate limit" and
+     check", and "You have reached the usage limit service" all have a service or a
+     check as their head, so the limit vocabulary in front of them is a modifier and
+     the object is the lookup — and so do the same phrases with trailing punctuation
+     or a retry clause after them, because the head noun is read rather than the raw
+     end of the phrase. The phrasal verb "reached out to" reaches what follows its
+     particle. A rate dimension is checked first, so "reached a rate limit" and
      "reached a quota metric" stay throttles whatever else the phrase says;
    - a bare quota plus an exhaustion verb, which is *not* decisive on its own,
      because that is also exactly how a provider describes a per-minute quota
