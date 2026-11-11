@@ -32,6 +32,8 @@ export interface ScriptedUsage {
 	output?: number;
 	cacheRead?: number;
 	cacheWrite?: number;
+	/** Subset of `output`, exactly as Pi's providers report reasoning tokens. */
+	reasoning?: number;
 }
 
 export interface ScriptedStep {
@@ -67,8 +69,8 @@ export default function scriptedProviderExtension(pi: ExtensionAPI): void {
 		apiKey: "scripted-test-key",
 		models: [
 			{
-				id: "scripted-1",
-				name: "Scripted 1",
+				id: "stepfun-5-preview",
+				name: "StepFun 5 Preview (scripted)",
 				reasoning: false,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -101,6 +103,7 @@ function streamScriptedStep(
 			output: step.usage?.output ?? 5,
 			cacheRead: step.usage?.cacheRead ?? 0,
 			cacheWrite: step.usage?.cacheWrite ?? 0,
+			reasoning: step.usage?.reasoning ?? 0,
 			totalTokens: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		};

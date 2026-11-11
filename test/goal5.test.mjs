@@ -1996,3 +1996,68 @@ test("/goal resume restarts a Goal stopped by an anti-loop bound without re-stop
 		await session.stop();
 	}
 });
+
+test("/goal resume restarts a blocked Goal with a budget, and refuses a budget-limited one", async () => {
+	const session = await PiRpcSession.start();
+	// A Goal with a token budget: three blocker reports block it, the resume
+	// restarts it, the resumed work crosses the budget, and the wrap-up is the last
+	// thing that runs. The budget-limited Goal is then refused a resume, which is
+	// the one non-continuing status a user decision does not end yet.
+	script(
+		[
+			{ text: "Kickoff answer.", usage: { input: 10, output: 5 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }], usage: { input: 5, output: 5 } },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }], usage: { input: 5, output: 5 } },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }], usage: { input: 5, output: 5 } },
+			{ text: "Reporting the blocker." },
+			{ text: "Resumed work after the blocker was resolved.", usage: { input: 20, output: 10 } },
+			{ text: "Wrap-up summary.", usage: { input: 20, output: 10 } },
+			{ text: "After the wrap-up." },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal --budget 100 ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await session.waitFor("the third report blocked the Goal", async () => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "blocked" ? true : undefined;
+		});
+		const blocked = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.deepEqual(blocked.blockedAudit, { blocker: BLOCKER, turns: 3 });
+		assert.equal(blocked.tokenBudget, 100, "the budget survives the stop");
+
+		// The resume keeps the budget and the identity, and clears the audit.
+		await session.prompt("/goal resume");
+		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
+		assert.match(resumed.message, /fresh audit/);
+
+		// The resumed work crosses the budget, so the Goal becomes budget_limited
+		// after exactly one bounded wrap-up rather than continuing.
+		await session.waitForNotify((r) => r.message.includes("reached its token budget"));
+		await session.waitFor("the Goal is budget_limited", async () => {
+			const entries = readSessionEntries(await session.sessionFile());
+			return lastGoalSnapshot(entries).data.goal.status === "budget_limited" ? true : undefined;
+		});
+
+		const limited = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(limited.id, blocked.id, "one Goal identity across the stop, the resume, and the budget");
+		assert.equal(limited.blockedAudit, undefined, "the resumed Goal kept no audit out of the stop");
+		assert.equal(limited.wrapUpPending, false, "the one bounded wrap-up was delivered");
+
+		// budget_limited is the one non-continuing status a user decision does not
+		// end yet, so the resume is refused and the Goal keeps its state.
+		await session.prompt("/goal resume");
+		const refused = await session.waitForNotify((r) => r.message.includes("cannot be resumed"));
+		assert.match(refused.message, /budget_limited/);
+		const stillLimited = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(stillLimited.status, "budget_limited");
+		assert.equal(stillLimited.revision, limited.revision, "the refused resume persisted nothing");
+
+		assert.ok(session.extensionErrors().length === 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});

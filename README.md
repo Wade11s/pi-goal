@@ -5,8 +5,8 @@ command and three model tools (`get_goal`, `create_goal`, `update_goal`) that gi
 session a durable, user-controlled objective. While a Goal is active, work
 continues automatically at Pi's safe settlement boundary until the model verifies
 completion, a genuine blocker persists, a provider usage limit or terminal failure
-stops the run, a conservative anti-loop bound is reached, the run is aborted, or
-the lifecycle changes.
+stops the run, a conservative anti-loop bound is reached, the run is aborted, the
+lifecycle changes, or the Goal's token budget runs out.
 
 Requires **Pi 1.5.1 or newer**. The extension uses only public extension APIs and
 does not patch Pi core.
@@ -82,11 +82,72 @@ it instead.
 /goal
 ```
 
-Reports the objective, lifecycle status, identity, timestamps, revision, and the
-usage fields that currently exist. Token usage and active time report
-`not tracked yet` until usage accounting lands in a later milestone. When a
-session with a Goal starts, restores, or reloads, a `Goal ... restored (active)`
-notification confirms reconstruction.
+Reports the objective, lifecycle status, identity, timestamps, revision, the
+configured token budget, the accounted token usage, the active elapsed time, and
+the remaining capacity:
+
+```
+Goal goal_1a2b3c4d — active
+Objective: Make the full test suite pass in this repository
+Created by: the user (/goal)
+Created: 2026-01-01T00:00:00.000Z
+Updated: 2026-01-01T00:05:00.000Z
+Revision: 0
+Token budget: 250000 tokens
+Token usage: 48210 tokens (input 31000, output 17000 including reasoning 4200, cache write 210;
+            cached read 184300 excluded as reuse, nested 0 counted once)
+Active time: 5m 12s
+Remaining capacity: 201790 tokens
+```
+
+When a session with a Goal starts, restores, or reloads, a `Goal ... restored
+(active)` notification confirms reconstruction. A compact one-line indicator
+(`goal_1a2b3c4d · active · 48210 tok · 201790 left · 5m 12s`) is published to
+Pi's status/footer surface whenever it exists.
+
+### Token budgets
+
+A Goal can carry a token budget that bounds unattended model usage:
+
+```
+/goal --budget 250000 Make the full test suite pass in this repository
+/goal --no-budget Make the full test suite pass in this repository
+```
+
+- `--budget <n>` (or `--budget=<n>`) sets an explicit per-Goal budget. It is only
+  recognized as a *leading* flag, so an objective that merely contains the word
+  `--budget` is never truncated.
+- `--no-budget` asks for an unbounded Goal. It is honoured only when **no**
+  `goal.maxTokenBudget` is configured; with a maximum configured it is refused,
+  because it would create exactly the Goal the configuration forbids.
+- With no flag, the extension-level default applies, and when only a maximum is
+  configured the maximum is the bound — so a session that configures a maximum
+  never gets an unbounded Goal by omission.
+- `create_goal` accepts the same budget as an optional `tokenBudget` argument.
+
+Extension-level defaults live in Pi's settings (agent-directory or project):
+
+```json
+{
+  "goal": {
+    "defaultTokenBudget": 250000,
+    "maxTokenBudget": 1000000
+  }
+}
+```
+
+- `goal.defaultTokenBudget` is applied to every new Goal that does not ask for an
+  explicit budget.
+- `goal.maxTokenBudget` is a **hard** bound that constrains every path: an
+  explicit budget above it is refused with an error (never clamped), a default
+  above it is clamped to it (the maximum is the safety bound, so it always wins),
+  and an unbounded Goal cannot be created while it is set. All three facts are
+  reported as a warning notification when the session starts.
+- Invalid values (not whole numbers of at least 1 token) are dropped and reported
+  rather than silently coerced.
+
+When the accounted usage reaches the budget, the Goal transitions to
+`budget_limited` (see *Budget exhaustion* below).
 
 ### The lifecycle: pause, resume, clear
 
@@ -105,7 +166,8 @@ and is reported as a persistence error).
   continuation seam only continues an `active` Goal, so whatever run is in
   flight finishes on its own and its settlement admits no continuation. Pause
   never aborts work — interrupting a run stays with the user, through Pi's
-  normal abort.
+  normal abort. A paused Goal also stops accruing active time, and `/goal resume`
+  restarts that clock with the work.
 - `/goal resume` restarts eligible work — a **paused**, **blocked**, or
   **usage_limited** Goal: the transition is durable, then a resume kickoff
   message restates the objective and asks for a fresh evidence audit of the
@@ -155,6 +217,133 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
 - A run that was aborted or that ended in a provider error is a hard exit: Pi
   owns retries, so the Goal does not add a retry loop of its own. The Goal stays
   active and continues on the next successful run.
+
+### Usage accounting
+
+Token usage and active elapsed time are durable Goal state, recovered from the
+session after a restart, a resume, a reload, or tree navigation.
+
+**Tokens.** Pi reports a `Usage` record on every assistant message, and optionally
+on tool-result messages for model work a tool performed. The accounted total is
+
+```
+input + output + cacheWrite
+```
+
+because that is what Pi's documented usage semantics mean:
+
+- `input` excludes cached reads *and* cache writes — every Pi provider adapter
+  subtracts both (`input = prompt_tokens - cached - cache_write`), so adding
+  `cacheRead` on top would double-count reuse;
+- `cacheRead` is prompt reuse, not new work, so it is excluded from the total and
+  reported separately for transparency;
+- `cacheWrite` is freshly processed prompt tokens that Pi itself counts in session
+  totals, so it is real consumption (`cacheWrite1h` is a subset of it and is never
+  added again);
+- `reasoning` is already a subset of `output` in every Pi provider adapter, so it
+  is reported and never added a second time.
+
+Each report is charged exactly once: an assistant response, a tool result (by tool
+call id), and a summarization entry (compaction, branch summary) each have a
+stable identity, and nested tool usage — which Pi merges into the calling tool
+result's own `usage` and never persists separately — is therefore counted once,
+not twice. Reconstruction replays the session branch under the same rule, so a
+reload, a restart, or a tree navigation converges on the same totals instead of
+re-charging them.
+
+A report is Goal work when a non-complete Goal exists as the report is *finalized*,
+not when the turn that produced it started. That distinction is load-bearing: a
+Goal can be created while a tool of an ordinary turn is still in flight — `/goal`
+commits its snapshot before it waits for the run to go idle, and `create_goal`
+commits from inside a tool batch — so the turn's own assistant `message_end`
+predates the Goal while its tool results land after it. Those results are Goal
+work: the branch replay charges every entry after the creation snapshot, and a
+live path that latched "was this turn Goal work?" at the assistant `message_end`
+would skip them and disagree with the replay it is supposed to converge with.
+Completion stays the one exception on both paths, which is what keeps the
+completing batch aligned with a replay that skips everything after a completion
+snapshot.
+
+Durable writes happen only at boundaries where every entry they cover is already
+on the branch. The ordering matters: Pi dispatches `message_end` to extensions
+*before* it appends the message that triggered it, so a checkpoint or a lifecycle
+transition written from inside that handler would sit on the branch *ahead* of the
+entry it already accounts for, and a reconstruction would replay that entry and
+charge it a second time. Usage is therefore charged at `message_end` — enforcement
+and status have to be immediate — and persisted at `turn_end`, `agent_before_settle`,
+`agent_settled`, and shutdown.
+
+The invariant has two halves, and both have to hold: a durable write must not sit
+ahead of an entry it covers, and it must cover *every* entry already on the
+branch. Every durable snapshot — a lifecycle transition as much as an accounting
+checkpoint — therefore carries the live accounting view at the moment it is
+written rather than the totals some earlier decision froze, so usage that lands
+in between — a concurrent nested tool result that was already in flight when the
+budget was crossed — is inside the snapshot instead of falling into the gap in
+front of it, where the replay can reach in neither direction.
+
+A checkpoint is a shortcut over that replay, never a second source of truth: the
+branch is the authority. Reconstruction adopts a checkpoint only when adopting it
+loses nothing, comparing its totals against the entries between the snapshot and
+it. A checkpoint that reports *fewer* tokens than those entries account for means
+the live path declined a report the replay charges, and adopting it would seal the
+omission permanently — the entry sits before the checkpoint, so no later replay can
+reach it. Such a checkpoint is discarded, the replay carries on, and only its
+active time is kept, because that is the one thing the branch cannot reconstruct.
+
+What is *not* counted: Pi's `usage` session entries (cache-warming refreshes),
+which are reported outside the transcript and outside Goal work; and any response
+produced after a Goal is complete, because completion is terminal. What *is*
+counted: the turn that completes a Goal or exhausts its budget, the one bounded
+wrap-up, and every later run of a `budget_limited` Goal. The branch replay after a
+restart draws exactly the same line, so an unclean exit cannot reclassify
+post-completion work as Goal usage.
+
+**Active time.** A monotonic clock (`performance.now()`, sampled exactly once per
+operation and clamped to the highest value seen) runs while a Goal is active in a
+live session. Paused time, process downtime, and a stopped Goal (complete,
+budget-limited) do not accrue. Folding a segment into the record at a lifecycle
+boundary neither loses nor double-counts time, and the accounted value is
+checkpointed durably at most once per accounted second of Goal activity, at every
+settlement, and at shutdown. Because the source is monotonic, a clock adjustment
+cannot make accounted time jump or shrink.
+
+Checkpoints are event-driven, not periodic: an *idle* active Goal accrues active
+time that only becomes durable at its next settlement or shutdown, so an unclean
+exit can lose more than one second of active time. Tokens are never lost that way —
+they are always recoverable from the branch, and a checkpoint that disagrees with
+the branch is discarded rather than adopted (see above).
+
+### Budget exhaustion
+
+Reaching the token budget is **not** completion:
+
+1. The Goal transitions to `budget_limited`, its active-time clock stops, and a
+   warning notification reports the accounted usage against the budget.
+2. Substantive continuation stops. At the next settlement of a *completed* run,
+   exactly one bounded wrap-up is requested on its own `goal-budget-wrapup`
+   custom-message channel: a concise summary of verified progress, remaining work,
+   blockers, and the single next useful action, with an explicit statement that
+   the budget ran out and the objective was not verified complete, and an explicit
+   instruction not to call `update_goal`.
+3. The budget boundary and the wrap-up are both *enforced*, not merely requested.
+   The same gate blocks and terminates every tool call while it is armed (Pi's
+   documented mechanism for stopping after the current tool batch), so a model that
+   reaches for a tool gets a refusal instead of an execution and the run ends after
+   that response: no substantive work, no additional model turn, no side effects.
+   It is armed the moment the budget is crossed — so the rest of *that* run cannot
+   work — and again for the wrap-up run, and it is cleared only at final settlement,
+   because Pi's `agent_end` is explicitly not final: retry backoff, final-attempt
+   recovery, and compaction retries all happen after it, so a retried wrap-up stays
+   gated. A genuine user turn disarms the gate immediately, so steering during a
+   gated run keeps its tools; while disarmed the gate returns nothing at all, so
+   other extensions' `tool_call` decisions are untouched.
+4. After that one response the Goal never continues again — including after a
+   restart, because the pending-wrap-up flag is durable. Later usage is still
+   accounted, so remaining capacity keeps being reported (floored at zero).
+
+Raising the budget or changing the objective is a user decision; resuming a
+budget-limited Goal arrives with the lifecycle commands.
 
 ### Model tool: `get_goal`
 
@@ -366,6 +555,42 @@ to be over.
   queued while the agent is busy) and an abort both restart the blocked audit and
   the anti-loop counters, and a replacement Goal starts from a fresh record.
 
+Budget exhaustion never reaches this tool as a completion: a `budget_limited`
+Goal is not active, so `update_goal complete` is refused for it, and the wrap-up
+message says so explicitly.
+
+### Structured tool responses
+
+`get_goal`, `create_goal`, and `update_goal` all return the same structured
+`{ goal }` payload, so status, budgets, usage, and remaining capacity are
+unambiguous for programmatic callers:
+
+```json
+{
+  "goal": {
+    "id": "goal_1a2b3c4d",
+    "status": "active",
+    "tokenBudget": 250000,
+    "usage": {
+      "totalTokens": 48210,
+      "inputTokens": 31000,
+      "outputTokens": 17000,
+      "cacheWriteTokens": 210,
+      "cachedReadTokens": 184300,
+      "reasoningTokens": 4200,
+      "nestedTokens": 0,
+      "activeSeconds": 312
+    },
+    "remainingTokens": 201790,
+    "budgetExhausted": false
+  }
+}
+```
+
+`remainingTokens` is `null` when the Goal has no budget and floors at zero once
+the budget is reached; `budgetExhausted` is the explicit signal. The objective,
+identity, origin, timestamps, and revision are part of the same payload.
+
 ## Persistence model
 
 - Goal snapshots are stored as **custom session entries** (`goal-state`), which
@@ -412,6 +637,12 @@ to be over.
   with a durable tombstone snapshot. A failed **replacement** write leaves the
   existing Goal untouched in memory and on disk (no tombstone, no resurrection
   on restart), and `/goal <objective>` can simply be retried.
+- Usage accounting is durable too. Token totals are always recoverable from the
+  session branch, and the accounted active time is checkpointed into separate
+  `goal-usage` custom entries — kept apart from `goal-state` so the lifecycle log
+  stays one entry per transition. On reconstruction the branch is replayed from
+  after the newest checkpoint or snapshot, which is why a restart recovers usage
+  accrued since the last write and can never charge it twice.
 - Interrupting the kickoff (Ctrl+C, killing the process, a hung model) does not
   lose the Goal: the snapshot and kickoff are already on disk and are restored
   by the next session.
@@ -466,17 +697,31 @@ test settles on a provider error.
   the request: unusual phrasing can be refused, and a pause request delivered
   only as an image, or one whose exact words were never sent as text, cannot be
   corroborated. The user can always pause directly with `/goal pause`.
-- No token budget, usage accounting, or active-time tracking yet, so
-  "preserved usage history" currently means the Goal identity, creation time,
-  and revision chain survive an edit; there are no token/second totals to
-  preserve until the accounting milestone lands, and `/goal resume`'s fresh
-  runtime baseline similarly has no accumulated usage to reset yet.
-- Replacement of an unfinished Goal discards the old Goal entirely (fresh
-  identity, fresh revisions). Refining the finish line without discarding
-  anything is what `/goal edit` is for.
-- No token budget, usage accounting, or active-time tracking yet, so unattended
-  work has no token bound. The anti-loop stops bound a malfunctioning loop, not a
-  healthy one: an active Goal whose runs keep completing keeps being continued.
+- An edit preserves the Goal identity, creation time, origin, budget, and usage
+  history: only the objective changes and the revision advances. Replacement of
+  an unfinished Goal instead discards the old Goal entirely (fresh identity,
+  fresh revisions). Refining the finish line without discarding anything is what
+  `/goal edit` is for.
+- Budget enforcement happens when a turn's usage is accounted, not inside the
+  provider loop: the extension cannot preempt a model call Pi has already
+  started, so a run in flight can overshoot the budget before it stops. It
+  cannot overshoot by unbounded work: the gate blocks every tool call from the
+  crossing response onwards, so no further substantive work runs. A tool that
+  was already in flight when the budget was crossed still finishes, and its
+  usage is accounted: the durable snapshot is written at the next
+  post-persistence boundary and carries it.
+- Because a durable accounting write never precedes the entry it covers, a crash
+  in the narrow window between crossing the budget and the next
+  post-persistence boundary leaves the Goal durably `active` with the budget
+  already exhausted. It self-corrects on the next accounted turn, and `/goal`
+  reports `budgetExhausted: true` with `remaining: 0` in the meantime.
+- Token accounting is provider-neutral but not invoice-exact: it excludes cached
+  reads and counts cache writes, and it does not reconcile against provider
+  billing. Pi's cache-warming `usage` entries are not counted.
+- Active time is durable to within one accounted second; an unclean exit loses
+  at most that.
+- A `budget_limited` Goal cannot be resumed with a higher budget yet — that
+  arrives with the lifecycle ticket.
 - The activity-free and execution-unavailable counters are per session, not
   durable. A restart or an extension reload gives a malfunctioning loop up to
   three more empty turns before it is stopped again; the blocked audit is durable
@@ -485,7 +730,6 @@ test settles on a provider error.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.
-- No status/widget UI yet.
 
 ## Development
 
@@ -507,6 +751,18 @@ events, extension notifications, tool results, model context, persisted session
 entries, and survival across hard kills and restarts. Set `PI_BINARY` to run
 against a specific Pi binary; a missing binary fails fast instead of hanging.
 
+Accounting rules that are impractical to cover exhaustively through the RPC seam
+(the token formula, deduplication, the active-time boundaries, budget validation)
+are unit-tested directly in `test/accounting.test.mjs` against the accounting
+module with an injected clock. The durability boundaries — snapshot aliasing,
+replay baselines, terminal-status replay, tombstones — are unit-tested in
+`test/store.test.mjs` against a fake Pi API that reproduces Pi's object-retention
+semantics, which is the only way to exercise the same-process reconstruction
+ordering an RPC test cannot reach. The RPC tests cover everything observable,
+including real nested usage (`test/extensions/nested-usage.ts`), real budget
+exhaustion with an attempted tool call during the wrap-up, and recovery after both
+a graceful and an unclean restart.
+
 ### Interactive smoke test
 
 Deterministic RPC tests are the automated gate; this manual procedure verifies
@@ -519,7 +775,8 @@ pi -e ./
 # 1. /goal Write a haiku about persistent sessions in a file called haiku.txt
 #    -> notification "Goal ... created and activated", agent starts working.
 # 2. /goal
-#    -> status report with the objective, "active", revision, timestamps.
+#    -> status report with the objective, "active", revision, timestamps, token
+#       usage, active time, and remaining capacity.
 # 3. Let the agent finish a turn.
 #    -> it continues on its own; the continuation prompt restates the objective
 #       and carries the no-progress and blocked-audit contract.
@@ -533,12 +790,24 @@ pi -e ./
 #    -> "Goal ... resumed"; work restarts from retained progress with a fresh audit.
 # 8. /goal Write a sonnet instead
 #    -> confirmation dialog; answer No -> "Replacement cancelled".
-# 9. /goal clear
-#    -> "Goal ... cleared"; the session is back to ordinary prompts.
-# 10. /reload
-#     -> no "restored" notification: the tombstone means no Goal comes back.
+# 9. /reload
+#    -> "Goal ... restored (active)" notification, and /goal reports the same
+#       objective and the same accounted usage after the reload.
+# 10. Exit (Ctrl+D), then: pi -c
 # 11. /goal
+#     -> the Goal, its usage, and its active time survive the restart.
+# 12. /goal clear
+#     -> "Goal ... cleared"; the session is back to ordinary prompts.
+# 13. /reload
+#     -> no "restored" notification: the tombstone means no Goal comes back.
+# 14. /goal
 #     -> "No Goal is set in this session."
+#
+# Budget check (optional):
+# 15. /goal --budget 1 Write a haiku
+#     -> the Goal is created, the very next accounted turn exhausts the budget,
+#        a warning notification reports it, exactly one wrap-up summary is
+#        produced, and the Goal stops continuing (status: budget_limited).
 ```
 
 To see a conservative stop interactively, give the agent a Goal it cannot make

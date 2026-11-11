@@ -81,7 +81,7 @@ export class PiRpcSession {
 			"--provider",
 			"scripted",
 			"--model",
-			"scripted-1",
+			"stepfun-5-preview",
 		);
 		for (const extension of this.extraExtensions) args.push("-e", extension);
 		if (this.noSession) args.push("--no-session");

@@ -84,6 +84,24 @@ async function forkableMessages(session) {
 	return messages;
 }
 
+/** Real delay, so an idle active Goal crosses the accounting checkpoint interval. */
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Longer than `ACCOUNTING_CHECKPOINT_MS`, so an idle active Goal has more
+ * unpersisted active time than one checkpoint interval when the replacement runs.
+ * The wait itself must not write anything: checkpoints are event-driven, and an
+ * idle session has no boundary to fire one.
+ */
+const IDLE_PAST_CHECKPOINT_MS = 1300;
+
+/** Every `goal-usage` accounting checkpoint in a session file, in append order. */
+function usageCheckpoints(entries) {
+	return entries.filter((e) => e.type === "custom" && e.customType === "goal-usage");
+}
+
 test("tree navigation reconstructs the selected branch: an older snapshot, a tombstone, and a different Goal", async () => {
 	const session = await PiRpcSession.start({ extraExtensions: [TREE_NAV] });
 	// warm-up, Goal 1 kickoff/continuation/hold, Goal 2 kickoff/continuation/hold,
@@ -431,6 +449,120 @@ async function sendFork(session, entryId) {
 	session.writeCommand({ id, type: "fork", entryId });
 	return responsePromise;
 }
+
+test("a clone after an idle active Goal leaves the source bytes untouched", async () => {
+	// A clone copies the branch *before* `session_shutdown` reaches the extension, so
+	// anything the shutdown handler appends lands only on the source: the clone never
+	// sees it, and the source has been mutated by an operation performed on a copy.
+	// That is invisible while the clone happens quickly, because the shutdown handler
+	// only writes when at least one checkpoint interval of active time is unpersisted
+	// — which an idle active Goal crosses with no model work at all.
+	const session = await PiRpcSession.start();
+	script([{ text: "kickoff" }, { text: "continuing" }, { hang: true }], session);
+	try {
+		await session.prompt("/goal Idle clone probe objective");
+		await abortActiveLoop(session, 2);
+		const sourceFile = await session.sessionFile();
+		const sourceBefore = readFileSync(sourceFile, "utf8");
+		const sourceGoal = lastGoalSnapshot(readSessionEntries(sourceFile)).data.goal;
+		assert.equal(sourceGoal.status, "active");
+		assert.equal(usageCheckpoints(readSessionEntries(sourceFile)).length, 0, "no checkpoint yet");
+
+		// Idle with the Goal active: the clock runs, but nothing is written, because
+		// checkpoints are event-driven and an idle session has no boundary to fire one.
+		await sleep(IDLE_PAST_CHECKPOINT_MS);
+		assert.equal(
+			readFileSync(sourceFile, "utf8"),
+			sourceBefore,
+			"the idle wait alone must not write anything",
+		);
+
+		// Now the replacement runs, with more than one checkpoint interval unpersisted.
+		const clone = await session.sendSimple("clone");
+		assert.deepEqual(clone, { cancelled: false });
+		await session.waitForNotify((r) => r.message.includes("restored (active)"));
+		const clonedFile = (await session.getState()).sessionFile;
+		assert.notEqual(clonedFile, sourceFile);
+
+		assert.equal(
+			readFileSync(sourceFile, "utf8"),
+			sourceBefore,
+			"the clone must not append anything to the source session",
+		);
+		assert.equal(
+			usageCheckpoints(readSessionEntries(clonedFile)).length,
+			0,
+			"and the clone carries no checkpoint the source never had",
+		);
+		assert.equal(lastGoalSnapshot(readSessionEntries(clonedFile)).data.goal.id, sourceGoal.id);
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a fork after an idle active Goal leaves the source bytes untouched", async () => {
+	// Same hazard through the RPC `fork` path, which is the same code as `clone` with
+	// a different position. The fork copies the selected branch before the extension
+	// hears about the shutdown, so a checkpoint written there would only ever reach
+	// the source.
+	const session = await PiRpcSession.start({ extraExtensions: [TREE_NAV] });
+	script([{ text: "kickoff" }, { text: "continuing" }, { hang: true }], session);
+	try {
+		await session.prompt("/goal Idle fork probe objective");
+		await abortActiveLoop(session, 2);
+		const sourceFile = await session.sessionFile();
+		const sourceBefore = readFileSync(sourceFile, "utf8");
+		const sourceGoal = lastGoalSnapshot(readSessionEntries(sourceFile)).data.goal;
+		assert.equal(sourceGoal.status, "active");
+		assert.equal(usageCheckpoints(readSessionEntries(sourceFile)).length, 0, "no checkpoint yet");
+
+		await sleep(IDLE_PAST_CHECKPOINT_MS);
+		assert.equal(
+			readFileSync(sourceFile, "utf8"),
+			sourceBefore,
+			"the idle wait alone must not write anything",
+		);
+
+		const messages = await forkableMessages(session);
+		const kickoff = messages.find((m) => m.text.startsWith("[pi-goal]"));
+		assert.ok(kickoff, "the kickoff user message is forkable");
+		const fork = await sendFork(session, kickoff.entryId);
+		assert.equal(fork.success, true);
+		assert.equal(fork.data.cancelled, false);
+		// The fork's runtime binds and restores the inherited Goal, which is what makes
+		// the fork usable at all.
+		await session.waitForNotify((r) => r.message.includes("restored (active)"));
+		const forkedFile = (await session.getState()).sessionFile;
+		assert.notEqual(forkedFile, sourceFile);
+
+		// The source is untouched, which is the whole point: the fork copied the branch
+		// before this extension heard about the shutdown, so anything written there
+		// would only ever have reached the source.
+		assert.equal(
+			readFileSync(sourceFile, "utf8"),
+			sourceBefore,
+			"the fork must not append anything to the source session",
+		);
+
+		// The inherited Goal is live state in the fork, not just a copied file: the
+		// fork's session file is created lazily, so drive one run to make it exist and
+		// to read the Goal back through the model-facing tool.
+		script([{ toolCalls: [{ name: "get_goal", args: {} }] }, { text: "fork working" }], session);
+		await session.prompt("continue the objective");
+		const toolEnd = await session.waitForToolResult("get_goal", 1);
+		const state = toolEnd.result.structuredContent?.goal ?? toolEnd.result.details?.goal;
+		assert.equal(state.id, sourceGoal.id, "the fork inherited the Goal");
+		assert.equal(
+			lastGoalSnapshot(readSessionEntries(forkedFile)).data.goal.id,
+			sourceGoal.id,
+			"and the fork's branch carries the same snapshot",
+		);
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+	} finally {
+		await session.stop();
+	}
+});
 
 test("fork from before the Goal inherits no Goal, and that branch's slot is free", async () => {
 	const session = await PiRpcSession.start({ extraExtensions: [TREE_NAV] });
