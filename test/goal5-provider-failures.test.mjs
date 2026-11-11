@@ -74,6 +74,13 @@ test("provider failures are classified from what the evidence actually says", as
 		["You have reached the API usage limit", "usage_limited"],
 		["You have reached the API's usage limit", "usage_limited"],
 		["You have reached your service usage limit", "usage_limited"],
+		["You have reached your service usage limit for the API", "usage_limited"],
+		["You have reached the API quota", "usage_limited"],
+		["You have reached your monthly quota", "usage_limited"],
+		// ...and the head is what decides, so the same limit vocabulary is a modifier
+		// when the phrase ends in a limit and a lookup when it ends in a service.
+		["You have reached the usage limit; the service timed out", "usage_limited"],
+		["You have reached the usage limit, and the service timed out", "usage_limited"],
 		// An explicit billing, plan, spending, account, or subscription limit is
 		// exhaustion in either word order.
 		["You have reached your billing limit", "usage_limited"],
@@ -117,6 +124,17 @@ test("provider failures are classified from what the evidence actually says", as
 		// a limit either, so the object still decides.
 		["The API check reached a timeout while checking your account", "active"],
 		["You have reached the service timeout", "active"],
+		// ...and the mirror case, where the limit word is the *modifier* and the head
+		// of the object is the lookup: a service, a check, or a lookup that merely
+		// carries limit vocabulary is still what the verb reached. The clause cut at
+		// "and" is what keeps "and timed out" from being read as the object.
+		["You have reached the quota service", "active"],
+		["You have reached the account quota service", "active"],
+		["You have reached the account quota service and timed out", "active"],
+		["You have reached the billing limit check", "active"],
+		["You have reached the billing limit lookup", "active"],
+		["You have reached the usage limit service", "active"],
+		["You have reached the quota service while checking your account", "active"],
 		// The verb-first order is subject to the same guards as the noun-first one.
 		["You have not reached your billing limit", "active"],
 		["Your billing limit has not been reached", "active"],
