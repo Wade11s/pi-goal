@@ -785,18 +785,31 @@ export class GoalStore {
 	flushAccounting(pi: ExtensionAPI, force = false): void {
 		if (!this.current) return;
 		try {
-			const pending = this.pendingTransition;
-			if (pending) {
-				this.persistSnapshot(pi, this.transitionToPersist(pending));
-				this.pendingTransition = undefined;
-				return;
-			}
+			if (this.flushPendingTransition(pi)) return;
 			if (force || this.clock.unpersistedMs >= ACCOUNTING_CHECKPOINT_MS) {
 				this.checkpointAccounting(pi);
 			}
 		} catch {
 			// Leave the pending state for the next boundary to retry.
 		}
+	}
+
+	/**
+	 * Write a pending lifecycle transition if one is waiting, and report whether one
+	 * was: a transition supersedes a checkpoint, so a caller that wrote one is done.
+	 *
+	 * Also used on its own when a session is being *replaced* rather than exited (see
+	 * the `session_shutdown` handler). The transition is state that belongs to the
+	 * outgoing branch, so losing it would leave a Goal durably `active` with its
+	 * budget already exhausted; a bare accounting checkpoint, by contrast, is only an
+	 * optimization and would land in a session the user has navigated away from.
+	 */
+	flushPendingTransition(pi: ExtensionAPI): boolean {
+		const pending = this.pendingTransition;
+		if (!pending) return false;
+		this.persistSnapshot(pi, this.transitionToPersist(pending));
+		this.pendingTransition = undefined;
+		return true;
 	}
 
 	/**

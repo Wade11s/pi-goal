@@ -468,12 +468,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * accounted time durable so a later resume continues from it instead of
 	 * silently restarting the clock.
 	 */
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (event, ctx) => {
 		if (!store.get()) return;
 		store.stopClock();
-		// Forced: this is the last chance to make a pending transition and the
-		// accounted active time durable.
-		store.flushAccounting(pi, true);
+		// Pi fires this both when the process quits and when a session is *replaced*
+		// (fork, clone, switch, resume, reload), and the two need different things.
+		//
+		// A pending lifecycle transition is state, not an optimization: it belongs to
+		// the outgoing branch, and losing it would leave a Goal durably `active` with
+		// its budget already exhausted. It is therefore always written, whichever
+		// reason brought us here.
+		//
+		// A forced accounting checkpoint is only the last chance to make accounted
+		// active time durable, so it is worth writing only when this session's file is
+		// the one that survives. `quit` has no destination at all, and a reload or a
+		// switch back to the same file keeps it, so both force the checkpoint. A fork
+		// or a clone copies its branch *before* this runs, and a switch to another file
+		// abandons this one, so a checkpoint written here would neither reach the new
+		// session nor leave the abandoned one untouched — which is exactly what
+		// "forking leaves the source session unmutated" forbids.
+		const currentFile = ctx.sessionManager.getSessionFile();
+		const keepsFile = event.targetSessionFile === undefined || event.targetSessionFile === currentFile;
+		store.flushAccounting(pi, keepsFile);
 	});
 
 	/**
