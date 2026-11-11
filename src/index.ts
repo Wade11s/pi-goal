@@ -4,8 +4,12 @@
  * Registers the /goal command, the get_goal / create_goal / update_goal model
  * tools, and the automatic-continuation seam. A Goal is a durable,
  * session-scoped record persisted as custom session entries and reconstructed
- * from the active branch on session start (restart, resume, reload, fork) and
- * after tree navigation.
+ * from the selected branch on session start (restart, resume, reload, and
+ * fork/clone, which copy the branch into a new session) and after tree
+ * navigation, so the selected session branch alone determines the active
+ * objective: snapshots on abandoned branches cannot leak into it, a cleared
+ * Goal stays cleared on the branch that cleared it, and model transitions are
+ * bound to the Goal identity and revision they were prepared against.
  *
  * Creating a Goal sends the objective into model context as a user message and
  * starts initial work. While a Goal is active, work continues at Pi's safe
@@ -56,6 +60,7 @@ import {
 	toPublicState,
 } from "./goal.ts";
 import { GoalStore, validateObjective, type GoalMutationFailure } from "./store.ts";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /** Auto-decline a replacement confirmation after this long (safe default: no discard). */
 const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
@@ -179,8 +184,79 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Goal ${goal.id} restored (${goal.status}).`, "info");
 		}
 	});
+	/** Whether two reconstructed states are observably the same Goal state. */
+	function sameBranchGoal(
+		a: GoalRecord | null | undefined,
+		b: GoalRecord | null | undefined,
+	): boolean {
+		if ((a ?? null) === (b ?? null)) return true;
+		if (!a || !b) return false;
+		return (
+			a.id === b.id &&
+			a.revision === b.revision &&
+			a.status === b.status &&
+			a.objective === b.objective
+		);
+	}
+
+	/**
+	 * Tell the user what the selected branch's Goal state is after tree
+	 * navigation, but only when it actually changed. Reconstruction itself is
+	 * silent: navigating between two views of the same state must not spam the
+	 * UI, while a change the user needs to know about (a Goal appearing,
+	 * disappearing, or becoming a different objective on the newly selected
+	 * branch) is exactly the moment abandoned-branch isolation becomes visible.
+	 */
+	function notifyBranchChange(ctx: ExtensionContext, before: GoalRecord | null, after: GoalRecord | null): void {
+		if (sameBranchGoal(before, after)) return;
+		if (!after) {
+			ctx.ui.notify(
+				before
+					? `No Goal on the selected branch (left the branch of ${before.id}, ${before.status}). Goal changes from the abandoned branch do not apply here.`
+					: "No Goal on the selected branch.",
+			"info",
+			);
+			return;
+		}
+		if (!before) {
+			ctx.ui.notify(
+				`Goal ${after.id} restored from the selected branch (${after.status}).` +
+					(after.status === "active"
+						? " It continues at the next settlement once a run starts; navigation alone starts no run."
+						: ""),
+				"info",
+			);
+			return;
+		}
+		const identity = before.id === after.id ? "" : ` (a different Goal identity than ${before.id})`;
+		const objective =
+			before.objective === after.objective ? "" : `; objective is now "${previewObjective(after.objective)}"`;
+		ctx.ui.notify(
+				`Goal changed with the selected branch${identity}: ${after.id} is ${after.status} at revision ${after.revision}${objective}.`,
+			"info",
+		);
+	}
+
+	/**
+	 * Tree navigation re-points the active branch inside the same session file,
+	 * so the Goal state is rebuilt from the newly selected branch alone: the
+	 * snapshots of any branch left behind (later edits, pauses, clears, or entire
+	 * other Goals) are unreachable from the new branch and cannot leak into it.
+	 * The change is announced whenever the reconstructed state observably
+	 * changed, so abandoned-branch isolation is visible rather than implicit.
+	 *
+	 * `turnGoal` is deliberately *not* reset here. It is the binding the current
+	 * turn's model transitions were prepared against; Pi rejects navigation while
+	 * a turn is streaming, so at this point the binding is either already fresh
+	 * for the selected branch or will be refreshed at the next `turn_start`. If a
+	 * turn somehow raced a navigation, leaving the binding untouched keeps the
+	 * execute-time identity+revision check refusing the stale transition instead
+	 * of handing it a fresh binding it was never prepared against.
+	 */
 	pi.on("session_tree", (_event, ctx) => {
-		store.reconstruct(ctx);
+		const before = store.get() ?? null;
+		const after = store.reconstruct(ctx);
+		notifyBranchChange(ctx, before, after);
 	});
 
 	/**
