@@ -12,7 +12,6 @@ Implementation issues are delegated through `rex-subagent` to this worker pool, 
 
 | Worker model |
 | --- |
-| `magpie/openrouter/thinkingmachines/inkling-2-small:free` |
 | `magpie/longcat/LongCat-2.5:max` |
 | `magpie/stepfun-cn/step-5-preview:high` |
 | `magpie/deepai/deepseek-v4.1-flash:high` |
