@@ -291,18 +291,23 @@ not twice. Reconstruction replays the session branch under the same rule, so a
 reload, a restart, or a tree navigation converges on the same totals instead of
 re-charging them.
 
-A report is Goal work when a non-complete Goal exists as the report is *finalized*,
-not when the turn that produced it started. That distinction is load-bearing: a
-Goal can be created while a tool of an ordinary turn is still in flight — `/goal`
-commits its snapshot before it waits for the run to go idle, and `create_goal`
-commits from inside a tool batch — so the turn's own assistant `message_end`
-predates the Goal while its tool results land after it. Those results are Goal
-work: the branch replay charges every entry after the creation snapshot, and a
-live path that latched "was this turn Goal work?" at the assistant `message_end`
-would skip them and disagree with the replay it is supposed to converge with.
-Completion stays the one exception on both paths, which is what keeps the
-completing batch aligned with a replay that skips everything after a completion
-snapshot.
+A report is Goal work only inside an open **admission segment**. A segment opens
+when pi-goal finalizes a Goal work message — the `/goal` kickoff, an objective
+edit, a resume, an automatic Continuation, or the one Budget wrap-up — and closes
+on a genuine user prompt or a new Goal identity. `/goal <objective>` therefore
+starts attribution at its actual kickoff: the ordinary run the command waited for
+is never adopted. `create_goal` leaves its creating run ordinary, and attribution
+starts at the first subsequent Continuation; pre-creation responses, creation
+controls, and unrelated same-batch tool results are excluded. Ordinary prompts
+are excluded in every lifecycle status.
+
+A steered message opens the segment when it is *delivered*, not when it is
+queued, so a steered replacement cannot steal an in-flight response that belongs
+to the previous identity. Work already admitted stays attributable through pause,
+completion, a blocked or usage-limit stop, and other lifecycle boundaries, while
+no new substantive work is admitted after the stop. Completion stays terminal on
+both paths, which is what keeps the completing batch aligned with a replay that
+skips everything after a completion snapshot.
 
 Durable writes happen only at boundaries where every entry they cover is already
 on the branch. The ordering matters: Pi dispatches `message_end` to extensions
@@ -644,10 +649,13 @@ identity, origin, timestamps, and revision are part of the same payload.
   restating the objective. Reconstruction also runs after `session_tree`
   navigation and on forked sessions: the *selected* branch alone decides the
   state, so snapshots on an abandoned branch cannot leak into the newly selected
-  one, a cleared Goal stays cleared on the branch that cleared it, and an entry
-  that is not a recognizable snapshot (unknown version, wrong shape, unknown
-  status) is skipped rather than trusted. A branch change is announced only when
-  the reconstructed state observably changed.
+  one, a cleared Goal stays cleared on the branch that cleared it. The newest
+  `goal-state` entry controls the branch: if it is malformed or has an
+  unrecognized version, reconstruction **fails closed** with no current Goal and
+  an actionable notification rather than falling back to an older snapshot, which
+  could resurrect a cleared, replaced, or stopped Goal. A later valid snapshot or
+  tombstone still wins. A branch change is announced only when the reconstructed
+  state observably changed.
 - A snapshot carries the optional `blockedAudit` (`{ blocker, turns }`): the
   blocker that stopped the Goal, or that is accumulating toward the blocked
   threshold, and how many consecutive Goal turns reported it. It is durable for
@@ -702,6 +710,38 @@ identity, origin, timestamps, and revision are part of the same payload.
   creating one returns a clear error instead of claiming durable storage.
 - Sessions without a Goal behave exactly as before; installing the extension
   only adds the command, the three tools, and the state they manage.
+
+## Legacy 0.1.0 cutover
+
+A `goal-state` snapshot written by pi-goal 0.1.0 is still loadable. It is never
+reinterpreted as evidence it cannot contain, and loading or migration sends no
+message and triggers no provider request.
+
+- The newest valid snapshot or tombstone determines the branch state. A malformed
+  or unrecognized newest `goal-state` fails closed with no current Goal and
+  actionable guidance; the extension never falls back to an older entry.
+- Once, under the 0.1.0 status-only accounting rules, the legacy token totals and
+  active milliseconds are reconstructed and frozen as the Goal's **legacy
+  reconstructed totals**. They are a historical baseline, not exact Goal-owned
+  attribution rebuilt under the repaired rules; `/goal` reports them as they are.
+- Before any repaired Goal work is admitted, the repaired snapshot and a
+  branch-local `goal-cutover` marker are written durably. A fork copied before the
+  cutover performs its own migration when selected; a fork copied after it
+  inherits the baseline. The legacy prefix is never replayed or merged again.
+- Absent optional fields keep their 0.1.0 meanings: origin `command`, zero usage
+  and active time, `wrapUpPending` false, and no open audit. An active Goal keeps
+  its normal continuation eligibility; every non-active status stays stopped,
+  `complete` stays terminal, and a tombstone leaves no current Goal.
+- The configured `goal.maxTokenBudget` is a hard safety bound during migration: an
+  unbounded Goal or one above the maximum is migrated to the maximum with an
+  explicit notice, while `goal.defaultTokenBudget` is never applied
+  retroactively. An active Goal whose reconstructed usage already reached its
+  effective budget becomes `budget_limited` and earns one bounded wrap-up; a
+  pending legacy wrap-up is delivered at most once.
+- A valid legacy open-audit description and count are preserved for the
+  Blocker-identity handoff; no text-similarity equivalence is introduced. An
+  existing `origin: "tool"` Goal remains a valid historical Goal, but migration
+  grants no fresh Goal-creation authority.
 
 ## How the tests stay honest
 
@@ -767,6 +807,10 @@ test settles on a provider error.
 - Token accounting is provider-neutral but not invoice-exact: it excludes cached
   reads and counts cache writes, and it does not reconcile against provider
   billing. Pi's cache-warming `usage` entries are not counted.
+- Migrated 0.1.0 Goals report **legacy reconstructed totals**: a one-time
+  baseline under the 0.1.0 status-only rule, not exact Goal-owned attribution
+  rebuilt under the repaired rules. Only work after the branch-local cutover is
+  attributed under the repaired contract.
 - Active time is durable to within one accounted second; an unclean exit loses
   at most that.
 - A `budget_limited` Goal cannot be resumed with a higher budget yet — that

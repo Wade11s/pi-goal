@@ -180,6 +180,20 @@ A host that implements the RPC extension-UI subprotocol can answer the
 `/goal edit` editor dialog; a host without a dialog-capable UI receives guidance
 to use `/goal edit <objective>` instead of a blocking terminal dialog.
 
+## 16. Optional: legacy 0.1.0 cutover
+
+Resume a session that was created by pi-goal 0.1.0 with the repaired version
+installed. Expect:
+
+- a `Goal ... restored (...)` notification, and no agent run started by the load
+  itself;
+- the Goal's **legacy reconstructed totals** reported by `/goal` — the 0.1.0
+  baseline, not exact Goal-owned attribution rebuilt under the repaired rules;
+- a durable `goal-cutover` marker in the session entries (inspect the session
+  `.jsonl`) and a repaired snapshot immediately after the legacy one;
+- the Goal continues under the repaired attribution: ordinary prompts are not
+  charged, only kickoff/edit/resume/Continuation/wrap-up work is.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -192,3 +206,5 @@ to use `/goal edit <objective>` instead of a blocking terminal dialog.
 - [ ] `/goal clear` removes the Goal and the status indicator.
 - [ ] The Goal survives a restart with its usage intact.
 - [ ] `/reload` after a clear does not resurrect the Goal.
+- [ ] A legacy 0.1.0 session loads without work, is cut over once, and reports its
+      legacy reconstructed totals.

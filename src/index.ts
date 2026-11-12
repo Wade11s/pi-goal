@@ -309,6 +309,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("turn_start", () => {
 		const goal = store.get();
 		turnGoal = goal ? { id: goal.id, revision: goal.revision } : null;
+		// The Goal identity that owned the segment when this provider request started.
+		// A replacement steered into an in-flight run must not steal the response that
+		// was already on the wire for the old identity, so the assistant report is
+		// bound to this identity (see the `message_end` handler).
+		turnOwnerId = store.currentOwnerId();
 	});
 
 	/**
@@ -631,6 +636,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	const chargedMessages = new WeakSet<object>();
 	let modelMessageSeq = 0;
+	/** The Goal identity owning the segment at the start of the current turn. */
+	let turnOwnerId: string | null = null;
 
 	/**
 	 * Token accounting, at the only seams where Pi reports finalized usage.
@@ -670,7 +677,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (message.role === "assistant") {
 			if (chargedMessages.has(message)) return;
 			chargedMessages.add(message);
-			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model");
+			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model", turnOwnerId);
 			afterAccounting(ctx);
 			return;
 		}

@@ -660,9 +660,33 @@ export class GoalStore {
 	 * charged, whatever the Goal's status. Completion stays terminal for accounting
 	 * on both the live path and the replay, so nothing after it is charged either.
 	 */
-	accountUsage(key: string, usage: Usage | undefined, source: UsageSource) {
+	/**
+	 * Charge one usage report exactly once, and only when it is Goal-owned work.
+	 *
+	 * `key` is the identity the accounting path guarantees: a sequence number for an
+	 * assistant message, `toolResult:<toolCallId>` for tool-performed nested work, or
+	 * the session entry id of a summarization entry. Returns the contribution when
+	 * the key was new.
+	 *
+	 * Ownership is the load-bearing guard: an ordinary prompt, a creation control,
+	 * a pre-creation response, or an unrelated same-batch tool result is never
+	 * charged, whatever the Goal's status. Completion stays terminal for accounting
+	 * on both the live path and the replay, so nothing after it is charged either.
+	 *
+	 * `admittedBy` binds the report to the Goal identity that owned the segment when
+	 * the provider request *started*. A replacement steered into an in-flight run
+	 * must not steal the response that was already on the wire for the old identity,
+	 * so an assistant report started under a different identity is refused rather
+	 * than re-attributed. `null` means the turn started with no Goal (a mid-turn Goal
+	 * work message may still open a segment); `undefined` is used for reports without
+	 * a turn seam (tool results, summarization), which use the live segment.
+	 */
+	accountUsage(key: string, usage: Usage | undefined, source: UsageSource, admittedBy?: string | null) {
 		const current = this.current;
 		if (!current || current.status === "complete") return undefined;
+		if (admittedBy !== undefined && admittedBy !== null && admittedBy !== current.id) {
+			return undefined;
+		}
 		if (!this.goalOwned || this.ownerId !== current.id) return undefined;
 		const contribution = this.ledger.account(key, usage, source);
 		if (contribution) this.refreshUsage();
@@ -684,6 +708,11 @@ export class GoalStore {
 	/** Whether the current segment is Goal-owned work. */
 	isGoalOwned(): boolean {
 		return this.goalOwned;
+	}
+
+	/** The identity the current segment was admitted for, or null when it is not Goal work. */
+	currentOwnerId(): string | null {
+		return this.goalOwned ? this.ownerId : null;
 	}
 
 	/** Actionable guidance from the last reconstruction, if any. */
