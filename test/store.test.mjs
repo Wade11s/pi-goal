@@ -66,6 +66,18 @@ function toolResultEntry(toolCallId, usageReport) {
 	};
 }
 
+/** A pi-goal work message on the branch, which opens a Goal-owned segment. */
+function goalWorkEntry(id = "kickoff") {
+	return {
+		type: "message",
+		id,
+		message: {
+			role: "user",
+			content: "[pi-goal] Working toward Goal goal_aaaaaaaa (active, revision 0).",
+		},
+	};
+}
+
 /** The accounted contribution of one nested model call: 40 + 7 + 3. */
 function nested() {
 	return usage(40, 7, { cacheWrite: 3 });
@@ -78,6 +90,7 @@ test("staging and committing never alias the object the session manager keeps", 
 
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 	store.accountUsage("model:1", usage(100, 10), "model");
 
 	// The appended snapshot is durable state: it must still read as created, not as
@@ -93,13 +106,14 @@ test("a same-process reconstruction after live accounting charges each entry onc
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 	store.accountUsage("model:1", usage(100, 10), "model");
 
 	// Same-process branch reconstruction (runtime replacement, tree navigation): the
 	// baseline is the creation snapshot, and the branch is replayed after it. If the
 	// live record aliased the appended snapshot, the baseline would already hold the
 	// live totals and the replay would charge them a second time (220 instead of 110).
-	const branch = [...pi.entries, assistantEntry(0, usage(100, 10))];
+	const branch = [...pi.entries, goalWorkEntry(), assistantEntry(0, usage(100, 10))];
 	store.reconstruct(fakeCtx(branch));
 
 	assert.equal(store.getUsage().totalTokens, 110, "the replay converges on the live total");
@@ -112,6 +126,7 @@ test("a transition is immediate in memory and durable only at a safe boundary", 
 	const goal = { ...store.create("Make the full test suite pass", "command"), tokenBudget: 100 };
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	assert.equal(store.isBudgetExhausted(), true);
@@ -155,6 +170,7 @@ test("a deferred budget snapshot carries the usage accounted before the flush", 
 	const goal = { ...store.create("Make the full test suite pass", "command"), tokenBudget: 150 };
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(110, 10), "model");
 	// The first concurrent nested result crosses the 150-token budget.
@@ -201,6 +217,7 @@ test("a deferred transition is written after the entry it covers", () => {
 	const goal = { ...store.create("Make the full test suite pass", "command"), tokenBudget: 100 };
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	assert.equal(store.markBudgetLimited().ok, true);
@@ -220,6 +237,7 @@ test("reconstruction after a completion ignores post-completion responses", () =
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	const completed = store.markComplete(pi);
@@ -247,6 +265,7 @@ test("the completing batch's tool results are excluded by both paths", () => {
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	assert.equal(store.markComplete(pi).ok, true);
@@ -269,6 +288,7 @@ test("reconstruction after budget exhaustion still accounts later Goal work", ()
 	const goal = { ...store.create("Make the full test suite pass", "command"), tokenBudget: 100 };
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	assert.equal(store.markBudgetLimited().ok, true);
@@ -276,8 +296,14 @@ test("reconstruction after budget exhaustion still accounts later Goal work", ()
 	assert.equal(wrapUpDelivered.ok, true);
 
 	// `budget_limited` is not terminal for accounting: the wrap-up run and later runs
-	// are still charged, and the replay must agree with the live path.
-	const branch = [...pi.entries, assistantEntry(0, usage(10, 5)), assistantEntry(1, usage(20, 2))];
+	// are still charged, and the replay must agree with the live path. The wrap-up
+	// message after the transition snapshot is what re-opens the segment.
+	const branch = [
+		...pi.entries,
+		goalWorkEntry("wrapup"),
+		assistantEntry(0, usage(10, 5)),
+		assistantEntry(1, usage(20, 2)),
+	];
 	store.reconstruct(fakeCtx(branch));
 
 	assert.equal(store.getUsage().totalTokens, 147, "110 + the wrap-up run + the later run");
@@ -290,6 +316,7 @@ test("an accounting checkpoint becomes the replay baseline", () => {
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	const checkpoint = store.checkpointAccounting(pi);
@@ -302,7 +329,7 @@ test("an accounting checkpoint becomes the replay baseline", () => {
 
 	// Everything after the checkpoint is replayed; everything before it is already
 	// inside the checkpoint's totals.
-	const branch = [...pi.entries, assistantEntry(0, usage(20, 2))];
+	const branch = [pi.entries[0], goalWorkEntry(), pi.entries[1], assistantEntry(0, usage(20, 2))];
 	store.reconstruct(fakeCtx(branch));
 	assert.equal(store.getUsage().totalTokens, 132, "the checkpoint plus the replay");
 });
@@ -313,6 +340,7 @@ test("a tombstone clears the Goal and its accounting baseline", () => {
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 	store.accountUsage("model:1", usage(100, 10), "model");
 
 	store.rollback(pi);
@@ -333,6 +361,7 @@ test("every durable lifecycle transition carries the live accounting view", asyn
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	store.accountUsage("model:2", usage(30, 5), "model");
@@ -389,6 +418,7 @@ test("a paused Goal accrues no active time, and a resumed one starts again", asy
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 	store.accountUsage("model:1", usage(100, 10), "model");
 
 	assert.equal(store.markPaused(pi).ok, true);
@@ -430,6 +460,7 @@ test("a durable transition supersedes a budget transition still waiting to be wr
 	const goal = { ...store.create("Make the full test suite pass", "command"), tokenBudget: 150 };
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(110, 10), "model");
 	store.accountUsage("toolResult:call_1", nested(), "nested");
@@ -472,6 +503,7 @@ test("a budget-limited Goal cannot be completed, and clearing it drops the accou
 	const goal = { ...store.create("Make the full test suite pass", "command"), tokenBudget: 150 };
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(110, 10), "model");
 	store.accountUsage("toolResult:call_1", nested(), "nested");
@@ -504,6 +536,7 @@ test("the two public accounting views agree, live time included", async () => {
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 	store.accountUsage("model:1", usage(100, 10), "model");
 	// A delay with no accounting: only a view that reads the clock can see this time.
 	await sleep(60);
@@ -533,6 +566,7 @@ test("an accounting checkpoint that undercounts the branch never becomes the bas
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	// The live path charged the assistant response and then, for whatever reason,
 	// never charged the tool result that follows it.
@@ -543,6 +577,7 @@ test("an accounting checkpoint that undercounts the branch never becomes the bas
 
 	const branch = [
 		pi.entries[0],
+		goalWorkEntry(),
 		assistantEntry(0, usage(100, 10)),
 		toolResultEntry("call_1", nested()),
 		pi.entries[1],
@@ -565,6 +600,7 @@ test("an accounting checkpoint that agrees with the branch is still adopted", ()
 	const goal = store.create("Make the full test suite pass", "command");
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 
 	store.accountUsage("model:1", usage(100, 10), "model");
 	store.accountUsage("toolResult:call_1", nested(), "nested");
@@ -573,6 +609,7 @@ test("an accounting checkpoint that agrees with the branch is still adopted", ()
 
 	const branch = [
 		pi.entries[0],
+		goalWorkEntry(),
 		assistantEntry(0, usage(100, 10)),
 		toolResultEntry("call_1", nested()),
 		pi.entries[1],
@@ -593,6 +630,7 @@ test("restoring a previous record keeps that record's usage, not the live ledger
 	const goal = store.create("Make the full test suite pass", "command", { tokenBudget: 500 });
 	store.stage(pi, goal);
 	store.commit(goal);
+	store.beginGoalWork(goal.id);
 	store.accountUsage("model:1", usage(100, 10), "model");
 	store.accountUsage("model:2", usage(30, 5), "model");
 	const previous = store.get();
@@ -602,6 +640,7 @@ test("restoring a previous record keeps that record's usage, not the live ledger
 	const replacement = store.create("Make the full test suite pass and document it", "command");
 	store.stage(pi, replacement);
 	store.commit(replacement);
+	store.beginGoalWork(replacement.id);
 	assert.equal(store.getUsage().totalTokens, 0, "the replacement starts from zero");
 
 	const restored = store.restore(pi, previous);

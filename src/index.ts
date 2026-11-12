@@ -386,6 +386,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
+		surfaceReconstructionNotice(ctx);
+		applyCutover(ctx);
 		// Runtime-only counters must not survive into a new runtime; the durable
 		// blocked audit is reconstructed with the Goal.
 		safety.reset();
@@ -395,6 +397,32 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 		updateStatus(ctx);
 	});
+
+	/**
+	 * Surface actionable guidance when reconstruction failed closed on a malformed
+	 * or unrecognized newest snapshot. Reconstruction itself is silent; the user is
+	 * told what to do instead of silently losing the Goal.
+	 */
+	function surfaceReconstructionNotice(ctx: ExtensionContext): void {
+		const notice = store.takeNotice();
+		if (notice) notify(ctx, notice, "error");
+	}
+
+	/**
+	 * Perform the one-time branch-local cutover of a pre-repair snapshot before any
+	 * repaired Goal work is admitted, and surface its migration notices. Loading and
+	 * migration send no message and trigger no provider request.
+	 */
+	function applyCutover(ctx: ExtensionContext): void {
+		if (!store.needsLegacyCutover()) return;
+		const result = store.applyLegacyCutover(pi, budgetSettings);
+		if (!result.ok) {
+			notify(ctx, `pi-goal could not cut over the legacy Goal state: ${describeError(result.error)}. ` + "No repaired Goal work was admitted; fix the cause and reload the session.", "error");
+			return;
+	}
+		for (const notice of result.notices) notify(ctx, notice, "warning");
+		updateStatus(ctx);
+	}
 	/** Whether two reconstructed states are observably the same Goal state. */
 	function sameBranchGoal(
 		a: GoalRecord | null | undefined,
@@ -467,6 +495,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => {
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
+		surfaceReconstructionNotice(ctx);
+		applyCutover(ctx);
 		notifyBranchChange(ctx, before, after);
 		// The status line follows the selected branch too, and the accounting
 		// baseline is rebuilt with it.
@@ -495,8 +525,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * so every anti-loop counter starts over. Extension commands (`/goal ...`) do
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
-	pi.on("input", (_event, ctx) => {
+	pi.on("input", (event, ctx) => {
 		continuesGoalTurn = false;
+		// A prompt the user actually typed is never Goal-owned work. pi-goal's own
+		// messages (and other extensions' `sendUserMessage` calls) arrive with
+		// source "extension": they do not close the segment, or the kickoff would
+		// clear the ownership its own `beginGoalWork` just opened.
+		if (event.source !== "extension") store.endGoalWork();
 		safety.reset();
 		reportAuditResetFailure("the prompt you just sent", ctx);
 	});
@@ -847,6 +882,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// Exactly one bounded wrap-up, then the Goal stops for good.
 			const delivered = store.consumeWrapUp(pi);
 			if (!delivered.ok) return;
+			// The wrap-up run is Goal-owned work: its one response is charged.
+			store.beginGoalWork(delivered.goal.id);
 			wrapUpArmed = true;
 			return {
 				entries: [
@@ -878,6 +915,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// The next run is Goal work, whether Pi starts it for our continuation or
 		// for queued work that already satisfies the decision.
 		pendingRunKind = "automatic";
+		store.beginGoalWork(goal.id);
 		return {
 			entries: [
 				...event.entries,
@@ -1400,12 +1438,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				toPublicState(goal),
 			);
 		}
-		const result = store.markBlockedReport(pi, {
-			blocker: validation.blocker,
-			turn: safety.currentTurn,
-		});
+		const result = store.markBlockedReport(
+			pi,
+			{
+				blocker: validation.blocker,
+				turn: safety.currentTurn,
+			},
+			turnGoal ?? undefined,
+		);
 		if (result.ok && !result.repeat) blockerCountedThisRun = true;
 		if (!result.ok) {
+			if (result.reason === "stale") {
+				const current = store.get();
+				return goalToolError(
+					"Blocker not recorded: this call was prepared against a Goal state that has since changed " +
+						`(expected ${turnGoal?.id ?? "unknown"} revision ${turnGoal?.revision ?? "unknown"}, ` +
+						`current ${current?.id ?? "none"} revision ${current?.revision ?? "none"}). ` +
+						"Call get_goal, re-read the current objective, and report again if the blocker persists.",
+					current ? toPublicState(current) : null,
+				);
+			}
 			const message =
 				result.reason === "persistence"
 					? `Blocker not recorded: writing the Goal to the session failed (${describeError(result.error)}). The Goal is still active; fix the cause and call update_goal again.`
@@ -1506,7 +1558,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * fire-and-forget: delivery failures surface as Pi extension errors, never as
 	 * a state lie ("steered" is reported only for the queueing itself).
 	 */
-	function deliverWorkMessage(content: string, ctx: ExtensionCommandContext): "started" | "steered" {
+	function deliverWorkMessage(
+		content: string,
+		ctx: ExtensionCommandContext,
+		goalId: string,
+	): "started" | "steered" {
+		// The message starts a Goal-owned segment: the run it starts (or the rest of
+		// the run it steers into) is attended Goal work and is charged to this Goal.
+		store.beginGoalWork(goalId);
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(content);
 			return "started";
@@ -1592,7 +1651,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const updated = resumed.goal!;
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
-		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx);
+		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx, updated.id);
 		const restarted =
 			goal.status === "paused"
 				? "Work restarted from retained progress."
@@ -1707,7 +1766,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (updated.status === "active") {
 			// Redirect the active run through Pi's steering (or start work when
 			// idle, e.g. after an aborted run left the Goal dormant).
-			const delivery = deliverWorkMessage(formatEditMessage(updated), ctx);
+			const delivery = deliverWorkMessage(formatEditMessage(updated), ctx, updated.id);
 			ctx.ui.notify(
 				`Goal ${updated.id} objective updated (revision ${updated.revision}); usage history is preserved. Work ${delivery === "started" ? "started" : "steered"} on the new objective.`,
 				"info",
@@ -1850,7 +1909,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// in flight - waiting for idle would deadlock behind its
 				// continuation loop - so the kickoff is steered into the active
 				// run or starts immediately when idle.
-				delivery = deliverWorkMessage(formatKickoffMessage(goal), ctx);
+				delivery = deliverWorkMessage(formatKickoffMessage(goal), ctx, goal.id);
 			} else {
 				// There is no Goal continuation loop that could starve this wait
 				// (abort also settles a stuck run), and the seam above declines to
@@ -1883,6 +1942,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// allows.
 				safety.reset();
 				pendingRunKind = "kickoff";
+				store.beginGoalWork(goal.id);
 				pi.sendUserMessage(formatKickoffMessage(goal));
 				delivery = "started";
 			}

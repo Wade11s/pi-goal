@@ -38,7 +38,11 @@ import type { Usage } from "@earendil-works/pi-ai";
 import {
 	BLOCKED_AUDIT_THRESHOLD,
 	CUSTOM_ENTRY_TYPE,
+	CUTOVER_ENTRY_TYPE,
 	GOAL_STATUSES,
+	isGoalCutover,
+	ownershipMarker,
+	type GoalCutover,
 	type GoalRecord,
 	type GoalSnapshot,
 	type GoalOrigin,
@@ -73,6 +77,35 @@ export interface UsageCheckpoint {
 	/** The Goal these totals belong to; a checkpoint for another Goal is ignored. */
 	goalId: string;
 	usage: GoalUsage;
+}
+
+/** Outcome of a durable legacy cutover. */
+export type CutoverResult =
+	| { ok: true; cutover: boolean; notices: string[] }
+	| { ok: false; reason: "persistence"; error: unknown };
+
+/**
+ * Structural validity of a `goal-state` payload.
+ *
+ * A snapshot is valid when it is an object of version 1 whose `goal` is either
+ * `null` (a durable tombstone) or a structurally valid record. Anything else —
+ * an unknown version, a malformed record, a non-object — is *not* a snapshot,
+ * and when it is the newest `goal-state` entry the branch fails closed rather
+ * than falling back to an older entry.
+ */
+function isGoalSnapshot(value: unknown): value is GoalSnapshot {
+	if (!value || typeof value !== "object") return false;
+	const record = value as Record<string, unknown>;
+	if (record.version !== 1) return false;
+	return record.goal === null || isGoalRecord(record.goal);
+}
+
+/** Deep-copy a reconstructed record so no live mutation can reach the branch object. */
+function copyRecord(goal: GoalRecord): GoalRecord {
+	const copy: GoalRecord = { ...goal };
+	if (goal.blockedAudit !== undefined) copy.blockedAudit = { ...goal.blockedAudit };
+	if (goal.usage !== undefined) copy.usage = { ...goal.usage };
+	return copy;
 }
 
 function isUsageCheckpoint(value: unknown): value is UsageCheckpoint {
@@ -112,7 +145,8 @@ export type BlockedReportResult =
 		/** True when this call repeated a report already counted for the same Goal turn. */
 		repeat: boolean;
 	}
-	| { ok: false; reason: "not-active" }
+	| { ok: false; reason: "not-active"; message?: string }
+	| { ok: false; reason: "stale"; message: string }
 	| { ok: false; reason: "persistence"; error: unknown };
 
 /**
@@ -206,6 +240,34 @@ export class GoalStore {
 	private lastBlockerTurn: number | undefined = undefined;
 
 	/**
+	 * Whether the current run/segment is Goal-owned work, and the identity it was
+	 * admitted for.
+	 *
+	 * Only explicitly admitted Goal work is charged: a run started by a Goal
+	 * lifecycle message (kickoff, edit, resume), an automatic Continuation, or the
+	 * one Budget wrap-up. An ordinary user prompt is never Goal work, whatever the
+	 * Goal's status, and neither is the run a `/goal` command waits for or the run
+	 * that called `create_goal`. The flag is set when pi-goal sends a Goal work
+	 * message and cleared on a genuine user prompt; reconstruction derives it from
+	 * the branch so live accounting and replay draw the same line.
+	 */
+	private goalOwned = false;
+	private ownerId: string | null = null;
+
+	/**
+	 * True when the selected branch's newest snapshot is a pre-repair (0.1.0)
+	 * snapshot that still has to be cut over. Cleared by `applyLegacyCutover`.
+	 */
+	private legacyPending = false;
+
+	/**
+	 * Actionable guidance from the last reconstruction (a newest `goal-state`
+	 * entry that was malformed or had an unrecognized version). The caller surfaces
+	 * it; reconstruction itself stays silent and fails closed.
+	 */
+	private lastNotice: string | null = null;
+
+	/**
 	 * Rebuild state from the active branch. Called on session_start (startup,
 	 * resume, reload, new, fork/clone) and session_tree (branch navigation).
 	 *
@@ -227,53 +289,67 @@ export class GoalStore {
 	 * against the replay instead of being trusted outright (see `replayBranch`).
 	 */
 	reconstruct(ctx: ExtensionContext): GoalRecord | null {
-		let restored: GoalRecord | null = null;
-		let seen = false;
-		let usage = zeroGoalUsage();
-		// Branch index of the newest `goal-state` snapshot for the restored Goal. The
-		// replay starts after it; the accounting checkpoints in that range are
-		// verified against the replay rather than trusted outright (see
-		// `replayBranch`).
-		let baselineIndex = -1;
+		this.lastNotice = null;
+		let branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>;
 		try {
-			const branch = ctx.sessionManager.getBranch();
-			for (let index = 0; index < branch.length; index++) {
-				const entry = branch[index]!;
-				if (entry.type !== "custom") continue;
-				if (entry.customType !== CUSTOM_ENTRY_TYPE) continue;
-				const snapshot = entry.data as GoalSnapshot | undefined;
-				if (!snapshot || typeof snapshot !== "object" || snapshot.version !== 1) continue;
-				if (!isGoalRecord(snapshot.goal)) continue;
-				seen = true;
-				// A `null` goal is the durable tombstone: it clears the Goal and resets
-				// the accounting baseline with it.
-				// The record is copied, never adopted: the session manager owns the entry
-				// object, and publishing the live accounting view onto it (see
-				// `refreshUsage`) would leak in-memory state into durable state.
-				restored = snapshot.goal
-					? { ...withSanitizedAudit(snapshot.goal) }
-					: null;
-				usage = snapshot.goal ? normalizeUsage(snapshot.goal.usage) : zeroGoalUsage();
-				baselineIndex = index;
-			}
+			branch = ctx.sessionManager.getBranch();
 		} catch (error) {
 			// Never break the session on corrupt entries; report and keep absent state.
 			console.error("[pi-goal] failed to reconstruct Goal state:", error);
-			this.current = null;
-			this.ledger.restore(zeroGoalUsage());
-			this.clock.reset();
-			this.lastBlockerTurn = undefined;
+			this.resetRuntimeState();
 			return null;
 		}
-		this.current = seen ? restored : null;
+
+		// The newest `goal-state` entry controls the branch. Scan to the end so a
+		// malformed or unrecognized *latest* entry can be told apart from an older
+		// invalid one: only the latest may fail the branch closed.
+		let baselineIndex = -1;
+		let latest: unknown;
+		for (let index = 0; index < branch.length; index++) {
+			const entry = branch[index]!;
+			if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
+				baselineIndex = index;
+				latest = entry.data;
+			}
+		}
+
+		if (baselineIndex === -1) {
+			this.resetRuntimeState();
+			return null;
+		}
+
+		// Fail closed on a malformed or unrecognized newest snapshot. Falling back to
+		// an older entry could resurrect a cleared, replaced, or stopped Goal, which
+		// is exactly what the cutover contract forbids.
+		if (!isGoalSnapshot(latest)) {
+			this.resetRuntimeState();
+			this.lastNotice =
+				"pi-goal could not read the newest Goal snapshot on this branch (malformed data or an " +
+				"unsupported version), so it left the session without a Goal instead of falling back to an older " +
+				"snapshot. Inspect the goal-state entries in the session file, remove or repair the newest one, " +
+				"then create a Goal again with /goal.";
+			return null;
+		}
+
+		const snapshot = latest as GoalSnapshot;
+		if (snapshot.goal === null) {
+			// A tombstone is a valid newest entry: the branch has no current Goal.
+			this.resetRuntimeState();
+			return null;
+		}
+
+		const goal = copyRecord(withSanitizedAudit(snapshot.goal));
+		const repaired = snapshot.repaired === true || this.hasCutover(branch, goal.id);
+		this.current = goal;
 		this.pendingTransition = undefined;
 		// The audit itself is durable, but which Goal turn it belongs to is not:
 		// a fresh runtime has no turn to match, so the next report starts a new
 		// turn rather than being swallowed as a repeat.
 		this.lastBlockerTurn = undefined;
-		this.ledger.restore(usage);
+		this.legacyPending = !repaired;
+		this.ledger.restore(normalizeUsage(goal.usage));
 		this.clock.reset();
-		this.clock.persisted(usage.activeMs);
+		this.clock.persisted(this.ledger.usage.activeMs);
 		// Replay everything after the baseline so usage accrued since the last
 		// durable write is recovered, not lost, and cannot be charged twice.
 		//
@@ -282,14 +358,66 @@ export class GoalStore {
 		// `message_end`, before the tool that completes it), and the replay must draw
 		// the same line. Without this, an unclean restart would reclassify the
 		// post-completion response as Goal usage and inflate the total.
-		if (this.current && this.current.status !== "complete") {
-			this.replayBranch(ctx, baselineIndex);
+		if (goal.status !== "complete") {
+			this.replayBranch(branch, baselineIndex, repaired ? "repaired" : "legacy");
 			// The replay may have adopted a checkpoint's accounted active time, so the
 			// clock resumes from the newest durable value rather than the snapshot's.
 			this.clock.persisted(this.ledger.usage.activeMs);
 		}
-		if (this.current?.status === "active") this.clock.start();
+		this.applyBranchOwnership(branch, baselineIndex);
+		if (goal.status === "active") this.clock.start();
 		return this.current;
+	}
+
+	/** Forget every runtime-only piece of state (no Goal, no ownership, no legacy flag). */
+	private resetRuntimeState(): void {
+		this.current = null;
+		this.pendingTransition = undefined;
+		this.lastBlockerTurn = undefined;
+		this.ledger.restore(zeroGoalUsage());
+		this.clock.reset();
+		this.goalOwned = false;
+		this.ownerId = null;
+		this.legacyPending = false;
+	}
+
+	/** Whether a branch carries a cutover marker for `goalId`. */
+	private hasCutover(
+		branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>,
+		goalId: string,
+	): boolean {
+		for (const entry of branch) {
+			if (entry.type !== "custom" || entry.customType !== CUTOVER_ENTRY_TYPE) continue;
+			const cutover = entry.data;
+			if (isGoalCutover(cutover) && cutover.goalId === goalId) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Derive the live Goal-owned flag from the branch after a reconstruction.
+	 *
+	 * Only a Goal work message that sits *after* the newest snapshot can leave a
+	 * segment open: the snapshot is a durable transition that supersedes whatever
+	 * came before it. A marker before the baseline therefore leaves ownership
+	 * closed, and a genuine user prompt after the baseline closes it again.
+	 */
+	private applyBranchOwnership(
+		branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>,
+		baselineIndex: number,
+	): void {
+		let lastMarkerIndex = -1;
+		let lastMarker: "goal-work" | "ordinary-user" | "none" = "none";
+		for (let index = 0; index < branch.length; index++) {
+			const marker = ownershipMarker(branch[index]!);
+			if (marker.kind !== "none") {
+				lastMarker = marker.kind;
+				lastMarkerIndex = index;
+			}
+		}
+		this.goalOwned =
+			lastMarker === "goal-work" && lastMarkerIndex > baselineIndex && this.current != null;
+		this.ownerId = this.goalOwned ? this.current?.id ?? null : null;
 	}
 
 	/**
@@ -311,16 +439,18 @@ export class GoalStore {
 	 * checkpoint. In that case the replay keeps its own totals and carries on, keeping
 	 * only the checkpoint's active time, which the branch cannot reconstruct.
 	 */
-	private replayBranch(ctx: ExtensionContext, afterIndex: number): void {
-		let branch;
-		try {
-			branch = ctx.sessionManager.getBranch();
-		} catch (error) {
-			console.error("[pi-goal] failed to replay Goal usage:", error);
-			return;
-		}
-		for (let index = afterIndex + 1; index < branch.length; index++) {
+	private replayBranch(
+		branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>,
+		afterIndex: number,
+		mode: "legacy" | "repaired",
+	): void {
+		let goalOwned = false;
+		for (let index = 0; index < branch.length; index++) {
 			const entry = branch[index]!;
+			const marker = ownershipMarker(entry);
+			if (marker.kind === "goal-work") goalOwned = true;
+			else if (marker.kind === "ordinary-user") goalOwned = false;
+			if (index <= afterIndex) continue;
 			if (entry.type === "custom") {
 				if (entry.customType !== USAGE_ENTRY_TYPE) continue;
 				const checkpoint = entry.data as UsageCheckpoint | undefined;
@@ -331,6 +461,7 @@ export class GoalStore {
 				this.applyCheckpoint(checkpoint);
 				continue;
 			}
+			if (mode === "repaired" && !goalOwned) continue;
 			if (entry.type === "message") {
 				const message = entry.message;
 				if (message.role === "assistant") {
@@ -442,7 +573,10 @@ export class GoalStore {
 	 * durable snapshot and the live record independent objects.
 	 */
 	private persistSnapshot(pi: ExtensionAPI, goal: GoalRecord): void {
-		pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: { ...goal } } satisfies GoalSnapshot);
+		pi.appendEntry(
+			CUSTOM_ENTRY_TYPE,
+			{ version: 1, repaired: true, goal: copyRecord(goal) } satisfies GoalSnapshot,
+		);
 	}
 
 	/**
@@ -451,7 +585,7 @@ export class GoalStore {
 	 * persisted entry.
 	 */
 	private adopt(goal: GoalRecord): GoalRecord {
-		return { ...goal };
+		return copyRecord(goal);
 	}
 
 	/**
@@ -504,26 +638,130 @@ export class GoalStore {
 		this.pendingTransition = undefined;
 		this.ledger.restore(zeroGoalUsage());
 		this.clock.reset();
+		// A new identity owns no work yet: attribution starts when pi-goal sends its
+		// first Goal work message (the /goal kickoff) or, for create_goal, at the
+		// first subsequent Continuation.
+		this.goalOwned = false;
+		this.ownerId = null;
+		this.legacyPending = false;
 		if (goal.status === "active") this.clock.start();
 	}
 
 	/**
-	 * Charge one usage report exactly once.
+	 * Charge one usage report exactly once, and only when it is Goal-owned work.
 	 *
 	 * `key` is the identity the accounting path guarantees: a sequence number for an
 	 * assistant message, `toolResult:<toolCallId>` for tool-performed nested work, or
 	 * the session entry id of a summarization entry. Returns the contribution when
 	 * the key was new.
+	 *
+	 * Ownership is the load-bearing guard: an ordinary prompt, a creation control,
+	 * a pre-creation response, or an unrelated same-batch tool result is never
+	 * charged, whatever the Goal's status. Completion stays terminal for accounting
+	 * on both the live path and the replay, so nothing after it is charged either.
 	 */
 	accountUsage(key: string, usage: Usage | undefined, source: UsageSource) {
-		// One rule, enforced here so the live path and the branch replay cannot drift
-		// apart: a tool result that arrives after the Goal was completed belongs to the
-		// suffix the replay deliberately skips (the completion snapshot is the replay
-		// baseline), so it is not Goal work either.
-		if (source === "nested" && this.current?.status === "complete") return undefined;
+		const current = this.current;
+		if (!current || current.status === "complete") return undefined;
+		if (!this.goalOwned || this.ownerId !== current.id) return undefined;
 		const contribution = this.ledger.account(key, usage, source);
 		if (contribution) this.refreshUsage();
 		return contribution;
+	}
+
+	/** Mark the current run/segment as Goal-owned work for `goalId`. */
+	beginGoalWork(goalId: string): void {
+		this.goalOwned = true;
+		this.ownerId = goalId;
+	}
+
+	/** Close the current segment: an ordinary user prompt is never Goal work. */
+	endGoalWork(): void {
+		this.goalOwned = false;
+		this.ownerId = null;
+	}
+
+	/** Whether the current segment is Goal-owned work. */
+	isGoalOwned(): boolean {
+		return this.goalOwned;
+	}
+
+	/** Actionable guidance from the last reconstruction, if any. */
+	takeNotice(): string | null {
+		const notice = this.lastNotice;
+		this.lastNotice = null;
+		return notice;
+	}
+
+	/** Whether the selected branch still needs its one-time legacy cutover. */
+	needsLegacyCutover(): boolean {
+		return this.legacyPending;
+	}
+
+	/**
+	 * Perform the one-time branch-local cutover of a pre-repair (0.1.0) snapshot.
+	 *
+	 * The legacy token totals and active milliseconds reconstructed by
+	 * {@link replayBranch} under the 0.1.0 status-only rule are frozen as the
+	 * Goal's historical baseline, never reclassified under the repaired Goal-owned
+	 * rules. The repaired snapshot and the branch-local cutover marker are written
+	 * before any repaired Goal work is admitted, so a crash in between re-runs the
+	 * cutover (idempotently) instead of ever replaying the legacy prefix under the
+	 * repaired rules.
+	 *
+	 * The configured maximum is a hard safety bound: an unbounded Goal or one
+	 * above the maximum is migrated to the maximum with an explicit notice, while
+	 * the configured default is never applied retroactively. An active Goal whose
+	 * reconstructed usage already reached its effective budget becomes
+	 * `budget_limited` and earns the one bounded wrap-up.
+	 */
+	applyLegacyCutover(pi: ExtensionAPI, settings: { maxTokenBudget?: number }): CutoverResult {
+		const current = this.current;
+		if (!this.legacyPending || !current) {
+			this.legacyPending = false;
+			return { ok: true, cutover: false, notices: [] };
+	}
+		const notices: string[] = [];
+		let updated: GoalRecord = copyRecord(current);
+		const max = settings.maxTokenBudget;
+		if (max !== undefined && (updated.tokenBudget === undefined || updated.tokenBudget > max)) {
+			const before = updated.tokenBudget === undefined ? "unbounded" : `${updated.tokenBudget} tokens`;
+			updated.tokenBudget = max;
+			notices.push(
+				`pi-goal migrated Goal ${updated.id} to the configured maximum token budget of ${max} tokens ` +
+				`(it was ${before}). The Goal's identity and accounted usage are unchanged; the default budget ` +
+				"was not applied retroactively.",
+			);
+		}
+
+		// Freeze the legacy reconstructed totals exactly as the 0.1.0 rules produced
+		// them. Live active time up to the cutover is part of the baseline.
+		const frozen = this.liveUsage();
+		if (updated.status === "active" && isBudgetExhausted(updated.tokenBudget, frozen.totalTokens)) {
+			updated.status = "budget_limited";
+			updated.wrapUpPending = true;
+			this.clock.stop();
+			notices.push(
+				`pi-goal found the legacy Goal ${updated.id} already at its token budget of ` +
+				`${updated.tokenBudget} tokens (${frozen.totalTokens} accounted). It is now budget_limited and ` +
+				"earns one bounded wrap-up; budget exhaustion is not completion.",
+			);
+		}
+
+		const record: GoalRecord = { ...updated, usage: frozen };
+		try {
+			this.persistSnapshot(pi, record);
+			pi.appendEntry(CUTOVER_ENTRY_TYPE, { version: 1, goalId: record.id } satisfies GoalCutover);
+		} catch (error) {
+			return { ok: false, reason: "persistence", error };
+		}
+		this.current = this.adopt(record);
+		this.ledger.restore(frozen);
+		this.clock.reset();
+		this.clock.persisted(frozen.activeMs);
+		if (record.status === "active") this.clock.start();
+		this.legacyPending = false;
+		return { ok: true, cutover: true, notices };
 	}
 
 	/** Whether the token budget is exhausted for the current Goal. */
@@ -588,6 +826,9 @@ export class GoalStore {
 		this.pendingTransition = undefined;
 		this.ledger.restore(zeroGoalUsage());
 		this.clock.reset();
+		this.goalOwned = false;
+		this.ownerId = null;
+		this.legacyPending = false;
 		return { ok: true, goal: null };
 	}
 
@@ -979,6 +1220,9 @@ export class GoalStore {
 		this.ledger.restore(zeroGoalUsage());
 		this.clock.reset();
 		this.lastBlockerTurn = undefined;
+		this.goalOwned = false;
+		this.ownerId = null;
+		this.legacyPending = false;
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
 		} catch {
@@ -1002,6 +1246,7 @@ export class GoalStore {
 	markBlockedReport(
 		pi: ExtensionAPI,
 		params: { blocker: string; turn: number },
+		expected?: GoalBinding,
 	): BlockedReportResult {
 		const current = this.current;
 		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
@@ -1010,7 +1255,10 @@ export class GoalStore {
 
 		// A repeated report inside the same Goal turn is idempotent: it must not
 		// advance the audit, or a model that retries its own tool call could
-		// satisfy the threshold inside one turn.
+		// satisfy the threshold inside one turn. This check comes before the stale
+		// binding check precisely because the first report advanced the revision: a
+		// repeat prepared against the pre-report revision is still the same turn and
+		// must read as one audit step, not as a stale write.
 		if (this.lastBlockerTurn === params.turn && previous) {
 			return {
 				ok: true,
@@ -1019,6 +1267,11 @@ export class GoalStore {
 				thresholdMet: previous.turns >= BLOCKED_AUDIT_THRESHOLD,
 				repeat: true,
 			};
+		}
+
+		const stale = this.checkBinding(current, expected);
+		if (stale) {
+			return { ok: false, reason: "stale", message: stale };
 		}
 
 		// The audit is about *consecutive* Goal turns, so a report that does not
@@ -1044,12 +1297,12 @@ export class GoalStore {
 			revision: current.revision + 1,
 		};
 		try {
-			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
+			this.persistSnapshot(pi, updated);
 		} catch (error) {
 			this.lastBlockerTurn = undefined;
 			return { ok: false, reason: "persistence", error };
 		}
-		this.current = updated;
+		this.current = this.adopt(updated);
 		return { ok: true, goal: updated, turns, thresholdMet, repeat: false };
 	}
 
@@ -1075,11 +1328,11 @@ export class GoalStore {
 			revision: current.revision + 1,
 		};
 		try {
-			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
+			this.persistSnapshot(pi, updated);
 		} catch (error) {
 			return { ok: false, reason: "persistence", error };
 		}
-		this.current = updated;
+		this.current = this.adopt(updated);
 		this.lastBlockerTurn = undefined;
 		return { ok: true, goal: updated };
 	}
@@ -1109,13 +1362,13 @@ export class GoalStore {
 		const { blockedAudit: _dropped, ...rest } = current;
 		const updated: GoalRecord = { ...rest, updatedAt: Date.now(), revision: current.revision + 1 };
 		try {
-			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: updated } satisfies GoalSnapshot);
+			this.persistSnapshot(pi, updated);
 		} catch (error) {
 			// Keep the audit rather than dropping it: an in-memory reset that is not
 			// durable would let a reload resurrect a count the user invalidated.
 			return { ok: false, reason: "persistence", error };
 		}
-		this.current = updated;
+		this.current = this.adopt(updated);
 		return { ok: true, reset: true };
 	}
 
@@ -1142,6 +1395,9 @@ export class GoalStore {
 		}
 		this.current = this.adopt(record);
 		this.pendingTransition = undefined;
+		this.goalOwned = false;
+		this.ownerId = null;
+		this.legacyPending = false;
 		const usage = normalizeUsage(record.usage);
 		this.ledger.restore(usage);
 		this.clock.reset();

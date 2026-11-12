@@ -303,9 +303,9 @@ test("usage accounting survives a restart and is never charged twice", async () 
 		await second.prompt("Please keep going");
 		await abortActiveLoop(second, 2);
 		const after = await reportUsage(second, (r) => r.message.includes(OBJECTIVE));
-		// 180 restored + 22 for the new step + the 15 Pi reports for the aborted
-		// request that held the loop open.
-		assert.equal(after.totalTokens, 217);
+		// 180 restored + 15 for the aborted continuation. The ordinary prompt itself
+		// ("Please keep going") is not Goal-owned work, so its 22 tokens are excluded.
+		assert.equal(after.totalTokens, 195);
 		assert.ok(after.activeSeconds >= restored.activeSeconds, "active time only grows");
 
 		const entries = readSessionEntries(sessionFile);
@@ -546,9 +546,11 @@ test("budget exhaustion stops continuation after exactly one bounded wrap-up and
 		assert.equal(lastGoalSnapshot(after).data.goal.status, "budget_limited");
 
 		// Status reporting agrees, and says the budget is exhausted rather than done.
+		// The wrap-up run (15) is Goal work; the ordinary follow-up prompt after it is
+		// not, so the total is 115 + 15.
 		const status = await reportUsage(session, (r) => r.message.includes(OBJECTIVE));
 		assert.equal(status.status, "budget_limited");
-		assert.equal(status.totalTokens, 145);
+		assert.equal(status.totalTokens, 130);
 		assert.equal(status.remaining, "0 tokens (budget exhausted)", "remaining capacity floors at zero");
 
 		assertCleanRun(session);
@@ -664,23 +666,25 @@ test("concurrent nested usage that lands after the budget crossing survives an u
  * The script for the mid-turn-creation probes.
  *
  * One ordinary assistant response asks for two tools in the same batch:
- * `create_goal`, which commits the Goal (budget 40) while the batch is still
- * running, and a gated tool that holds its call until the test releases it and then
- * reports 50 accounted tokens of nested usage. The response itself predates the
- * Goal, so it is correctly not Goal work; the gated tool's result lands after the
- * creation snapshot, so it is.
+ * `create_goal`, which commits the Goal while the batch is still running, and a
+ * gated tool that holds its call until the test releases it and then reports 50
+ * accounted tokens of nested usage. Under the repaired Goal-owned-work contract
+ * the creating run stays ordinary: neither its own response, nor the nested tool
+ * result that lands after the creation snapshot, nor the response that follows the
+ * batch is charged. Attribution starts at the first subsequent Continuation.
  */
 const MID_TURN_STEPS = [
 	{
 		toolCalls: [
-			{ name: "create_goal", args: { objective: OBJECTIVE, tokenBudget: 40 } },
+			{ name: "create_goal", args: { objective: OBJECTIVE } },
 			{ name: NESTED_GATED_TOOL, args: {} },
 		],
 		usage: { input: 10, output: 5 },
 	},
 	{ text: "Noted.", usage: { input: 5, output: 2 } },
-	{ text: "Wrap-up summary." },
-	{ text: "Never requested." },
+	{ text: "Continuation work.", usage: { input: 20, output: 2 } },
+	{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 10, output: 1 } },
+	{ text: "Wrapping up.", usage: { input: 5, output: 1 } },
 ];
 
 /**
@@ -690,8 +694,8 @@ const MID_TURN_STEPS = [
  * `stopMode` is `"kill"` (SIGKILL, so no shutdown checkpoint is written and the
  * branch replay is the only recovery) or `"stop"` (a clean exit, which force-flushes
  * an accounting checkpoint). Both must land on the same total as the live process:
- * the tool result belongs to Goal work exactly once, and a checkpoint must never
- * seal an undercount of it.
+ * the creating run's nested tool is not Goal work, the first Continuation and the
+ * completing turn are, and the replay must draw exactly that line.
  */
 async function probeMidTurnCreation(stopMode) {
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
@@ -727,9 +731,11 @@ async function probeMidTurnCreation(stopMode) {
 		await first.waitForSettled(1);
 
 		live = await reportUsage(first, (r) => r.message.includes(OBJECTIVE));
-		assert.equal(live.status, "budget_limited", "the tool's 50 tokens exhaust the 40-token budget");
-		assert.equal(live.nestedTokens, NESTED_LEAF_ACCOUNTED, "the gated tool's nested usage is charged");
-		assert.equal(live.remaining, "0 tokens (budget exhausted)");
+		assert.equal(live.status, "complete", "the Goal completed on its first Continuation chain");
+		// 22 (first Continuation) + 11 (completing turn). The creating run, its nested
+		// tool, and the post-completion response are all excluded.
+		assert.equal(live.totalTokens, 33);
+		assert.equal(live.nestedTokens, 0, "the creating run's nested tool is not Goal-owned work");
 		assertOnlyFailures(first, []);
 		assert.equal(first.extensionErrors().length, 0, JSON.stringify(first.extensionErrors()));
 
@@ -739,6 +745,7 @@ async function probeMidTurnCreation(stopMode) {
 			await first.waitForExit();
 		}
 	} finally {
+		delete process.env.PI_GOAL_TEST_GATE;
 		await first.stop();
 	}
 	// The session dir outlives the process, so the file is read *after* the exit: a
@@ -751,11 +758,11 @@ async function probeMidTurnCreation(stopMode) {
 	const resumed = await PiRpcSession.start({ sessionFile, cwd: workDir });
 	script([{ text: "Nothing to continue." }, { text: "Never requested." }], resumed);
 	try {
-		await resumed.waitForNotify((r) => r.message.includes("restored (budget_limited)"));
+		await resumed.waitForNotify((r) => r.message.includes("restored (complete)"));
 		const restored = await reportUsage(resumed, (r) => r.message.includes(OBJECTIVE));
-		assert.equal(restored.status, "budget_limited");
-		assert.equal(restored.nestedTokens, NESTED_LEAF_ACCOUNTED, "and it is restored, not lost");
-		assert.equal(restored.remaining, "0 tokens (budget exhausted)");
+		assert.equal(restored.status, "complete");
+		assert.equal(restored.totalTokens, 33, "and it is restored, not lost");
+		assert.equal(restored.nestedTokens, 0, "the replay draws the same ownership line");
 		assertOnlyFailures(resumed, []);
 		assert.equal(resumed.extensionErrors().length, 0, JSON.stringify(resumed.extensionErrors()));
 		// Read the durable entries before the resumed session's temp dir goes away.
@@ -768,21 +775,18 @@ async function probeMidTurnCreation(stopMode) {
 	}
 }
 
-test("a Goal created while a usage-bearing tool is in flight charges that tool exactly once", async () => {
-	// Live, unclean exit, and clean exit must all agree. The tool result belongs to
-	// the turn that requested it but is finalized after the Goal exists, so a live
-	// path that latched "was this turn Goal work?" at the assistant `message_end`
-	// skipped it while the replay charged it — and a clean shutdown then sealed the
-	// undercount into a checkpoint that sits after the result, making it
-	// unrecoverable.
+test("create_goal leaves its creating run ordinary and starts attribution at the first Continuation", async () => {
+	// The old status-only rule charged the nested tool that was still in flight when
+	// the Goal was created. The repaired rule does not: the creating run is ordinary,
+	// so its response, its same-batch tool results, and the response that follows the
+	// batch are excluded. Live, unclean exit, and clean exit must all agree.
 	const unclean = await probeMidTurnCreation("kill");
 	assert.equal(
 		unclean.restored.totalTokens,
 		unclean.live.totalTokens,
 		`an unclean exit restores the live total (${unclean.restored.totalTokens} vs ${unclean.live.totalTokens})`,
 	);
-	// 50 nested + 7 for the response after the tool + 15 for the wrap-up.
-	assert.equal(unclean.live.totalTokens, 72);
+	assert.equal(unclean.live.totalTokens, 33);
 
 	const clean = await probeMidTurnCreation("stop");
 	assert.equal(
@@ -791,20 +795,20 @@ test("a Goal created while a usage-bearing tool is in flight charges that tool e
 		`a clean exit restores the live total (${clean.restored.totalTokens} vs ${clean.live.totalTokens})`,
 	);
 	assert.equal(clean.live.totalTokens, unclean.live.totalTokens, "both probes account the same work");
-	assert.equal(clean.restored.nestedTokens, NESTED_LEAF_ACCOUNTED);
+	assert.equal(clean.live.nestedTokens, 0);
+	assert.equal(clean.restored.nestedTokens, 0);
 
-	// The durable baseline must not have sealed an undercount: the shutdown
-	// checkpoint records what the live path charged, which is exactly what the
-	// replay charges, so adopting it changes nothing.
+	// The durable baseline must agree with the live path: the shutdown checkpoint
+	// records exactly what the replay recovers, so adopting it changes nothing.
 	const checkpoints = usageCheckpoints(clean.entries);
 	assert.ok(checkpoints.length >= 1, "the clean exit wrote an accounting checkpoint");
 	const last = checkpoints[checkpoints.length - 1];
 	assert.equal(
 		last.data.usage.totalTokens,
 		clean.live.totalTokens,
-		"the shutdown checkpoint carries the live total, nested usage included",
+		"the shutdown checkpoint carries the live total",
 	);
-	assert.equal(last.data.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
+	assert.equal(last.data.usage.nestedTokens, 0);
 });
 
 test("a budget-limited Goal can be edited, keeps its accounted usage, and never continues", async () => {
@@ -863,7 +867,9 @@ test("a budget-limited Goal can be edited, keeps its accounted usage, and never 
 
 		const status = await reportUsage(session, (r) => r.message.includes("stay green"));
 		assert.equal(status.status, "budget_limited");
-		assert.equal(status.totalTokens, 145, "115 at the boundary + the wrap-up + this run");
+		// 115 at the boundary + the wrap-up run. The ordinary run that followed the
+		// edit is not Goal-owned work.
+		assert.equal(status.totalTokens, 130);
 		assert.equal(status.remaining, "0 tokens (budget exhausted)");
 
 		// The edited, exhausted Goal survives an unclean exit with the same totals.
@@ -882,7 +888,7 @@ test("a budget-limited Goal can be edited, keeps its accounted usage, and never 
 		await resumed.waitForNotify((r) => r.message.includes("restored (budget_limited)"));
 		const status = await reportUsage(resumed, (r) => r.message.includes("stay green"));
 		assert.equal(status.status, "budget_limited");
-		assert.equal(status.totalTokens, 145, "the edited Goal restores with the same usage");
+		assert.equal(status.totalTokens, 130, "the edited Goal restores with the same usage");
 		assert.equal(status.remaining, "0 tokens (budget exhausted)");
 		assert.equal(
 			lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal.objective,
@@ -1281,11 +1287,12 @@ test("a restored budget-limited Goal never continues and keeps its accounted usa
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "budget_limited");
 		assert.equal(lastGoalSnapshot(entries).data.goal.wrapUpPending, false);
 
-		// The replay recovers the wrap-up run (15) and this run (15) on top of the
-		// 115 the transition snapshot recorded: nothing is lost across the restart.
+		// The replay recovers the wrap-up run (15) on top of the 115 the transition
+		// snapshot recorded. The ordinary prompt is not Goal-owned work, so it adds
+		// nothing: nothing is lost and nothing unrelated is charged across the restart.
 		const status = await reportUsage(second, (r) => r.message.includes(OBJECTIVE));
 		assert.equal(status.status, "budget_limited");
-		assert.equal(status.totalTokens, 145);
+		assert.equal(status.totalTokens, 130);
 		assert.equal(status.remaining, "0 tokens (budget exhausted)");
 		assertCleanRun(second);
 		assert.equal(second.extensionErrors().length, 0);

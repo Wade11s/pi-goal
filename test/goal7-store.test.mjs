@@ -134,7 +134,7 @@ it("a fresh binding against the selected branch's state still mutates", () => {
 	assert.equal(pi.appended[0].data.goal.status, "complete");
 });
 
-it("reconstruction skips corrupt snapshots instead of trusting them", () => {
+it("reconstruction fails closed on a malformed or unrecognized newest snapshot", () => {
 	const store = new GoalStore();
 	const goal = record();
 	const branch = [
@@ -149,12 +149,31 @@ it("reconstruction skips corrupt snapshots instead of trusting them", () => {
 		{ type: "custom", customType: "someone-elses-state", data: { version: 1, goal: { ...goal, revision: 3 } } },
 	];
 	store.reconstruct(fakeCtx(branch));
-	// The last *valid* snapshot wins; nothing invalid decides the state.
-	assert.equal(store.get().revision, 0);
+	// The newest goal-state entry is malformed, so the branch fails closed. It must
+	// not fall back to the older valid snapshot, which could resurrect a cleared,
+	// replaced, or stopped Goal.
+	assert.equal(store.get(), null);
+	const notice = store.takeNotice();
+	assert.ok(notice, "actionable guidance is exposed");
+	assert.match(notice, /could not read the newest Goal snapshot/);
 
-	// A tombstone ahead of a corrupt later entry still clears the Goal.
+	// A later valid snapshot or tombstone still wins over an older malformed entry.
+	store.reconstruct(
+		fakeCtx([goalEntry(goal), goalEntry({ ...goal, status: "bogus" }), goalEntry({ ...goal, revision: 2 })]),
+	);
+	assert.equal(store.get().revision, 2);
+	store.reconstruct(fakeCtx([goalEntry(goal), goalEntry({ ...goal, status: "bogus" }), goalEntry(null)]));
+	assert.equal(store.get(), null);
+});
+
+it("a tombstone ahead of a corrupt later entry does not resurrect the Goal", () => {
+	const store = new GoalStore();
+	const goal = record();
+	// The newest entry is corrupt, so the branch fails closed rather than adopting
+	// the older tombstone's "no Goal" as a fallback.
 	store.reconstruct(fakeCtx([goalEntry(goal), goalEntry(null), goalEntry({ ...goal, status: "bogus" })]));
 	assert.equal(store.get(), null);
+	assert.ok(store.takeNotice(), "the fail-closed path still explains itself");
 });
 
 it("reconstruction with no recognizable snapshot yields no Goal", () => {
