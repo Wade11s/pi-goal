@@ -81,7 +81,18 @@ export interface UsageCheckpoint {
 
 /** Outcome of a durable legacy cutover. */
 export type CutoverResult =
-	| { ok: true; cutover: boolean; notices: string[] }
+	| {
+			ok: true;
+			cutover: boolean;
+			notices: string[];
+			/**
+			 * Set when the branch-local cutover marker could not be written *after* the
+			 * repaired snapshot already was. The cutover itself stands — the repaired
+			 * snapshot is what the next load reads — so this is a degraded outcome rather
+			 * than a failure, and the caller reports it as one.
+			 */
+			markerError?: unknown;
+	  }
 	| { ok: false; reason: "persistence"; error: unknown };
 
 /**
@@ -231,13 +242,17 @@ export class GoalStore {
 	private pendingTransition: GoalRecord | undefined;
 
 	/**
-	 * The Goal turn of the last counted blocker report.
+	 * The Goal turn of the last counted blocker report, and the revision that report
+	 * wrote.
 	 *
 	 * Several `update_goal` calls can arrive inside one Goal turn (a model that
 	 * retries its own tool call, or a batch that repeats it). Only the first one
-	 * counts: the audit is about consecutive *turns*, not calls.
+	 * counts: the audit is about consecutive *turns*, not calls. The revision is what
+	 * makes that shortcut safe — a repeat is the same audit step only while the Goal
+	 * still reads exactly as the counted report left it.
 	 */
 	private lastBlockerTurn: number | undefined = undefined;
+	private lastBlockerRevision: number | undefined = undefined;
 
 	/**
 	 * Whether the current run/segment is Goal-owned work, and the identity it was
@@ -346,6 +361,7 @@ export class GoalStore {
 		// a fresh runtime has no turn to match, so the next report starts a new
 		// turn rather than being swallowed as a repeat.
 		this.lastBlockerTurn = undefined;
+		this.lastBlockerRevision = undefined;
 		this.legacyPending = !repaired;
 		this.ledger.restore(normalizeUsage(goal.usage));
 		this.clock.reset();
@@ -363,10 +379,35 @@ export class GoalStore {
 			// The replay may have adopted a checkpoint's accounted active time, so the
 			// clock resumes from the newest durable value rather than the snapshot's.
 			this.clock.persisted(this.ledger.usage.activeMs);
+			// Budget-stop convergence. The live path stops a Goal at the `message_end`
+			// that crosses its budget and makes the transition durable at the next
+			// boundary; a process that dies in between leaves an `active` snapshot and a
+			// branch that replays past the budget. Reconstruction has to reach the same
+			// stop, or the continuation seam admits a Goal turn the live session had
+			// already paid for and failed to stop. Only a cut-over branch is repaired
+			// this way: a pre-repair snapshot is migrated by {@link applyLegacyCutover},
+			// which owns the configured maximum and the notice that goes with it.
+			if (repaired) this.convergeBudgetStop();
 		}
 		this.applyBranchOwnership(branch, baselineIndex);
-		if (goal.status === "active") this.clock.start();
+		if (this.current?.status === "active") this.clock.start();
 		return this.current;
+	}
+
+	/**
+	 * Stop an active Goal whose accounted usage has already reached its budget.
+	 *
+	 * Nothing is written: this is the reconstruction of a transition the live path
+	 * made in memory, so it follows the same rule — the snapshot would otherwise land
+	 * ahead of entries the ledger already covers. `flushAccounting` persists it at the
+	 * next boundary, and the next reconstruction re-derives it from the branch if
+	 * nothing ever runs.
+	 */
+	private convergeBudgetStop(): void {
+		const goal = this.current;
+		if (!goal || goal.status !== "active") return;
+		if (!isBudgetExhausted(goal.tokenBudget, this.ledger.usage.totalTokens)) return;
+		this.markBudgetLimited();
 	}
 
 	/** Forget every runtime-only piece of state (no Goal, no ownership, no legacy flag). */
@@ -374,6 +415,7 @@ export class GoalStore {
 		this.current = null;
 		this.pendingTransition = undefined;
 		this.lastBlockerTurn = undefined;
+		this.lastBlockerRevision = undefined;
 		this.ledger.restore(zeroGoalUsage());
 		this.clock.reset();
 		this.goalOwned = false;
@@ -429,6 +471,16 @@ export class GoalStore {
 	 * both charge each entry exactly once — the live path while the entry is created,
 	 * the replay for everything the newest durable baseline does not already cover.
 	 *
+	 * The segment is tracked by *identity*, not just as a boolean, because a snapshot
+	 * that introduces a different Goal identity closes the segment the previous
+	 * identity opened. That is the branch-side half of `commit()` zeroing the ledger:
+	 * a replacement staged while the old identity's run is still in flight appends its
+	 * snapshot before the old response and its tool results, so carrying the old
+	 * kickoff's flag across it would charge work the live path refused to the new
+	 * Goal. A snapshot for the *same* identity (pause, resume, edit, an audit step)
+	 * is a transition of that Goal's own work and leaves the segment open, which is
+	 * what keeps already-admitted in-flight work attributable through a pause.
+	 *
 	 * A checkpoint is a shortcut over that replay, never a second source of truth, so
 	 * it is adopted only when adopting it loses nothing. The branch is the authority:
 	 * if a checkpoint reports fewer tokens than the entries between the baseline and
@@ -444,12 +496,28 @@ export class GoalStore {
 		afterIndex: number,
 		mode: "legacy" | "repaired",
 	): void {
-		let goalOwned = false;
+		// The identity whose snapshot most recently preceded the entries being walked.
+		// A work message opens the segment for that identity, so an entry appended after
+		// a replacement snapshot is only ever charged once the replacement's own work
+		// message has been delivered.
+		let snapshotGoalId: string | null = null;
+		let segmentOwner: string | null = null;
 		for (let index = 0; index < branch.length; index++) {
 			const entry = branch[index]!;
 			const marker = ownershipMarker(entry);
-			if (marker.kind === "goal-work") goalOwned = true;
-			else if (marker.kind === "ordinary-user") goalOwned = false;
+			if (marker.kind === "goal-work") segmentOwner = snapshotGoalId;
+			else if (marker.kind === "ordinary-user") segmentOwner = null;
+			if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
+				const snapshot = entry.data as GoalSnapshot | undefined;
+				const goalId: string | null = isGoalSnapshot(snapshot)
+					? (snapshot.goal?.id ?? null)
+					: snapshotGoalId;
+				if (goalId !== snapshotGoalId) {
+					// A new identity (or a tombstone) supersedes the previous one's segment.
+					segmentOwner = null;
+					snapshotGoalId = goalId;
+				}
+			}
 			if (index <= afterIndex) continue;
 			if (entry.type === "custom") {
 				if (entry.customType !== USAGE_ENTRY_TYPE) continue;
@@ -461,7 +529,7 @@ export class GoalStore {
 				this.applyCheckpoint(checkpoint);
 				continue;
 			}
-			if (mode === "repaired" && !goalOwned) continue;
+			if (mode === "repaired" && segmentOwner !== this.current?.id) continue;
 			if (entry.type === "message") {
 				const message = entry.message;
 				if (message.role === "assistant") {
@@ -734,9 +802,12 @@ export class GoalStore {
 	 * {@link replayBranch} under the 0.1.0 status-only rule are frozen as the
 	 * Goal's historical baseline, never reclassified under the repaired Goal-owned
 	 * rules. The repaired snapshot and the branch-local cutover marker are written
-	 * before any repaired Goal work is admitted, so a crash in between re-runs the
-	 * cutover (idempotently) instead of ever replaying the legacy prefix under the
-	 * repaired rules.
+	 * before any repaired Goal work is admitted. The snapshot is the load-bearing
+	 * write — it is what the next load reads — so once it is durable the cutover
+	 * stands and the in-memory record is replaced with it; only the marker is
+	 * allowed to fail afterwards, and that failure is reported rather than thrown
+	 * (see {@link CutoverResult}). A snapshot write that fails leaves the branch
+	 * untouched, so a reload retries the whole cutover.
 	 *
 	 * The configured maximum is a hard safety bound: an unbounded Goal or one
 	 * above the maximum is migrated to the maximum with an explicit notice, while
@@ -780,17 +851,29 @@ export class GoalStore {
 		const record: GoalRecord = { ...updated, usage: frozen };
 		try {
 			this.persistSnapshot(pi, record);
+		} catch (error) {
+			// Nothing was written, so the branch is untouched and a reload retries.
+			return { ok: false, reason: "persistence", error };
+		}
+		// The repaired snapshot is durable from here on, so the cutover stands whatever
+		// happens to the marker: adopting the record now is what keeps a later
+		// transition from persisting the pre-cutover record over it. The marker is a
+		// branch-local record that a snapshot without `repaired` was migrated; this
+		// snapshot carries it, so its absence only means a fork copied in the fault
+		// window re-runs the migration instead of inheriting the baseline.
+		let markerError: unknown;
+		try {
 			pi.appendEntry(CUTOVER_ENTRY_TYPE, { version: 1, goalId: record.id } satisfies GoalCutover);
 		} catch (error) {
-			return { ok: false, reason: "persistence", error };
+			markerError = error;
 		}
 		this.current = this.adopt(record);
 		this.ledger.restore(frozen);
 		this.clock.reset();
 		this.clock.persisted(frozen.activeMs);
-		if (record.status === "active") this.clock.start();
 		this.legacyPending = false;
-		return { ok: true, cutover: true, notices };
+		if (record.status === "active") this.clock.start();
+		return { ok: true, cutover: true, notices, ...(markerError === undefined ? {} : { markerError }) };
 	}
 
 	/** Whether the token budget is exhausted for the current Goal. */
@@ -1010,6 +1093,7 @@ export class GoalStore {
 			};
 		}
 		this.lastBlockerTurn = undefined;
+		this.lastBlockerRevision = undefined;
 		const result = this.commitSnapshot(pi, {
 			...current,
 			status: "active",
@@ -1249,6 +1333,7 @@ export class GoalStore {
 		this.ledger.restore(zeroGoalUsage());
 		this.clock.reset();
 		this.lastBlockerTurn = undefined;
+		this.lastBlockerRevision = undefined;
 		this.goalOwned = false;
 		this.ownerId = null;
 		this.legacyPending = false;
@@ -1288,7 +1373,15 @@ export class GoalStore {
 		// binding check precisely because the first report advanced the revision: a
 		// repeat prepared against the pre-report revision is still the same turn and
 		// must read as one audit step, not as a stale write.
-		if (this.lastBlockerTurn === params.turn && previous) {
+		//
+		// The revision the counted report wrote is what keeps that sound. A Goal can
+		// advance for a reason that has nothing to do with the report — `/goal edit`
+		// runs immediately while the run is busy — and then the repeat is *not* the
+		// same audit step: the model is reporting a blocker against an objective it
+		// can no longer see. It falls through to the stale check below instead of
+		// being reported as recorded.
+		const repeatedTurn = this.lastBlockerTurn === params.turn && previous !== undefined;
+		if (repeatedTurn && current.revision === this.lastBlockerRevision) {
 			return {
 				ok: true,
 				goal: current,
@@ -1302,6 +1395,17 @@ export class GoalStore {
 		if (stale) {
 			return { ok: false, reason: "stale", message: stale };
 		}
+		if (repeatedTurn) {
+			return {
+				ok: false,
+				reason: "stale",
+				message:
+					`the Goal changed while the call was in flight: the blocker report already counted for this Goal ` +
+					`turn was recorded at revision ${this.lastBlockerRevision} but the Goal is now revision ` +
+					`${current.revision}. Call get_goal, re-read the current objective, and report again if the ` +
+					"blocker persists.",
+			};
+		}
 
 		// The audit is about *consecutive* Goal turns, so a report that does not
 		// follow the previous one immediately starts a new chain: the turns in
@@ -1311,6 +1415,7 @@ export class GoalStore {
 		const followsPreviousTurn =
 			this.lastBlockerTurn === undefined || this.lastBlockerTurn === params.turn - 1;
 		this.lastBlockerTurn = params.turn;
+		this.lastBlockerRevision = current.revision + 1;
 
 		const sameBlocker =
 			followsPreviousTurn &&
@@ -1329,6 +1434,7 @@ export class GoalStore {
 			this.persistSnapshot(pi, updated);
 		} catch (error) {
 			this.lastBlockerTurn = undefined;
+			this.lastBlockerRevision = undefined;
 			return { ok: false, reason: "persistence", error };
 		}
 		this.current = this.adopt(updated);
@@ -1363,6 +1469,7 @@ export class GoalStore {
 		}
 		this.current = this.adopt(updated);
 		this.lastBlockerTurn = undefined;
+		this.lastBlockerRevision = undefined;
 		return { ok: true, goal: updated };
 	}
 
@@ -1384,6 +1491,7 @@ export class GoalStore {
 	 */
 	resetBlockedAudit(pi: ExtensionAPI): ResetAuditResult {
 		this.lastBlockerTurn = undefined;
+		this.lastBlockerRevision = undefined;
 		const current = this.current;
 		if (!current || current.status !== "active" || current.blockedAudit === undefined) {
 			return { ok: true, reset: false };

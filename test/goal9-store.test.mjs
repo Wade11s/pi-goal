@@ -80,6 +80,32 @@ function assistantEntry(index, usage) {
 	return { type: "message", id: `msg-${index}`, message: { role: "assistant", usage } };
 }
 
+/** A tool result entry carrying reported nested usage, as the session manager persists it. */
+function toolResultEntry(toolCallId, usageReport) {
+	return {
+		type: "message",
+		id: `tool-${toolCallId}`,
+		message: { role: "toolResult", toolCallId, usage: usageReport },
+	};
+}
+
+/** An ordinary user prompt on the branch, which closes any open segment. */
+function ordinaryUserEntry(text) {
+	return { type: "message", id: "ordinary-user", message: { role: "user", content: text } };
+}
+
+/** A pi-goal work message on the branch, which opens a Goal-owned segment. */
+function goalWorkEntry(id = "kickoff") {
+	return {
+		type: "message",
+		id,
+		message: {
+			role: "user",
+			content: "[pi-goal] Working toward Goal goal_aaaaaaaa (active, revision 0).",
+		},
+	};
+}
+
 function usage(total, overrides = {}) {
 	return {
 		totalTokens: total,
@@ -251,4 +277,166 @@ it("0.1.0 optional-field defaults are preserved by the cutover", () => {
 	assert.equal(store.get().origin, undefined);
 	assert.equal(store.get().wrapUpPending, undefined);
 	assert.equal(store.get().blockedAudit, undefined);
+});
+
+it("replay does not carry an old identity's open segment across a replacement snapshot", () => {
+	// A replacement is staged while the previous identity's run is still in flight, so
+	// the branch reads: the old kickoff, the old response, the replacement snapshot,
+	// the old response's own tool result, then the steered replacement kickoff. The
+	// segment the old kickoff opened belongs to the old identity, so it must close at
+	// the snapshot instead of charging the in-flight response to the new Goal.
+	const store = new GoalStore();
+	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	const branch = [
+		goalEntry(previous, { repaired: true }),
+		goalWorkEntry("kickoff-old"),
+		assistantEntry(0, usageReport(100, 10)),
+		goalEntry(replacement, { repaired: true }),
+		assistantEntry(1, usageReport(100, 10)),
+		toolResultEntry("call_1", usageReport(40, 7)),
+		goalWorkEntry("steer-new"),
+		assistantEntry(2, usageReport(20, 2)),
+	];
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.get()?.id, "goal_bbbbbbbb", "the replacement is the current Goal");
+	assert.equal(
+		store.getUsage().totalTokens,
+		22,
+		"only the replacement's own steered work is charged; the old identity's in-flight response and tool result are not",
+	);
+	assert.equal(store.isGoalOwned(), true, "the delivered steer leaves the new segment open");
+	assert.equal(store.currentOwnerId(), "goal_bbbbbbbb");
+});
+
+it("replay closes an open segment at a tombstone and at an ordinary prompt", () => {
+	// The same identity rule has to hold for the other two closers, or a cleared Goal
+	// would keep charging the work that follows it.
+	const store = new GoalStore();
+	const goal = record({ usage: usage(0) });
+	const branch = [
+		goalEntry(goal),
+		goalWorkEntry("kickoff"),
+		assistantEntry(0, usageReport(20, 2)),
+		{ type: "custom", id: "tombstone", customType: "goal-state", data: { version: 1, goal: null } },
+		assistantEntry(1, usageReport(100, 10)),
+		ordinaryUserEntry("anything else?"),
+		assistantEntry(2, usageReport(50, 5)),
+	];
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.get(), null, "the tombstone leaves no Goal");
+	assert.equal(store.getUsage().totalTokens, 0, "nothing after the tombstone is charged");
+});
+
+it("a reloaded Goal whose replayed usage reached its budget stops instead of admitting more work", () => {
+	// The live path stops at the message_end that crosses the budget and persists the
+	// transition at the next boundary. A process that dies in between leaves the branch
+	// with an active snapshot and a replay that has already crossed the budget, so the
+	// reconstruction has to reach the same stop: otherwise the continuation seam admits
+	 // another Goal turn the live session had already paid for and failed to stop.
+	const store = new GoalStore();
+	const goal = record({ tokenBudget: 100, usage: usage(0) });
+	const branch = [
+		goalEntry(goal, { repaired: true }),
+		goalWorkEntry("kickoff"),
+		assistantEntry(0, usageReport(95, 10)),
+	];
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.get()?.status, "budget_limited", "the replayed crossing stops the Goal");
+	assert.equal(store.get()?.wrapUpPending, true, "and it earns the one bounded wrap-up");
+	assert.equal(store.hasPendingTransition(), true, "the stop is durable at the next boundary");
+	assert.equal(store.getUsage().totalTokens, 105);
+});
+
+it("reconstruction leaves a legacy branch's budget stop to the cutover", () => {
+	// A pre-repair snapshot is migrated by the cutover, which owns the configured
+	// maximum and its notice. Reconstruction must not apply the repaired budget stop
+	// first, or the Goal would already be budget_limited and the migration notice — the
+	// only place the user learns the maximum was applied — would never be issued.
+	const store = new GoalStore();
+	const goal = record({ tokenBudget: 100, usage: usage(110, { inputTokens: 100, outputTokens: 10 }) });
+	store.reconstruct(fakeCtx([goalEntry(goal)]));
+	assert.equal(store.get()?.status, "active");
+	assert.equal(store.needsLegacyCutover(), true);
+	const result = store.applyLegacyCutover(fakePi(), {});
+	assert.equal(result.ok, true);
+	assert.equal(store.get()?.status, "budget_limited", "the cutover makes the stop");
+	assert.match(result.notices.join("\n"), /already at its token budget/);
+});
+
+it("a failed cutover marker leaves memory holding the durable repaired snapshot", () => {
+	// The repaired snapshot and the branch-local marker are two appends. If the second
+	// one throws, the snapshot is already durable, so the cutover *is* on the branch:
+	// keeping the pre-cutover record in memory would let a later pause or budget flush
+	// persist `active` with the original budget over the clamped snapshot, and a reload
+	// would not cut over again because it reads `repaired: true`.
+	const store = new GoalStore();
+	const goal = record({ usage: usage(1_000_000, { inputTokens: 999_990, outputTokens: 10 }) });
+	store.reconstruct(fakeCtx([goalEntry(goal)]));
+	const pi = fakePi();
+	const append = pi.appendEntry.bind(pi);
+	let calls = 0;
+	pi.appendEntry = (customType, data) => {
+		if (++calls === 2) throw new Error("disk full");
+		return append(customType, data);
+	};
+	const result = store.applyLegacyCutover(pi, { maxTokenBudget: 100_000 });
+	assert.equal(result.ok, true, "the repaired snapshot is durable, so the cutover stands");
+	assert.equal(result.cutover, true);
+	assert.notEqual(result.markerError, undefined, "the missing marker is reported");
+	assert.equal(store.needsLegacyCutover(), false, "the branch is cut over");
+	assert.equal(store.get()?.tokenBudget, 100_000, "the clamp survives in memory");
+
+	// The next durable write must carry the clamped record, not the pre-cutover one.
+	const edited = store.editObjective(pi, "A refined objective");
+	assert.equal(edited.ok, true);
+	const appended = pi.appended.at(-1).data.goal;
+	assert.equal(appended.tokenBudget, 100_000, "a later transition cannot restore the original budget");
+	assert.equal(appended.status, "budget_limited", "nor the pre-cutover status");
+});
+
+it("a same-turn blocked repeat after the Goal was edited is refused as stale", () => {
+	// The repeat shortcut exists for a model that retries its own tool call. It is only
+	// sound while the Goal still reads exactly as the counted report left it: `/goal
+	// edit` runs immediately while the same run is busy, so a second report in that turn
+	// was prepared against an objective that no longer exists.
+	const store = new GoalStore();
+	const goal = record({ usage: usage(0) });
+	store.reconstruct(fakeCtx([goalEntry(goal)]));
+	store.beginGoalWork(goal.id);
+	const pi = fakePi();
+	const first = store.markBlockedReport(pi, { blocker: "The test database is down", turn: 1 });
+	assert.equal(first.ok, true);
+	assert.equal(first.repeat, false);
+
+	const edited = store.editObjective(pi, "A completely different objective");
+	assert.equal(edited.ok, true);
+
+	const repeat = store.markBlockedReport(
+		pi,
+		{ blocker: "The test database is down", turn: 1 },
+		{ id: goal.id, revision: 0 },
+	);
+	assert.equal(repeat.ok, false, "the repeat is not reported as recorded");
+	assert.equal(repeat.reason, "stale");
+	assert.match(repeat.message, /the Goal changed while the call was in flight/);
+	assert.equal(store.get()?.blockedAudit?.turns, 1, "the repeat recorded no second audit step");
+	assert.equal(store.get()?.revision, 2, "only the report and the edit advanced the revision");
+});
+
+it("a same-turn blocked repeat with no other transition stays idempotent", () => {
+	// The behaviour the shortcut was written for must survive the stale guard.
+	const store = new GoalStore();
+	const goal = record({ usage: usage(0) });
+	store.reconstruct(fakeCtx([goalEntry(goal)]));
+	store.beginGoalWork(goal.id);
+	const pi = fakePi();
+	const first = store.markBlockedReport(pi, { blocker: "The test database is down", turn: 1 });
+	assert.equal(first.ok, true);
+	const repeat = store.markBlockedReport(pi, { blocker: "The test database is down", turn: 1 });
+	assert.equal(repeat.ok, true);
+	assert.equal(repeat.repeat, true);
+	assert.equal(repeat.turns, 1);
+	assert.equal(repeat.thresholdMet, false);
+	assert.equal(pi.appended.length, 1, "the repeat appended nothing");
 });

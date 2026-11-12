@@ -16,22 +16,23 @@ persisted entries.
 | --- | --- | --- |
 | Stale `complete` | Rejected after identity/revision change, no mutation | `test/goal4-regressions.test.mjs` ("a held completion cannot complete…") |
 | Stale model `pause` | Rejected after identity/revision change, no mutation | `test/goal4-regressions.test.mjs` ("a held model pause cannot pause…") |
-| Stale `blocked` | Rejected after identity/revision change, no mutation/audit/continuation | `test/goal9-ownership.test.mjs` ("a held blocked report prepared against an edited Goal…") |
+| Stale `blocked` | Rejected after identity/revision change, no mutation/audit/continuation | `test/goal9-ownership.test.mjs` ("a held blocked report prepared against an edited Goal…"); `test/goal9-store.test.mjs` ("a same-turn blocked repeat after the Goal was edited…") |
 | Persistence isolation | Later live mutation never alters an appended snapshot, checkpoint, or reconstructed record | `test/goal9-store.test.mjs` (aliasing tests); `test/store.test.mjs` |
 | Non-retroactive `/goal` | The ordinary run the command waited for is never adopted | `test/goal9-ownership.test.mjs` ("/goal issued during an ordinary run…") |
 | Non-retroactive `create_goal` | Creating run and same-batch tool results excluded; attribution starts at the first Continuation | `test/goal6.test.mjs` ("create_goal leaves its creating run ordinary…") |
 | Ordinary prompts excluded in every status | Paused/blocked/usage-limited/budget-limited/complete ordinary runs add nothing | `test/goal9-ownership.test.mjs` ("an ordinary prompt while a Goal is paused…"); `test/goal6.test.mjs` (budget/complete accounting tests) |
-| Replacement starts at zero | Old identity keeps its admitted work; new identity inherits nothing | `test/goal9-ownership.test.mjs` ("a Replacement Goal starts at zero…") |
+| Replacement starts at zero | Old identity keeps its admitted work; new identity inherits nothing | `test/goal9-ownership.test.mjs` ("a Replacement Goal starts at zero…"; "a steered Replacement keeps the old identity's in-flight work…") |
 | Clear boundary | Cleared identity publishes no further usage; a future Goal is not charged | `test/goal9-ownership.test.mjs` ("Clear publishes no further usage…") |
-| Admitted in-flight work | Stays attributable through pause/completion/blocked/usage-limit stops | `test/goal9-ownership.test.mjs` ("already-admitted in-flight Goal work stays attributable through a pause"); `test/goal6.test.mjs` (completion/budget tests) |
+| Admitted in-flight work | Stays attributable through pause/completion/blocked/usage-limit stops | `test/goal9-ownership.test.mjs` ("already-admitted in-flight Goal work stays attributable through a pause"; "an ordinary prompt typed during an admitted Goal response…") |
 | Cached/reasoning/nested/compaction | Exactly-once accounting preserved under the ownership boundary | `test/goal6.test.mjs` (cached-read, nested, compaction, retry tests) |
-| Live/replay convergence | Restart, reload, crash windows, fork, tree navigation | `test/goal6.test.mjs` (restart/crash); `test/goal7.test.mjs` (fork/tree); `test/goal9-store.test.mjs` (replay mode) |
+| Live/replay convergence | Restart, reload, crash windows, fork, tree navigation | `test/goal6.test.mjs` (restart/crash); `test/goal7.test.mjs` (fork/tree); `test/goal9-ownership.test.mjs` (reload of the two in-flight orderings); `test/goal9-store.test.mjs` (replay identity boundary) |
+| Budget-stop convergence | A branch that replays past the budget stops instead of admitting another Goal turn | `test/goal9-store.test.mjs` ("a reloaded Goal whose replayed usage reached its budget…"); `test/goal9-ownership.test.mjs` ("an ordinary prompt typed during an admitted Goal response…") |
 | Active elapsed time | Only live active segments accrue; live and replay converge | `test/goal6.test.mjs` (active-time tests); `test/store.test.mjs`; `test/accounting.test.mjs` |
 | Legacy loadable | Every structurally valid version-1 snapshot/checkpoint stays readable | `test/goal9-legacy.test.mjs` (all statuses) |
 | Latest snapshot/tombstone wins | Newest entry controls; malformed latest fails closed with guidance | `test/goal9-legacy.test.mjs` ("a malformed or unrecognized newest legacy snapshot…"); `test/goal7-store.test.mjs` |
 | No work from loading | Loading/migration sends no message and triggers no provider request | `test/goal9-legacy.test.mjs` (`runCount === 0` after load) |
 | One-time baseline | Legacy totals reconstructed once under 0.1.0 rules and frozen | `test/goal9-legacy.test.mjs` ("a legacy active Goal is cut over once…"); `test/goal9-store.test.mjs` |
-| Durable cutover before work | Repaired snapshot plus branch-local marker written before repaired work | `test/goal9-legacy.test.mjs`; `test/goal9-store.test.mjs` |
+| Durable cutover before work | Repaired snapshot plus branch-local marker written before repaired work | `test/goal9-legacy.test.mjs`; `test/goal9-store.test.mjs` ("a failed cutover marker leaves memory holding the durable repaired snapshot") |
 | Branch-local cutover | Pre-cutover fork migrates; post-cutover fork inherits | `test/goal9-store.test.mjs` ("a pre-cutover fork performs its own migration…") |
 | Optional-field defaults | Absent origin/usage/activeMs/wrapUpPending/audit keep 0.1.0 meanings | `test/goal9-legacy.test.mjs` ("0.1.0 optional-field defaults…"); `test/goal9-store.test.mjs` |
 | Configured maximum | Hard bound with explicit notice; default never applied retroactively | `test/goal9-legacy.test.mjs` ("the configured maximum clamps…"); `test/goal9-store.test.mjs` |
@@ -89,8 +90,70 @@ fixtures in place. Representative failures:
 ```
 
 The complete captured run is quoted in the PR description. After the repair, the
-same suite passes (`npm test`: 214 tests, 0 failures) and `npm run typecheck`
+same suite passes (`npm test`: 223 tests, 0 failures) and `npm run typecheck`
 passes.
+
+## Review follow-up: live/replay ownership divergences
+
+PR review (subagent 9253ee) found that the two in-flight orderings above passed
+live while a reload, fork, or tree navigation reconstructed a different total, so
+`npm test` stayed green without the convergence contract being met. Four further
+findings were a fault window in the cutover, a same-turn stale `blocked` repeat, a
+test-helper race, and a stale comment. Each has a regression that fails on the
+pre-fix `src/`:
+
+```text
+a steered Replacement keeps the old identity's in-flight work out of the new Goal
+  AssertionError: the reload converges on the live total
+    actual: 197, expected: 37      (live was 87: the old identity's nested tool
+                                    result had been charged to the replacement)
+
+an ordinary prompt typed during an admitted Goal response stays attributed and converges
+  AssertionError: the live path must stop at the crossing; notifications were [...]
+    actual: 0, expected: 1
+    (live accounted 45 of the 100-token budget and stayed active: the 80-token
+     in-flight response was dropped and the script then ran out of steps. A reload
+     reconstructed 125 and was still active with the budget exhausted, so the
+     continuation seam was free to admit a Goal turn the live session had already
+     paid for and failed to stop.)
+
+replay does not carry an old identity's open segment across a replacement snapshot
+  AssertionError: only the replacement's own steered work is charged
+    actual: 179, expected: 22
+
+a reloaded Goal whose replayed usage reached its budget stops instead of admitting more work
+  AssertionError: the replayed crossing stops the Goal
+    + actual - expected
+    + 'active'
+    - 'budget_limited'
+
+a failed cutover marker leaves memory holding the durable repaired snapshot
+  AssertionError: Expected values to be strictly equal: false !== true
+
+a same-turn blocked repeat after the Goal was edited is refused as stale
+  AssertionError: the repeat is not reported as recorded
+    true !== false
+```
+
+Both divergences had the same root cause on both sides. Live, the admission segment
+was opened when a work message was *queued* and closed when a prompt was *typed*,
+while the replay read the markers off the delivered entries. The segment is now
+opened and closed at `message_end` for the delivered user message, which is the same
+event Pi appends it in and therefore the same entry `ownershipMarker` reads back.
+The replay tracks the segment by Goal identity, so a snapshot that introduces a new
+identity (or a tombstone) closes the previous identity's segment, while a snapshot
+for the same identity leaves it open, which is what keeps the pause case at 154.
+
+The budget-stop convergence is the other half of the ordinary-prompt fix: a branch
+that replays past an active Goal's budget now reaches the same `budget_limited`
+stop the live path made, instead of leaving the continuation seam free to admit a
+Goal turn the live session had already paid for. A pre-repair branch is exempt,
+because `applyLegacyCutover` owns that stop and its configured-maximum notice.
+
+`test/goal4-regressions.test.mjs`'s `waitForStoredGoal` also polled a session file
+Pi may not have created yet, so the first `readFileSync` threw `ENOENT` and the
+five-second retry never ran. It now treats `ENOENT` as "not written yet", matching
+the copy in `test/goal9-ownership.test.mjs`.
 
 ## Rewritten superseded tests
 

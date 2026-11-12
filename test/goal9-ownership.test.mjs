@@ -10,8 +10,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
 import {
 	PiRpcSession,
 	assertCleanRun,
@@ -22,6 +23,11 @@ import {
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
+/** Test-only extension whose outer tool reports nested model usage on its result. */
+const NESTED_EXTENSION = join(import.meta.dirname, "extensions", "nested-usage.ts");
+const NESTED_OUTER_TOOL = "nested_usage_outer";
+/** The leaf's accounted contribution: 40 input + 7 output + 3 cache write. */
+const NESTED_LEAF_ACCOUNTED = 50;
 
 function script(steps, session) {
 	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
@@ -80,6 +86,24 @@ async function abortActiveLoop(session, runs) {
 }
 
 /**
+ * Stop the process and start a fresh one on a copy of its session file.
+ *
+ * A second process reconstructs from the branch exactly as a restart, reload, fork,
+ * or tree navigation does, so this is the seam that proves live accounting and
+ * replay draw the same line. The working and session directories are passed in by
+ * the caller and therefore outlive `stop()`, which is what makes the copy possible.
+ */
+async function reload(session, workDir) {
+	const file = await session.sessionFile();
+	await session.stop();
+	const dir = mkdtempSync(join(tmpdir(), "pi-goal-reload-"));
+	const copy = join(dir, basename(file));
+	copyFileSync(file, copy);
+	const resumed = await PiRpcSession.start({ sessionFile: copy, cwd: workDir });
+	return { resumed, dir };
+}
+
+/**
  * Fail unless exactly `steps` provider responses were consumed. One provider
  * request consumes one scripted step, so equality proves the scenario neither
  * exhausted the script nor left a step unconsumed.
@@ -90,6 +114,13 @@ function assertStepsConsumed(session, steps, expectedFailures = []) {
 	);
 	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
 	assertOnlyFailures(session, expectedFailures);
+}
+
+/** Every extension notification message this process has produced, in order. */
+function notifyMessages(session) {
+	return session.records
+		.filter((r) => r.type === "extension_ui_request" && r.method === "notify")
+		.map((r) => r.message);
 }
 
 async function reportStatus(session, matcher = /Token usage/) {
@@ -108,6 +139,7 @@ async function reportStatus(session, matcher = /Token usage/) {
 	return {
 		status: one(/^Goal \S+ — (\S+)/),
 		totalTokens: Number(one(/Token usage: (\d+) tokens/)),
+		nestedTokens: Number(one(/nested (\d+) counted once/)),
 		message: notify.message,
 	};
 }
@@ -334,6 +366,168 @@ test("a held blocked report prepared against an edited Goal is refused without m
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
+	}
+});
+
+test("a steered Replacement keeps the old identity's in-flight work out of the new Goal", async () => {
+	// The replacement is staged while the previous identity's run is still in flight,
+	// so the branch reads: the old kickoff, the old response, the replacement
+	// snapshot, the old response's tool result, and only then the steered replacement
+	// kickoff. Work admitted for the old identity stays with it: neither the response
+	// nor its nested tool result may be charged to the replacement, live or replayed.
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
+	const session = await PiRpcSession.start({
+		cwd: workDir,
+		sessionDir,
+		extraExtensions: [NESTED_EXTENSION],
+	});
+	const gate = join(workDir, "provider-gate");
+	script(
+		[
+			{
+				toolCalls: [{ name: NESTED_OUTER_TOOL, args: {} }],
+				waitForFile: gate,
+				usage: { input: 100, output: 10 },
+			},
+			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
+			{ hang: true },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await waitForTurns(session, 1);
+
+		// Replace while the provider request that holds the old kickoff is streaming.
+		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
+		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
+		assert.equal((await replacePromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+
+		// Release the old response: it is finalized *after* the replacement snapshot,
+		// and its nested tool result lands after that.
+		writeFileSync(gate, "", "utf8");
+		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
+		await abortActiveLoop(session, 2);
+
+		const status = await reportStatus(session);
+		assert.equal(status.status, "active");
+		assert.equal(
+			status.totalTokens,
+			37,
+			"22 for the steered replacement response + 15 for the aborted continuation; the old identity's " +
+				"response and nested tool result belong to nobody on the new Goal",
+		);
+		assert.equal(status.nestedTokens, 0, "the old identity's nested usage is not transferred");
+		// The old identity's durable record is not rewritten either: its in-flight work
+		// was never persisted for it, and a replacement must not resurrect it.
+		const superseded = goalSnapshots(readSessionEntries(await session.sessionFile())).find(
+			(e) => e.data.goal?.objective === OBJECTIVE,
+		);
+		assert.equal(superseded.data.goal.usage.totalTokens, 0);
+
+		// A fresh process reconstructs from the branch. Without the identity boundary in
+		// the replay, the old kickoff's segment is carried across the replacement
+		// snapshot and the response plus its tool result are charged to the new Goal.
+		const { resumed, dir } = await reload(session, workDir);
+		script([{ text: "Never requested." }, { hang: true }], resumed);
+		try {
+			await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
+			const restored = await reportStatus(resumed);
+			assert.equal(restored.status, "active");
+			assert.equal(restored.totalTokens, 37, "the reload converges on the live total");
+			assert.equal(restored.nestedTokens, 0);
+			assertStepsConsumed(resumed, 0, []);
+			assert.equal(resumed.extensionErrors().length, 0);
+		} finally {
+			await resumed.stop();
+			rmSync(dir, { recursive: true, force: true });
+		}
+		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+		rmSync(workDir, { recursive: true, force: true });
+		rmSync(sessionDir, { recursive: true, force: true });
+	}
+});
+
+test("an ordinary prompt typed during an admitted Goal response stays attributed and converges", async () => {
+	// The prompt is typed while the provider request is still streaming, which is when
+	// Pi dispatches `input`. The response was admitted when its turn started, so it
+	// stays attributable: closing the segment at `input` would drop it live while the
+	// replay — where the assistant message is appended *before* the prompt that
+	// interrupted it — charges it. That divergence also loses the budget stop, because
+	// the only live check runs at the dropped report's `message_end`.
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
+	const session = await PiRpcSession.start({ cwd: workDir, sessionDir });
+	const gate = join(workDir, "provider-gate");
+	script(
+		[
+			{ text: "Kickoff answer.", usage: { input: 25, output: 5 } },
+			{ text: "Continuation answer.", waitForFile: gate, usage: { input: 75, output: 5 } },
+			{ text: "Ordinary answer.", usage: { input: 50, output: 5 } },
+			{ text: "Wrap-up summary.", usage: { input: 10, output: 5 } },
+		],
+		session,
+	);
+	try {
+		const createPromise = submitCommand(session, "create", `/goal --budget 100 ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		// The automatic Continuation is admitted Goal work and its request is held, so
+		// the agent is provably busy when the prompt is typed.
+		await session.waitFor(
+			"the continuation run started",
+			(records) => (records.filter((r) => r.type === "agent_start").length >= 2 ? true : undefined),
+		);
+		await session.steer("anything else while you work?");
+		writeFileSync(gate, "", "utf8");
+
+		// 30 (kickoff) + 80 (the admitted in-flight response) crosses the 100-token
+		// budget, so the Goal stops now rather than only after a reload.
+		await session.waitForSettled(1);
+		const stopped = notifyMessages(session).filter((m) => m.includes("reached its token budget"));
+		assert.equal(
+			stopped.length,
+			1,
+			`the live path must stop at the crossing; notifications were ${JSON.stringify(notifyMessages(session))}`,
+		);
+		assert.match(stopped[0], /100 tokens \(110 accounted\)/);
+
+		const status = await reportStatus(session);
+		assert.equal(status.status, "budget_limited");
+		// 110 Goal work + 15 for the one bounded wrap-up. The ordinary prompt's own
+		// response (55) is excluded, and the Goal admits no further work.
+		assert.equal(status.totalTokens, 125);
+
+		// A fresh process must reach the same state. If the in-flight response had been
+		// dropped live, the reload would replay it onto an `active` Goal and the
+		// continuation seam would admit a turn the live session had already paid for.
+		const { resumed, dir } = await reload(session, workDir);
+		script([{ text: "Never requested." }], resumed);
+		try {
+			await resumed.waitForNotify((r) => r.message.includes("restored (budget_limited)"));
+			const restored = await reportStatus(resumed);
+			assert.equal(restored.status, "budget_limited", "the reload keeps the stop");
+			assert.equal(restored.totalTokens, 125, "the reload converges on the live total");
+			assert.equal(runCount(resumed), 0, "the restored Goal admits no further Goal work");
+			assertStepsConsumed(resumed, 0, []);
+			assert.equal(resumed.extensionErrors().length, 0);
+		} finally {
+			await resumed.stop();
+			rmSync(dir, { recursive: true, force: true });
+		}
+		assert.equal((await createPromise).data.disposition, "handled");
+		assertStepsConsumed(session, 4, []);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+		rmSync(workDir, { recursive: true, force: true });
+		rmSync(sessionDir, { recursive: true, force: true });
 	}
 });
 

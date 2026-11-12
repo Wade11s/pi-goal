@@ -72,8 +72,10 @@ import {
 	formatNoGoal,
 	formatResumeMessage,
 	getGoalOutputSchema,
+	GOAL_MESSAGE_PREFIX,
 	MAX_BLOCKER_LENGTH,
 	MAX_OBJECTIVE_LENGTH,
+	messageText,
 	MIN_BLOCKER_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 	MIN_USER_REQUEST_LENGTH,
@@ -426,6 +428,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 	}
 		for (const notice of result.notices) notify(ctx, notice, "warning");
+		if (result.markerError !== undefined) {
+			// The repaired snapshot is durable, so the cutover stands and the Goal keeps
+			// working under the repaired rules. What is missing is only the branch-local
+			// record that this snapshot was migrated, which a fork copied in this window
+			// would otherwise inherit instead of migrating itself.
+			notify(
+				ctx,
+				`pi-goal migrated the legacy Goal state but could not record the branch-local cutover marker ` +
+					`(${describeError(result.markerError)}). The migrated snapshot is durable, so no usage was lost; ` +
+					"a fork of this branch taken now may migrate itself again instead of inheriting the baseline.",
+				"warning",
+			);
+		}
 		updateStatus(ctx);
 	}
 	/** Whether two reconstructed states are observably the same Goal state. */
@@ -532,11 +547,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	pi.on("input", (event, ctx) => {
 		continuesGoalTurn = false;
-		// A prompt the user actually typed is never Goal-owned work. pi-goal's own
-		// messages (and other extensions' `sendUserMessage` calls) arrive with
-		// source "extension": they do not close the segment, or the kickoff would
-		// clear the ownership its own `beginGoalWork` just opened.
-		if (event.source !== "extension") store.endGoalWork();
+		// A prompt the user actually typed is never Goal-owned work, so the
+		// admission segment closes — but at *delivery*, not here: Pi dispatches this
+		// while the provider request is still streaming, and closing now would drop
+		// the in-flight response the Goal had already admitted. `message_end` for the
+		// delivered user message is the seam that matches the branch replay (see
+		// `applyDeliveredUserMessage`). pi-goal's own messages arrive with source
+		// "extension" and never close a segment.
 		safety.reset();
 		reportAuditResetFailure("the prompt you just sent", ctx);
 	});
@@ -654,12 +671,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * belongs to. A Goal can be created while a tool of an ordinary turn is still in
 	 * flight — `/goal` commits before it waits for idle, and `create_goal` runs inside
 	 * a tool batch — so the turn's own assistant `message_end` predates the Goal while
-	 * its tool results land after it. Those results are Goal work: the branch replay
-	 * charges every entry after the creation snapshot, and a live path that skipped
-	 * them would disagree with the replay it is supposed to converge with (a probe
-	 * measured 17 live against 67 restored). The `complete` guard inside
-	 * `accountUsage` keeps the completing batch aligned with the replay, which skips
-	 * everything after a completion snapshot.
+	 * its tool results land after it. Those results are not Goal work either: the
+	 * creating run stays ordinary, and the branch replay charges nothing between the
+	 * creation snapshot and the first Goal work message, so a live path that charged
+	 * them would disagree with the replay it is supposed to converge with.
+	 * `applyDeliveredUserMessage` is what keeps the two on the same line.
 	 */
 	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
@@ -667,6 +683,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// A genuine user turn is not Goal work: the budget gate must not block the
 			// tools the user's own request needs, even inside a gated run.
 			budgetGateActive = false;
+			// This is also the ownership seam. Pi appends the message in this very event,
+			// so what happens here is exactly what `ownershipMarker` reads back on replay:
+			// a pi-goal work message opens its admission segment, and every other prompt
+			// closes it.
+			applyDeliveredUserMessage(message);
 			return;
 		}
 		const goal = store.get();
@@ -1553,6 +1574,39 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 
 	/**
+	 * Open or close the admission segment for a user message Pi has just delivered.
+	 *
+	 * This is the live half of `ownershipMarker`, and drawing the line here rather
+	 * than at `input` is what makes live accounting and branch replay converge:
+	 *
+	 * - `input` fires while the provider request is still streaming, so an ordinary
+	 *   prompt typed during an admitted Goal response would close the segment before
+	 *   that response is finalized and drop it live, while the replay — where the
+	 *   assistant message is appended *before* the prompt that interrupted it —
+	 *   charges it. A budget that only the live path failed to stop would then be
+	 *   crossed on reload.
+	 * - a queued steer is appended only after the in-flight assistant message and its
+	 *   tool results, so opening the segment when the message is *queued* would
+	 *   charge the previous identity's (or the previous turn's) work to this Goal.
+	 *
+	 * Pi appends the message in the same event, so the entry this sees is the entry
+	 * the replay reads. The segment is opened for the Goal that is current at
+	 * delivery — the identity whose newest snapshot precedes it — which is what stops
+	 * a work message queued for a Goal that has since been replaced, cleared, or
+	 * completed from opening anything.
+	 */
+	function applyDeliveredUserMessage(message: { content: unknown }): void {
+		const goal = store.get();
+		const isGoalWork =
+			goal != null && goal.status !== "complete" && messageText(message.content).startsWith(GOAL_MESSAGE_PREFIX);
+		if (isGoalWork) {
+			store.beginGoalWork(goal.id);
+			return;
+		}
+		store.endGoalWork();
+	}
+
+	/**
 	 * Deliver a work-start (or work-redirect) message without ever waiting for an
 	 * active run to finish.
 	 *
@@ -1564,15 +1618,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * change of an active run is supposed to use. `pi.sendUserMessage` is
 	 * fire-and-forget: delivery failures surface as Pi extension errors, never as
 	 * a state lie ("steered" is reported only for the queueing itself).
+	 *
+	 * The admission segment is *not* opened here. It opens when the message is
+	 * delivered, in {@link applyDeliveredUserMessage}, because a steer reaches the
+	 * branch only after the work that was already in flight.
 	 */
-	function deliverWorkMessage(
-		content: string,
-		ctx: ExtensionCommandContext,
-		goalId: string,
-	): "started" | "steered" {
-		// The message starts a Goal-owned segment: the run it starts (or the rest of
-		// the run it steers into) is attended Goal work and is charged to this Goal.
-		store.beginGoalWork(goalId);
+	function deliverWorkMessage(content: string, ctx: ExtensionCommandContext): "started" | "steered" {
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(content);
 			return "started";
@@ -1658,7 +1709,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const updated = resumed.goal!;
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
-		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx, updated.id);
+		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx);
 		const restarted =
 			goal.status === "paused"
 				? "Work restarted from retained progress."
@@ -1773,7 +1824,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (updated.status === "active") {
 			// Redirect the active run through Pi's steering (or start work when
 			// idle, e.g. after an aborted run left the Goal dormant).
-			const delivery = deliverWorkMessage(formatEditMessage(updated), ctx, updated.id);
+			const delivery = deliverWorkMessage(formatEditMessage(updated), ctx);
 			ctx.ui.notify(
 				`Goal ${updated.id} objective updated (revision ${updated.revision}); usage history is preserved. Work ${delivery === "started" ? "started" : "steered"} on the new objective.`,
 				"info",
@@ -1916,7 +1967,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// in flight - waiting for idle would deadlock behind its
 				// continuation loop - so the kickoff is steered into the active
 				// run or starts immediately when idle.
-				delivery = deliverWorkMessage(formatKickoffMessage(goal), ctx, goal.id);
+				delivery = deliverWorkMessage(formatKickoffMessage(goal), ctx);
 			} else {
 				// There is no Goal continuation loop that could starve this wait
 				// (abort also settles a stuck run), and the seam above declines to
@@ -1949,7 +2000,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// allows.
 				safety.reset();
 				pendingRunKind = "kickoff";
-				store.beginGoalWork(goal.id);
+				// The admission segment opens when the kickoff is delivered, in
+				// `applyDeliveredUserMessage`, like every other work message.
 				pi.sendUserMessage(formatKickoffMessage(goal));
 				delivery = "started";
 			}

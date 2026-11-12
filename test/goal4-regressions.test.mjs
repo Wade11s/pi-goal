@@ -58,7 +58,18 @@ async function waitForStoredGoal(session, predicate, description = "stored Goal"
 	const file = await session.sessionFile();
 	const deadline = Date.now() + 5000;
 	while (Date.now() < deadline) {
-		const snapshot = lastGoalSnapshot(readSessionEntries(file));
+		let entries;
+		try {
+			entries = readSessionEntries(file);
+		} catch (error) {
+			// Pi defers creating the session file until the first user/assistant
+			// message, so the path can be reported before it exists. Treat that as
+			// "not written yet" and keep polling instead of failing the first read:
+			// under a full parallel `npm test` that window is reachable.
+			if (error.code !== "ENOENT") throw error;
+			entries = [];
+		}
+		const snapshot = lastGoalSnapshot(entries);
 		const goal = snapshot?.data?.goal;
 		if (goal && predicate(goal)) return goal;
 		await new Promise((resolve) => setTimeout(resolve, 10));

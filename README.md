@@ -292,22 +292,28 @@ reload, a restart, or a tree navigation converges on the same totals instead of
 re-charging them.
 
 A report is Goal work only inside an open **admission segment**. A segment opens
-when pi-goal finalizes a Goal work message — the `/goal` kickoff, an objective
-edit, a resume, an automatic Continuation, or the one Budget wrap-up — and closes
-on a genuine user prompt or a new Goal identity. `/goal <objective>` therefore
+when Pi delivers a Goal work message — the `/goal` kickoff, an objective edit, a
+resume, an automatic Continuation, or the one Budget wrap-up — and closes when Pi
+delivers a genuine user prompt or a new Goal identity. `/goal <objective>` therefore
 starts attribution at its actual kickoff: the ordinary run the command waited for
 is never adopted. `create_goal` leaves its creating run ordinary, and attribution
 starts at the first subsequent Continuation; pre-creation responses, creation
 controls, and unrelated same-batch tool results are excluded. Ordinary prompts
 are excluded in every lifecycle status.
 
-A steered message opens the segment when it is *delivered*, not when it is
-queued, so a steered replacement cannot steal an in-flight response that belongs
-to the previous identity. Work already admitted stays attributable through pause,
-completion, a blocked or usage-limit stop, and other lifecycle boundaries, while
-no new substantive work is admitted after the stop. Completion stays terminal on
-both paths, which is what keeps the completing batch aligned with a replay that
-skips everything after a completion snapshot.
+Delivery is the seam at both ends because it is the entry the branch replay reads
+back. A steer queued during an in-flight response reaches the branch only *after*
+that response and its tool results, so a segment opened at queue time would charge
+the previous identity's work to the new Goal; and a prompt typed while a response
+streams is delivered only after that response, so a segment closed when the prompt
+was typed would drop work the Goal had already admitted. Either way live accounting
+and replay would disagree — and a budget only the live path failed to stop would be
+crossed on reload, where the reconstruction re-derives the stop from the branch.
+Work already admitted stays attributable through pause, completion, a blocked or
+usage-limit stop, and other lifecycle boundaries, while no new substantive work is
+admitted after the stop. Completion stays terminal on both paths, which is what
+keeps the completing batch aligned with a replay that skips everything after a
+completion snapshot.
 
 Durable writes happen only at boundaries where every entry they cover is already
 on the branch. The ordering matters: Pi dispatches `message_end` to extensions
