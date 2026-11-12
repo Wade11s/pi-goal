@@ -52,6 +52,15 @@ function cutovers(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-cutover");
 }
 
+/** Fail unless exactly `steps` provider responses were consumed. */
+function assertStepsConsumed(session, steps, expectedFailures = []) {
+	const outcomes = session.records.filter(
+		(r) => r.type === "message_end" && r.message.role === "assistant",
+	);
+	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
+	assertOnlyFailures(session, expectedFailures);
+}
+
 test("a legacy active Goal is cut over once, keeps its reconstructed baseline, and continues under repaired attribution", async () => {
 	const { session, dir, sessionFile } = await startLegacy("legacy-active.jsonl");
 	// The provider is only read when a request is made, so the script also proves
@@ -94,7 +103,8 @@ test("a legacy active Goal is cut over once, keeps its reconstructed baseline, a
 			const again = readSessionEntries(sessionFile);
 			assert.equal(goalStates(again).length, 2, "no second cutover");
 			assert.equal(cutovers(again).length, 1);
-			assertOnlyFailures(second, []);
+			assertStepsConsumed(second, 0, []);
+			assert.equal(second.extensionErrors().length, 0);
 		} finally {
 			await second.stop();
 		}
@@ -125,12 +135,12 @@ test("a legacy active Goal is cut over once, keeps its reconstructed baseline, a
 				228,
 				"180 legacy + 33 Goal-owned Continuation + 15 aborted continuation (ordinary prompt excluded)",
 			);
-			assertOnlyFailures(third, [{ stopReason: "aborted" }]);
+			assertStepsConsumed(third, 3, [{ stopReason: "aborted" }]);
 			assert.equal(third.extensionErrors().length, 0);
 		} finally {
 			await third.stop();
 		}
-		assertCleanRun(session);
+		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -159,7 +169,7 @@ test("non-active legacy statuses stay stopped, complete stays terminal, and a to
 			await session.prompt("anything else?");
 			await session.waitForSettled(1);
 			assert.equal(runCount(session), 1, `${fixture}: only the ordinary prompt ran`);
-			assertCleanRun(session);
+			assertStepsConsumed(session, 1, []);
 			assert.equal(session.extensionErrors().length, 0);
 		} finally {
 			await session.stop();
@@ -175,7 +185,7 @@ test("non-active legacy statuses stay stopped, complete stays terminal, and a to
 		assert.equal(runCount(tombstone.session), 0, "loading a tombstone starts no run");
 		const entries = readSessionEntries(tombstone.sessionFile);
 		assert.equal(cutovers(entries).length, 0, "a tombstone is not a legacy Goal to migrate");
-		assertCleanRun(tombstone.session);
+		assertStepsConsumed(tombstone.session, 0, []);
 		assert.equal(tombstone.session.extensionErrors().length, 0);
 	} finally {
 		await tombstone.session.stop();
@@ -196,7 +206,7 @@ test("a malformed or unrecognized newest legacy snapshot fails closed with guida
 		const entries = readSessionEntries(sessionFile);
 		assert.equal(goalStates(entries).length, 2, "no repaired snapshot is written for a corrupt latest entry");
 		assert.equal(cutovers(entries).length, 0);
-		assertCleanRun(session);
+		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -220,7 +230,7 @@ test("0.1.0 optional-field defaults are preserved: origin command, zero usage, n
 		assert.equal(repaired.usage.totalTokens, 0);
 		assert.equal(repaired.wrapUpPending, undefined);
 		assert.equal(repaired.blockedAudit, undefined);
-		assertCleanRun(session);
+		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -245,7 +255,7 @@ test("the configured maximum clamps an unbounded legacy Goal with an explicit no
 		assert.equal(status.remaining, "335 tokens");
 		const repaired = goalStates(readSessionEntries(sessionFile)).at(-1).data.goal;
 		assert.equal(repaired.tokenBudget, 500);
-		assertCleanRun(session);
+		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -283,7 +293,7 @@ test("an active legacy Goal already at its budget becomes budget_limited before 
 		const after = await reportStatus(session);
 		assert.equal(after.status, "budget_limited");
 		assert.equal(after.totalTokens, 125, "110 legacy + 15 wrap-up (ordinary prompt excluded)");
-		assertCleanRun(session);
+		assertStepsConsumed(session, 2, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -322,7 +332,7 @@ test("a pending legacy wrap-up is delivered at most once", async () => {
 			1,
 			"no duplicate wrap-up",
 		);
-		assertCleanRun(session);
+		assertStepsConsumed(session, 3, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -340,7 +350,7 @@ test("a legacy open audit is preserved for the Blocker-identity handoff without 
 		assert.equal(status.blockedTurns, 2);
 		const repaired = goalStates(readSessionEntries(sessionFile)).at(-1).data.goal;
 		assert.deepEqual(repaired.blockedAudit, { blocker: "The test database is unavailable", turns: 2 });
-		assertCleanRun(session);
+		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -356,7 +366,7 @@ test("an existing tool-created legacy Goal stays a valid historical Goal", async
 		const status = await reportStatus(session);
 		assert.match(status.origin, /the model \(create_goal\)/);
 		assert.equal(status.totalTokens, 165);
-		assertCleanRun(session);
+		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();

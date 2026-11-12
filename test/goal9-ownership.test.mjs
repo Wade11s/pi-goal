@@ -79,6 +79,19 @@ async function abortActiveLoop(session, runs) {
 	return session.waitForSettled(1);
 }
 
+/**
+ * Fail unless exactly `steps` provider responses were consumed. One provider
+ * request consumes one scripted step, so equality proves the scenario neither
+ * exhausted the script nor left a step unconsumed.
+ */
+function assertStepsConsumed(session, steps, expectedFailures = []) {
+	const outcomes = session.records.filter(
+		(r) => r.type === "message_end" && r.message.role === "assistant",
+	);
+	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
+	assertOnlyFailures(session, expectedFailures);
+}
+
 async function reportStatus(session, matcher = /Token usage/) {
 	await session.prompt("/goal");
 	const notify = await session.waitFor("a /goal report", (records) => {
@@ -139,7 +152,7 @@ test("/goal issued during an ordinary run never adopts that run's work", async (
 		const persisted = lastGoalSnapshot(readSessionEntries(await session.sessionFile()));
 		assert.equal(persisted.data.goal.id, status.message.match(/^Goal (\S+)/)[1]);
 		assert.equal(persisted.data.goal.usage.totalTokens, 0, "the durable creation snapshot is not polluted");
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -175,7 +188,7 @@ test("an ordinary prompt while a Goal is paused is not charged", async () => {
 		const persisted = lastGoalSnapshot(readSessionEntries(await session.sessionFile()));
 		assert.equal(persisted.data.goal.status, "paused");
 		assert.equal(persisted.data.goal.usage.totalTokens, 125, "the pause snapshot carries the admitted work");
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -215,7 +228,7 @@ test("a Replacement Goal starts at zero and never inherits the old identity's us
 			lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.id,
 			original.id,
 		);
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -267,7 +280,7 @@ test("Clear publishes no further usage for the cleared identity and transfers no
 			lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.id,
 			cleared.id,
 		);
-		assertOnlyFailures(session, [
+		assertStepsConsumed(session, 5, [
 			{ stopReason: "aborted" },
 			{ stopReason: "aborted" },
 		]);
@@ -317,7 +330,7 @@ test("a held blocked report prepared against an edited Goal is refused without m
 		assert.equal(after.status, "active");
 		await session.sendSimple("abort");
 		await session.waitForSettled(1);
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -352,7 +365,7 @@ test("already-admitted in-flight Goal work stays attributable through a pause", 
 		// response completes, so no aborted usage). The post-pause response is the
 		// held one and is admitted; nothing after the pause is charged.
 		assert.equal(status.totalTokens, 154);
-		assertCleanRun(session);
+		assertStepsConsumed(session, 2, []);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
