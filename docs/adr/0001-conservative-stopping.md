@@ -24,16 +24,35 @@ observable Pi events, with thresholds that are constants rather than settings.
 
 1. **The blocked audit is enforced, not requested.** `update_goal` accepts
    `blocked` with a blocker description, but the Goal only becomes `blocked` once
-   the same blocker has been reported for three *consecutive* Goal turns. Reports
-   are counted per Goal turn, compared after normalizing case, whitespace, and
-   trailing punctuation, and persisted on the Goal record so compaction cannot hand
-   the model three fresh turns. A Goal turn that reports no blocker — it made
-   progress, verified a wait, or simply had nothing to report — breaks the chain,
-   and that break is persisted too, because an in-memory-only reset would let a
-   reload resurrect a count the model already invalidated. What durability cannot
-   do is outlast a user action: the prompt that resumes work after a restart is
-   itself a user action and starts a fresh audit, which is the intended trade
-   between "the user stepped in" and "the loop kept its count".
+   the same blocker has been reported for three *consecutive* Goal turns. The first
+   valid report omits a blocker ID; the extension issues and persists an opaque
+   **Blocker identity**. A later report of the same condition reuses the current
+   ID, so differently worded descriptions and changed next steps still advance the
+   audit. Omitting the ID reports a genuinely different condition and starts a new
+   chain at one with a fresh ID. An unrecognized or non-current ID is rejected
+   without mutation; free-text similarity is never a fallback. The model therefore
+   judges semantic equivalence by choosing whether to reuse the ID, while the
+   extension alone enforces identity, consecutiveness, and the threshold. Incorrect
+   reuse can merge different blockers, while an omitted ID can split one condition
+   and delay stopping; the latter is the safer failure direction.
+
+   Reports are counted per Goal turn and persisted on the Goal record so compaction
+   cannot hand the model three fresh turns. The first valid report owns its turn;
+   later calls in that turn are idempotent and cannot advance, reset, or replace
+   the audit. A Goal turn that reports no blocker — it made progress, verified a
+   wait, or simply had nothing to report — breaks the chain, and that break is
+   persisted too, because an in-memory-only reset would let a reload resurrect a
+   count the model already invalidated. What durability cannot do is outlast a user
+   action: the prompt that resumes work after a restart is itself a user action and
+   starts a fresh audit, which is the intended trade between "the user stepped in"
+   and "the loop kept its count". Resume and Replacement Goals also start fresh.
+
+   The tool and continuation contracts both require a report on every Goal turn
+   while a genuine blocker persists, rather than waiting until the threshold is
+   already satisfied. Structured tool responses, `get_goal`, and continuations
+   expose the open audit's current ID, latest description, and count so the model
+   can reuse the identity after compaction or restart. The third consecutive report
+   performs the transition; earlier reports are recorded and refused.
 2. **Activity-free turns are bounded.** An *automatic* Goal turn with no tool call,
    no output, and no reasoning is a malfunctioning continuation. Three in a row
    stop the Goal as `blocked`. Any activity resets the counter, and a kickoff or a
