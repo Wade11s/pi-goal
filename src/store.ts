@@ -697,6 +697,25 @@ export class GoalStore {
 		}
 	}
 
+
+	/**
+	 * Persist the current Goal's already-accounted totals as a durable historical
+	 * snapshot before replacement commits a new identity.
+	 *
+	 * The frozen record preserves the superseded Goal's accounted usage on its own
+	 * branch history without changing the live ledger: the replacement still resets
+	 * accounting for the new Goal, and any pre-replacement work that was not
+	 * already accounted remains unattributed on both the live path and replay.
+	 */
+	preserveSupersededForReplacement(pi: ExtensionAPI): void {
+		const current = this.current;
+		if (!current) return;
+		this.persistSnapshot(pi, {
+			...copyRecord(current),
+			usage: this.liveUsage(),
+		});
+	}
+
 	/** Make a staged Goal visible to /goal and get_goal. */
 	commit(goal: GoalRecord): void {
 		this.current = this.adopt(goal);

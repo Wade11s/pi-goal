@@ -976,6 +976,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// next report starts a fresh chain instead of resuming an old one.
 			reportAuditResetFailure("a Goal turn that reported no blocker", ctx);
 		}
+		// The admitted Goal turn is over at its settlement boundary, so its
+		// ownership segment must not leak into later user actions or runs (e.g. a
+		// bare `/goal` edit dialog, or an ordinary prompt before a closing user
+		// message is delivered). Continuations reopen their own segment explicitly.
+		if (wasGoalTurn) {
+			store.endGoalWork();
+		}
 	}
 
 	/**
@@ -1932,6 +1939,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const sameRecord = (candidate: GoalRecord | null | undefined) =>
 				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
 			try {
+				// Replacement must preserve the superseded Goal's already-accounted
+				// totals as a durable historical record before the new identity takes
+				// over the session's Goal slot and resets the live ledger.
+				if (replacing) {
+					store.preserveSupersededForReplacement(pi);
+				}
 				// Stage and commit before any wait: the new record is what a
 				// concurrent /goal clear, edit, pause, or resume acts on, and
 				// revalidating it after the wait detects exactly that change.

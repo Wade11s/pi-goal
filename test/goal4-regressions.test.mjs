@@ -183,8 +183,8 @@ test("a held completion cannot complete a Goal the user replaced while it was in
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.deepEqual(
 			goalSnapshots(entries).map((s) => s.data.goal.id === replacement.id ? `new:${s.data.goal.status}:${s.data.goal.revision}` : `old:${s.data.goal.status}:${s.data.goal.revision}`),
-			["old:active:0", "new:active:0"],
-			"the replacement Goal was not completed by the stale call",
+			["old:active:0", "old:active:0", "new:active:0"],
+			"replacement preserves a durable superseded old-goal record and the stale completion cannot complete the replacement",
 		);
 		assert.equal(lastGoalSnapshot(entries).data.goal.id, replacement.id);
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
