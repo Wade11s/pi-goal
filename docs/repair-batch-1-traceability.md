@@ -305,6 +305,62 @@ behaviour, because they fail on an intermediate state of this branch: a reload
 must not rewrite a tail that is already durable, and a recovered open tail must
 not steal the replacement's own open segment.
 
+## Review follow-up: the Clear boundary
+
+The re-review by subagent 7d3961 at `282b9c7` found that the documented Clear
+residual was a contract violation: a `/goal clear` issued after a replacement but
+before the old identity's in-flight response was accounted charged that response
+to nobody, and a failed freeze at Clear silently discarded already-accounted work.
+It also found that the README and GLOSSARY called the initial preserve snapshot
+"superseded" when the code writes a *current* snapshot, and that
+`GoalStore.isGoalOwned()` was dead code.
+
+- **Clear keeps the superseded admission open.** `commitTombstone` no longer
+  freezes or drops an open tail. The tail stays open past the tombstone, bound to
+  the old identity, so its in-flight response and tool results are charged to it;
+  the next delivered user message, shutdown, or new Goal creation freezes it. A
+  closed tail is frozen before the tombstone, and a failed write refuses the
+  Clear (`persistence`) instead of dropping the work. `message_end` and
+  `session_compact` keep charging an open tail even with no current Goal.
+- **Replay recovers past a tombstone.** When the newest non-superseded entry is a
+  tombstone, `reconstruct` replays from the newest non-tombstone snapshot to
+  rebuild the superseded identity's tail, and `replayBranch` no longer closes an
+  open superseded admission at a tombstone. The recovered tail is frozen at the
+  first durable boundary and is marked `superseded`, so it never becomes current.
+- **Documentation matches the durable representation.** The initial preserve is a
+  current, non-superseded snapshot (so a crash before the replacement's snapshot
+  still reconstructs the old Goal); only the later tail freeze is marked
+  `superseded`. The stale Clear limitation is removed.
+- **`isGoalOwned` removed.** The unused accessor is gone; the tests that used it
+  assert `currentOwnerId()` and `hasOpenSupersededTail()` instead.
+
+The new regressions fail on the pre-fix `src/` (`282b9c7`):
+
+```text
+Clear keeps the superseded identity's already-accounted open tail through the tombstone
+  AssertionError: Clear does not freeze an open tail
+    actual: 1, expected: 0
+
+Clear keeps the superseded identity's admission open so a later response stays attributed
+  AssertionError: Expected values to be strictly equal:
+    actual: undefined, expected: 110
+
+Clear refuses to commit when an already-accounted tail cannot be frozen
+  AssertionError: Clear is refused
+    actual: true, expected: false
+
+replay recovers a superseded tail when the newest non-superseded entry is a tombstone
+  AssertionError: the recovered tail is frozen
+    actual: undefined, expected: 'goal_aaaaaaaa'
+
+a recovered superseded tail is frozen as history and never resurrects the old Goal
+  AssertionError: the recovered tail is frozen
+    actual: 0, expected: 1
+
+Clear during the superseded identity's in-flight response keeps the tail attributed
+  AssertionError: the tail is frozen as history
+```
+
 ## Compatibility landing constraint
 
 Batches 1–3 form one mandatory compatibility unit (see #23). This branch is not
