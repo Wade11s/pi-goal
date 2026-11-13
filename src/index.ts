@@ -686,8 +686,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// This is also the ownership seam. Pi appends the message in this very event,
 			// so what happens here is exactly what `ownershipMarker` reads back on replay:
 			// a pi-goal work message opens its admission segment, and every other prompt
-			// closes it.
-			applyDeliveredUserMessage(message);
+			// closes it. A delivered message also closes the superseded identity's
+			// admission, freezing its in-flight tail before the new segment opens.
+			applyDeliveredUserMessage(message, pi);
 			return;
 		}
 		const goal = store.get();
@@ -749,6 +750,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const currentFile = ctx.sessionManager.getSessionFile();
 		const keepsFile = event.targetSessionFile === undefined || event.targetSessionFile === currentFile;
 		if (!keepsFile) return;
+		// A superseded identity's in-flight tail is frozen at this last durable
+		// boundary too, so a quit or reload cannot lose work that never saw another
+		// delivered user message.
+		store.closeSupersededSegment(pi);
 		store.stopClock();
 		store.flushAccounting(pi, true);
 	});
@@ -1601,11 +1606,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * delivery — the identity whose newest snapshot precedes it — which is what stops
 	 * a work message queued for a Goal that has since been replaced, cleared, or
 	 * completed from opening anything.
+	 *
+	 * This is also the boundary that closes a superseded identity's admission: the
+	 * replacement kept the old segment open for its in-flight tail, and the first
+	 * delivered user message is where that tail is frozen onto the old identity's
+	 * durable record (see `GoalStore.closeSupersededSegment`).
 	 */
-	function applyDeliveredUserMessage(message: { content: unknown }): void {
+	function applyDeliveredUserMessage(message: { content: unknown }, pi: ExtensionAPI): void {
 		const goal = store.get();
 		const isGoalWork =
 			goal != null && goal.status !== "complete" && messageText(message.content).startsWith(GOAL_MESSAGE_PREFIX);
+		store.closeSupersededSegment(pi);
 		if (isGoalWork) {
 			store.beginGoalWork(goal.id);
 			return;

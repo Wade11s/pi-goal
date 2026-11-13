@@ -183,8 +183,16 @@ test("a held completion cannot complete a Goal the user replaced while it was in
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.deepEqual(
 			goalSnapshots(entries).map((s) => s.data.goal.id === replacement.id ? `new:${s.data.goal.status}:${s.data.goal.revision}` : `old:${s.data.goal.status}:${s.data.goal.revision}`),
-			["old:active:0", "old:active:0", "new:active:0"],
+			["old:active:0", "old:active:0", "new:active:0", "old:active:0", "new:active:0"],
 			"replacement preserves a durable superseded old-goal record and the stale completion cannot complete the replacement",
+		);
+		const oldSnapshots = goalSnapshots(entries).filter((s) => s.data.goal.id !== replacement.id);
+		assert.equal(oldSnapshots[0].data.goal.usage.totalTokens, 0, "the creation snapshot is not polluted");
+		assert.equal(oldSnapshots[1].data.goal.usage.totalTokens, 15, "the superseded snapshot carries the exact already-accounted kickoff total");
+		assert.equal(
+			oldSnapshots.at(-1).data.goal.usage.totalTokens,
+			30,
+			"the finalized superseded record carries the in-flight completion turn's response",
 		);
 		assert.equal(lastGoalSnapshot(entries).data.goal.id, replacement.id);
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);

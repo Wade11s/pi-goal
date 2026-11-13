@@ -279,22 +279,119 @@ it("0.1.0 optional-field defaults are preserved by the cutover", () => {
 	assert.equal(store.get().blockedAudit, undefined);
 });
 
-it("replay does not carry an old identity's open segment across a replacement snapshot", () => {
-	// A replacement is staged while the previous identity's run is still in flight, so
-	// the branch reads: the old kickoff, the old response, the replacement snapshot,
-	// the old response's own tool result, then the steered replacement kickoff. The
-	// segment the old kickoff opened belongs to the old identity, so it must close at
-	// the snapshot instead of charging the in-flight response to the new Goal.
+it("a replacement attributes the superseded identity's in-flight assistant and tool-result tail", () => {
+	// A replacement commits while the old identity's provider request is still in
+	// flight. The old admission stays open past commit(), so the response and its
+	// nested tool result are charged to the old identity, then frozen onto a
+	// superseded snapshot when the next user message is delivered.
+	const store = new GoalStore();
+	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
+	store.reconstruct(fakeCtx([goalEntry(previous)]));
+	store.beginGoalWork(previous.id);
+
+	const pi = fakePi();
+	store.preserveSupersededForReplacement(pi);
+	assert.equal(pi.appended.length, 1, "the already-accounted superseded snapshot is written first");
+	assert.equal(pi.appended[0].data.goal.id, previous.id);
+	assert.equal(pi.appended[0].data.goal.usage.totalTokens, 0);
+
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	store.stage(pi, replacement);
+	store.commit(replacement);
+	assert.equal(store.get()?.id, replacement.id);
+	assert.equal(store.getUsage().totalTokens, 0, "the replacement starts at zero");
+
+	// The old response lands after the replacement snapshot and is bound to the old
+	// identity by the turn seam.
+	const assistant = store.accountUsage("model:1", usageReport(100, 10), "model", previous.id);
+	assert.equal(assistant?.totalTokens, 110);
+	// Its nested tool result carries no turn binding, so it follows the open segment.
+	const nested = store.accountUsage("toolResult:call_1", usageReport(40, 7, { cacheWrite: 3 }), "nested");
+	assert.equal(nested?.totalTokens, 50);
+	assert.equal(store.getUsage().totalTokens, 0, "the replacement is not charged for the old tail");
+
+	store.closeSupersededSegment(pi);
+	const finalized = pi.appended
+		.filter((e) => e.type === "goal-state" && e.data.goal.id === previous.id)
+		.at(-1);
+	assert.equal(finalized.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
+	assert.equal(finalized.data.goal.usage.nestedTokens, 50);
+	assert.equal(finalized.data.goal.status, "active");
+	// The replacement is re-affirmed as the newest snapshot so it stays current.
+	assert.equal(pi.appended.at(-1).data.goal.id, replacement.id);
+	assert.equal(pi.appended.at(-1).data.goal.usage.totalTokens, 0);
+});
+
+it("the superseded snapshot carries the exact already-accounted totals", () => {
+	const store = new GoalStore();
+	const previous = record({
+		id: "goal_aaaaaaaa",
+		usage: usage(45, { inputTokens: 40, outputTokens: 5 }),
+	});
+	store.reconstruct(fakeCtx([goalEntry(previous)]));
+	store.beginGoalWork(previous.id);
+	const pi = fakePi();
+	store.preserveSupersededForReplacement(pi);
+	assert.equal(pi.appended[0].data.goal.usage.totalTokens, 45);
+	assert.equal(pi.appended[0].data.goal.usage.inputTokens, 40);
+	assert.equal(pi.appended[0].data.goal.usage.outputTokens, 5);
+});
+
+it("old-budget exhaustion is recorded on the superseded record and never on the replacement", () => {
+	const store = new GoalStore();
+	const previous = record({ id: "goal_aaaaaaaa", tokenBudget: 100, usage: usage(0) });
+	store.reconstruct(fakeCtx([goalEntry(previous)]));
+	store.beginGoalWork(previous.id);
+	const pi = fakePi();
+	store.preserveSupersededForReplacement(pi);
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	store.stage(pi, replacement);
+	store.commit(replacement);
+
+	store.accountUsage("model:1", usageReport(110, 0), "model", previous.id);
+	store.accountUsage("toolResult:call_1", usageReport(40, 7, { cacheWrite: 3 }), "nested");
+	store.closeSupersededSegment(pi);
+
+	const finalized = pi.appended
+		.filter((e) => e.type === "goal-state" && e.data.goal.id === previous.id)
+		.at(-1);
+	assert.equal(finalized.data.goal.status, "budget_limited", "the old identity's exhaustion is recorded");
+	assert.equal(finalized.data.goal.usage.totalTokens, 160, "the in-flight tail is still attributed");
+	assert.equal(store.get()?.id, replacement.id);
+	assert.equal(store.getUsage().totalTokens, 0, "the replacement is not charged and does not inherit the stop");
+	assert.equal(store.get()?.status, "active");
+});
+
+it("replay attributes the superseded tail to the old identity and keeps the replacement at zero", () => {
+	// The branch after a steered replacement: old creation, old kickoff, the
+	// already-accounted superseded snapshot, the new creation, the old in-flight
+	// response and tool result, the finalized old snapshot, the re-affirmed new
+	// snapshot, then the steered new kickoff and its response. The old tail sits
+	// before the finalized old snapshot, so replay never recharges it; the new
+	// Goal's baseline is the re-affirmed snapshot, so it charges only its own work.
 	const store = new GoalStore();
 	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
 	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
 	const branch = [
 		goalEntry(previous, { repaired: true }),
 		goalWorkEntry("kickoff-old"),
-		assistantEntry(0, usageReport(100, 10)),
+		goalEntry(previous, { repaired: true }),
 		goalEntry(replacement, { repaired: true }),
-		assistantEntry(1, usageReport(100, 10)),
-		toolResultEntry("call_1", usageReport(40, 7)),
+		assistantEntry(0, usageReport(100, 10)),
+		toolResultEntry("call_1", usageReport(40, 7, { cacheWrite: 3 })),
+		goalEntry(
+			record({
+				id: "goal_aaaaaaaa",
+				usage: usage(160, {
+					inputTokens: 140,
+					outputTokens: 10,
+					cacheWriteTokens: 3,
+					nestedTokens: 50,
+				}),
+			}),
+			{ repaired: true },
+		),
+		goalEntry(replacement, { repaired: true }),
 		goalWorkEntry("steer-new"),
 		assistantEntry(2, usageReport(20, 2)),
 	];

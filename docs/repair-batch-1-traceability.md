@@ -21,11 +21,14 @@ persisted entries.
 | Non-retroactive `/goal` | The ordinary run the command waited for is never adopted | `test/goal9-ownership.test.mjs` ("/goal issued during an ordinary run…") |
 | Non-retroactive `create_goal` | Creating run and same-batch tool results excluded; attribution starts at the first Continuation | `test/goal6.test.mjs` ("create_goal leaves its creating run ordinary…") |
 | Ordinary prompts excluded in every status | Paused/blocked/usage-limited/budget-limited/complete ordinary runs add nothing | `test/goal9-ownership.test.mjs` ("an ordinary prompt while a Goal is paused…"); `test/goal6.test.mjs` (budget/complete accounting tests) |
-| Replacement starts at zero | Old identity keeps its admitted work; new identity inherits nothing | `test/goal9-ownership.test.mjs` ("a Replacement Goal starts at zero…"; "a steered Replacement keeps the old identity's in-flight work…") |
+| Replacement starts at zero | Old identity keeps its admitted work; new identity inherits nothing | `test/goal9-ownership.test.mjs` ("a Replacement Goal starts at zero…"; "a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("the superseded snapshot carries the exact already-accounted totals") |
+| Old in-flight tail | The old identity's in-flight assistant response and tool results stay attributed to it, live and on replay | `test/goal9-ownership.test.mjs` ("a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("a replacement attributes the superseded identity's in-flight assistant and tool-result tail") |
+| Old-budget exhaustion | Recorded on the old identity's superseded record only; no old continuation or wrap-up | `test/goal9-ownership.test.mjs` ("old-budget exhaustion is recorded on the superseded identity and admits no old continuation"); `test/goal9-store.test.mjs` ("old-budget exhaustion is recorded on the superseded record and never on the replacement") |
+| Durable superseded totals | The superseded snapshot carries the exact already-accounted total; the finalized record carries the exact tail and survives reload | `test/goal4.test.mjs` ("replacing an unfinished objective requires confirmation"); `test/goal9-store.test.mjs` ("the superseded snapshot carries the exact already-accounted totals"); `test/goal9-ownership.test.mjs` (reload assertions in the two Replacement tests) |
 | Clear boundary | Cleared identity publishes no further usage; a future Goal is not charged | `test/goal9-ownership.test.mjs` ("Clear publishes no further usage…") |
 | Admitted in-flight work | Stays attributable through pause/completion/blocked/usage-limit stops | `test/goal9-ownership.test.mjs` ("already-admitted in-flight Goal work stays attributable through a pause"; "an ordinary prompt typed during an admitted Goal response…") |
 | Cached/reasoning/nested/compaction | Exactly-once accounting preserved under the ownership boundary | `test/goal6.test.mjs` (cached-read, nested, compaction, retry tests) |
-| Live/replay convergence | Restart, reload, crash windows, fork, tree navigation | `test/goal6.test.mjs` (restart/crash); `test/goal7.test.mjs` (fork/tree); `test/goal9-ownership.test.mjs` (reload of the two in-flight orderings); `test/goal9-store.test.mjs` (replay identity boundary) |
+| Live/replay convergence | Restart, reload, crash windows, fork, tree navigation | `test/goal6.test.mjs` (restart/crash); `test/goal7.test.mjs` (fork/tree); `test/goal9-ownership.test.mjs` (reload of the Replacement and ordinary-prompt orderings); `test/goal9-store.test.mjs` ("replay attributes the superseded tail to the old identity…") |
 | Budget-stop convergence | A branch that replays past the budget stops instead of admitting another Goal turn | `test/goal9-store.test.mjs` ("a reloaded Goal whose replayed usage reached its budget…"); `test/goal9-ownership.test.mjs` ("an ordinary prompt typed during an admitted Goal response…") |
 | Active elapsed time | Only live active segments accrue; live and replay converge | `test/goal6.test.mjs` (active-time tests); `test/store.test.mjs`; `test/accounting.test.mjs` |
 | Legacy loadable | Every structurally valid version-1 snapshot/checkpoint stays readable | `test/goal9-legacy.test.mjs` (all statuses) |
@@ -170,6 +173,45 @@ rewritten to the repaired contract rather than deleted:
   unrecognized newest snapshot".
 - `test/store.test.mjs`: accounting tests now open a Goal-owned segment before
   charging, and replay branches carry the work message that opens the segment.
+- `test/goal9-ownership.test.mjs`: "a steered Replacement keeps the old identity's
+  in-flight work out of the new Goal" asserted that the old response and its tool
+  result belonged to nobody. It became "a steered Replacement attributes the old
+  identity's in-flight work to the old identity", which asserts the exact tail on
+  the old identity's durable record and its survival across a reload.
+- `test/goal4.test.mjs`: "replacing an unfinished objective requires confirmation"
+  had its continuation assertions dropped and a vacuous `>= 0` superseded-total
+  check added. The continuation count/objective assertions are restored and the
+  superseded snapshot is pinned to the exact already-accounted total.
+
+## Review follow-up: the superseded identity's in-flight tail
+
+The re-review by subagent b95f29 found that the already-accounted half of the
+old-identity finding was fixed, but the still-in-flight half was still charged to
+nobody: `commit()` closed the old admission, so the old response was refused and
+its tool result followed the closed segment, while replay skipped both because a
+new-identity snapshot nulls the segment owner. The code, a test, and the glossary
+all blessed the drop.
+
+The old admission now stays open past `commit()` until the next delivered user
+message. The old response is bound to the old identity by the turn seam; tool
+results and compaction that land before the next delivery follow the open segment;
+and the tail is frozen onto a durable superseded `goal-state` snapshot, after which
+the replacement is re-affirmed as the newest snapshot. The old active-time clock
+stops at replacement, the old budget stop is recorded on the old record only, and
+no continuation or wrap-up is ever issued for the superseded identity. Clear is
+unchanged. The regressions above fail on the pre-fix `src/`:
+
+```text
+a replacement attributes the superseded identity's in-flight assistant and tool-result tail
+  AssertionError: Expected values to be strictly equal: undefined !== 110
+
+old-budget exhaustion is recorded on the superseded record and never on the replacement
+  TypeError: store.closeSupersededSegment is not a function
+
+a steered Replacement attributes the old identity's in-flight work to the old identity
+  AssertionError: the exact assistant plus tool-result tail
+    actual: 0, expected: 160
+```
 
 ## Compatibility landing constraint
 

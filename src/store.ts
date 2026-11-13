@@ -270,6 +270,28 @@ export class GoalStore {
 	private ownerId: string | null = null;
 
 	/**
+	 * The superseded identity's still-open admission tail.
+	 *
+	 * A replacement commits a new identity while the old identity's provider request
+	 * may still be in flight. Decision #17 requires that work to stay with the old
+	 * identity, so `commit()` deliberately leaves the old admission open: the old
+	 * response and its tool results are charged to this ledger, and the tail is frozen
+	 * onto a durable superseded snapshot when the next user message is delivered
+	 * (`closeSupersededSegment`). The old active-time clock is stopped at replacement;
+	 * only the tokens of the in-flight tail are still collected here.
+	 */
+	private supersededTail:
+		| {
+				record: GoalRecord;
+				ledger: UsageLedger;
+				/** Whether the old admission is still open for its in-flight tail. */
+				open: boolean;
+			/** Whether the tail changed the record since the superseded snapshot. */
+			dirty: boolean;
+		}
+		| null = null;
+
+	/**
 	 * True when the selected branch's newest snapshot is a pre-repair (0.1.0)
 	 * snapshot that still has to be cut over. Cleared by `applyLegacyCutover`.
 	 */
@@ -356,6 +378,7 @@ export class GoalStore {
 		const goal = copyRecord(withSanitizedAudit(snapshot.goal));
 		const repaired = snapshot.repaired === true || this.hasCutover(branch, goal.id);
 		this.current = goal;
+		this.supersededTail = null;
 		this.pendingTransition = undefined;
 		// The audit itself is durable, but which Goal turn it belongs to is not:
 		// a fresh runtime has no turn to match, so the next report starts a new
@@ -420,6 +443,7 @@ export class GoalStore {
 		this.clock.reset();
 		this.goalOwned = false;
 		this.ownerId = null;
+		this.supersededTail = null;
 		this.legacyPending = false;
 	}
 
@@ -700,20 +724,57 @@ export class GoalStore {
 
 	/**
 	 * Persist the current Goal's already-accounted totals as a durable historical
-	 * snapshot before replacement commits a new identity.
+	 * snapshot before replacement commits a new identity, and keep the old
+	 * identity's admission open for its in-flight tail.
 	 *
 	 * The frozen record preserves the superseded Goal's accounted usage on its own
 	 * branch history without changing the live ledger: the replacement still resets
-	 * accounting for the new Goal, and any pre-replacement work that was not
-	 * already accounted remains unattributed on both the live path and replay.
+	 * accounting for the new Goal. The old identity's segment stays open past
+	 * `commit()` when it was open here, so a response or tool result still in flight
+	 * is charged to the old identity and frozen onto a superseded snapshot by
+	 * {@link closeSupersededSegment} instead of being dropped or charged to the
+	 * replacement.
 	 */
 	preserveSupersededForReplacement(pi: ExtensionAPI): void {
 		const current = this.current;
 		if (!current) return;
-		this.persistSnapshot(pi, {
-			...copyRecord(current),
-			usage: this.liveUsage(),
-		});
+		const usage = this.liveUsage();
+		const record = { ...copyRecord(current), usage };
+		this.persistSnapshot(pi, record);
+		const open = this.goalOwned && this.ownerId === current.id && record.status !== "complete";
+		this.supersededTail = {
+			record: copyRecord(record),
+			ledger: new UsageLedger(usage),
+			open,
+			dirty: false,
+		};
+	}
+
+	/**
+	 * Freeze the superseded identity's in-flight tail onto a durable snapshot and
+	 * re-affirm the replacement as the newest snapshot.
+	 *
+	 * Called when the next user message is delivered, which is the boundary that
+	 * closes the old admission. The old identity's tail is written as a superseded
+	 * `goal-state` snapshot; the replacement is then re-affirmed so it stays the
+	 * newest snapshot and therefore the current Goal. Nothing is written when the old
+	 * segment was never open or collected no tail, so an idle replacement does not
+	 * grow the snapshot log.
+	 */
+	closeSupersededSegment(pi: ExtensionAPI): void {
+		const superseded = this.supersededTail;
+		if (!superseded) return;
+		this.supersededTail = null;
+		if (!this.current || !superseded.open) return;
+		const record = superseded.record;
+		record.usage = { ...superseded.ledger.usage };
+		if (!superseded.dirty) return;
+		this.refreshUsage();
+		this.persistSnapshot(pi, record);
+		// The replacement must remain the newest snapshot: re-affirm it immediately
+		// after the superseded record so reconstruction still selects the new Goal.
+		this.persistSnapshot(pi, this.current);
+		this.pendingTransition = undefined;
 	}
 
 	/** Make a staged Goal visible to /goal and get_goal. */
@@ -725,11 +786,20 @@ export class GoalStore {
 		this.pendingTransition = undefined;
 		this.ledger.restore(zeroGoalUsage());
 		this.clock.reset();
-		// A new identity owns no work yet: attribution starts when pi-goal sends its
-		// first Goal work message (the /goal kickoff) or, for create_goal, at the
-		// first subsequent Continuation.
-		this.goalOwned = false;
-		this.ownerId = null;
+		// A replacement does not close the superseded identity's admission: its
+		// in-flight tail stays attributable to the old identity until the next
+		// delivered user message (see `closeSupersededSegment`).
+		const superseded = this.supersededTail;
+		if (superseded && superseded.open) {
+			this.goalOwned = true;
+			this.ownerId = superseded.record.id;
+		} else {
+			// A new identity owns no work yet: attribution starts when pi-goal sends its
+			// first Goal work message (the /goal kickoff) or, for create_goal, at the
+			// first subsequent Continuation.
+			this.goalOwned = false;
+			this.ownerId = null;
+		}
 		this.legacyPending = false;
 		if (goal.status === "active") this.clock.start();
 	}
@@ -763,21 +833,77 @@ export class GoalStore {
 	 * `admittedBy` binds the report to the Goal identity that owned the segment when
 	 * the provider request *started*. A replacement steered into an in-flight run
 	 * must not steal the response that was already on the wire for the old identity,
-	 * so an assistant report started under a different identity is refused rather
-	 * than re-attributed. `null` means the turn started with no Goal (a mid-turn Goal
-	 * work message may still open a segment); `undefined` is used for reports without
-	 * a turn seam (tool results, summarization), which use the live segment.
+	 * so an assistant report started under the old identity is charged to the old
+	 * identity's superseded tail, and a report started under any other identity is
+	 * refused rather than re-attributed. `null` means the turn started with no Goal
+	 * (a mid-turn Goal work message may still open a segment); `undefined` is used
+	 * for reports without a turn seam (tool results, summarization), which follow
+	 * the currently open segment.
 	 */
 	accountUsage(key: string, usage: Usage | undefined, source: UsageSource, admittedBy?: string | null) {
+		const target = this.usageTarget(admittedBy);
+		if (!target) return undefined;
+		if (target === "superseded") {
+			const superseded = this.supersededTail!;
+			const record = superseded.record;
+			if (record.status === "complete") return undefined;
+			const contribution = superseded.ledger.account(key, usage, source);
+			if (contribution) {
+				record.usage = superseded.ledger.usage;
+				superseded.dirty = true;
+				this.refreshSupersededBudget();
+			}
+			return contribution;
+		}
 		const current = this.current;
 		if (!current || current.status === "complete") return undefined;
-		if (admittedBy !== undefined && admittedBy !== null && admittedBy !== current.id) {
-			return undefined;
-		}
-		if (!this.goalOwned || this.ownerId !== current.id) return undefined;
 		const contribution = this.ledger.account(key, usage, source);
 		if (contribution) this.refreshUsage();
 		return contribution;
+	}
+
+	/**
+	 * Which identity an accounting report belongs to, given its turn binding.
+	 *
+	 * The superseded identity's open segment is a real admission: a report bound to
+	 * it (or an unbound report while its segment is the open one) is charged to the
+	 * old identity, never to the replacement. A report bound to the current identity
+	 * is charged only while that identity's own segment is open.
+	 */
+	private usageTarget(admittedBy: string | null | undefined): "current" | "superseded" | null {
+		const current = this.current;
+		const superseded = this.supersededTail;
+		if (admittedBy !== undefined && admittedBy !== null) {
+			if (superseded && superseded.open && admittedBy === superseded.record.id) return "superseded";
+			if (current && admittedBy === current.id && this.goalOwned && this.ownerId === current.id) {
+				return "current";
+			}
+			return null;
+		}
+		if (this.goalOwned && this.ownerId !== null) {
+			if (superseded && superseded.open && this.ownerId === superseded.record.id) return "superseded";
+			if (current && this.ownerId === current.id) return "current";
+		}
+		return null;
+	}
+
+	/**
+	 * Record the old identity's budget exhaustion on its superseded record only.
+	 *
+	 * The replacement keeps its own fresh ledger and its own budget; the old
+	 * identity's stop is a historical fact about its frozen record. No wrap-up is
+	 * armed for it: a superseded identity never continues.
+	 */
+	private refreshSupersededBudget(): void {
+		const superseded = this.supersededTail;
+		if (!superseded) return;
+		const record = superseded.record;
+		if (record.status !== "active") return;
+		if (!isBudgetExhausted(record.tokenBudget, superseded.ledger.usage.totalTokens)) return;
+		record.status = "budget_limited";
+		record.updatedAt = Date.now();
+		record.revision += 1;
+		superseded.dirty = true;
 	}
 
 	/** Mark the current run/segment as Goal-owned work for `goalId`. */
@@ -788,6 +914,10 @@ export class GoalStore {
 
 	/** Close the current segment: an ordinary user prompt is never Goal work. */
 	endGoalWork(): void {
+		// The superseded identity's admission closes only through
+		// `closeSupersededSegment`, which freezes its in-flight tail durably. Closing
+		// it here would drop work that was already admitted for the old identity.
+		if (this.supersededTail && this.ownerId === this.supersededTail.record.id) return;
 		this.goalOwned = false;
 		this.ownerId = null;
 	}
@@ -797,9 +927,18 @@ export class GoalStore {
 		return this.goalOwned;
 	}
 
-	/** The identity the current segment was admitted for, or null when it is not Goal work. */
+	/**
+	 * The identity the *current* segment was admitted for, or null when the open
+	 * segment belongs to the superseded identity (or no segment is open).
+	 *
+	 * `turn_start` uses this to bind the turn's assistant report. A replacement
+	 * steered into an in-flight run must not bind the new turn to the old identity,
+	 * so an open superseded segment reads as no current owner; the old tail is
+	 * routed by the open segment itself (see `usageTarget`).
+	 */
 	currentOwnerId(): string | null {
-		return this.goalOwned ? this.ownerId : null;
+		if (!this.goalOwned || this.ownerId === null) return null;
+		return this.current != null && this.ownerId === this.current.id ? this.ownerId : null;
 	}
 
 	/** Actionable guidance from the last reconstruction, if any. */
@@ -959,6 +1098,7 @@ export class GoalStore {
 		this.clock.reset();
 		this.goalOwned = false;
 		this.ownerId = null;
+		this.supersededTail = null;
 		this.legacyPending = false;
 		return { ok: true, goal: null };
 	}
@@ -1355,6 +1495,7 @@ export class GoalStore {
 		this.lastBlockerRevision = undefined;
 		this.goalOwned = false;
 		this.ownerId = null;
+		this.supersededTail = null;
 		this.legacyPending = false;
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
@@ -1553,6 +1694,7 @@ export class GoalStore {
 		this.pendingTransition = undefined;
 		this.goalOwned = false;
 		this.ownerId = null;
+		this.supersededTail = null;
 		this.legacyPending = false;
 		const usage = normalizeUsage(record.usage);
 		this.ledger.restore(usage);
