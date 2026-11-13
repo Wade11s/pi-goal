@@ -38,6 +38,23 @@ function goalSnapshots(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
+/**
+ * The newest *current* goal-state snapshot: the one that selects the session's Goal.
+ *
+ * A snapshot marked `superseded` is a finalized historical record of a replaced
+ * identity. It is valid and replayable, but it never becomes the current Goal, so
+ * the newest goal-state entry on the branch is not necessarily this one.
+ */
+function currentGoalSnapshot(entries) {
+	let snapshot;
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
+			snapshot = entry;
+		}
+	}
+	return snapshot;
+}
+
 function submitCommand(session, id, message) {
 	const responsePromise = session.waitFor(
 		`response for ${id}`,
@@ -181,9 +198,12 @@ test("a held completion cannot complete a Goal the user replaced while it was in
 		await replacePromise;
 
 		const entries = readSessionEntries(await session.sessionFile());
+		// The freeze of the old identity's in-flight tail is the last snapshot, and it is
+		// historical: the replacement is re-selected as the current Goal from its own
+		// snapshot rather than from a second, re-affirming append.
 		assert.deepEqual(
-			goalSnapshots(entries).map((s) => s.data.goal.id === replacement.id ? `new:${s.data.goal.status}:${s.data.goal.revision}` : `old:${s.data.goal.status}:${s.data.goal.revision}`),
-			["old:active:0", "old:active:0", "new:active:0", "old:active:0", "new:active:0"],
+			goalSnapshots(entries).map((s) => `${s.data.goal.id === replacement.id ? "new" : "old"}:${s.data.goal.status}:${s.data.goal.revision}:${s.data.superseded === true ? "superseded" : "current"}`),
+			["old:active:0:current", "old:active:0:current", "new:active:0:current", "old:active:0:superseded"],
 			"replacement preserves a durable superseded old-goal record and the stale completion cannot complete the replacement",
 		);
 		const oldSnapshots = goalSnapshots(entries).filter((s) => s.data.goal.id !== replacement.id);
@@ -194,7 +214,8 @@ test("a held completion cannot complete a Goal the user replaced while it was in
 			30,
 			"the finalized superseded record carries the in-flight completion turn's response",
 		);
-		assert.equal(lastGoalSnapshot(entries).data.goal.id, replacement.id);
+		assert.equal(currentGoalSnapshot(entries).data.goal.id, replacement.id);
+		assert.equal(lastGoalSnapshot(entries).data.superseded, true, "the newest goal-state entry is the historical freeze");
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {

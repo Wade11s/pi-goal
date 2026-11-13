@@ -126,6 +126,25 @@ function isUsageCheckpoint(value: unknown): value is UsageCheckpoint {
 }
 
 /**
+ * The superseded identity's still-open admission tail.
+ *
+ * A replacement commits a new identity while the old identity's provider request may
+ * still be in flight, so `commit()` deliberately leaves the old admission open: the
+ * old response and its tool results are charged to `ledger`, and `record` is the old
+ * identity's own record, frozen onto a durable superseded snapshot by
+ * `closeSupersededSegment`. `open` says the admission is still taking in-flight
+ * reports; `dirty` says the branch does not yet carry this tail.
+ */
+interface SupersededTail {
+	record: GoalRecord;
+	ledger: UsageLedger;
+	/** Whether the old admission is still open for its in-flight tail. */
+	open: boolean;
+	/** Whether the tail changed the record since the superseded snapshot. */
+	dirty: boolean;
+}
+
+/**
  * Outcome of a durable Goal transition (completion, pause, resume, clear,
  * objective edit). Distinguishes lifecycle refusals ("no-goal" / "not-eligible" /
  * "stale", with an explanation) from persistence failures, because the second
@@ -280,16 +299,7 @@ export class GoalStore {
 	 * (`closeSupersededSegment`). The old active-time clock is stopped at replacement;
 	 * only the tokens of the in-flight tail are still collected here.
 	 */
-	private supersededTail:
-		| {
-				record: GoalRecord;
-				ledger: UsageLedger;
-				/** Whether the old admission is still open for its in-flight tail. */
-				open: boolean;
-			/** Whether the tail changed the record since the superseded snapshot. */
-			dirty: boolean;
-		}
-		| null = null;
+	private supersededTail: SupersededTail | null = null;
 
 	/**
 	 * True when the selected branch's newest snapshot is a pre-repair (0.1.0)
@@ -308,12 +318,16 @@ export class GoalStore {
 	 * Rebuild state from the active branch. Called on session_start (startup,
 	 * resume, reload, new, fork/clone) and session_tree (branch navigation).
 	 *
-	 * The last *valid* `goal-state` entry on the branch wins, and a tombstone
-	 * (`goal: null`) is a valid entry: a cleared Goal therefore stays cleared on
+	 * The last *current* `goal-state` entry on the branch wins, and a tombstone
+	 * (`goal: null`) is a current entry: a cleared Goal therefore stays cleared on
 	 * the branch that cleared it, no matter how many older snapshots of it the
-	 * same branch still contains. An entry that is not a recognizable snapshot
-	 * (unknown version, wrong shape, unknown status) is skipped rather than
-	 * trusted, so a corrupt line never decides the session's Goal state.
+	 * same branch still contains. A snapshot marked `superseded` is a finalized
+	 * historical record of a replaced identity: it is valid and replayable, but it
+	 * never wins, so a freeze that landed after the replacement's own snapshot
+	 * cannot resurrect the identity the user replaced. An entry that is not a
+	 * recognizable snapshot (unknown version, wrong shape, unknown status) is
+	 * skipped rather than trusted, so a corrupt line never decides the session's
+	 * Goal state.
 	 *
 	 * Returns the reconstructed state so the caller can observe what changed;
 	 * never throws for bad entry data (reconstruction failures are logged and
@@ -337,20 +351,31 @@ export class GoalStore {
 			return null;
 		}
 
-		// The newest `goal-state` entry controls the branch. Scan to the end so a
+		// The newest *current* `goal-state` entry controls the branch. Scan to the end so a
 		// malformed or unrecognized *latest* entry can be told apart from an older
-		// invalid one: only the latest may fail the branch closed.
-		let baselineIndex = -1;
+		// invalid one: only the latest may fail the branch closed. A snapshot marked
+		// `superseded` is a finalized historical record of an identity that has been
+		// replaced; it is valid and replayable, but it must never become the current
+		// Goal, so the newest non-superseded snapshot is the baseline. That is what
+		// keeps a crash between the historical freeze and the next durable write from
+		// resurrecting the superseded identity.
+		let latestIndex = -1;
 		let latest: unknown;
+		let baselineIndex = -1;
+		let baseline: GoalSnapshot | undefined;
 		for (let index = 0; index < branch.length; index++) {
 			const entry = branch[index]!;
 			if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
-				baselineIndex = index;
+				latestIndex = index;
 				latest = entry.data;
+				if (isGoalSnapshot(entry.data) && entry.data.superseded !== true) {
+					baselineIndex = index;
+					baseline = entry.data;
+				}
 			}
 		}
 
-		if (baselineIndex === -1) {
+		if (latestIndex === -1) {
 			this.resetRuntimeState();
 			return null;
 		}
@@ -368,15 +393,21 @@ export class GoalStore {
 			return null;
 		}
 
-		const snapshot = latest as GoalSnapshot;
-		if (snapshot.goal === null) {
+		const latestSnapshot = latest as GoalSnapshot;
+		if (latestSnapshot.goal === null) {
 			// A tombstone is a valid newest entry: the branch has no current Goal.
 			this.resetRuntimeState();
 			return null;
 		}
+		if (!baseline || baseline.goal === null) {
+			// Only historical superseded snapshots (possibly followed by a tombstone)
+			// exist, so there is no current Goal.
+			this.resetRuntimeState();
+			return null;
+		}
 
-		const goal = copyRecord(withSanitizedAudit(snapshot.goal));
-		const repaired = snapshot.repaired === true || this.hasCutover(branch, goal.id);
+		const goal = copyRecord(withSanitizedAudit(baseline.goal));
+		const repaired = baseline.repaired === true || this.hasCutover(branch, goal.id);
 		this.current = goal;
 		this.supersededTail = null;
 		this.pendingTransition = undefined;
@@ -398,7 +429,12 @@ export class GoalStore {
 		// the same line. Without this, an unclean restart would reclassify the
 		// post-completion response as Goal usage and inflate the total.
 		if (goal.status !== "complete") {
-			this.replayBranch(branch, baselineIndex, repaired ? "repaired" : "legacy");
+			const replay = this.replayBranch(branch, baselineIndex, repaired ? "repaired" : "legacy");
+			// A hard crash can leave the superseded identity's in-flight tail on the
+			// branch after the replacement snapshot, with no freeze boundary yet. The
+			// replay rebuilds that tail into a superseded record so the live view and a
+			// reload converge on the old identity's total instead of dropping it.
+			if (replay.superseded) this.supersededTail = replay.superseded;
 			// The replay may have adopted a checkpoint's accounted active time, so the
 			// clock resumes from the newest durable value rather than the snapshot's.
 			this.clock.persisted(this.ledger.usage.activeMs);
@@ -413,6 +449,22 @@ export class GoalStore {
 			if (repaired) this.convergeBudgetStop();
 		}
 		this.applyBranchOwnership(branch, baselineIndex);
+		// A superseded segment that is still open at the end of the branch is the live
+		// replacement's ownership too: commit() kept the old admission open, and no
+		// delivered user message has closed it yet. `currentOwnerId()` then reads as no
+		// current owner, so a turn started now is not bound to the replacement, while
+		// unbound reports follow the old open segment.
+		//
+		// Only while the replacement has no open segment of its own, though: a branch
+		// whose newest work message belongs to the replacement (its kickoff was
+		// delivered, and only the freeze write failed) keeps that segment, because that
+		// is what the live path holds. Claiming the old identity here would rebind the
+		// replacement's own turns — and its unbound tool results — to a Goal that was
+		// already replaced.
+		if (this.supersededTail?.open && !(this.goalOwned && this.ownerId === this.current?.id)) {
+			this.goalOwned = true;
+			this.ownerId = this.supersededTail.record.id;
+		}
 		if (this.current?.status === "active") this.clock.start();
 		return this.current;
 	}
@@ -519,57 +571,159 @@ export class GoalStore {
 		branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>,
 		afterIndex: number,
 		mode: "legacy" | "repaired",
-	): void {
+	): {
+		superseded: { record: GoalRecord; ledger: UsageLedger; open: boolean; dirty: boolean } | null;
+	} {
 		// The identity whose snapshot most recently preceded the entries being walked.
 		// A work message opens the segment for that identity, so an entry appended after
 		// a replacement snapshot is only ever charged once the replacement's own work
 		// message has been delivered.
 		let snapshotGoalId: string | null = null;
 		let segmentOwner: string | null = null;
+		// The most recent snapshot record, used to seed the superseded identity's ledger
+		// when a replacement snapshot arrives while its segment is still open.
+		let previousSnapshotRecord: GoalRecord | null = null;
+		let supersededRecord: GoalRecord | null = null;
+		let supersededLedger: UsageLedger | null = null;
+		let supersededOpen = false;
+		let supersededDirty = false;
 		for (let index = 0; index < branch.length; index++) {
 			const entry = branch[index]!;
 			const marker = ownershipMarker(entry);
 			if (marker.kind === "goal-work") segmentOwner = snapshotGoalId;
-			else if (marker.kind === "ordinary-user") segmentOwner = null;
+			else if (marker.kind === "ordinary-user") {
+				segmentOwner = null;
+				// A delivered user message is the freeze boundary: live accounting has
+				// already closed the old admission, so replay closes it too. The durable
+				// frozen snapshot normally already records the tail; if a crash lost that
+				// write, the recovered tail stays dirty for the next boundary to persist.
+				supersededOpen = false;
+			}
 			if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
 				const snapshot = entry.data as GoalSnapshot | undefined;
-				const goalId: string | null = isGoalSnapshot(snapshot)
-					? (snapshot.goal?.id ?? null)
-					: snapshotGoalId;
-				if (goalId !== snapshotGoalId) {
-					// A new identity (or a tombstone) supersedes the previous one's segment.
+				if (snapshot?.superseded === true) {
+					// A finalized historical freeze closes the superseded identity's
+					// admission without changing which identity is current. It is never
+					// selected as the baseline, so it cannot resurrect the old Goal.
+					supersededOpen = false;
 					segmentOwner = null;
+					if (
+						supersededRecord &&
+						supersededLedger &&
+						snapshot.goal != null &&
+						snapshot.goal.id === supersededRecord.id
+					) {
+						// The freeze is already durable, so adopt it instead of re-deriving the
+						// tail from the entries before it. Without this, every reload of a
+						// branch that had a replacement would report the recovered tail as
+						// still unwritten and append the same historical snapshot again.
+						supersededRecord = copyRecord(withSanitizedAudit(snapshot.goal));
+						supersededLedger.restore(normalizeUsage(snapshot.goal.usage));
+						supersededDirty = false;
+					}
+					continue;
+				}
+				if (!isGoalSnapshot(snapshot)) continue;
+				const goalId: string | null = snapshot.goal?.id ?? null;
+				if (goalId !== snapshotGoalId) {
+					if (goalId === null) {
+						// A tombstone ends every admission and leaves no current Goal.
+						supersededOpen = false;
+						segmentOwner = null;
+					} else if (
+						mode === "repaired" &&
+						segmentOwner !== null &&
+						segmentOwner !== goalId &&
+						previousSnapshotRecord?.id === segmentOwner &&
+						previousSnapshotRecord.status !== "complete"
+					) {
+						// The old identity's admission was still open when the replacement
+						// committed. Its already-accounted totals are the last snapshot for
+						// that identity; the entries that follow the replacement snapshot
+						// until the next delivered user message are its in-flight tail.
+						supersededRecord = copyRecord(previousSnapshotRecord);
+						supersededLedger = new UsageLedger(normalizeUsage(previousSnapshotRecord.usage));
+						supersededOpen = true;
+						supersededDirty = false;
+					}
+					if (segmentOwner === goalId) segmentOwner = null;
 					snapshotGoalId = goalId;
 				}
+				previousSnapshotRecord = snapshot.goal
+					? copyRecord(withSanitizedAudit(snapshot.goal))
+					: null;
 			}
 			if (index <= afterIndex) continue;
 			if (entry.type === "custom") {
 				if (entry.customType !== USAGE_ENTRY_TYPE) continue;
 				const checkpoint = entry.data as UsageCheckpoint | undefined;
 				if (!isUsageCheckpoint(checkpoint)) continue;
-				// A checkpoint only counts for the Goal it was written for; every
-				// checkpoint here is already after the baseline snapshot.
+				// A checkpoint only counts for the Goal it was written for.
+				if (supersededRecord && supersededLedger && checkpoint.goalId === supersededRecord.id) {
+					this.applyCheckpointTo(supersededLedger, checkpoint);
+					supersededRecord.usage = supersededLedger.usage;
+					supersededDirty = true;
+					if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
+					continue;
+				}
 				if (checkpoint.goalId !== this.current?.id) continue;
 				this.applyCheckpoint(checkpoint);
 				continue;
 			}
-			if (mode === "repaired" && segmentOwner !== this.current?.id) continue;
+			const superseded =
+				supersededRecord != null && supersededLedger != null && segmentOwner === supersededRecord.id;
+			if (mode === "repaired" && !superseded && segmentOwner !== this.current?.id) continue;
 			if (entry.type === "message") {
 				const message = entry.message;
 				if (message.role === "assistant") {
-					this.ledger.account(entry.id, message.usage, "model");
+					if (superseded && supersededLedger && supersededRecord) {
+						if (supersededLedger.account(entry.id, message.usage, "model")) {
+							supersededRecord.usage = supersededLedger.usage;
+							supersededDirty = true;
+							if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
+						}
+					} else {
+						this.ledger.account(entry.id, message.usage, "model");
+					}
 				} else if (message.role === "toolResult") {
 					// Nested usage arrives merged into the tool result's own `usage`,
 					// so charging the result once is what keeps it from being counted
 					// twice.
-					this.ledger.account(`toolResult:${message.toolCallId}`, message.usage, "nested");
+					if (superseded && supersededLedger && supersededRecord) {
+						if (supersededLedger.account(`toolResult:${message.toolCallId}`, message.usage, "nested")) {
+							supersededRecord.usage = supersededLedger.usage;
+							supersededDirty = true;
+							if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
+						}
+					} else {
+						this.ledger.account(`toolResult:${message.toolCallId}`, message.usage, "nested");
+					}
 				}
 				continue;
 			}
 			if (entry.type !== "compaction" && entry.type !== "branch_summary") continue;
 			if (!entry.usage) continue;
-			this.ledger.account(entry.id, entry.usage, "nested");
+			if (superseded && supersededLedger && supersededRecord) {
+				if (supersededLedger.account(entry.id, entry.usage, "nested")) {
+					supersededRecord.usage = supersededLedger.usage;
+					supersededDirty = true;
+					if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
+				}
+			} else {
+				this.ledger.account(entry.id, entry.usage, "nested");
+			}
 		}
+		if (!supersededRecord || !supersededLedger || (!supersededOpen && !supersededDirty)) {
+			return { superseded: null };
+		}
+		return {
+			superseded: {
+				record: supersededRecord,
+				ledger: supersededLedger,
+				open: supersededOpen,
+				dirty: supersededDirty,
+			},
+		};
 	}
 
 	/**
@@ -585,18 +739,23 @@ export class GoalStore {
 	 * undercount falls through to the replay.
 	 */
 	private applyCheckpoint(checkpoint: UsageCheckpoint): void {
+		this.applyCheckpointTo(this.ledger, checkpoint);
+	}
+
+	/** Adopt a checkpoint onto any ledger using the same undercount rule. */
+	private applyCheckpointTo(ledger: UsageLedger, checkpoint: UsageCheckpoint): void {
 		const checkpointUsage = normalizeUsage(checkpoint.usage);
-		const replayed = this.ledger.usage;
+		const replayed = ledger.usage;
 		if (checkpointUsage.totalTokens < replayed.totalTokens) {
 			// Undercount: keep the replayed tokens, and keep the checkpoint's active
 			// time, which is the one thing the branch cannot reconstruct.
-			this.ledger.restore({
+			ledger.restore({
 				...replayed,
 				activeMs: Math.max(replayed.activeMs, checkpointUsage.activeMs),
 			});
 			return;
 		}
-		this.ledger.restore(checkpointUsage);
+		ledger.restore(checkpointUsage);
 	}
 
 	/** Current record, or undefined when not yet reconstructed. */
@@ -672,6 +831,23 @@ export class GoalStore {
 	}
 
 	/**
+	 * Append a finalized historical snapshot of a superseded identity.
+	 *
+	 * The `superseded` marker is what makes this single append crash-safe:
+	 * reconstruction skips a superseded snapshot when it chooses the current Goal, so
+	 * a crash immediately after this append still reconstructs the replacement from
+	 * its own snapshot. There is no second append to lose, and therefore no window in
+	 * which the newest `goal-state` entry is a replaced identity that would be read as
+	 * current.
+	 */
+	private persistSupersededSnapshot(pi: ExtensionAPI, goal: GoalRecord): void {
+		pi.appendEntry(
+			CUSTOM_ENTRY_TYPE,
+			{ version: 1, repaired: true, superseded: true, goal: copyRecord(goal) } satisfies GoalSnapshot,
+		);
+	}
+
+	/**
 	 * Adopt a *copy* of `goal` as the live record, for the same reason
 	 * `persistSnapshot` copies: one object must never be both the live record and a
 	 * persisted entry.
@@ -713,7 +889,12 @@ export class GoalStore {
 					continue;
 				}
 				const custom = entry as { customType?: string; data?: GoalSnapshot };
-				if (custom?.customType === CUSTOM_ENTRY_TYPE) lastGoal = custom.data?.goal ?? undefined;
+				if (custom?.customType !== CUSTOM_ENTRY_TYPE) continue;
+				// A finalized superseded snapshot is history, not the current Goal: a
+				// durability check for the replacement must not be defeated by the old
+				// identity's freeze landing after the replacement snapshot.
+				if (custom.data?.superseded === true) continue;
+				lastGoal = custom.data?.goal ?? undefined;
 			}
 			return lastGoal?.id === goalId;
 		} catch {
@@ -721,23 +902,29 @@ export class GoalStore {
 		}
 	}
 
-
 	/**
-	 * Persist the current Goal's already-accounted totals as a durable historical
-	 * snapshot before replacement commits a new identity, and keep the old
-	 * identity's admission open for its in-flight tail.
+	 * Persist the current Goal's already-accounted totals as a durable snapshot
+	 * before replacement commits a new identity, and keep the old identity's
+	 * admission open for its in-flight tail.
 	 *
 	 * The frozen record preserves the superseded Goal's accounted usage on its own
 	 * branch history without changing the live ledger: the replacement still resets
-	 * accounting for the new Goal. The old identity's segment stays open past
-	 * `commit()` when it was open here, so a response or tool result still in flight
-	 * is charged to the old identity and frozen onto a superseded snapshot by
+	 * accounting for the new Goal. It is a *current* snapshot, not a historical one,
+	 * because it is what a crash between this write and the replacement's own snapshot
+	 * must reconstruct from. The old identity's segment stays open past `commit()` when
+	 * it was open here, so a response or tool result still in flight is charged to the
+	 * old identity and frozen onto a superseded snapshot by
 	 * {@link closeSupersededSegment} instead of being dropped or charged to the
 	 * replacement.
 	 */
 	preserveSupersededForReplacement(pi: ExtensionAPI): void {
 		const current = this.current;
 		if (!current) return;
+		// A still-open previous tail must be frozen *before* this replacement's
+		// already-accounted snapshot overwrites it. The tail belongs to the identity
+		// that was replaced first; dropping it here would lose work the old identity
+		// had already admitted.
+		this.closeSupersededSegment(pi);
 		const usage = this.liveUsage();
 		const record = { ...copyRecord(current), usage };
 		this.persistSnapshot(pi, record);
@@ -751,30 +938,42 @@ export class GoalStore {
 	}
 
 	/**
-	 * Freeze the superseded identity's in-flight tail onto a durable snapshot and
-	 * re-affirm the replacement as the newest snapshot.
+	 * Freeze the superseded identity's in-flight tail onto a durable historical
+	 * snapshot and return that record, or `null` when there is nothing to freeze or
+	 * the write failed.
 	 *
-	 * Called when the next user message is delivered, which is the boundary that
-	 * closes the old admission. The old identity's tail is written as a superseded
-	 * `goal-state` snapshot; the replacement is then re-affirmed so it stays the
-	 * newest snapshot and therefore the current Goal. Nothing is written when the old
-	 * segment was never open or collected no tail, so an idle replacement does not
-	 * grow the snapshot log.
+	 * Called when the next user message is delivered, at shutdown, and before Clear, a
+	 * second replacement, or a durability-rollback restore — every boundary that would
+	 * otherwise discard the old identity's already-admitted work.
+	 *
+	 * The snapshot is marked `superseded`, so it can never become the current Goal on
+	 * reconstruction even if the process dies immediately after this append. There is
+	 * no separate re-affirmation of the replacement to lose: the replacement's own
+	 * snapshot is already the newest non-superseded entry. A write failure leaves the
+	 * tail dirty for the next boundary instead of dropping it, and does not throw into
+	 * the event handler that called it.
 	 */
-	closeSupersededSegment(pi: ExtensionAPI): void {
+	closeSupersededSegment(pi: ExtensionAPI): GoalRecord | null {
 		const superseded = this.supersededTail;
-		if (!superseded) return;
-		this.supersededTail = null;
-		if (!this.current || !superseded.open) return;
+		if (!superseded) return null;
 		const record = superseded.record;
 		record.usage = { ...superseded.ledger.usage };
-		if (!superseded.dirty) return;
+		if (!superseded.dirty) {
+			// Nothing new to write: the earlier superseded snapshot already carries this
+			// identity's totals. Closing an idle tail must not grow the snapshot log.
+			this.supersededTail = null;
+			return record;
+		}
 		this.refreshUsage();
-		this.persistSnapshot(pi, record);
-		// The replacement must remain the newest snapshot: re-affirm it immediately
-		// after the superseded record so reconstruction still selects the new Goal.
-		this.persistSnapshot(pi, this.current);
-		this.pendingTransition = undefined;
+		try {
+			this.persistSupersededSnapshot(pi, record);
+		} catch {
+			// Keep the tail for the next boundary. Losing it would drop work that was
+			// already admitted for the superseded identity.
+			return null;
+		}
+		this.supersededTail = null;
+		return record;
 	}
 
 	/** Make a staged Goal visible to /goal and get_goal. */
@@ -804,19 +1003,6 @@ export class GoalStore {
 		if (goal.status === "active") this.clock.start();
 	}
 
-	/**
-	 * Charge one usage report exactly once, and only when it is Goal-owned work.
-	 *
-	 * `key` is the identity the accounting path guarantees: a sequence number for an
-	 * assistant message, `toolResult:<toolCallId>` for tool-performed nested work, or
-	 * the session entry id of a summarization entry. Returns the contribution when
-	 * the key was new.
-	 *
-	 * Ownership is the load-bearing guard: an ordinary prompt, a creation control,
-	 * a pre-creation response, or an unrelated same-batch tool result is never
-	 * charged, whatever the Goal's status. Completion stays terminal for accounting
-	 * on both the live path and the replay, so nothing after it is charged either.
-	 */
 	/**
 	 * Charge one usage report exactly once, and only when it is Goal-owned work.
 	 *
@@ -897,13 +1083,22 @@ export class GoalStore {
 	private refreshSupersededBudget(): void {
 		const superseded = this.supersededTail;
 		if (!superseded) return;
-		const record = superseded.record;
-		if (record.status !== "active") return;
-		if (!isBudgetExhausted(record.tokenBudget, superseded.ledger.usage.totalTokens)) return;
+		if (this.refreshSupersededRecord(superseded.record, superseded.ledger)) {
+			superseded.dirty = true;
+		}
+	}
+
+	/**
+	 * Record budget exhaustion on a superseded identity's record, returning whether
+	 * it changed. Used both by the live tail and by replay reconstruction.
+	 */
+	private refreshSupersededRecord(record: GoalRecord, ledger: UsageLedger): boolean {
+		if (record.status !== "active") return false;
+		if (!isBudgetExhausted(record.tokenBudget, ledger.usage.totalTokens)) return false;
 		record.status = "budget_limited";
 		record.updatedAt = Date.now();
 		record.revision += 1;
-		superseded.dirty = true;
+		return true;
 	}
 
 	/** Mark the current run/segment as Goal-owned work for `goalId`. */
@@ -1087,6 +1282,10 @@ export class GoalStore {
 	 * left to carry and no transition left waiting.
 	 */
 	private commitTombstone(pi: ExtensionAPI): GoalMutationResult {
+		// The superseded identity's tail belongs to that identity, not to the Goal being
+		// cleared. Freeze it before the tombstone so Clear cannot drop already-admitted
+		// work. The superseded snapshot is historical and can never become current.
+		this.closeSupersededSegment(pi);
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
 		} catch (error) {
@@ -1684,7 +1883,26 @@ export class GoalStore {
 	 * rebuilt from it rather than from the discarded replacement.
 	 */
 	restore(pi: ExtensionAPI, previous: GoalRecord): GoalMutationResult {
-		const record: GoalRecord = { ...previous };
+		let record: GoalRecord = { ...previous };
+		// A replacement whose durability could not be confirmed may still have the old
+		// identity's in-flight tail open. Freeze that tail before restoring: the tail
+		// belongs to the identity being restored, and dropping it here would lose work
+		// that was already admitted and sits before the restored snapshot.
+		const superseded = this.supersededTail;
+		if (superseded) {
+			const frozen = this.closeSupersededSegment(pi);
+			if (frozen && frozen.id === previous.id) {
+				record = frozen;
+			} else if (!frozen && superseded.record.id === previous.id) {
+				// The freeze write failed. Keep the tail on the restored record rather than
+				// dropping it; the next durable write will carry it.
+				record = {
+					...record,
+					usage: { ...superseded.ledger.usage },
+					...(superseded.record.status === "budget_limited" ? { status: "budget_limited" as const } : {}),
+				};
+			}
+		}
 		try {
 			this.persistSnapshot(pi, record);
 		} catch (error) {

@@ -168,7 +168,8 @@ export interface GoalSnapshot {
 	version: 1;
 	/**
 	 * Full Goal record, or `null` for a durable tombstone (clearing a Goal).
-	 * The last goal-state entry on the active branch wins.
+	 * The last *current* goal-state entry on the active branch wins; an entry
+	 * marked `superseded` never does.
 	 */
 	goal: GoalRecord | null;
 	/**
@@ -177,6 +178,14 @@ export interface GoalSnapshot {
 	 * work must be attributed under the repaired rules after a one-time cutover.
 	 */
 	repaired?: boolean;
+	/**
+	 * True for a finalized historical snapshot of a superseded identity. It is
+	 * loadable and replayable, but never selects the current Goal: reconstruction
+	 * falls back to the newest non-superseded snapshot, so a crash immediately after
+	 * this append still reconstructs the replacement and cannot resurrect the
+	 * replaced identity.
+	 */
+	superseded?: boolean;
 }
 
 export const CUSTOM_ENTRY_TYPE = "goal-state";

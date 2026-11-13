@@ -43,6 +43,23 @@ function goalSnapshots(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
+/**
+ * The newest *current* goal-state snapshot: the one that selects the session's Goal.
+ *
+ * A snapshot marked `superseded` is a finalized historical record of a replaced
+ * identity. It is valid and replayable, but it never becomes the current Goal, so
+ * the newest goal-state entry on the branch is not necessarily this one.
+ */
+function currentGoalSnapshot(entries) {
+	let snapshot;
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
+			snapshot = entry;
+		}
+	}
+	return snapshot;
+}
+
 function submitCommand(session, id, message) {
 	const responsePromise = session.waitFor(
 		`response for ${id}`,
@@ -85,6 +102,52 @@ async function abortActiveLoop(session, runs) {
 	);
 	await session.sendSimple("abort");
 	return session.waitForSettled(1);
+}
+
+/**
+ * Read a session file, ignoring a line Pi is still writing.
+ *
+ * A crash test kills the process at an exact branch position, so it has to observe
+ * the file as it is rather than assume a complete last line.
+ */
+function readBranchEntries(file) {
+	const entries = [];
+	for (const line of readFileSync(file, "utf8").split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			entries.push(JSON.parse(line));
+		} catch {
+			// A partially written line is not an entry yet.
+		}
+	}
+	return entries;
+}
+
+/**
+ * Wait until the session file holds an entry matching `predicate`, and return the
+ * branch *up to and including it*.
+ *
+ * A crash test needs an exact branch position, and Pi keeps appending while the
+ * poll runs, so the prefix is cut at the matching entry rather than taken as the
+ * whole file.
+ */
+async function waitForBranchEntry(file, predicate, description) {
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		let entries;
+		try {
+			entries = readBranchEntries(file);
+		} catch (error) {
+			// Pi defers creating the session file until the first user/assistant
+			// message, so the path can be reported before it exists.
+			if (error.code !== "ENOENT") throw error;
+			entries = [];
+		}
+		const index = entries.findIndex(predicate);
+		if (index !== -1) return entries.slice(0, index + 1);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`Timed out waiting for ${description}`);
 }
 
 /**
@@ -139,6 +202,7 @@ async function reportStatus(session, matcher = /Token usage/) {
 		return match[1];
 	};
 	return {
+		goalId: one(/^Goal (\S+) — /),
 		status: one(/^Goal \S+ — (\S+)/),
 		totalTokens: Number(one(/Token usage: (\d+) tokens/)),
 		nestedTokens: Number(one(/nested (\d+) counted once/)),
@@ -258,10 +322,12 @@ test("a Replacement Goal starts at zero and never inherits the old identity's us
 		const status = await reportStatus(session);
 		assert.equal(status.status, "active");
 		assert.equal(status.totalTokens, 37, "the replacement starts at zero and inherits nothing");
-		assert.notEqual(
-			lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.id,
-			original.id,
-		);
+		// The newest *current* snapshot is the replacement. The newest goal-state entry
+		// may be the old identity's finalized historical record: it is marked
+		// superseded, so it never selects the current Goal.
+		const current = currentGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(current.id, status.goalId);
+		assert.notEqual(current.id, original.id);
 		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -428,13 +494,18 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 
 		// The old identity's in-flight assistant response (110) and nested tool result
 		// (50) are frozen onto its superseded snapshot, at exact totals.
-		const oldSnapshots = goalSnapshots(readSessionEntries(await session.sessionFile())).filter(
-			(e) => e.data.goal?.id === original.id,
-		);
+		const liveFile = await session.sessionFile();
+		const liveStates = goalSnapshots(readSessionEntries(liveFile));
+		const oldSnapshots = liveStates.filter((e) => e.data.goal?.id === original.id);
 		const finalized = oldSnapshots.at(-1);
 		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
 		assert.equal(finalized.data.goal.usage.nestedTokens, 50);
 		assert.equal(finalized.data.goal.status, "active");
+		// The freeze is a single append and the newest goal-state entry on the branch.
+		// There is no re-affirmation to lose: the superseded marker is what keeps this
+		// historical record from becoming the current Goal.
+		assert.equal(liveStates.at(-1).data.goal.id, original.id);
+		assert.equal(liveStates.at(-1).data.superseded, true);
 
 		// A fresh process reconstructs from the branch. The old tail must stay on the
 		// old identity's durable record and must not be charged to the replacement.
@@ -455,6 +526,13 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 				"the old identity's durable total survives reload",
 			);
 			assert.equal(reloadedOld.data.goal.status, "active");
+			// The reload neither re-affirms the replacement nor rewrites the historical
+			// snapshot: the tail it recovers is already durable.
+			assert.equal(
+				goalSnapshots(readSessionEntries(await resumed.sessionFile())).length,
+				liveStates.length,
+				"the reload appends no snapshot of its own",
+			);
 			assertStepsConsumed(resumed, 0, []);
 			assert.equal(resumed.extensionErrors().length, 0);
 		} finally {
@@ -560,6 +638,120 @@ test("old-budget exhaustion is recorded on the superseded identity and admits no
 		rmSync(workDir, { recursive: true, force: true });
 		rmSync(sessionDir, { recursive: true, force: true });
 	}
+});
+
+test("a hard crash between the old identity's tail and its freeze boundary recovers the tail on reload", async () => {
+	// The crash window: the process dies after the old identity's in-flight response and
+	// its nested tool result landed, but before any freeze boundary ran. The branch that
+	// leaves behind carries the tail with no historical snapshot after it, so the next
+	// load has to recover the tail from the branch instead of dropping work the live
+	// path had already charged to the superseded identity.
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
+	const session = await PiRpcSession.start({
+		cwd: workDir,
+		sessionDir,
+		extraExtensions: [NESTED_EXTENSION],
+	});
+	const gate = join(workDir, "provider-gate");
+	script(
+		[
+			{
+				toolCalls: [{ name: NESTED_OUTER_TOOL, args: {} }],
+				waitForFile: gate,
+				usage: { input: 100, output: 10 },
+			},
+			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
+			{ hang: true },
+		],
+		session,
+	);
+	let crashEntries;
+	let crashFile;
+	let original;
+	try {
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await waitForTurns(session, 1);
+		original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+
+		const replacePromise = submitCommand(session, "replace-crash", "/goal A replacement objective");
+		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
+		assert.equal((await replacePromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+
+		// Release the old response: it is finalized *after* the replacement snapshot,
+		// and its nested tool result lands after that.
+		writeFileSync(gate, "", "utf8");
+		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
+
+		// Pi emits the tool-execution record before it appends the tool result, so wait
+		// for the entry itself to be on the branch before dying.
+		crashFile = await session.sessionFile();
+		crashEntries = await waitForBranchEntry(
+			crashFile,
+			(entry) => entry.type === "message" && entry.message?.role === "toolResult",
+			"the old identity's tool result on the branch",
+		);
+
+		// Die here — before the replacement's kickoff is delivered, and therefore before
+		// any freeze boundary could have run.
+		session.killNow();
+		await session.waitForExit();
+	} finally {
+		await session.stop();
+	}
+
+	// The branch the crash leaves: everything through the old identity's tool result.
+	// A checkpoint, the freeze, and the steered kickoff all come after it, so keeping
+	// this prefix is exactly the state a SIGKILL at that point produces.
+	const crashGoalStates = crashEntries.filter(
+		(entry) => entry.type === "custom" && entry.customType === "goal-state",
+	);
+	assert.ok(crashEntries.length > 1, "the old identity's tool result is on the branch");
+	assert.equal(
+		crashEntries.at(-1).message.role,
+		"toolResult",
+		"the crash position is the old identity's nested tool result",
+	);
+	assert.equal(
+		crashGoalStates.filter((entry) => entry.data.superseded === true).length,
+		0,
+		"no freeze boundary ran before the crash",
+	);
+
+	const dir = mkdtempSync(join(tmpdir(), "pi-goal-reload-"));
+	const copy = join(dir, basename(crashFile));
+	writeFileSync(copy, crashEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+
+	const resumed = await PiRpcSession.start({ sessionFile: copy, cwd: workDir });
+	script([{ text: "Never requested." }, { hang: true }], resumed);
+	try {
+		await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
+		const restored = await reportStatus(resumed);
+		assert.equal(restored.status, "active");
+		assert.equal(restored.totalTokens, 0, "the replacement is not charged for the old identity's tail");
+
+		// The recovered tail is frozen at the first durable boundary of this runtime.
+		const resumedEntries = readSessionEntries(await resumed.sessionFile());
+		const frozen = goalSnapshots(resumedEntries).filter((entry) => entry.data.superseded === true);
+		assert.equal(frozen.length, 1, "exactly one historical snapshot is recovered from the branch");
+		assert.equal(frozen[0].data.goal.id, original.id, "the tail stays with the identity that was replaced");
+		assert.equal(frozen[0].data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
+		assert.equal(frozen[0].data.goal.usage.nestedTokens, 50);
+		assert.equal(
+			resumedEntries.filter((entry) => entry.type === "custom" && entry.customType === "goal-state").length,
+			crashGoalStates.length + 1,
+			"the reload appends the recovered freeze and nothing else",
+		);
+		assertStepsConsumed(resumed, 0, []);
+		assert.equal(resumed.extensionErrors().length, 0, JSON.stringify(resumed.extensionErrors()));
+	} finally {
+		await resumed.stop();
+		rmSync(dir, { recursive: true, force: true });
+	}
+	rmSync(workDir, { recursive: true, force: true });
+	rmSync(sessionDir, { recursive: true, force: true });
 });
 
 test("an ordinary prompt typed during an admitted Goal response stays attributed and converges", async () => {

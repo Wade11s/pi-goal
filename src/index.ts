@@ -393,6 +393,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
+		// A hard crash can leave the superseded identity's in-flight tail on the branch
+		// with no freeze boundary after it. Reconstruction recovers that tail into
+		// memory; freezing it now makes the reload converge durably with the live path
+		// rather than waiting for another boundary that a later crash could lose.
+		store.closeSupersededSegment(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
 		// Runtime-only counters must not survive into a new runtime; the durable
@@ -515,6 +520,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => {
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
+		// A tail recovered from the selected branch belongs to an identity that is no
+		// longer current. Freeze it at this durable boundary so the branch records the
+		// old identity's already-admitted work instead of leaving it for a later crash
+		// to lose.
+		store.closeSupersededSegment(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
 		notifyBranchChange(ctx, before, after);
