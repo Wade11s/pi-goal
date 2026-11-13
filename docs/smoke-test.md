@@ -166,21 +166,38 @@ warning notification, exactly one bounded wrap-up summary, and the status
 indicator showing `budget_limited`. Budget exhaustion is never reported as
 completion.
 
-A `budget_limited` Goal is resumed only by raising its cumulative ceiling:
+A `budget_limited` Goal is resumed only by raising its cumulative ceiling. Run
+the commands below in order, while the Goal is still `budget_limited`:
 
 ```
 /goal resume
-/goal resume --budget 500
-/goal resume --budget=250
+/goal resume --budget 1
+/goal resume --budget=500
 ```
 
-- The bare resume is refused with guidance to supply a new total.
-- `--budget 500` raises the absolute ceiling to 500 tokens. `/goal` shows the
-  full prior usage still accounted against it (never reset or discounted).
-- A value at or below the current usage is refused (no positive headroom), and a
-  value above the configured `goal.maxTokenBudget` is refused, never clamped.
+- The bare resume is refused with guidance to supply a new total
+  (`/goal resume --budget <new-total>`).
+- A value at or below the current usage is refused with the no-positive-headroom
+  reason, and the Goal stays `budget_limited`. `--budget 1` is always such a
+  value here: the Goal was created with `--budget 1`, so its usage has already
+  reached that total.
+- A value above the configured `goal.maxTokenBudget` is refused, never clamped,
+  and the Goal also stays `budget_limited`. With `"maxTokenBudget": 100000` set
+  in Pi settings, `/goal resume --budget=200000` shows the refusal; without a
+  configured maximum no raise is refused on that ground.
+- `--budget=500` — the `=` spelling, on a still-`budget_limited` Goal — is the
+  successful raise. It sets the absolute ceiling to 500 tokens and the Goal
+  becomes `active`. `/goal` shows the full prior usage still accounted against
+  the new ceiling (never reset or discounted).
+- A further `--budget` after a successful raise (for example `--budget=250`
+  tried out of habit) is refused for status, not for headroom or maximum:
+  "the `--budget` option only resumes a budget_limited Goal". Use a bare
+  `/goal resume`, which reports the Goal already active, or let the resumed work
+  exhaust the new ceiling first so the Goal is `budget_limited` again.
 - The pending old-episode wrap-up is cancelled by a valid raise. If the resumed
-  work later exhausts the new ceiling, exactly one fresh wrap-up is delivered.
+  work later exhausts the new ceiling, the Goal is `budget_limited` again and
+  another raise — either spelling — resumes it; exactly one fresh wrap-up is
+  delivered for that new exhaustion episode.
 - `/goal edit <objective>` without a resume preserves `budget_limited` and does
   not cancel an owed wrap-up; edit first, then resume with the new budget.
 
