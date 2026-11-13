@@ -27,6 +27,7 @@ Pull requests are reviewed through `rex-subagent` by this reviewer pool, using h
 | --- |
 | `magpie/workbuddy/deepseek-v4.1-flash:high` |
 | `magpie/workbuddy/hy4free:high` |
+| `magpie/zcode/GLM-5.3:max` |
 
 The orchestrator dispatches reviews, routes requested changes back to the implementation worker, and verifies the resulting updates.
 
