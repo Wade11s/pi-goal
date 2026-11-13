@@ -23,6 +23,11 @@ persisted entries.
 | Ordinary prompts excluded in every status | Paused/blocked/usage-limited/budget-limited/complete ordinary runs add nothing | `test/goal9-ownership.test.mjs` ("an ordinary prompt while a Goal is paused…"); `test/goal6.test.mjs` (budget/complete accounting tests) |
 | Replacement starts at zero | Old identity keeps its admitted work; new identity inherits nothing | `test/goal9-ownership.test.mjs` ("a Replacement Goal starts at zero…"; "a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("the superseded snapshot carries the exact already-accounted totals") |
 | Old in-flight tail | The old identity's in-flight assistant response and tool results stay attributed to it, live and on replay | `test/goal9-ownership.test.mjs` ("a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("a replacement attributes the superseded identity's in-flight assistant and tool-result tail") |
+| Tail survives every boundary | Clear, a second replacement, and a durability-rollback restore freeze the open tail instead of dropping it | `test/goal9-store.test.mjs` ("Clear freezes the superseded identity's open tail before the tombstone"; "a second replacement freezes the first identity's open tail before the second preserve"; "a durability rollback restores the old identity together with its open tail") |
+| Freeze is crash-safe | One append, marked `superseded`, so a crash right after it cannot resurrect the replaced Goal, and a failed write keeps the tail | `test/goal9-store.test.mjs` ("a crash right after the freeze append never resurrects the superseded Goal"; "a failed freeze write keeps the tail for the next boundary") |
+| Hard-crash recovery | A branch whose freeze boundary never ran recovers the tail on the next load and freezes it there | `test/goal9-ownership.test.mjs` ("a hard crash between the old identity's tail and its freeze boundary recovers the tail on reload"); `test/goal9-store.test.mjs` ("a hard crash between the old tail and its freeze boundary recovers the tail on the next load") |
+| Superseded never current | A superseded snapshot is loadable and replayable but never selects the current Goal, alone or after a tombstone | `test/goal9-store.test.mjs` ("a branch of only superseded snapshots, or a tombstone after one, leaves no current Goal"); `test/goal9-store.test.mjs` ("replay attributes the superseded tail to the old identity and keeps the replacement at zero") |
+| Recovered tail is not re-written | A reload adopts a durable freeze instead of appending the same historical snapshot again, and does not steal the replacement's own open segment | `test/goal9-store.test.mjs` ("a reload does not rewrite a tail that is already durable"; "a recovered open tail does not steal the replacement's own open segment") |
 | Old-budget exhaustion | Recorded on the old identity's superseded record only; no old continuation or wrap-up | `test/goal9-ownership.test.mjs` ("old-budget exhaustion is recorded on the superseded identity and admits no old continuation"); `test/goal9-store.test.mjs` ("old-budget exhaustion is recorded on the superseded record and never on the replacement") |
 | Durable superseded totals | The superseded snapshot carries the exact already-accounted total; the finalized record carries the exact tail and survives reload | `test/goal4.test.mjs` ("replacing an unfinished objective requires confirmation"); `test/goal9-store.test.mjs` ("the superseded snapshot carries the exact already-accounted totals"); `test/goal9-ownership.test.mjs` (reload assertions in the two Replacement tests) |
 | Clear boundary | Cleared identity publishes no further usage; a future Goal is not charged | `test/goal9-ownership.test.mjs` ("Clear publishes no further usage…") |
@@ -93,8 +98,8 @@ fixtures in place. Representative failures:
 ```
 
 The complete captured run is quoted in the PR description. After the repair, the
-same suite passes (`npm test`: 223 tests, 0 failures) and `npm run typecheck`
-passes.
+same suite passes and `npm run typecheck` passes; the current default-seam counts
+are recorded in the PR description.
 
 ## Review follow-up: live/replay ownership divergences
 
@@ -182,6 +187,11 @@ rewritten to the repaired contract rather than deleted:
   had its continuation assertions dropped and a vacuous `>= 0` superseded-total
   check added. The continuation count/objective assertions are restored and the
   superseded snapshot is pinned to the exact already-accounted total.
+- `test/goal4-regressions.test.mjs`: "a held completion cannot complete a Goal the
+  user replaced while it was in flight" asserted the five-snapshot ordering that
+  included the replacement's re-affirming append. The re-affirmation is gone, so
+  the ordering is now four snapshots ending in the historical freeze, and the
+  assertion reads the newest *current* snapshot for the replacement's identity.
 
 ## Review follow-up: the superseded identity's in-flight tail
 
@@ -212,6 +222,83 @@ a steered Replacement attributes the old identity's in-flight work to the old id
   AssertionError: the exact assistant plus tool-result tail
     actual: 0, expected: 160
 ```
+
+## Review follow-up: the superseded tail across the remaining boundaries
+
+The re-review by subagent c5bfeb at `40b4985` found that the open superseded tail
+was dropped on every path except message delivery and shutdown, that the
+two-append freeze could resurrect the replaced Goal, and that a hard crash inside
+the window left the tail unattributed on replay.
+
+- **Every boundary freezes.** `commitTombstone`, `preserveSupersededForReplacement`,
+  and `restore` now call `closeSupersededSegment` first, so Clear, a second
+  replacement, and a durability-rollback restore cannot discard work the old
+  identity had already admitted. `restore` folds the frozen record into the
+  record it writes, because those entries sit *before* the restored snapshot and
+  no later replay can recover them.
+- **The freeze is one append and it is marked `superseded`.** The second,
+  re-affirming append is gone: reconstruction selects the newest *non-superseded*
+  snapshot, so the replacement stays current even if the process dies immediately
+  after the freeze. `isDurable` skips superseded entries for the same reason, so
+  the freeze cannot defeat the replacement's durability check. A failed freeze
+  write is reported rather than thrown, and leaves the tail for the next boundary.
+- **A hard crash inside the window is recovered.** `replayBranch` rebuilds the
+  superseded identity's tail from the branch when a replacement snapshot arrives
+  while its segment is open, so a reload converges on the live view and the first
+  durable boundary of the new runtime freezes it. A tail whose freeze is already
+  on the branch is adopted rather than re-derived, so a reload appends nothing.
+- **The recovered tail does not steal the replacement's own segment.** A branch
+  whose newest work message belongs to the replacement keeps that segment; only a
+  branch with no open segment for the current identity claims the old one.
+
+The new regressions fail on the pre-fix `src/` (`40b4985`):
+
+```text
+Clear freezes the superseded identity's open tail before the tombstone
+  AssertionError: the freeze precedes the tombstone and is historical
+    actual: undefined, expected: true
+
+a second replacement freezes the first identity's open tail before the second preserve
+  AssertionError: Expected values to be strictly equal:
+    + 'goal_bbbbbbbb' - 'goal_aaaaaaaa'
+
+a durability rollback restores the old identity together with its open tail
+  AssertionError: Expected values to be strictly equal:
+    + 'goal_bbbbbbbb' - 'goal_aaaaaaaa'
+
+a failed freeze write keeps the tail for the next boundary
+  AssertionError: the failure is reported, not thrown
+    actual: undefined, expected: null
+
+a crash right after the freeze append never resurrects the superseded Goal
+  AssertionError: the freeze is the newest goal-state entry
+    + 'goal_bbbbbbbb' - 'goal_aaaaaaaa'
+
+a hard crash between the old tail and its freeze boundary recovers the tail on the next load
+  AssertionError: Expected values to be strictly equal:
+    actual: undefined, expected: 160
+
+a branch of only superseded snapshots, or a tombstone after one, leaves no current Goal
+  AssertionError: history alone is not a current Goal
+    actual: { id: 'goal_aaaaaaaa', ... }, expected: null
+
+replay attributes the superseded tail to the old identity and keeps the replacement at zero
+  AssertionError: the replacement is the current Goal
+    + 'goal_aaaaaaaa' - 'goal_bbbbbbbb'
+
+a steered Replacement attributes the old identity's in-flight work to the old identity
+  AssertionError: the newest goal-state entry is the historical freeze
+    + 'goal_7c7b021e' - 'goal_a31eecb8'
+
+a hard crash between the old identity's tail and its freeze boundary recovers the tail on reload
+  AssertionError: exactly one historical snapshot is recovered from the branch
+    actual: 0, expected: 1
+```
+
+Two of the new regressions guard the repair itself rather than the pre-fix
+behaviour, because they fail on an intermediate state of this branch: a reload
+must not rewrite a tail that is already durable, and a recovered open tail must
+not steal the replacement's own open segment.
 
 ## Compatibility landing constraint
 

@@ -68,15 +68,29 @@ can be updated with `pi update --extensions` and removed with `pi remove <source
 
 ### Replace a Goal
 
-Setting a new objective while an unfinished Goal exists is a *replacement*: the
-old Goal is discarded (fresh identity, no retained history) and a new one
-starts. A replacement never happens silently — `/goal <objective>` shows a
-confirmation dialog first, and a declined (or timed-out, or dismissed) dialog
-keeps the current Goal untouched. The dialog is answered over the RPC
+Setting a new objective while an unfinished Goal exists is a *replacement*: a new
+Goal identity takes over the session's single Goal slot and starts at zero
+Goal-owned usage. A replacement never happens silently — `/goal <objective>`
+shows a confirmation dialog first, and a declined (or timed-out, or dismissed)
+dialog keeps the current Goal untouched. The dialog is answered over the RPC
 extension-UI subprotocol in RPC mode, so headless hosts confirm the same way an
 interactive user does. Modes without any UI cannot confirm and keep the current
 Goal (use `/goal clear` then `/goal <objective>` there). Replacing a **complete**
 Goal asks nothing, because nothing unfinished is discarded.
+
+The replaced Goal is not erased. Its already-accounted usage is frozen onto a
+durable **superseded** snapshot before the new identity commits, and its
+admission segment stays open past the commit so a response and tool results that
+were already in flight are charged to it rather than to the replacement or to
+nobody. That tail is frozen onto the old identity's record at the next freeze
+boundary — the next delivered user message, a shutdown that keeps the session
+file, `/goal clear`, a second replacement, a durability-rollback restore, or the
+first load of a branch whose freeze never ran — and a tail that collected
+nothing new is never written. The frozen record is marked `superseded`, so it is
+loadable and replayable but never becomes the current Goal: a crash immediately
+after the freeze still reconstructs the replacement. The old identity's
+active-time clock stops at the replacement, its own budget exhaustion is
+recorded on its own record only, and it never continues or earns a wrap-up.
 
 ### Edit the objective
 
@@ -656,12 +670,15 @@ identity, origin, timestamps, and revision are part of the same payload.
   navigation and on forked sessions: the *selected* branch alone decides the
   state, so snapshots on an abandoned branch cannot leak into the newly selected
   one, a cleared Goal stays cleared on the branch that cleared it. The newest
-  `goal-state` entry controls the branch: if it is malformed or has an
+  *current* `goal-state` entry controls the branch: if it is malformed or has an
   unrecognized version, reconstruction **fails closed** with no current Goal and
   an actionable notification rather than falling back to an older snapshot, which
   could resurrect a cleared, replaced, or stopped Goal. A later valid snapshot or
-  tombstone still wins. A branch change is announced only when the reconstructed
-  state observably changed.
+  tombstone still wins. An entry marked `superseded` is a finalized historical
+  record of a replaced identity: it is valid and replayable, but it never wins,
+  so freezing the old identity's tail can never make it the current Goal. A
+  branch change is announced only when the reconstructed state observably
+  changed.
 - A snapshot carries the optional `blockedAudit` (`{ blocker, turns }`): the
   blocker that stopped the Goal, or that is accumulating toward the blocked
   threshold, and how many consecutive Goal turns reported it. It is durable for
@@ -789,9 +806,10 @@ test settles on a provider error.
   corroborated. The user can always pause directly with `/goal pause`.
 - An edit preserves the Goal identity, creation time, origin, budget, and usage
   history: only the objective changes and the revision advances. Replacement of
-  an unfinished Goal instead discards the old Goal entirely (fresh identity,
-  fresh revisions). Refining the finish line without discarding anything is what
-  `/goal edit` is for.
+  an unfinished Goal gives the session a fresh identity and fresh revisions, and
+  preserves the replaced Goal's accounted history on its own superseded record
+  rather than transferring any of it. Refining the finish line without replacing
+  anything is what `/goal edit` is for.
 - Bare `/goal edit` needs a dialog-capable UI. TUI and RPC hosts that implement
   Pi's extension-UI subprotocol can answer the editor dialog; print/JSON mode and
   hosts without a dialog-capable UI get guidance to use
@@ -819,6 +837,12 @@ test settles on a provider error.
   attributed under the repaired contract.
 - Active time is durable to within one accounted second; an unclean exit loses
   at most that.
+- A freeze boundary can only persist work that has already been accounted when it
+  runs. A `/goal clear` issued while the replaced identity's provider request is
+  still in flight ends the session's Goal accounting at that point, so a response
+  for the superseded identity that is finalized *after* the tombstone is not
+  published to any record: the session has no Goal, and Clear publishes no
+  further usage.
 - A `budget_limited` Goal cannot be resumed with a higher budget yet — that
   arrives with the lifecycle ticket.
 - The activity-free and execution-unavailable counters are per session, not
