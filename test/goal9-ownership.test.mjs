@@ -548,6 +548,104 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 	}
 });
 
+test("Clear during the superseded identity's in-flight response keeps the tail attributed", async () => {
+	// A replacement commits while the old identity's request is streaming, then the
+	// user clears the replacement before that response is finalized. Clear of the
+	// replacement must not erase the old identity's admitted work: the response and
+	// its nested tool result land after the tombstone and stay on the old identity's
+	// superseded record.
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
+	const session = await PiRpcSession.start({
+		cwd: workDir,
+		sessionDir,
+		extraExtensions: [NESTED_EXTENSION],
+	});
+	const gate = join(workDir, "provider-gate");
+	script(
+		[
+			{
+				toolCalls: [{ name: NESTED_OUTER_TOOL, args: {} }],
+				waitForFile: gate,
+				usage: { input: 100, output: 10 },
+			},
+			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
+			{ hang: true },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await waitForTurns(session, 1);
+		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+
+		// Replace A→B while A's request is streaming, then Clear B before A's
+		// response is finalized.
+		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
+		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
+		assert.equal((await replacePromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+
+		const clearPromise = submitCommand(session, "clear-busy", "/goal clear");
+		assert.equal((await clearPromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("cleared"));
+
+		// Release the old response: it lands after the tombstone and must still be
+		// charged to A.
+		writeFileSync(gate, "", "utf8");
+		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
+		await session.waitForSettled(1);
+
+		// The session has no Goal, and the old identity's tail is frozen on its
+		// superseded record.
+		const statusPromise = submitCommand(session, "status", "/goal");
+		assert.equal((await statusPromise).data.disposition, "handled");
+		await session.waitFor("a no-Goal report", (records) =>
+			records.find(
+				(r) =>
+					r.type === "extension_ui_request" &&
+					r.method === "notify" &&
+					r.message.includes("No Goal is set"),
+			),
+		);
+
+		const liveStates = goalSnapshots(readSessionEntries(await session.sessionFile()));
+		assert.equal(currentGoalSnapshot(liveStates).data.goal, null, "the tombstone is the newest current state");
+		const oldSnapshots = liveStates.filter((e) => e.data.goal?.id === original.id);
+		const finalized = oldSnapshots.at(-1);
+		assert.equal(finalized.data.superseded, true, "the tail is frozen as history");
+		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
+		assert.equal(finalized.data.goal.usage.nestedTokens, 50);
+
+		// A fresh process reconstructs no Goal and keeps the old identity's total.
+		const { resumed, dir } = await reload(session, workDir);
+		script([{ text: "Never requested." }, { hang: true }], resumed);
+		try {
+			// A session with no Goal emits no startup notify; the status line is the
+			// observable signal that session_start has finished.
+			await resumed.waitFor("the startup status line", (records) =>
+				records.find((r) => r.type === "extension_ui_request" && r.method === "setStatus"),
+			);
+			const reloadedStates = goalSnapshots(readSessionEntries(await resumed.sessionFile()));
+			const reloadedOld = reloadedStates.filter((e) => e.data.goal?.id === original.id).at(-1);
+			assert.equal(reloadedOld.data.goal.usage.totalTokens, 160, "the old total survives reload");
+			assert.equal(reloadedOld.data.superseded, true);
+			assertStepsConsumed(resumed, 0, []);
+			assert.equal(resumed.extensionErrors().length, 0);
+		} finally {
+			await resumed.stop();
+			rmSync(dir, { recursive: true, force: true });
+		}
+		assertStepsConsumed(session, 2, []);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+		rmSync(workDir, { recursive: true, force: true });
+		rmSync(sessionDir, { recursive: true, force: true });
+	}
+});
+
 test("old-budget exhaustion is recorded on the superseded identity and admits no old continuation", async () => {
 	// The old identity's in-flight tail crosses its own budget. The exhaustion belongs
 	// to the old identity's durable record only: the replacement keeps its fresh

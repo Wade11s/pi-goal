@@ -363,6 +363,11 @@ export class GoalStore {
 		let latest: unknown;
 		let baselineIndex = -1;
 		let baseline: GoalSnapshot | undefined;
+		// The newest non-superseded snapshot that is not a tombstone. When the newest
+		// non-superseded entry is a tombstone, this is the replay baseline for
+		// recovering a superseded identity's still-open tail.
+		let replayBaselineIndex = -1;
+		let replayBaseline: GoalSnapshot | undefined;
 		for (let index = 0; index < branch.length; index++) {
 			const entry = branch[index]!;
 			if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
@@ -371,6 +376,10 @@ export class GoalStore {
 				if (isGoalSnapshot(entry.data) && entry.data.superseded !== true) {
 					baselineIndex = index;
 					baseline = entry.data;
+					if (entry.data.goal !== null) {
+						replayBaselineIndex = index;
+						replayBaseline = entry.data;
+					}
 				}
 			}
 		}
@@ -393,16 +402,25 @@ export class GoalStore {
 			return null;
 		}
 
-		const latestSnapshot = latest as GoalSnapshot;
-		if (latestSnapshot.goal === null) {
-			// A tombstone is a valid newest entry: the branch has no current Goal.
-			this.resetRuntimeState();
-			return null;
-		}
 		if (!baseline || baseline.goal === null) {
-			// Only historical superseded snapshots (possibly followed by a tombstone)
-			// exist, so there is no current Goal.
+			// No current Goal. A superseded identity's tail may still be open on the
+			// branch: Clear of the replacement does not close it, so the entries after
+			// the replacement snapshot are its admitted work. Recover that tail by
+			// replaying from the newest non-tombstone snapshot before the tombstone;
+			// the caller's freeze boundary then persists it. A fresh runtime has no
+			// in-flight turn to route, so the recovered tail never claims ownership.
 			this.resetRuntimeState();
+			if (replayBaseline && replayBaseline.goal !== null) {
+				const replayed =
+					replayBaseline.repaired === true || this.hasCutover(branch, replayBaseline.goal.id);
+				// A superseded tail is a repaired-rules construct: a legacy branch has no
+				// replacement machinery, so there is nothing to recover and no current
+				// ledger to charge.
+				if (replayed) {
+					const replay = this.replayBranch(branch, replayBaselineIndex, "repaired");
+					if (replay.superseded) this.supersededTail = replay.superseded;
+				}
+			}
 			return null;
 		}
 
@@ -627,9 +645,12 @@ export class GoalStore {
 				const goalId: string | null = snapshot.goal?.id ?? null;
 				if (goalId !== snapshotGoalId) {
 					if (goalId === null) {
-						// A tombstone ends every admission and leaves no current Goal.
-						supersededOpen = false;
-						segmentOwner = null;
+						// A tombstone ends the current Goal's admission. A superseded
+						// identity's admission is independent: Clear of the replacement does
+						// not erase the old identity's admitted work, so an open tail stays
+						// open past the tombstone and keeps collecting its in-flight work.
+						if (!supersededOpen) segmentOwner = null;
+						snapshotGoalId = null;
 					} else if (
 						mode === "repaired" &&
 						segmentOwner !== null &&
@@ -672,7 +693,13 @@ export class GoalStore {
 			}
 			const superseded =
 				supersededRecord != null && supersededLedger != null && segmentOwner === supersededRecord.id;
-			if (mode === "repaired" && !superseded && segmentOwner !== this.current?.id) continue;
+			if (
+				mode === "repaired" &&
+				!superseded &&
+				(this.current == null || segmentOwner !== this.current.id)
+			) {
+				continue;
+			}
 			if (entry.type === "message") {
 				const message = entry.message;
 				if (message.role === "assistant") {
@@ -917,14 +944,18 @@ export class GoalStore {
 	 * {@link closeSupersededSegment} instead of being dropped or charged to the
 	 * replacement.
 	 */
-	preserveSupersededForReplacement(pi: ExtensionAPI): void {
+	preserveSupersededForReplacement(pi: ExtensionAPI): boolean {
 		const current = this.current;
-		if (!current) return;
+		if (!current) return true;
 		// A still-open previous tail must be frozen *before* this replacement's
 		// already-accounted snapshot overwrites it. The tail belongs to the identity
 		// that was replaced first; dropping it here would lose work the old identity
-		// had already admitted.
-		this.closeSupersededSegment(pi);
+		// had already admitted. If the freeze fails, the replacement must not proceed.
+		const superseded = this.supersededTail;
+		if (superseded) {
+			const frozen = this.closeSupersededSegment(pi);
+			if (!frozen && superseded.dirty) return false;
+		}
 		const usage = this.liveUsage();
 		const record = { ...copyRecord(current), usage };
 		this.persistSnapshot(pi, record);
@@ -935,6 +966,7 @@ export class GoalStore {
 			open,
 			dirty: false,
 		};
+		return true;
 	}
 
 	/**
@@ -942,9 +974,12 @@ export class GoalStore {
 	 * snapshot and return that record, or `null` when there is nothing to freeze or
 	 * the write failed.
 	 *
-	 * Called when the next user message is delivered, at shutdown, and before Clear, a
-	 * second replacement, or a durability-rollback restore — every boundary that would
-	 * otherwise discard the old identity's already-admitted work.
+	 * Called when the next user message is delivered, at shutdown, and before a
+	 * second replacement or a durability-rollback restore — every boundary that
+	 * would otherwise discard the old identity's already-admitted work. Clear does
+	 * not freeze an *open* tail: it keeps the admission open past the tombstone so
+	 * the old identity's in-flight work stays attributable (see
+	 * {@link commitTombstone}).
 	 *
 	 * The snapshot is marked `superseded`, so it can never become the current Goal on
 	 * reconstruction even if the process dies immediately after this append. There is
@@ -954,26 +989,52 @@ export class GoalStore {
 	 * the event handler that called it.
 	 */
 	closeSupersededSegment(pi: ExtensionAPI): GoalRecord | null {
+		const result = this.tryCloseSupersededSegment(pi);
+		return result.ok ? result.record : null;
+	}
+
+	/**
+	 * Freeze the superseded identity's tail and report a write failure distinctly
+	 * from "nothing to freeze", so a boundary that must not lose already-accounted
+	 * work (Clear) can refuse to proceed instead of dropping it.
+	 */
+	private tryCloseSupersededSegment(
+		pi: ExtensionAPI,
+	): { ok: true; record: GoalRecord | null } | { ok: false; error: unknown } {
 		const superseded = this.supersededTail;
-		if (!superseded) return null;
+		if (!superseded) return { ok: true, record: null };
 		const record = superseded.record;
 		record.usage = { ...superseded.ledger.usage };
 		if (!superseded.dirty) {
 			// Nothing new to write: the earlier superseded snapshot already carries this
 			// identity's totals. Closing an idle tail must not grow the snapshot log.
 			this.supersededTail = null;
-			return record;
+			return { ok: true, record };
 		}
 		this.refreshUsage();
 		try {
 			this.persistSupersededSnapshot(pi, record);
-		} catch {
+		} catch (error) {
 			// Keep the tail for the next boundary. Losing it would drop work that was
 			// already admitted for the superseded identity.
-			return null;
+			return { ok: false, error };
 		}
 		this.supersededTail = null;
-		return record;
+		return { ok: true, record };
+	}
+
+	/**
+	 * Close the superseded identity's admission at a delivery or load boundary.
+	 *
+	 * The tail is frozen when the write succeeds. If the write fails, the dirty tail
+	 * is kept for the next boundary but the admission is closed, so work that follows
+	 * the boundary is never attributed to the old identity.
+	 */
+	closeSupersededAdmission(pi: ExtensionAPI): GoalRecord | null {
+		const frozen = this.closeSupersededSegment(pi);
+		const superseded = this.supersededTail;
+		if (superseded) superseded.open = false;
+		return frozen;
 	}
 
 	/** Make a staged Goal visible to /goal and get_goal. */
@@ -1109,17 +1170,30 @@ export class GoalStore {
 
 	/** Close the current segment: an ordinary user prompt is never Goal work. */
 	endGoalWork(): void {
-		// The superseded identity's admission closes only through
-		// `closeSupersededSegment`, which freezes its in-flight tail durably. Closing
-		// it here would drop work that was already admitted for the old identity.
-		if (this.supersededTail && this.ownerId === this.supersededTail.record.id) return;
+		// The superseded identity's admission closes at its freeze boundary (see
+		// `closeSupersededAdmission`). While it is open, an ordinary prompt must not
+		// clear the binding: the old identity's in-flight tail is still admitted.
+		const superseded = this.supersededTail;
+		if (superseded?.open && this.ownerId === superseded.record.id) return;
 		this.goalOwned = false;
 		this.ownerId = null;
 	}
 
-	/** Whether the current segment is Goal-owned work. */
-	isGoalOwned(): boolean {
-		return this.goalOwned;
+	/**
+	 * Whether the superseded identity's admission is still open for in-flight work.
+	 *
+	 * The `message_end` and compaction seams charge reports against the Goal that
+	 * exists when the report is finalized; a Clear that lands while the old
+	 * identity's request is in flight leaves no current Goal, so they must still
+	 * charge its admitted tail.
+	 */
+	hasOpenSupersededTail(): boolean {
+		return this.supersededTail?.open === true;
+	}
+
+	/** Whether a superseded tail is still waiting to be made durable. */
+	hasUnfrozenSupersededTail(): boolean {
+		return this.supersededTail?.dirty === true;
 	}
 
 	/**
@@ -1282,10 +1356,16 @@ export class GoalStore {
 	 * left to carry and no transition left waiting.
 	 */
 	private commitTombstone(pi: ExtensionAPI): GoalMutationResult {
-		// The superseded identity's tail belongs to that identity, not to the Goal being
-		// cleared. Freeze it before the tombstone so Clear cannot drop already-admitted
-		// work. The superseded snapshot is historical and can never become current.
-		this.closeSupersededSegment(pi);
+		const superseded = this.supersededTail;
+		if (superseded && !superseded.open) {
+			// A closed tail is finished work: it must be durable before the tombstone,
+			// or Clear would erase already-accounted work. Refuse the Clear instead of
+			// dropping it. The superseded snapshot is historical and never current.
+			const frozen = this.tryCloseSupersededSegment(pi);
+			if (!frozen.ok) {
+				return { ok: false, reason: "persistence", error: frozen.error };
+			}
+		}
 		try {
 			pi.appendEntry(CUSTOM_ENTRY_TYPE, { version: 1, goal: null } satisfies GoalSnapshot);
 		} catch (error) {
@@ -1295,10 +1375,19 @@ export class GoalStore {
 		this.pendingTransition = undefined;
 		this.ledger.restore(zeroGoalUsage());
 		this.clock.reset();
-		this.goalOwned = false;
-		this.ownerId = null;
-		this.supersededTail = null;
 		this.legacyPending = false;
+		if (superseded && superseded.open) {
+			// The old identity's admission is still taking its in-flight tail. Clear of
+			// the replacement does not erase work already admitted for the superseded
+			// identity, so the tail stays open and bound to it until the next freeze
+			// boundary (the next delivered user message, a shutdown, or a new Goal).
+			this.goalOwned = true;
+			this.ownerId = superseded.record.id;
+		} else {
+			this.goalOwned = false;
+			this.ownerId = null;
+			this.supersededTail = null;
+		}
 		return { ok: true, goal: null };
 	}
 

@@ -439,28 +439,187 @@ function replaceWithTailInFlight() {
 	return { store, previous, replacement, branch, pi };
 }
 
-it("Clear freezes the superseded identity's open tail before the tombstone", () => {
-	// Clear-of-the-replacement is not Clear-of-the-superseded-identity: the tail
-	// belongs to the identity that was replaced, so the tombstone must not drop it.
-	const { store, previous, replacement, pi } = replaceWithTailInFlight();
+it("Clear keeps the superseded identity's already-accounted open tail through the tombstone", () => {
+	// The old tail landed before Clear, but its admission is still open: Clear of
+	// the replacement does not erase work already admitted for the superseded
+	// identity, so the tail stays open past the tombstone and is frozen at the
+	// next boundary instead of being dropped.
+	const { store, previous, pi } = replaceWithTailInFlight();
 
 	const cleared = store.clear(pi);
 	assert.equal(cleared.ok, true);
 
 	const states = appendedGoalStates(pi);
 	assert.equal(states.at(-1).data.goal, null, "the tombstone is the newest state");
-	const frozen = states.at(-2);
-	assert.equal(frozen.data.superseded, true, "the freeze precedes the tombstone and is historical");
-	assert.equal(frozen.data.goal.id, previous.id, "the tail stays with the identity that was replaced");
-	assert.equal(frozen.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
-	assert.equal(frozen.data.goal.usage.nestedTokens, 50);
+	assert.equal(appendedSuperseded(pi).length, 0, "Clear does not freeze an open tail");
 	assert.equal(store.get(), null, "Clear still leaves no Goal");
+	assert.equal(store.hasOpenSupersededTail(), true, "the old admission stays open past the tombstone");
+
+	// The next delivered user message is the freeze boundary.
+	store.closeSupersededSegment(pi);
+	const frozen = appendedSuperseded(pi);
+	assert.equal(frozen.length, 1);
+	assert.equal(frozen[0].data.goal.id, previous.id, "the tail stays with the identity that was replaced");
+	assert.equal(frozen[0].data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
+	assert.equal(frozen[0].data.goal.usage.nestedTokens, 50);
 
 	// The branch replays to the same place: no Goal, and the old identity's total
 	// is durable history rather than work that belonged to nobody.
 	const reloaded = new GoalStore();
 	reloaded.reconstruct(fakeCtx([goalEntry(record({ id: previous.id })), ...asBranch(pi)]));
 	assert.equal(reloaded.get(), null);
+});
+
+it("Clear keeps the superseded identity's admission open so a later response stays attributed", () => {
+	// A replacement commits while A's provider request is still in flight. Clear
+	// of the replacement lands *before* A's response is finalized: the old
+	// identity's admission must stay open past the tombstone, so the response and
+	// its nested tool result are still charged to A rather than dropped.
+	const store = new GoalStore();
+	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
+	store.reconstruct(fakeCtx([goalEntry(previous)]));
+	store.beginGoalWork(previous.id);
+	const pi = fakePi();
+	store.preserveSupersededForReplacement(pi);
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	store.stage(pi, replacement);
+	store.commit(replacement);
+
+	const cleared = store.clear(pi);
+	assert.equal(cleared.ok, true);
+	assert.equal(store.get(), null, "Clear leaves no current Goal");
+
+	// A's response lands after the tombstone. It was admitted for A, so it is
+	// charged to A's superseded tail, not dropped.
+	const assistant = store.accountUsage("model:1", usageReport(100, 10), "model", previous.id);
+	assert.equal(assistant?.totalTokens, 110);
+	const nested = store.accountUsage("toolResult:call_1", usageReport(40, 7, { cacheWrite: 3 }), "nested");
+	assert.equal(nested?.totalTokens, 50);
+
+	// The next delivered user message is the freeze boundary.
+	store.closeSupersededSegment(pi);
+	const states = appendedGoalStates(pi);
+	const frozen = states.at(-1);
+	assert.equal(frozen.data.superseded, true, "the tail is frozen as history");
+	assert.equal(frozen.data.goal.id, previous.id);
+	assert.equal(frozen.data.goal.usage.totalTokens, 160);
+	assert.equal(frozen.data.goal.usage.nestedTokens, 50);
+
+	// Replay recovers the same history: the newest non-superseded entry is the
+	// tombstone, but the superseded freeze is durable and no Goal is current.
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(fakeCtx([goalEntry(record({ id: previous.id })), ...asBranch(pi)]));
+	assert.equal(reloaded.get(), null, "no current Goal after Clear");
+});
+
+it("Clear refuses to commit when an already-accounted tail cannot be frozen", () => {
+	// The superseded identity's tail is already accounted and its admission is
+	// closed (a delivered user message closed it, but the freeze write failed).
+	// Clear must not erase that work: it refuses to write the tombstone instead.
+	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	const branch = [
+		goalEntry(previous, { repaired: true }),
+		goalWorkEntry("kickoff-old"),
+		goalEntry(previous, { repaired: true }),
+		goalEntry(replacement, { repaired: true }),
+		assistantEntry(0, usageReport(100, 10)),
+		toolResultEntry("call_1", usageReport(40, 7, { cacheWrite: 3 })),
+		{
+			type: "custom",
+			id: "checkpoint",
+			customType: "goal-usage",
+			data: {
+				version: 1,
+				goalId: previous.id,
+				usage: usage(160, { inputTokens: 140, outputTokens: 10, cacheWriteTokens: 3, nestedTokens: 50 }),
+			},
+		},
+		ordinaryUserEntry("anything else?"),
+	];
+	const store = new GoalStore();
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.get()?.id, replacement.id, "the replacement is current");
+
+	const failing = fakePi();
+	const append = failing.appendEntry.bind(failing);
+	failing.appendEntry = (type, data) => {
+		if (type === "goal-state" && data.superseded === true) throw new Error("disk full");
+		return append(type, data);
+	};
+	const cleared = store.clear(failing);
+	assert.equal(cleared.ok, false, "Clear is refused");
+	assert.equal(cleared.reason, "persistence");
+	assert.equal(store.get()?.id, replacement.id, "the replacement stays current");
+	assert.equal(appendedGoalStates(failing).length, 0, "no tombstone was written");
+
+	// The already-accounted tail survives for the next boundary.
+	const retry = fakePi();
+	const frozen = store.closeSupersededSegment(retry);
+	assert.equal(frozen?.id, previous.id);
+	assert.equal(frozen?.usage.totalTokens, 160, "the tail survived the failed write");
+	assert.equal(appendedSuperseded(retry).length, 1);
+});
+
+it("replay recovers a superseded tail when the newest non-superseded entry is a tombstone", () => {
+	// A→B, A's in-flight tail lands, then Clear B writes the tombstone, and the
+	// process dies before any freeze boundary. The newest non-superseded entry is
+	// the tombstone, but A's admitted work is on the branch and must be recovered.
+	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	const branch = [
+		goalEntry(previous, { repaired: true }),
+		goalWorkEntry("kickoff-old"),
+		goalEntry(previous, { repaired: true }),
+		goalEntry(replacement, { repaired: true }),
+		assistantEntry(0, usageReport(100, 10)),
+		toolResultEntry("call_1", usageReport(40, 7, { cacheWrite: 3 })),
+		{ type: "custom", id: "tombstone", customType: "goal-state", data: { version: 1, goal: null } },
+	];
+	const store = new GoalStore();
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.get(), null, "the tombstone leaves no current Goal");
+
+	const pi = fakePi();
+	const frozen = store.closeSupersededSegment(pi);
+	assert.equal(frozen?.id, previous.id, "the recovered tail is frozen");
+	assert.equal(frozen?.usage.totalTokens, 160);
+	assert.equal(frozen?.usage.nestedTokens, 50);
+	assert.equal(appendedSuperseded(pi).length, 1);
+});
+
+it("a recovered superseded tail is frozen as history and never resurrects the old Goal", () => {
+	// The branch a crash leaves after Clear: the tombstone is the newest
+	// non-superseded entry, and the old identity's tail has no freeze yet. The
+	// recovered tail must be written as a superseded historical record, and a
+	// reload of the branch including that freeze must still have no current Goal.
+	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	const branch = [
+		goalEntry(previous, { repaired: true }),
+		goalWorkEntry("kickoff-old"),
+		goalEntry(previous, { repaired: true }),
+		goalEntry(replacement, { repaired: true }),
+		assistantEntry(0, usageReport(100, 10)),
+		toolResultEntry("call_1", usageReport(40, 7, { cacheWrite: 3 })),
+		{ type: "custom", id: "tombstone", customType: "goal-state", data: { version: 1, goal: null } },
+	];
+	const store = new GoalStore();
+	store.reconstruct(fakeCtx(branch));
+	assert.equal(store.get(), null);
+
+	const pi = fakePi();
+	store.closeSupersededSegment(pi);
+	const frozen = appendedSuperseded(pi);
+	assert.equal(frozen.length, 1, "the recovered tail is frozen");
+	assert.equal(frozen[0].data.superseded, true, "the freeze is historical");
+	assert.equal(frozen[0].data.goal.id, previous.id);
+	assert.equal(frozen[0].data.goal.usage.totalTokens, 160);
+
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(fakeCtx([...branch, ...asBranch(pi)]));
+	assert.equal(reloaded.get(), null, "the freeze never resurrects the old Goal");
+	assert.equal(reloaded.getUsage().totalTokens, 0);
 });
 
 it("a second replacement freezes the first identity's open tail before the second preserve", () => {
@@ -604,7 +763,8 @@ it("a hard crash between the old tail and its freeze boundary recovers the tail 
 	reloaded.reconstruct(fakeCtx([...branch, ...asBranch(pi)]));
 	assert.equal(reloaded.get()?.id, replacement.id);
 	assert.equal(reloaded.getUsage().totalTokens, 0, "the reload converges on the live view");
-	assert.equal(reloaded.isGoalOwned(), false, "no segment is open at the end of the branch");
+	assert.equal(reloaded.hasOpenSupersededTail(), false, "no segment is open at the end of the branch");
+	assert.equal(reloaded.currentOwnerId(), null, "no current owner at the end of the branch");
 });
 
 it("a reload does not rewrite a tail that is already durable", () => {
@@ -730,7 +890,6 @@ it("replay attributes the superseded tail to the old identity and keeps the repl
 		22,
 		"only the replacement's own steered work is charged; the old identity's in-flight response and tool result are not",
 	);
-	assert.equal(store.isGoalOwned(), true, "the delivered steer leaves the new segment open");
 	assert.equal(store.currentOwnerId(), "goal_bbbbbbbb");
 
 	// Reloading the same branch must not append the historical snapshot again.
@@ -745,7 +904,7 @@ it("replay closes an open segment at a tombstone and at an ordinary prompt", () 
 	const store = new GoalStore();
 	const goal = record({ usage: usage(0) });
 	const branch = [
-		goalEntry(goal),
+		goalEntry(goal, { repaired: true }),
 		goalWorkEntry("kickoff"),
 		assistantEntry(0, usageReport(20, 2)),
 		{ type: "custom", id: "tombstone", customType: "goal-state", data: { version: 1, goal: null } },

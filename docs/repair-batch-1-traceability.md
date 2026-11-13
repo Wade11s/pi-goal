@@ -23,7 +23,9 @@ persisted entries.
 | Ordinary prompts excluded in every status | Paused/blocked/usage-limited/budget-limited/complete ordinary runs add nothing | `test/goal9-ownership.test.mjs` ("an ordinary prompt while a Goal is paused…"); `test/goal6.test.mjs` (budget/complete accounting tests) |
 | Replacement starts at zero | Old identity keeps its admitted work; new identity inherits nothing | `test/goal9-ownership.test.mjs` ("a Replacement Goal starts at zero…"; "a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("the superseded snapshot carries the exact already-accounted totals") |
 | Old in-flight tail | The old identity's in-flight assistant response and tool results stay attributed to it, live and on replay | `test/goal9-ownership.test.mjs` ("a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("a replacement attributes the superseded identity's in-flight assistant and tool-result tail") |
-| Tail survives every boundary | Clear, a second replacement, and a durability-rollback restore freeze the open tail instead of dropping it | `test/goal9-store.test.mjs` ("Clear freezes the superseded identity's open tail before the tombstone"; "a second replacement freezes the first identity's open tail before the second preserve"; "a durability rollback restores the old identity together with its open tail") |
+| Tail survives every boundary | A second replacement and a durability-rollback restore freeze the open tail; Clear keeps an open tail open past the tombstone and freezes a closed tail, refusing on a failed write | `test/goal9-store.test.mjs` ("Clear keeps the superseded identity's already-accounted open tail through the tombstone"; "Clear keeps the superseded identity's admission open so a later response stays attributed"; "Clear refuses to commit when an already-accounted tail cannot be frozen"; "a second replacement freezes the first identity's open tail before the second preserve"; "a durability rollback restores the old identity together with its open tail") |
+| Clear keeps the old admission open | Clear of the replacement does not erase the superseded identity's admitted or in-flight work; the tail freezes at the next boundary | `test/goal9-store.test.mjs` ("Clear keeps the superseded identity's admission open so a later response stays attributed"; "Clear keeps the superseded identity's already-accounted open tail through the tombstone") |
+| Replay recovers past a tombstone | A superseded tail is recovered even when the newest non-superseded entry is a tombstone, and never resurrects the old Goal | `test/goal9-store.test.mjs` ("replay recovers a superseded tail when the newest non-superseded entry is a tombstone"; "a recovered superseded tail is frozen as history and never resurrects the old Goal") |
 | Freeze is crash-safe | One append, marked `superseded`, so a crash right after it cannot resurrect the replaced Goal, and a failed write keeps the tail | `test/goal9-store.test.mjs` ("a crash right after the freeze append never resurrects the superseded Goal"; "a failed freeze write keeps the tail for the next boundary") |
 | Hard-crash recovery | A branch whose freeze boundary never ran recovers the tail on the next load and freezes it there | `test/goal9-ownership.test.mjs` ("a hard crash between the old identity's tail and its freeze boundary recovers the tail on reload"); `test/goal9-store.test.mjs` ("a hard crash between the old tail and its freeze boundary recovers the tail on the next load") |
 | Superseded never current | A superseded snapshot is loadable and replayable but never selects the current Goal, alone or after a tombstone | `test/goal9-store.test.mjs` ("a branch of only superseded snapshots, or a tombstone after one, leaves no current Goal"); `test/goal9-store.test.mjs` ("replay attributes the superseded tail to the old identity and keeps the replacement at zero") |
@@ -230,12 +232,15 @@ was dropped on every path except message delivery and shutdown, that the
 two-append freeze could resurrect the replaced Goal, and that a hard crash inside
 the window left the tail unattributed on replay.
 
-- **Every boundary freezes.** `commitTombstone`, `preserveSupersededForReplacement`,
-  and `restore` now call `closeSupersededSegment` first, so Clear, a second
-  replacement, and a durability-rollback restore cannot discard work the old
-  identity had already admitted. `restore` folds the frozen record into the
-  record it writes, because those entries sit *before* the restored snapshot and
-  no later replay can recover them.
+- **Every boundary freezes, except an open tail at Clear.**
+  `preserveSupersededForReplacement` and `restore` call `closeSupersededSegment`
+  first, so a second replacement and a durability-rollback restore cannot discard
+  work the old identity had already admitted. `commitTombstone` freezes a *closed*
+  tail and refuses the tombstone if that write fails; an *open* tail stays open
+  past the tombstone so the old identity's in-flight work is still attributed to
+  it, and freezes at the next boundary. `restore` folds the frozen record into
+  the record it writes, because those entries sit *before* the restored snapshot
+  and no later replay can recover them.
 - **The freeze is one append and it is marked `superseded`.** The second,
   re-affirming append is gone: reconstruction selects the newest *non-superseded*
   snapshot, so the replacement stays current even if the process dies immediately

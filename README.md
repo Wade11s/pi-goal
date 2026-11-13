@@ -78,19 +78,24 @@ interactive user does. Modes without any UI cannot confirm and keep the current
 Goal (use `/goal clear` then `/goal <objective>` there). Replacing a **complete**
 Goal asks nothing, because nothing unfinished is discarded.
 
-The replaced Goal is not erased. Its already-accounted usage is frozen onto a
-durable **superseded** snapshot before the new identity commits, and its
-admission segment stays open past the commit so a response and tool results that
-were already in flight are charged to it rather than to the replacement or to
-nobody. That tail is frozen onto the old identity's record at the next freeze
-boundary — the next delivered user message, a shutdown that keeps the session
-file, `/goal clear`, a second replacement, a durability-rollback restore, or the
-first load of a branch whose freeze never ran — and a tail that collected
-nothing new is never written. The frozen record is marked `superseded`, so it is
-loadable and replayable but never becomes the current Goal: a crash immediately
-after the freeze still reconstructs the replacement. The old identity's
-active-time clock stops at the replacement, its own budget exhaustion is
-recorded on its own record only, and it never continues or earns a wrap-up.
+The replaced Goal is not erased. Its already-accounted usage is written as a
+durable **current** snapshot before the new identity commits — current, not
+historical, so a crash between that write and the replacement's own snapshot
+still reconstructs the old Goal — and its admission segment stays open past the
+commit so a response and tool results that were already in flight are charged to
+it rather than to the replacement or to nobody. That tail is frozen onto the old
+identity's record as a **superseded** snapshot at the next freeze boundary — the
+next delivered user message, a shutdown that keeps the session file, a new Goal
+creation, a second replacement, a durability-rollback restore, or the first load
+of a branch whose freeze never ran — and a tail that collected nothing new is
+never written. `/goal clear` of the replacement does not freeze an open tail: the
+old identity's admission stays open past the tombstone so its in-flight work is
+still attributed to it, and the tail freezes at the next boundary. The frozen
+record is marked `superseded`, so it is loadable and replayable but never becomes
+the current Goal: a crash immediately after the freeze still reconstructs the
+replacement. The old identity's active-time clock stops at the replacement, its
+own budget exhaustion is recorded on its own record only, and it never continues
+or earns a wrap-up.
 
 ### Edit the objective
 
@@ -837,12 +842,6 @@ test settles on a provider error.
   attributed under the repaired contract.
 - Active time is durable to within one accounted second; an unclean exit loses
   at most that.
-- A freeze boundary can only persist work that has already been accounted when it
-  runs. A `/goal clear` issued while the replaced identity's provider request is
-  still in flight ends the session's Goal accounting at that point, so a response
-  for the superseded identity that is finalized *after* the tombstone is not
-  published to any record: the session has no Goal, and Clear publishes no
-  further usage.
 - A `budget_limited` Goal cannot be resumed with a higher budget yet — that
   arrives with the lifecycle ticket.
 - The activity-free and execution-unavailable counters are per session, not

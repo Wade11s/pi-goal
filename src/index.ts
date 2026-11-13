@@ -397,7 +397,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// with no freeze boundary after it. Reconstruction recovers that tail into
 		// memory; freezing it now makes the reload converge durably with the live path
 		// rather than waiting for another boundary that a later crash could lose.
-		store.closeSupersededSegment(pi);
+		store.closeSupersededAdmission(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
 		// Runtime-only counters must not survive into a new runtime; the durable
@@ -524,7 +524,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// longer current. Freeze it at this durable boundary so the branch records the
 		// old identity's already-admitted work instead of leaving it for a later crash
 		// to lose.
-		store.closeSupersededSegment(pi);
+		store.closeSupersededAdmission(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
 		notifyBranchChange(ctx, before, after);
@@ -705,7 +705,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// A report is Goal work exactly when a non-complete Goal exists as it is
 		// finalized. Completion is terminal for accounting, so the completing turn is
 		// charged at its own `message_end` and nothing after the completion snapshot is.
-		if (!goal || goal.status === "complete") return;
+		// A Clear that lands while the superseded identity's request is still in flight
+		// leaves no current Goal, but its admitted tail must still be charged, so an
+		// open superseded tail keeps the seam alive.
+		if ((!goal || goal.status === "complete") && !store.hasOpenSupersededTail()) return;
 		if (message.role === "assistant") {
 			if (chargedMessages.has(message)) return;
 			chargedMessages.add(message);
@@ -724,7 +727,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	pi.on("session_compact", (event, ctx) => {
 		const goal = store.get();
-		if (!goal || goal.status === "complete") return;
+		if ((!goal || goal.status === "complete") && !store.hasOpenSupersededTail()) return;
 		store.accountUsage(event.compactionEntry.id, event.compactionEntry.usage, "nested");
 		afterAccounting(ctx);
 	});
@@ -735,7 +738,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * silently restarting the clock.
 	 */
 	pi.on("session_shutdown", (event, ctx) => {
-		if (!store.get()) return;
+		if (!store.get() && !store.hasOpenSupersededTail()) return;
 		// Pi fires this both when the process quits and when a session is *replaced*
 		// (fork, clone, switch, resume, reload). The two are not the same event for a
 		// durable writer, and telling them apart by the destination rather than the
@@ -763,7 +766,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// A superseded identity's in-flight tail is frozen at this last durable
 		// boundary too, so a quit or reload cannot lose work that never saw another
 		// delivered user message.
-		store.closeSupersededSegment(pi);
+		store.closeSupersededAdmission(pi);
 		store.stopClock();
 		store.flushAccounting(pi, true);
 	});
@@ -1224,6 +1227,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				);
 			}
 			const goal = store.create(validation.objective, "tool", { tokenBudget: budget.tokenBudget });
+			// A superseded identity's open tail must be durable before a new Goal takes
+			// the session's Goal slot: its entries sit before the new snapshot, so a
+			// reload could not recover them afterwards. Refuse rather than lose work.
+			try {
+				store.closeSupersededSegment(pi);
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				return goalToolError(
+					`Goal not created: the replaced Goal's admitted work could not be written to the session (${reason}). Nothing was stored.`,
+					null,
+				);
+			}
+			if (store.hasUnfrozenSupersededTail()) {
+				return goalToolError(
+					"Goal not created: the replaced Goal's admitted work could not be written to the session. Nothing was stored.",
+					null,
+				);
+			}
 			try {
 				// Stage before announcing: a write failure here abandons creation with no
 				// visible state change, and the attempt can simply be retried.
@@ -1626,7 +1647,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const goal = store.get();
 		const isGoalWork =
 			goal != null && goal.status !== "complete" && messageText(message.content).startsWith(GOAL_MESSAGE_PREFIX);
-		store.closeSupersededSegment(pi);
+		store.closeSupersededAdmission(pi);
 		if (isGoalWork) {
 			store.beginGoalWork(goal.id);
 			return;
@@ -1956,15 +1977,41 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const previous = store.get();
 			const replacing = previous != null;
 
+			// A fresh create (for example after a Clear) has no current Goal to
+			// preserve, but a superseded identity's tail still has to be frozen before
+			// the new snapshot: its entries sit before it, so a reload could not
+			// recover them afterwards. Refuse rather than lose admitted work.
+			if (!replacing) {
+				try {
+					store.closeSupersededSegment(pi);
+				} catch (error) {
+					ctx.ui.notify(
+						"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
+							"Nothing was stored; fix the cause and run /goal again.",
+						"error",
+					);
+					return;
+				}
+				if (store.hasUnfrozenSupersededTail()) {
+					ctx.ui.notify(
+						"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
+							"Nothing was stored; fix the cause and run /goal again.",
+						"error",
+					);
+					return;
+				}
+			}
+
 			const goal = store.create(validation.objective, "command", { tokenBudget: budget.tokenBudget });
 			const sameRecord = (candidate: GoalRecord | null | undefined) =>
 				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
 			try {
 				// Replacement must preserve the superseded Goal's already-accounted
 				// totals as a durable historical record before the new identity takes
-				// over the session's Goal slot and resets the live ledger.
-				if (replacing) {
-					store.preserveSupersededForReplacement(pi);
+				// over the session's Goal slot and resets the live ledger. If that
+				// freeze fails, the replacement must not proceed.
+				if (replacing && !store.preserveSupersededForReplacement(pi)) {
+					throw new Error("could not freeze the replaced Goal's admitted work");
 				}
 				// Stage and commit before any wait: the new record is what a
 				// concurrent /goal clear, edit, pause, or resume acts on, and
