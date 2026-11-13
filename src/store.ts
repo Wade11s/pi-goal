@@ -605,17 +605,27 @@ export class GoalStore {
 		let supersededLedger: UsageLedger | null = null;
 		let supersededOpen = false;
 		let supersededDirty = false;
+		// Whether a user message has been *delivered* since the replacement opened the
+		// superseded admission. A delivered message is the freeze boundary that closes
+		// it; a durable freeze is not, because `restore()` writes its own freeze while it
+		// is retracting the replacement. This is what tells a retracted replacement —
+		// which keeps the old admission open — apart from one whose tail was already
+		// closed at a boundary.
+		let deliveredSinceSupersede = false;
 		for (let index = 0; index < branch.length; index++) {
 			const entry = branch[index]!;
 			const marker = ownershipMarker(entry);
-			if (marker.kind === "goal-work") segmentOwner = snapshotGoalId;
-			else if (marker.kind === "ordinary-user") {
+			if (marker.kind === "goal-work") {
+				segmentOwner = snapshotGoalId;
+				deliveredSinceSupersede = true;
+			} else if (marker.kind === "ordinary-user") {
 				segmentOwner = null;
 				// A delivered user message is the freeze boundary: live accounting has
 				// already closed the old admission, so replay closes it too. The durable
 				// frozen snapshot normally already records the tail; if a crash lost that
 				// write, the recovered tail stays dirty for the next boundary to persist.
 				supersededOpen = false;
+				deliveredSinceSupersede = true;
 			}
 			if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
 				const snapshot = entry.data as GoalSnapshot | undefined;
@@ -666,8 +676,28 @@ export class GoalStore {
 						supersededLedger = new UsageLedger(normalizeUsage(previousSnapshotRecord.usage));
 						supersededOpen = true;
 						supersededDirty = false;
+						deliveredSinceSupersede = false;
+					} else if (
+						mode === "repaired" &&
+						goalId === supersededRecord?.id &&
+						!deliveredSinceSupersede
+					) {
+						// A current snapshot for the identity whose admission was superseded, with
+						// nothing delivered since: the replacement was retracted, because
+						// `restore()` is the only writer that puts a current snapshot back for a
+						// superseded identity. That identity is current again and its admission
+						// was never closed by a delivery, so the segment is reopened and the
+						// superseded record is cancelled: its totals are the restored record's own
+						// baseline, not a replaced identity's history, and the response still in
+						// flight is charged to the restored Goal exactly as the live path does.
+						supersededRecord = null;
+						supersededLedger = null;
+						supersededOpen = false;
+						supersededDirty = false;
+						segmentOwner = goalId;
+					} else if (segmentOwner === goalId) {
+						segmentOwner = null;
 					}
-					if (segmentOwner === goalId) segmentOwner = null;
 					snapshotGoalId = goalId;
 				}
 				previousSnapshotRecord = snapshot.goal
@@ -953,8 +983,14 @@ export class GoalStore {
 		// had already admitted. If the freeze fails, the replacement must not proceed.
 		const superseded = this.supersededTail;
 		if (superseded) {
-			const frozen = this.closeSupersededSegment(pi);
-			if (!frozen && superseded.dirty) return false;
+			// A new identity is about to take the session's Goal slot, and that boundary
+			// leaves no marker of its own on the branch: the replacement's snapshot is the
+			// only entry. An open admission therefore has to be closed *durably* here,
+			// because replay only draws that line at a superseded snapshot — a live path
+			// that merely dropped the tail would refuse the old identity's in-flight
+			// response while the replay still charged it to the old identity. If the
+			// freeze fails, the replacement must not proceed.
+			if (!this.closeSupersededForCreation(pi)) return false;
 		}
 		const usage = this.liveUsage();
 		const record = { ...copyRecord(current), usage };
@@ -979,7 +1015,8 @@ export class GoalStore {
 	 * would otherwise discard the old identity's already-admitted work. Clear does
 	 * not freeze an *open* tail: it keeps the admission open past the tombstone so
 	 * the old identity's in-flight work stays attributable (see
-	 * {@link commitTombstone}).
+	 * {@link commitTombstone}). Creating a Goal does close an open tail, and has to
+	 * write it to do so (see {@link closeSupersededForCreation}).
 	 *
 	 * The snapshot is marked `superseded`, so it can never become the current Goal on
 	 * reconstruction even if the process dies immediately after this append. There is
@@ -994,18 +1031,51 @@ export class GoalStore {
 	}
 
 	/**
+	 * Close the superseded identity's admission at a boundary that creates a new Goal,
+	 * and report whether the caller may proceed.
+	 *
+	 * A delivered user message and a shutdown both leave a marker of their own on the
+	 * branch — the message itself, or the freeze they write — so replay draws the same
+	 * line they do. Creating a Goal leaves nothing of the kind, and the new identity's
+	 * snapshot is the only entry: replay would keep walking the old admission straight
+	 * past it. The close therefore has to be written as the historical freeze replay
+	 * already understands, or the live path would refuse the old identity's in-flight
+	 * response while the replay charged it to the old identity and froze a record the
+	 * live path never accounted.
+	 *
+	 * Returns `false` when an open or dirty tail could not be written, so the caller
+	 * refuses the creation instead of dropping admitted work on one path and charging
+	 * it on the other.
+	 */
+	closeSupersededForCreation(pi: ExtensionAPI): boolean {
+		const superseded = this.supersededTail;
+		if (!superseded) return true;
+		// A tail that is neither open nor dirty is finished work that is already durable,
+		// so there is nothing to write and nothing to keep the admission open for.
+		const writeEvenIfClean = superseded.open || superseded.dirty;
+		const result = this.tryCloseSupersededSegment(pi, writeEvenIfClean);
+		return result.ok && this.supersededTail === null;
+	}
+
+	/**
 	 * Freeze the superseded identity's tail and report a write failure distinctly
 	 * from "nothing to freeze", so a boundary that must not lose already-accounted
 	 * work (Clear) can refuse to proceed instead of dropping it.
+	 *
+	 * `writeEvenIfClean` is set by boundaries that must close the admission *and*
+	 * leave evidence of it on the branch, because nothing else will: a clean tail
+	 * otherwise carries nothing to write, and dropping it would close the admission
+	 * live while replay kept it open.
 	 */
 	private tryCloseSupersededSegment(
 		pi: ExtensionAPI,
+		writeEvenIfClean = false,
 	): { ok: true; record: GoalRecord | null } | { ok: false; error: unknown } {
 		const superseded = this.supersededTail;
 		if (!superseded) return { ok: true, record: null };
 		const record = superseded.record;
 		record.usage = { ...superseded.ledger.usage };
-		if (!superseded.dirty) {
+		if (!superseded.dirty && !writeEvenIfClean) {
 			// Nothing new to write: the earlier superseded snapshot already carries this
 			// identity's totals. Closing an idle tail must not grow the snapshot log.
 			this.supersededTail = null;
@@ -1189,11 +1259,6 @@ export class GoalStore {
 	 */
 	hasOpenSupersededTail(): boolean {
 		return this.supersededTail?.open === true;
-	}
-
-	/** Whether a superseded tail is still waiting to be made durable. */
-	hasUnfrozenSupersededTail(): boolean {
-		return this.supersededTail?.dirty === true;
 	}
 
 	/**
@@ -1978,6 +2043,13 @@ export class GoalStore {
 		// belongs to the identity being restored, and dropping it here would lose work
 		// that was already admitted and sits before the restored snapshot.
 		const superseded = this.supersededTail;
+		// The replacement is retracted, so `previous` is the current Goal again. Its
+		// admission was still open when the replacement committed — the response it was
+		// streaming is admitted work that has not landed yet — so the restore keeps that
+		// admission open instead of dropping the response on the floor. Charging it to the
+		// restored Goal is what both the live path and the branch replay then do, so the
+		// window converges instead of losing already-admitted work.
+		const reopen = superseded != null && superseded.open && superseded.record.id === previous.id;
 		if (superseded) {
 			const frozen = this.closeSupersededSegment(pi);
 			if (frozen && frozen.id === previous.id) {
@@ -1999,8 +2071,12 @@ export class GoalStore {
 		}
 		this.current = this.adopt(record);
 		this.pendingTransition = undefined;
-		this.goalOwned = false;
-		this.ownerId = null;
+		// A restored Goal admits no *new* automatic work through this: the continuation
+		// and wrap-up seams are status-guarded, so retaining the admission only keeps the
+		// response that was already in flight attributable to the restored identity. A
+		// delivered user message still closes it, exactly as before the replacement.
+		this.goalOwned = reopen;
+		this.ownerId = reopen ? record.id : null;
 		this.supersededTail = null;
 		this.legacyPending = false;
 		const usage = normalizeUsage(record.usage);

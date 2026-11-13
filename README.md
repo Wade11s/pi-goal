@@ -87,8 +87,19 @@ it rather than to the replacement or to nobody. That tail is frozen onto the old
 identity's record as a **superseded** snapshot at the next freeze boundary — the
 next delivered user message, a shutdown that keeps the session file, a new Goal
 creation, a second replacement, a durability-rollback restore, or the first load
-of a branch whose freeze never ran — and a tail that collected nothing new is
-never written. `/goal clear` of the replacement does not freeze an open tail: the
+of a branch whose freeze never ran — and a tail that collected nothing new is not
+written at a boundary that carries its own marker on the branch, so an idle
+replacement does not grow the snapshot log. Creating a Goal is the exception: it
+leaves no marker of its own, so an open admission is closed *durably* there, as a
+superseded snapshot. That write is the only evidence on the branch that the
+admission closed, and it is what makes the live path refuse a response that lands
+after the creation exactly as the replay does, instead of one charging it to the
+old identity. A replacement whose durability cannot be confirmed is retracted by
+restoring the previous record: the tail is frozen onto that record first — its
+entries sit before the restored snapshot, so no later replay could recover them —
+and the restored identity's admission stays open, so a response that was still
+streaming when the replacement was retracted is charged to it rather than dropped.
+`/goal clear` of the replacement does not freeze an open tail: the
 old identity's admission stays open past the tombstone so its in-flight work is
 still attributed to it, and the tail freezes at the next boundary. The frozen
 record is marked `superseded`, so it is loadable and replayable but never becomes

@@ -439,6 +439,36 @@ function replaceWithTailInFlight() {
 	return { store, previous, replacement, branch, pi };
 }
 
+/**
+ * The state a steered replacement leaves behind when the old identity's response has
+ * not landed yet: its already-accounted snapshot, the replacement's snapshot, and an
+ * admission that is open but has charged nothing. This is the window the new-Goal
+ * creation boundaries sit in — the tail is clean, so there is nothing to write and
+ * nothing to refuse on a dirty write.
+ */
+function replaceWithCleanTailInFlight() {
+	const store = new GoalStore();
+	const previous = record({ id: "goal_aaaaaaaa", usage: usage(0) });
+	store.reconstruct(fakeCtx([goalEntry(previous, { repaired: true })]));
+	store.beginGoalWork(previous.id);
+	const pi = fakePi();
+	store.preserveSupersededForReplacement(pi);
+	const replacement = record({ id: "goal_bbbbbbbb", usage: usage(0) });
+	store.stage(pi, replacement);
+	store.commit(replacement);
+	return { store, previous, replacement, pi };
+}
+
+/** The branch a reload reads for a replacement scenario, including the old kickoff. */
+function reloadBranchAfterReplacement(pi, extra = []) {
+	return [
+		goalEntry(record({ id: "goal_aaaaaaaa" }), { repaired: true }),
+		goalWorkEntry("kickoff-old"),
+		...asBranch(pi),
+		...extra,
+	];
+}
+
 it("Clear keeps the superseded identity's already-accounted open tail through the tombstone", () => {
 	// The old tail landed before Clear, but its admission is still open: Clear of
 	// the replacement does not erase work already admitted for the superseded
@@ -620,6 +650,184 @@ it("a recovered superseded tail is frozen as history and never resurrects the ol
 	reloaded.reconstruct(fakeCtx([...branch, ...asBranch(pi)]));
 	assert.equal(reloaded.get(), null, "the freeze never resurrects the old Goal");
 	assert.equal(reloaded.getUsage().totalTokens, 0);
+});
+
+it("creating a Goal closes an open, clean superseded tail durably so live and replay agree", () => {
+	// A→B while A's response streams, Clear B (the admission stays open and clean), then
+	// a new Goal C is created before A's response lands. Creating a Goal leaves no
+	// marker of its own on the branch, so the close has to be durable: a live path that
+	// merely dropped the open tail would refuse A's in-flight response while the replay
+	// still charged it to A and froze a record the live path never accounted.
+	const { store, previous, pi } = replaceWithCleanTailInFlight();
+	assert.equal(store.clear(pi).ok, true);
+	assert.equal(store.hasOpenSupersededTail(), true, "Clear keeps the admission open");
+
+	// The creation boundary closes the old admission with durable evidence.
+	assert.equal(store.closeSupersededForCreation(pi), true, "the creation may proceed");
+	const frozen = appendedSuperseded(pi);
+	assert.equal(frozen.length, 1, "the close is written, not silent");
+	assert.equal(frozen[0].data.goal.id, previous.id, "the tail stays with the replaced identity");
+	assert.equal(frozen[0].data.goal.usage.totalTokens, 0, "nothing new had landed, and nothing is invented");
+	assert.equal(store.hasOpenSupersededTail(), false, "the admission is closed");
+
+	const next = record({ id: "goal_dddddddd", usage: usage(0) });
+	store.stage(pi, next);
+	store.commit(next);
+
+	// A's response lands after the creation boundary: refused live ...
+	assert.equal(store.accountUsage("model:9", usageReport(100, 10), "model", previous.id), undefined);
+	// ... and the new Goal owns nothing yet, so neither is a report bound to it.
+	assert.equal(store.accountUsage("model:10", usageReport(20, 2), "model", next.id), undefined);
+
+	// ... and refused on replay, so the two paths converge on the same attribution.
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(fakeCtx(reloadBranchAfterReplacement(pi, [assistantEntry(9, usageReport(100, 10))])));
+	assert.equal(reloaded.get()?.id, next.id, "the new Goal is current");
+	assert.equal(reloaded.getUsage().totalTokens, 0, "the replay charges the late response to nobody");
+	assert.equal(reloaded.hasOpenSupersededTail(), false, "no admission survives the close");
+	const boundary = fakePi();
+	reloaded.closeSupersededSegment(boundary);
+	assert.equal(boundary.appended.length, 0, "the reload neither recovers an open tail nor rewrites the freeze");
+});
+
+it("creating a Goal is refused when an open tail cannot be frozen", () => {
+	// The freeze is the evidence the replay reads, so a failed write must stop the
+	// creation rather than let the live path drop an admission the replay keeps open.
+	const { store, previous, pi } = replaceWithCleanTailInFlight();
+	assert.equal(store.clear(pi).ok, true);
+
+	const failing = fakePi();
+	const append = failing.appendEntry.bind(failing);
+	failing.appendEntry = (type, data) => {
+		if (type === "goal-state" && data.superseded === true) throw new Error("disk full");
+		return append(type, data);
+	};
+	assert.equal(store.closeSupersededForCreation(failing), false, "the creation is refused");
+	assert.equal(store.hasOpenSupersededTail(), true, "the admission stays open for the retry");
+	assert.equal(appendedGoalStates(failing).length, 0, "nothing was written");
+
+	const retry = fakePi();
+	assert.equal(store.closeSupersededForCreation(retry), true, "the retry succeeds");
+	const frozen = appendedSuperseded(retry);
+	assert.equal(frozen.length, 1);
+	assert.equal(frozen[0].data.goal.id, previous.id);
+	assert.equal(frozen[0].data.goal.usage.totalTokens, 0);
+});
+
+it("a second replacement closes the first identity's open tail durably", () => {
+	// A→B while A's response streams, then B→C before A's response lands. A's tail is
+	// open and clean, and the second replacement leaves only its own snapshots on the
+	// branch, so A's admission has to be closed durably here rather than dropped.
+	const { store, previous, pi } = replaceWithCleanTailInFlight();
+	const second = record({ id: "goal_cccccccc", usage: usage(0) });
+
+	assert.equal(store.preserveSupersededForReplacement(pi), true);
+	store.stage(pi, second);
+	store.commit(second);
+
+	const states = appendedGoalStates(pi);
+	assert.equal(states.at(-3).data.goal.id, previous.id);
+	assert.equal(states.at(-3).data.superseded, true, "the first identity's open tail is closed durably");
+	assert.equal(states.at(-3).data.goal.usage.totalTokens, 0, "at the totals it had already accounted");
+	assert.equal(states.at(-2).data.goal.id, "goal_bbbbbbbb", "the replacement's already-accounted snapshot");
+	assert.equal(states.at(-2).data.superseded, undefined);
+	assert.equal(states.at(-1).data.goal.id, second.id);
+	assert.equal(store.get()?.id, second.id);
+
+	// A's response is refused live ...
+	assert.equal(store.accountUsage("model:9", usageReport(100, 10), "model", previous.id), undefined);
+
+	// ... and refused on replay, so the two paths agree instead of one charging it to A.
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(fakeCtx(reloadBranchAfterReplacement(pi, [assistantEntry(9, usageReport(100, 10))])));
+	assert.equal(reloaded.get()?.id, second.id, "the newest replacement is current");
+	assert.equal(reloaded.getUsage().totalTokens, 0, "the replay charges the late response to nobody");
+	assert.equal(reloaded.hasOpenSupersededTail(), false, "no admission survives the close");
+	const boundary = fakePi();
+	reloaded.closeSupersededSegment(boundary);
+	assert.equal(boundary.appended.length, 0, "the reload neither recovers an open tail nor rewrites the freeze");
+});
+
+it("a durability rollback restores the old identity's admission for its in-flight response", () => {
+	// The replacement's durability could not be confirmed while A's response was still
+	// streaming. The restore retracts the replacement, so A is current again — and the
+	// admission it was retracted from is still open, because the response it was
+	// streaming is admitted work that has not landed yet. Dropping it would lose work
+	// live that the branch replay still accounts for.
+	const { store, previous, replacement, pi } = replaceWithCleanTailInFlight();
+	assert.equal(store.restore(pi, previous).ok, true);
+
+	const states = appendedGoalStates(pi);
+	assert.equal(states.at(-1).data.goal.id, previous.id, "the previous identity is restored");
+	assert.equal(states.at(-1).data.superseded, undefined, "as the current Goal, not as history");
+	assert.equal(store.get()?.id, previous.id);
+	assert.equal(store.hasOpenSupersededTail(), false, "the restored identity is current, not superseded");
+	assert.equal(store.currentOwnerId(), previous.id, "its admission is retained");
+
+	// A's response lands after the restore: charged to the restored Goal, live ...
+	const late = store.accountUsage("model:9", usageReport(100, 10), "model", previous.id);
+	assert.equal(late?.totalTokens, 110);
+	assert.equal(store.getUsage().totalTokens, 110);
+	// The discarded replacement's own work is not transferred to the restored Goal.
+	assert.equal(store.accountUsage("model:10", usageReport(20, 2), "model", replacement.id), undefined);
+
+	// ... and on replay, so the two paths converge on the same total.
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(fakeCtx(reloadBranchAfterReplacement(pi, [assistantEntry(9, usageReport(100, 10))])));
+	assert.equal(reloaded.get()?.id, previous.id, "the restored identity stays current");
+	assert.equal(reloaded.getUsage().totalTokens, 110, "the reload converges on the live total");
+	assert.equal(reloaded.hasOpenSupersededTail(), false);
+});
+
+it("a durability rollback keeps an already-accounted tail's in-flight response with the restored Goal", () => {
+	// The same window with a tail that had already landed: the restore freezes it onto
+	// the restored record first, and the response still in flight is charged to the
+	// restored Goal instead of being dropped after it.
+	const { store, previous, pi } = replaceWithTailInFlight();
+	assert.equal(store.restore(pi, previous).ok, true);
+
+	const states = appendedGoalStates(pi);
+	assert.equal(states.at(-2).data.goal.id, previous.id);
+	assert.equal(states.at(-2).data.superseded, true, "the tail is frozen as history first");
+	assert.equal(states.at(-2).data.goal.usage.totalTokens, 160);
+	assert.equal(states.at(-1).data.goal.id, previous.id, "the previous identity is restored");
+	assert.equal(states.at(-1).data.goal.usage.totalTokens, 160, "carrying the admitted tail");
+	assert.equal(store.currentOwnerId(), previous.id, "its admission is retained");
+
+	const late = store.accountUsage("model:9", usageReport(100, 10), "model", previous.id);
+	assert.equal(late?.totalTokens, 110);
+	assert.equal(store.getUsage().totalTokens, 270, "160 restored + 110 in flight");
+
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(fakeCtx(reloadBranchAfterReplacement(pi, [assistantEntry(9, usageReport(100, 10))])));
+	assert.equal(reloaded.get()?.id, previous.id, "the restored identity stays current");
+	assert.equal(reloaded.getUsage().totalTokens, 270, "the reload converges on the live total");
+});
+
+it("a rollback restore after a delivered message does not reopen the closed admission", () => {
+	// A delivered user message is the freeze boundary: it closed A's admission, so the
+	// restore must not reopen it. Live and replay both refuse what follows, instead of
+	// one of them charging it to the restored Goal.
+	const { store, previous, pi } = replaceWithCleanTailInFlight();
+	store.closeSupersededAdmission(pi);
+	assert.equal(store.hasOpenSupersededTail(), false, "the delivered message closed the admission");
+
+	assert.equal(store.restore(pi, previous).ok, true);
+	assert.equal(store.currentOwnerId(), null, "the closed admission stays closed");
+	assert.equal(store.accountUsage("model:9", usageReport(100, 10), "model", previous.id), undefined);
+
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(
+		fakeCtx([
+			goalEntry(record({ id: "goal_aaaaaaaa" }), { repaired: true }),
+			goalWorkEntry("kickoff-old"),
+			...asBranch(pi),
+			ordinaryUserEntry("anything else?"),
+			assistantEntry(9, usageReport(100, 10)),
+		]),
+	);
+	assert.equal(reloaded.get()?.id, previous.id, "the restored identity stays current");
+	assert.equal(reloaded.getUsage().totalTokens, 0, "the replay draws the same line");
 });
 
 it("a second replacement freezes the first identity's open tail before the second preserve", () => {

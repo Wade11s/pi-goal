@@ -24,6 +24,8 @@ persisted entries.
 | Replacement starts at zero | Old identity keeps its admitted work; new identity inherits nothing | `test/goal9-ownership.test.mjs` ("a Replacement Goal starts at zero…"; "a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("the superseded snapshot carries the exact already-accounted totals") |
 | Old in-flight tail | The old identity's in-flight assistant response and tool results stay attributed to it, live and on replay | `test/goal9-ownership.test.mjs` ("a steered Replacement attributes the old identity's in-flight work to the old identity"); `test/goal9-store.test.mjs` ("a replacement attributes the superseded identity's in-flight assistant and tool-result tail") |
 | Tail survives every boundary | A second replacement and a durability-rollback restore freeze the open tail; Clear keeps an open tail open past the tombstone and freezes a closed tail, refusing on a failed write | `test/goal9-store.test.mjs` ("Clear keeps the superseded identity's already-accounted open tail through the tombstone"; "Clear keeps the superseded identity's admission open so a later response stays attributed"; "Clear refuses to commit when an already-accounted tail cannot be frozen"; "a second replacement freezes the first identity's open tail before the second preserve"; "a durability rollback restores the old identity together with its open tail") |
+| New-Goal creation closes the old admission | `/goal`, `create_goal`, and a second replacement close an open tail durably, so the live refusal and the replay's attribution are identical; the creation is refused when that write fails | `test/goal9-ownership.test.mjs` ("creating a Goal after a Clear closes the old admission so live and replay agree"); `test/goal9-store.test.mjs` ("creating a Goal closes an open, clean superseded tail durably so live and replay agree"; "creating a Goal is refused when an open tail cannot be frozen"; "a second replacement closes the first identity's open tail durably") |
+| Rollback restore retains the admission | A retracted replacement restores the old identity with its admission open, so a response still streaming is charged to it live and on replay; a delivered message still closes it | `test/goal9-store.test.mjs` ("a durability rollback restores the old identity's admission for its in-flight response"; "a durability rollback keeps an already-accounted tail's in-flight response with the restored Goal"; "a rollback restore after a delivered message does not reopen the closed admission") |
 | Clear keeps the old admission open | Clear of the replacement does not erase the superseded identity's admitted or in-flight work; the tail freezes at the next boundary | `test/goal9-store.test.mjs` ("Clear keeps the superseded identity's admission open so a later response stays attributed"; "Clear keeps the superseded identity's already-accounted open tail through the tombstone") |
 | Replay recovers past a tombstone | A superseded tail is recovered even when the newest non-superseded entry is a tombstone, and never resurrects the old Goal | `test/goal9-store.test.mjs` ("replay recovers a superseded tail when the newest non-superseded entry is a tombstone"; "a recovered superseded tail is frozen as history and never resurrects the old Goal") |
 | Freeze is crash-safe | One append, marked `superseded`, so a crash right after it cannot resurrect the replaced Goal, and a failed write keeps the tail | `test/goal9-store.test.mjs` ("a crash right after the freeze append never resurrects the superseded Goal"; "a failed freeze write keeps the tail for the next boundary") |
@@ -360,6 +362,83 @@ a recovered superseded tail is frozen as history and never resurrects the old Go
 Clear during the superseded identity's in-flight response keeps the tail attributed
   AssertionError: the tail is frozen as history
 ```
+
+## Review follow-up: the new-Goal creation boundaries and the rollback restore
+
+The re-review by subagent d6feec at `fe3b070` found two medium edge-window
+gaps, both reproduced against head, and neither is an accepted residual.
+
+- **An open, clean superseded tail was dropped with no durable trace at a
+  new-Goal creation boundary.** `tryCloseSupersededSegment` nulls a clean tail
+  unconditionally, which is correct at a delivery or shutdown boundary (both
+  leave a marker on the branch) but not at the markerless ones: the fresh
+  `/goal` path, `create_goal`, and `preserveSupersededForReplacement`. Replacing
+  A→B while A's response streams, clearing B, and creating C before A's response
+  landed charged that response to nobody live, while the replay walked A's
+  admission past the tombstone and C's snapshot and froze a 110-token record the
+  live path never accounted. All three boundaries now call
+  `closeSupersededForCreation`, which closes an open (or dirty) tail *and writes
+  it* — `writeEvenIfClean` on `tryCloseSupersededSegment` — because the freeze is
+  the only entry that tells the replay the admission closed. The creation is
+  refused when that write fails, so admitted work is never dropped on one path
+  and charged on the other. `hasUnfrozenSupersededTail` is gone: both call sites
+  now read the boolean result.
+- **A durability-rollback restore dropped the old identity's post-restore
+  in-flight response on both paths.** `restore()` froze the pre-restore tail and
+  then cleared ownership, so a response admitted before the replacement but
+  finalized after the restore was charged to nobody — live, because
+  `usageTarget` refuses an identity with no open segment, and on replay, because
+  the restored same-identity snapshot nulled `segmentOwner`. `restore()` now
+  retains the restored identity's admission when its tail was open at restore
+  (and only then: a delivered message is still the boundary that closes it), and
+  `replayBranch` treats a current snapshot for the superseded identity with
+  nothing delivered since as the retracted replacement it is: the segment is
+  reopened and the superseded record cancelled, because its totals are the
+  restored record's own baseline rather than a replaced identity's history. The
+  live charge and the replay charge then land on the same ledger — 110 for a
+  clean tail, 270 for one that had already collected 160 — and no new automatic
+  work is admitted, because the continuation and wrap-up seams stay
+  status-guarded.
+
+The new regressions fail on the pre-fix `src/` (`fe3b070`):
+
+```text
+creating a Goal closes an open, clean superseded tail durably so live and replay agree
+  TypeError: store.closeSupersededForCreation is not a function
+
+creating a Goal is refused when an open tail cannot be frozen
+  TypeError: store.closeSupersededForCreation is not a function
+
+a second replacement closes the first identity's open tail durably
+  AssertionError: Expected values to be strictly equal:
+    + 'goal_bbbbbbbb' - 'goal_aaaaaaaa'
+
+a durability rollback restores the old identity's admission for its in-flight response
+  AssertionError: its admission is retained
+    + null - 'goal_aaaaaaaa'
+
+a durability rollback keeps an already-accounted tail's in-flight response with the restored Goal
+  AssertionError: its admission is retained
+    + null - 'goal_aaaaaaaa'
+
+creating a Goal after a Clear closes the old admission so live and replay agree
+  AssertionError: the old admission is closed with durable evidence
+    + undefined - true
+```
+
+Two of the new regressions guard the repair itself rather than the pre-fix
+behaviour: the creation must be refused when the close cannot be written, and a
+restore after a delivered message must not reopen the admission that message
+closed.
+
+The durability-rollback window (the 5 s durability timeout expiring while the
+old identity's response is still streaming) cannot be forced through real RPC
+without a fault injector, so that window is covered by the store regressions
+above — live charge, exact totals, and reload convergence — while the creation
+window is covered end to end by
+`test/goal9-ownership.test.mjs` ("creating a Goal after a Clear closes the old
+admission so live and replay agree"), which drives a real `pi --mode rpc`
+process and asserts both the live totals and what a fresh process reconstructs.
 
 ## Compatibility landing constraint
 

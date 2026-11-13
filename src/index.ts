@@ -1227,21 +1227,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				);
 			}
 			const goal = store.create(validation.objective, "tool", { tokenBudget: budget.tokenBudget });
-			// A superseded identity's open tail must be durable before a new Goal takes
-			// the session's Goal slot: its entries sit before the new snapshot, so a
-			// reload could not recover them afterwards. Refuse rather than lose work.
-			try {
-				store.closeSupersededSegment(pi);
-			} catch (error) {
-				const reason = error instanceof Error ? error.message : String(error);
+			// A superseded identity's open tail must be durable before a new Goal takes the
+			// session's Goal slot: creating a Goal leaves no marker of its own on the
+			// branch, so replay only closes that admission at a durable freeze. Refuse
+			// rather than lose admitted work or let the two paths disagree about it.
+			if (!store.closeSupersededForCreation(pi)) {
 				return goalToolError(
-					`Goal not created: the replaced Goal's admitted work could not be written to the session (${reason}). Nothing was stored.`,
-					null,
-				);
-			}
-			if (store.hasUnfrozenSupersededTail()) {
-				return goalToolError(
-					"Goal not created: the replaced Goal's admitted work could not be written to the session. Nothing was stored.",
+					"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
+						"Nothing was stored.",
 					null,
 				);
 			}
@@ -1977,22 +1970,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const previous = store.get();
 			const replacing = previous != null;
 
-			// A fresh create (for example after a Clear) has no current Goal to
-			// preserve, but a superseded identity's tail still has to be frozen before
-			// the new snapshot: its entries sit before it, so a reload could not
-			// recover them afterwards. Refuse rather than lose admitted work.
+			// A fresh create (for example after a Clear) has no current Goal to preserve,
+			// but a superseded identity's open admission still has to be closed before the
+			// new snapshot. Creating a Goal leaves no marker of its own on the branch, so
+			// replay only closes that admission at a durable freeze: refuse rather than
+			// lose admitted work, or let the live path and the replay disagree about it.
 			if (!replacing) {
-				try {
-					store.closeSupersededSegment(pi);
-				} catch (error) {
-					ctx.ui.notify(
-						"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
-							"Nothing was stored; fix the cause and run /goal again.",
-						"error",
-					);
-					return;
-				}
-				if (store.hasUnfrozenSupersededTail()) {
+				if (!store.closeSupersededForCreation(pi)) {
 					ctx.ui.notify(
 						"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
 							"Nothing was stored; fix the cause and run /goal again.",

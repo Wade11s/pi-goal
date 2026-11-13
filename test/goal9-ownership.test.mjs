@@ -646,6 +646,122 @@ test("Clear during the superseded identity's in-flight response keeps the tail a
 	}
 });
 
+test("creating a Goal after a Clear closes the old admission so live and replay agree", async () => {
+	// A replacement commits while A's request is streaming, the user clears the
+	// replacement, and a new Goal C is created before A's response is finalized.
+	// Creating a Goal is a boundary that leaves no marker of its own on the branch, so
+	// the old admission has to be closed durably there: a live path that merely dropped
+	// it would refuse A's response while the replay still charged it to A and froze a
+	// 110-token record the live path never accounted.
+	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
+	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
+	const session = await PiRpcSession.start({ cwd: workDir, sessionDir });
+	const gate = join(workDir, "provider-gate");
+	script(
+		[
+			{ text: "Original kickoff.", waitForFile: gate, usage: { input: 100, output: 10 } },
+			{ text: "Steered kickoff.", usage: { input: 20, output: 2 } },
+			{ hang: true },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await waitForTurns(session, 1);
+		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+
+		// Replace A→B while A's request is streaming, then Clear B before it lands.
+		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
+		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
+		assert.equal((await replacePromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+
+		const clearPromise = submitCommand(session, "clear-busy", "/goal clear");
+		assert.equal((await clearPromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("cleared"));
+
+		// Create Goal C while A's request is still streaming. The creation boundary closes
+		// A's admission, and that close is durable before C's own snapshot.
+		const createPromise = submitCommand(session, "create-c", "/goal A third objective");
+		await waitForStoredGoal(session, (goal) => goal.objective === "A third objective", "the new Goal's snapshot");
+		const statesAtCreation = goalSnapshots(readSessionEntries(await session.sessionFile()));
+		assert.equal(currentGoalSnapshot(statesAtCreation).data.goal.objective, "A third objective");
+		const closeAtCreation = statesAtCreation.filter((e) => e.data.goal?.id === original.id).at(-1);
+		assert.equal(closeAtCreation.data.superseded, true, "the old admission is closed with durable evidence");
+		assert.equal(closeAtCreation.data.goal.usage.totalTokens, 0, "A's response had not landed yet");
+
+		// Release A's response: it lands after the creation boundary and is charged to
+		// nobody, live and on replay.
+		writeFileSync(gate, "", "utf8");
+		await abortActiveLoop(session, 2);
+		assert.equal((await createPromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+
+		const status = await reportStatus(session);
+		assert.equal(status.status, "active");
+		assert.equal(
+			status.totalTokens,
+			37,
+			"22 for the steered response + 15 for the aborted kickoff; A's late response is charged to nobody",
+		);
+		assert.equal(status.nestedTokens, 0);
+
+		const liveStates = goalSnapshots(readSessionEntries(await session.sessionFile()));
+		assert.equal(
+			liveStates.length,
+			statesAtCreation.length,
+			"the live path appends nothing after the creation boundary",
+		);
+		const oldStates = liveStates.filter((e) => e.data.goal?.id === original.id);
+		assert.equal(oldStates.length, 3, "creation, the replacement's preserve, and the durable close");
+		assert.equal(oldStates.at(-1).data.superseded, true);
+		for (const state of oldStates) {
+			assert.equal(state.data.goal.usage.totalTokens, 0, "the late response was never accounted, live");
+		}
+
+		// A fresh process reconstructs from the branch and must reach the same totals.
+		const { resumed, dir } = await reload(session, workDir);
+		script([{ text: "Ordinary after reload.", usage: { input: 50, output: 5 } }], resumed);
+		try {
+			await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
+			const restored = await reportStatus(resumed);
+			assert.equal(restored.status, "active");
+			assert.equal(restored.totalTokens, 37, "the reload converges on the live total");
+			assert.equal(
+				goalSnapshots(readSessionEntries(await resumed.sessionFile())).length,
+				liveStates.length,
+				"the reload appends no snapshot of its own",
+			);
+
+			// The next delivered user message is a freeze boundary. It must not invent a
+			// historical record for the old identity's late response: live refused it, so the
+			// replay has to refuse it too instead of freezing a total nobody accounted.
+			await resumed.prompt("/goal pause");
+			await resumed.waitForNotify((r) => r.message.includes("paused"));
+			await resumed.prompt("anything else after the reload?");
+			await resumed.waitForSettled(1);
+			const afterBoundary = goalSnapshots(readSessionEntries(await resumed.sessionFile()));
+			const oldAfterBoundary = afterBoundary.filter((e) => e.data.goal?.id === original.id);
+			assert.equal(oldAfterBoundary.length, 3, "no historical freeze is invented for the late response");
+			for (const state of oldAfterBoundary) {
+				assert.equal(state.data.goal.usage.totalTokens, 0, "and the old identity's total stays exact");
+			}
+			assertStepsConsumed(resumed, 1, []);
+			assert.equal(resumed.extensionErrors().length, 0, JSON.stringify(resumed.extensionErrors()));
+		} finally {
+			await resumed.stop();
+			rmSync(dir, { recursive: true, force: true });
+		}
+		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+		rmSync(workDir, { recursive: true, force: true });
+		rmSync(sessionDir, { recursive: true, force: true });
+	}
+});
+
 test("old-budget exhaustion is recorded on the superseded identity and admits no old continuation", async () => {
 	// The old identity's in-flight tail crosses its own budget. The exhaustion belongs
 	// to the old identity's durable record only: the replacement keeps its fresh
