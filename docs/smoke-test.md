@@ -155,7 +155,7 @@ command reports `No Goal is set in this session.`
 Expect no `restored` notification and `No Goal is set in this session.` The
 durable tombstone prevents a cleared Goal from being resurrected.
 
-## 14. Optional: budget exhaustion
+## 14. Optional: budget exhaustion and cumulative recovery
 
 ```
 /goal --budget 1 Write a haiku
@@ -165,6 +165,24 @@ Expect the Goal to be created, the next accounted turn to exhaust the budget, a
 warning notification, exactly one bounded wrap-up summary, and the status
 indicator showing `budget_limited`. Budget exhaustion is never reported as
 completion.
+
+A `budget_limited` Goal is resumed only by raising its cumulative ceiling:
+
+```
+/goal resume
+/goal resume --budget 500
+/goal resume --budget=250
+```
+
+- The bare resume is refused with guidance to supply a new total.
+- `--budget 500` raises the absolute ceiling to 500 tokens. `/goal` shows the
+  full prior usage still accounted against it (never reset or discounted).
+- A value at or below the current usage is refused (no positive headroom), and a
+  value above the configured `goal.maxTokenBudget` is refused, never clamped.
+- The pending old-episode wrap-up is cancelled by a valid raise. If the resumed
+  work later exhausts the new ceiling, exactly one fresh wrap-up is delivered.
+- `/goal edit <objective>` without a resume preserves `budget_limited` and does
+  not cancel an owed wrap-up; edit first, then resume with the new budget.
 
 ## 15. Optional: RPC / headless check
 
@@ -203,6 +221,10 @@ installed. Expect:
 - [ ] Bare `/goal edit` opens a prefilled editor and applies the edit.
 - [ ] `/goal pause` changes status to `paused` and stops continuation.
 - [ ] `/goal resume` changes status back to `active` and restarts work.
+- [ ] `/goal resume --budget <new-total>` resumes a `budget_limited` Goal with a
+      higher cumulative ceiling, and the `--budget=` spelling works.
+- [ ] A bare `/goal resume` of a `budget_limited` Goal, a no-headroom raise, and
+      a raise above `goal.maxTokenBudget` are all refused with guidance.
 - [ ] `/goal clear` removes the Goal and the status indicator.
 - [ ] The Goal survives a restart with its usage intact.
 - [ ] `/reload` after a clear does not resurrect the Goal.

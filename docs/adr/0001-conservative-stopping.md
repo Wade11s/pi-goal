@@ -143,6 +143,39 @@ legacy open audit keeps its description and count for the Blocker-identity hando
 in batch 3, and the extension does not introduce text-similarity equivalence to
 recover it. Nothing in this ADR's thresholds or reset rules changes.
 
+### Repair batch 2: cumulative budget recovery and per-episode wrap-ups
+
+Batch 2 (issue #25) repairs how a `budget_limited` Goal resumes. The old budget
+is a cumulative ceiling, so an explicit raise — and only an explicit raise — can
+restart the same identity: `/goal resume --budget <new-total>` (or
+`--budget=<new-total>`). The value is the new absolute total, not an increment;
+it must be strictly greater than the accounted usage so the resumed Goal has
+positive headroom, and at most the configured `goal.maxTokenBudget`, which is
+never clamped. `goal.defaultTokenBudget` is never implicit resume authority.
+
+A successful raise is one durable transition: identity, creation time, origin,
+objective, and complete usage history are preserved; the ceiling and
+`status: active` are set; any pending old-episode wrap-up is cleared; the
+revision advances exactly once; and a fresh active-time segment starts. The
+commit precedes any resumed work message. A validation or persistence failure
+leaves the Goal `budget_limited` with its old budget and wrap-up state.
+
+One bounded wrap-up is owed per exhaustion episode, not per Goal lifetime. A
+valid raise cancels an undelivered wrap-up. If the old wrap-up is already in
+flight, its admitted usage stays charged; the old budget gate lifts only after
+the raise is durable, the resumed work is steered through Pi's normal seam, and
+no second old-budget wrap-up is sent. Already-admitted in-flight usage can
+immediately exhaust the new ceiling, in which case the Goal becomes
+`budget_limited` again and earns the new episode's one wrap-up. Editing the
+objective without resuming does not cancel an owed wrap-up: an undelivered
+wrap-up uses the latest durable objective, and an in-flight or completed one is
+never duplicated. `/goal edit` stays independent, so changing both the
+objective and the budget is edit first, then a budget-raising resume.
+
+This batch does not change any threshold or reset rule in this ADR. The
+conservative stops still end automatic continuation, and the blocked audit still
+starts fresh on a user resume.
+
 ## Consequences
 
 - Stopping needs no model cooperation and no judge service: the same events Pi

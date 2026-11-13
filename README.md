@@ -195,6 +195,32 @@ A Goal can carry a token budget that bounds unattended model usage:
   never gets an unbounded Goal by omission.
 - `create_goal` accepts the same budget as an optional `tokenBudget` argument.
 
+A `budget_limited` Goal can be resumed only by raising its **cumulative**
+ceiling:
+
+```
+/goal resume --budget 500000
+/goal resume --budget=500000
+```
+
+- The new value is the Goal's new absolute total, not an increment and not a
+  fresh allowance. All Goal-owned usage already accounted — including overshoot
+  and every admitted wrap-up — stays charged against it, so the value must be
+  strictly greater than the current `usage.totalTokens` and is refused otherwise
+  (no-headroom resumes are rejected rather than resuming into an immediate stop).
+- The configured `goal.maxTokenBudget` remains a hard cap: a value above it is
+  refused, never clamped. `goal.defaultTokenBudget` is never implicit resume
+  authority; a bare `/goal resume` of a `budget_limited` Goal is refused with
+  guidance to supply a new total.
+- A successful raise is one durable transition: it preserves the identity,
+  creation time, origin, objective, and complete usage history, sets the new
+  ceiling and `active`, cancels any pending old-episode wrap-up, advances the
+  revision exactly once, starts a fresh active-time segment, and commits before
+  any resumed work message is admitted.
+- `/goal edit <objective>` stays independent: it preserves `budget_limited` and
+  admits no substantive Goal work. To change both, edit first and then resume
+  with the new budget. There is no combined edit-and-resume command.
+
 Extension-level defaults live in Pi's settings (agent-directory or project):
 
 ```json
@@ -239,15 +265,19 @@ and is reported as a persistence error).
   normal abort. A paused Goal also stops accruing active time, and `/goal resume`
   restarts that clock with the work.
 - `/goal resume` restarts eligible work — a **paused**, **blocked**, or
-  **usage_limited** Goal: the transition is durable, then a resume kickoff
-  message restates the objective and asks for a fresh evidence audit of the
-  retained progress. Resuming while another run is in flight steers the resume
-  message into it rather than waiting for idle. Resuming a `blocked` or
+  **usage_limited** Goal, or a **budget_limited** Goal with a higher cumulative
+  token budget: the transition is durable, then a resume kickoff message
+  restates the objective and asks for a fresh evidence audit of the retained
+  progress. Resuming while another run is in flight steers the resume message
+  into it rather than waiting for idle. Resuming a `blocked` or
   `usage_limited` Goal is the user decision those stops ask for, so it keeps the
   same identity, creation time, and history, drops the audit that described the
   stop, and starts a **fresh** blocked audit: the next blocker report counts from
   one rather than inheriting the count the user just overruled. A **complete**
   Goal is terminal for its identity and is refused — replacing it is a new Goal.
+  The `--budget` option is valid only for a `budget_limited` Goal; it is refused
+  for `active`, `paused`, `blocked`, `usage_limited`, and `complete`, whose
+  existing lifecycle behavior is unchanged.
 - `/goal clear` removes the Goal from any status by writing a durable tombstone
   snapshot, so restarts and reloads cannot resurrect it, and the session returns
   to ordinary prompt-by-prompt behavior.
@@ -423,8 +453,19 @@ Reaching the token budget is **not** completion:
    restart, because the pending-wrap-up flag is durable. Later usage is still
    accounted, so remaining capacity keeps being reported (floored at zero).
 
-Raising the budget or changing the objective is a user decision; resuming a
-budget-limited Goal arrives with the lifecycle commands.
+One bounded wrap-up is owed **per budget-exhaustion episode**, not per Goal
+lifetime. A valid `/goal resume --budget <new-total>` cancels an undelivered
+wrap-up; if the old wrap-up is already in flight, its admitted usage stays
+charged, the old budget gate lifts only after the new ceiling is durably
+authorized, and no second old-budget wrap-up is sent. If the resumed work later
+exhausts the new ceiling — including immediately, when already-admitted
+in-flight usage crosses it — the Goal becomes `budget_limited` again and earns
+exactly one fresh wrap-up. Editing the objective without resuming does not
+cancel an owed wrap-up; an undelivered wrap-up uses the latest durable
+objective, and an in-flight or completed wrap-up is never duplicated by an edit.
+
+Raising the budget or changing the objective is a user decision; a
+`budget_limited` Goal is resumed with `/goal resume --budget <new-total>`.
 
 ### Model tool: `get_goal`
 
@@ -853,8 +894,6 @@ test settles on a provider error.
   attributed under the repaired contract.
 - Active time is durable to within one accounted second; an unclean exit loses
   at most that.
-- A `budget_limited` Goal cannot be resumed with a higher budget yet — that
-  arrives with the lifecycle ticket.
 - The activity-free and execution-unavailable counters are per session, not
   durable. A restart or an extension reload gives a malfunctioning loop up to
   three more empty turns before it is stopped again; the blocked audit is durable
@@ -897,14 +936,18 @@ against a specific Pi binary; a missing binary fails fast instead of hanging.
 Accounting rules that are impractical to cover exhaustively through the RPC seam
 (the token formula, deduplication, the active-time boundaries, budget validation)
 are unit-tested directly in `test/accounting.test.mjs` against the accounting
-module with an injected clock. The durability boundaries — snapshot aliasing,
-replay baselines, terminal-status replay, tombstones — are unit-tested in
-`test/store.test.mjs` against a fake Pi API that reproduces Pi's object-retention
-semantics, which is the only way to exercise the same-process reconstruction
-ordering an RPC test cannot reach. The RPC tests cover everything observable,
-including real nested usage (`test/extensions/nested-usage.ts`), real budget
-exhaustion with an attempted tool call during the wrap-up, and recovery after both
-a graceful and an unclean restart.
+module with an injected clock, including the cumulative budget-raise validation.
+The durability boundaries — snapshot aliasing, replay baselines, terminal-status
+replay, tombstones — are unit-tested in `test/store.test.mjs` against a fake Pi
+API that reproduces Pi's object-retention semantics, which is the only way to
+exercise the same-process reconstruction ordering an RPC test cannot reach. The
+budget-recovery durability and injected-fault seams are unit-tested in
+`test/goal10-budget-recovery-store.test.mjs`. The RPC tests cover everything
+observable, including real nested usage (`test/extensions/nested-usage.ts`), real
+budget exhaustion with an attempted tool call during the wrap-up, cumulative
+budget-raising recovery and per-episode wrap-ups
+(`test/goal10-budget-recovery.test.mjs`), and recovery after both a graceful and
+an unclean restart.
 
 ### Interactive smoke test
 
@@ -933,6 +976,8 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] automatic continuation at settlement
 - [ ] bare `/goal edit` interactive editing
 - [ ] `/goal pause`, `/goal resume`, and `/goal clear`
+- [ ] `/goal resume --budget <new-total>` after budget exhaustion, including the
+      `--budget=` spelling and the positive-headroom/maximum refusals
 - [ ] the compact status indicator for `active`, `paused`, `blocked`,
       `usage_limited`, `budget_limited`, and `complete`
 - [ ] restart persistence and the clear tombstone
