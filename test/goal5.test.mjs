@@ -2016,12 +2016,12 @@ test("/goal resume restarts a Goal stopped by an anti-loop bound without re-stop
 	}
 });
 
-test("/goal resume restarts a blocked Goal with a budget, and refuses a budget-limited one", async () => {
+test("/goal resume restarts a blocked Goal with a budget, and a budget-limited one needs a higher total", async () => {
 	const session = await PiRpcSession.start();
 	// A Goal with a token budget: three blocker reports block it, the resume
 	// restarts it, the resumed work crosses the budget, and the wrap-up is the last
-	// thing that runs. The budget-limited Goal is then refused a resume, which is
-	// the one non-continuing status a user decision does not end yet.
+	// thing that runs. A bare resume of the budget-limited Goal is then refused with
+	// guidance: only a higher cumulative total can resume it.
 	script(
 		[
 			{ text: "Kickoff answer.", usage: { input: 10, output: 5 } },
@@ -2066,11 +2066,12 @@ test("/goal resume restarts a blocked Goal with a budget, and refuses a budget-l
 		assert.equal(limited.blockedAudit, undefined, "the resumed Goal kept no audit out of the stop");
 		assert.equal(limited.wrapUpPending, false, "the one bounded wrap-up was delivered");
 
-		// budget_limited is the one non-continuing status a user decision does not
-		// end yet, so the resume is refused and the Goal keeps its state.
+		// budget_limited cannot be resumed bare: the resume needs a higher cumulative
+		// total, so the refusal is guidance and the Goal keeps its state.
 		await session.prompt("/goal resume");
-		const refused = await session.waitForNotify((r) => r.message.includes("cannot be resumed"));
+		const refused = await session.waitForNotify((r) => r.message.includes("higher cumulative total"));
 		assert.match(refused.message, /budget_limited/);
+		assert.match(refused.message, /--budget <new-total>/);
 		const stillLimited = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 		assert.equal(stillLimited.status, "budget_limited");
 		assert.equal(stillLimited.revision, limited.revision, "the refused resume persisted nothing");

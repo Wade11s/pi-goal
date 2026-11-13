@@ -132,6 +132,70 @@ export type GoalBudgetRequest =
 	/** `--budget <n>`: an explicit budget. */
 	| { kind: "value"; value: number };
 
+/**
+ * Parsed `/goal resume` request.
+ *
+ * The budget option is the only way to resume a `budget_limited` Goal, and only
+ * the two explicit spellings are recognized. Everything else after `resume`
+ * keeps its pre-repair meaning as an objective, so an objective that merely
+ * starts with the word "resume" is never swallowed.
+ */
+export type ResumeBudgetRequest =
+	| { kind: "none" }
+	| { kind: "value"; value: number };
+
+const RESUME_BUDGET_GUIDANCE =
+	"Goal not resumed: use /goal resume --budget <new-total> (or --budget=<new-total>) to raise a " +
+	"budget_limited Goal's cumulative token ceiling.";
+
+/**
+ * Parse the argument of `/goal resume --budget <new-total>`.
+ *
+ * Strict on purpose: exactly one flag, one value, no trailing argument. A
+ * malformed request is refused with guidance rather than being read as an
+ * objective or silently ignored.
+ */
+function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string } {
+	const text = raw.trim();
+	const match = /^--budget(?:=(\S+))?(?:\s+|$)/.exec(text);
+	if (!match) return { error: RESUME_BUDGET_GUIDANCE };
+	const inline = match[1];
+	let valueText: string;
+	let consumed = match[0].length;
+	if (inline !== undefined) {
+		valueText = inline;
+	} else {
+		const rest = text.slice(consumed);
+		const value = /^(\S+)/.exec(rest);
+		if (!value) {
+			return {
+				error:
+				"Goal not resumed: /goal resume --budget needs a new total, for example " +
+				"/goal resume --budget 150.",
+			};
+		}
+		valueText = value[1]!;
+		consumed += value[0].length;
+	}
+	const trailing = text.slice(consumed).trim();
+	if (trailing !== "") {
+		return {
+			error:
+				`Goal not resumed: unexpected argument ${JSON.stringify(trailing)} after --budget ${valueText}. ` +
+				"Use /goal resume --budget <new-total>.",
+		};
+	}
+	const value = Number(valueText);
+	if (!Number.isFinite(value)) {
+		return {
+			error:
+			`Goal not resumed: ${JSON.stringify(valueText)} is not a number. Use ` +
+				"/goal resume --budget <new-total>.",
+		};
+	}
+	return { kind: "value", value };
+}
+
 function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequest } {
 	let rest = raw.trim();
 	let budget: GoalBudgetRequest = { kind: "default" };
@@ -190,7 +254,7 @@ type GoalCommand =
 	| { kind: "edit"; objective: string }
 	| { kind: "edit-dialog" }
 	| { kind: "pause" }
-	| { kind: "resume" }
+	| { kind: "resume"; budget: ResumeBudgetRequest }
 	| { kind: "clear" }
 	| { kind: "invalid"; message: string };
 
@@ -210,8 +274,18 @@ function parseGoalCommand(args: string): GoalCommand {
 	const first = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
 	const remainder = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex).trim();
 	const word = first.toLowerCase();
-	if (remainder === "" && (word === "pause" || word === "resume" || word === "clear")) {
+	if (remainder === "" && (word === "pause" || word === "clear")) {
 		return { kind: word };
+	}
+	if (word === "resume") {
+		if (remainder === "") return { kind: "resume", budget: { kind: "none" } };
+		if (/^--budget(?:=|\s|$)/.test(remainder)) {
+			const parsed = parseResumeBudget(remainder);
+			if ("error" in parsed) return { kind: "invalid", message: parsed.error };
+			return { kind: "resume", budget: parsed };
+		}
+		// `resume <other>` keeps its pre-repair meaning as an objective.
+		return { kind: "create", objective: trimmed };
 	}
 	if (word === "edit") {
 		if (remainder === "") {
@@ -1275,7 +1349,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			"\"blocked\" once the same genuine blocker has persisted for at least three consecutive Goal turns, " +
 			"and \"pause\" after an explicit user request, which must be quoted verbatim in user_request. " +
 			"Complete and blocked are terminal: they stop the Goal's automatic continuation. " +
-			"The model cannot resume, clear, replace, or budget-limit a Goal.",
+			"The model cannot resume, clear, replace, budget-limit, or raise the token budget of a Goal.",
 		parameters: Type.Object({
 			action: Type.String({
 				description:
@@ -1306,7 +1380,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			`Call update_goal with action blocked only when the same genuine blocker has persisted for at least ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns, and never because the work is merely hard, slow, uncertain, or incomplete.`,
 			"Completing or blocking a Goal stops its automatic continuation, so never use either to escape a difficult or merely tiring task.",
 			"Call update_goal with action pause only when the user explicitly asked to pause this Goal, and quote their exact words in user_request. Never pause on your own initiative.",
-			"Never call update_goal to resume or clear a Goal; the user owns those transitions.",
+			"Never call update_goal to resume or clear a Goal; the user owns those transitions, and a budget-raising resume is /goal resume --budget <new-total>.",
 		],
 		/**
 		 * Compatibility shim for the spellings a model reaches for: `{ status: … }`
@@ -1573,7 +1647,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("goal", {
 		description:
-			"Create (/goal <objective>), inspect (bare /goal), edit (/goal edit <objective>), pause, resume, or clear the session Goal",
+			"Create (/goal <objective>), inspect (bare /goal), edit (/goal edit <objective>), pause, resume " +
+			"(/goal resume, or /goal resume --budget <new-total> for a budget_limited Goal), or clear the session Goal",
 		handler: async (args, ctx) => {
 			try {
 				const command = parseGoalCommand(args);
@@ -1594,7 +1669,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						pauseGoal(ctx);
 						return;
 					case "resume":
-						resumeGoal(ctx);
+						resumeGoal(ctx, command.budget);
 						return;
 					case "clear":
 						clearGoal(ctx);
@@ -1720,17 +1795,39 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		);
 	}
 
-	function resumeGoal(ctx: ExtensionCommandContext): void {
+	function resumeGoal(ctx: ExtensionCommandContext, budget: ResumeBudgetRequest): void {
 		const goal = store.get();
 		if (!goal) {
 			ctx.ui.notify(formatNoGoal(), "info");
+			return;
+		}
+		if (budget.kind === "value" && goal.status !== "budget_limited") {
+			ctx.ui.notify(
+				`Goal ${goal.id} is ${goal.status}; the --budget option only resumes a budget_limited Goal. ` +
+					"Use /goal resume without --budget.",
+				"warning",
+			);
+			return;
+		}
+		if (budget.kind === "none" && goal.status === "budget_limited") {
+			ctx.ui.notify(
+				`Goal ${goal.id} is budget_limited at ${store.getUsage().totalTokens} tokens of its ` +
+					`${goal.tokenBudget}-token budget. Resume it with a higher cumulative total: ` +
+					"/goal resume --budget <new-total>.",
+				"warning",
+			);
 			return;
 		}
 		if (goal.status === "active") {
 			ctx.ui.notify(`Goal ${goal.id} is already active; work continues at every settlement.`, "info");
 			return;
 		}
-		if (goal.status !== "paused" && goal.status !== "blocked" && goal.status !== "usage_limited") {
+		if (
+			goal.status !== "paused" &&
+			goal.status !== "blocked" &&
+			goal.status !== "usage_limited" &&
+			goal.status !== "budget_limited"
+		) {
 			ctx.ui.notify(
 				`Goal ${goal.id} is ${goal.status} and cannot be resumed. A complete Goal is finished — use /goal <objective> to set a new one.`,
 				"warning",
@@ -1742,22 +1839,36 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// audit itself is dropped by the store, so what resumes is the objective and
 		// its retained progress rather than the count that stopped it.
 		safety.reset();
-		const resumed = store.markResumed(pi);
+		const resumed = store.markResumed(
+			pi,
+			budget.kind === "value"
+				? { tokenBudget: budget.value, maxTokenBudget: budgetSettings.maxTokenBudget }
+				: {},
+		);
 		if (!resumed.ok) {
 			notifyMutationFailure(ctx, "resumed", resumed);
 			return;
 		}
+		// The old budget gate is lifted only after the new ceiling is durably
+		// authorized. An in-flight old-episode wrap-up keeps its admitted usage, and
+		// the steered resume message is what runs the resumed work; no second
+		// old-budget wrap-up is sent.
+		budgetGateActive = false;
+		wrapUpArmed = false;
 		updateStatus(ctx);
 		const updated = resumed.goal!;
+		const previousStatus = goal.status;
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
-		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx);
+		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus), ctx);
 		const restarted =
-			goal.status === "paused"
+			previousStatus === "paused"
 				? "Work restarted from retained progress."
-				: goal.status === "blocked"
+				: previousStatus === "blocked"
 					? "The blocked audit that ended it is cleared, so work restarts from retained progress with a fresh audit."
-					: "The usage-limit stop that ended it is cleared, so work restarts from retained progress.";
+					: previousStatus === "usage_limited"
+						? "The usage-limit stop that ended it is cleared, so work restarts from retained progress."
+						: `The cumulative token ceiling is now ${updated.tokenBudget} tokens with ${store.getUsage().totalTokens} tokens already accounted; the old episode's wrap-up is cancelled.`;
 		ctx.ui.notify(
 			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
 			"info",
@@ -1874,7 +1985,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		ctx.ui.notify(
-			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; /goal resume restarts work.`,
+			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ` +
+				(updated.status === "budget_limited"
+					? "/goal resume --budget <new-total> restarts work with a higher cumulative ceiling."
+					: "/goal resume restarts work."),
 			"info",
 		);
 	}
