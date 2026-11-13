@@ -219,6 +219,25 @@ export class PiRpcSession {
 		return responsePromise;
 	}
 
+	/**
+	 * Queue a steering message while the agent runs; returns its response record.
+	 *
+	 * A steer is what an interactive user produces by typing while the provider request
+	 * is still streaming: Pi dispatches the `input` event immediately and delivers the
+	 * message only after the in-flight assistant message and its tool results. That
+	 * ordering is the whole point of the ownership tests, so it needs the same
+	 * promise-based seam `followUp` has.
+	 */
+	async steer(message) {
+		const id = `req-${++nextRequestId}`;
+		const responsePromise = this.waitFor(
+			`response for steer ${id}`,
+			(records) => records.find((r) => r.type === "response" && r.id === id),
+		);
+		this.writeCommand({ id, type: "steer", message });
+		return responsePromise;
+	}
+
 	/** Wait for the n-th agent_settled event (1-based). */
 	async waitForSettled(count = 1) {
 		return this.waitFor(`${count} agent_settled event(s)`, (records) => {

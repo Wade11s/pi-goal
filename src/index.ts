@@ -72,8 +72,10 @@ import {
 	formatNoGoal,
 	formatResumeMessage,
 	getGoalOutputSchema,
+	GOAL_MESSAGE_PREFIX,
 	MAX_BLOCKER_LENGTH,
 	MAX_OBJECTIVE_LENGTH,
+	messageText,
 	MIN_BLOCKER_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 	MIN_USER_REQUEST_LENGTH,
@@ -309,6 +311,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("turn_start", () => {
 		const goal = store.get();
 		turnGoal = goal ? { id: goal.id, revision: goal.revision } : null;
+		// The Goal identity that owned the segment when this provider request started.
+		// A replacement steered into an in-flight run must not steal the response that
+		// was already on the wire for the old identity, so the assistant report is
+		// bound to this identity (see the `message_end` handler).
+		turnOwnerId = store.currentOwnerId();
 	});
 
 	/**
@@ -386,6 +393,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
+		// A hard crash can leave the superseded identity's in-flight tail on the branch
+		// with no freeze boundary after it. Reconstruction recovers that tail into
+		// memory; freezing it now makes the reload converge durably with the live path
+		// rather than waiting for another boundary that a later crash could lose.
+		store.closeSupersededAdmission(pi);
+		surfaceReconstructionNotice(ctx);
+		applyCutover(ctx);
 		// Runtime-only counters must not survive into a new runtime; the durable
 		// blocked audit is reconstructed with the Goal.
 		safety.reset();
@@ -395,6 +409,45 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 		updateStatus(ctx);
 	});
+
+	/**
+	 * Surface actionable guidance when reconstruction failed closed on a malformed
+	 * or unrecognized newest snapshot. Reconstruction itself is silent; the user is
+	 * told what to do instead of silently losing the Goal.
+	 */
+	function surfaceReconstructionNotice(ctx: ExtensionContext): void {
+		const notice = store.takeNotice();
+		if (notice) notify(ctx, notice, "error");
+	}
+
+	/**
+	 * Perform the one-time branch-local cutover of a pre-repair snapshot before any
+	 * repaired Goal work is admitted, and surface its migration notices. Loading and
+	 * migration send no message and trigger no provider request.
+	 */
+	function applyCutover(ctx: ExtensionContext): void {
+		if (!store.needsLegacyCutover()) return;
+		const result = store.applyLegacyCutover(pi, budgetSettings);
+		if (!result.ok) {
+			notify(ctx, `pi-goal could not cut over the legacy Goal state: ${describeError(result.error)}. ` + "No repaired Goal work was admitted; fix the cause and reload the session.", "error");
+			return;
+	}
+		for (const notice of result.notices) notify(ctx, notice, "warning");
+		if (result.markerError !== undefined) {
+			// The repaired snapshot is durable, so the cutover stands and the Goal keeps
+			// working under the repaired rules. What is missing is only the branch-local
+			// record that this snapshot was migrated, which a fork copied in this window
+			// would otherwise inherit instead of migrating itself.
+			notify(
+				ctx,
+				`pi-goal migrated the legacy Goal state but could not record the branch-local cutover marker ` +
+					`(${describeError(result.markerError)}). The migrated snapshot is durable, so no usage was lost; ` +
+					"a fork of this branch taken now may migrate itself again instead of inheriting the baseline.",
+				"warning",
+			);
+		}
+		updateStatus(ctx);
+	}
 	/** Whether two reconstructed states are observably the same Goal state. */
 	function sameBranchGoal(
 		a: GoalRecord | null | undefined,
@@ -467,6 +520,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => {
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
+		// A tail recovered from the selected branch belongs to an identity that is no
+		// longer current. Freeze it at this durable boundary so the branch records the
+		// old identity's already-admitted work instead of leaving it for a later crash
+		// to lose.
+		store.closeSupersededAdmission(pi);
+		surfaceReconstructionNotice(ctx);
+		applyCutover(ctx);
 		notifyBranchChange(ctx, before, after);
 		// The status line follows the selected branch too, and the accounting
 		// baseline is rebuilt with it.
@@ -495,8 +555,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * so every anti-loop counter starts over. Extension commands (`/goal ...`) do
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
-	pi.on("input", (_event, ctx) => {
+	pi.on("input", (event, ctx) => {
 		continuesGoalTurn = false;
+		// A prompt the user actually typed is never Goal-owned work, so the
+		// admission segment closes — but at *delivery*, not here: Pi dispatches this
+		// while the provider request is still streaming, and closing now would drop
+		// the in-flight response the Goal had already admitted. `message_end` for the
+		// delivered user message is the seam that matches the branch replay (see
+		// `applyDeliveredUserMessage`). pi-goal's own messages arrive with source
+		// "extension" and never close a segment.
 		safety.reset();
 		reportAuditResetFailure("the prompt you just sent", ctx);
 	});
@@ -596,6 +663,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	const chargedMessages = new WeakSet<object>();
 	let modelMessageSeq = 0;
+	/** The Goal identity owning the segment at the start of the current turn. */
+	let turnOwnerId: string | null = null;
 
 	/**
 	 * Token accounting, at the only seams where Pi reports finalized usage.
@@ -612,12 +681,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * belongs to. A Goal can be created while a tool of an ordinary turn is still in
 	 * flight — `/goal` commits before it waits for idle, and `create_goal` runs inside
 	 * a tool batch — so the turn's own assistant `message_end` predates the Goal while
-	 * its tool results land after it. Those results are Goal work: the branch replay
-	 * charges every entry after the creation snapshot, and a live path that skipped
-	 * them would disagree with the replay it is supposed to converge with (a probe
-	 * measured 17 live against 67 restored). The `complete` guard inside
-	 * `accountUsage` keeps the completing batch aligned with the replay, which skips
-	 * everything after a completion snapshot.
+	 * its tool results land after it. Those results are not Goal work either: the
+	 * creating run stays ordinary, and the branch replay charges nothing between the
+	 * creation snapshot and the first Goal work message, so a live path that charged
+	 * them would disagree with the replay it is supposed to converge with.
+	 * `applyDeliveredUserMessage` is what keeps the two on the same line.
 	 */
 	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
@@ -625,17 +693,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// A genuine user turn is not Goal work: the budget gate must not block the
 			// tools the user's own request needs, even inside a gated run.
 			budgetGateActive = false;
+			// This is also the ownership seam. Pi appends the message in this very event,
+			// so what happens here is exactly what `ownershipMarker` reads back on replay:
+			// a pi-goal work message opens its admission segment, and every other prompt
+			// closes it. A delivered message also closes the superseded identity's
+			// admission, freezing its in-flight tail before the new segment opens.
+			applyDeliveredUserMessage(message, pi);
 			return;
 		}
 		const goal = store.get();
 		// A report is Goal work exactly when a non-complete Goal exists as it is
 		// finalized. Completion is terminal for accounting, so the completing turn is
 		// charged at its own `message_end` and nothing after the completion snapshot is.
-		if (!goal || goal.status === "complete") return;
+		// A Clear that lands while the superseded identity's request is still in flight
+		// leaves no current Goal, but its admitted tail must still be charged, so an
+		// open superseded tail keeps the seam alive.
+		if ((!goal || goal.status === "complete") && !store.hasOpenSupersededTail()) return;
 		if (message.role === "assistant") {
 			if (chargedMessages.has(message)) return;
 			chargedMessages.add(message);
-			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model");
+			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model", turnOwnerId);
 			afterAccounting(ctx);
 			return;
 		}
@@ -650,7 +727,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	pi.on("session_compact", (event, ctx) => {
 		const goal = store.get();
-		if (!goal || goal.status === "complete") return;
+		if ((!goal || goal.status === "complete") && !store.hasOpenSupersededTail()) return;
 		store.accountUsage(event.compactionEntry.id, event.compactionEntry.usage, "nested");
 		afterAccounting(ctx);
 	});
@@ -661,7 +738,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * silently restarting the clock.
 	 */
 	pi.on("session_shutdown", (event, ctx) => {
-		if (!store.get()) return;
+		if (!store.get() && !store.hasOpenSupersededTail()) return;
 		// Pi fires this both when the process quits and when a session is *replaced*
 		// (fork, clone, switch, resume, reload). The two are not the same event for a
 		// durable writer, and telling them apart by the destination rather than the
@@ -686,6 +763,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const currentFile = ctx.sessionManager.getSessionFile();
 		const keepsFile = event.targetSessionFile === undefined || event.targetSessionFile === currentFile;
 		if (!keepsFile) return;
+		// A superseded identity's in-flight tail is frozen at this last durable
+		// boundary too, so a quit or reload cannot lose work that never saw another
+		// delivered user message.
+		store.closeSupersededAdmission(pi);
 		store.stopClock();
 		store.flushAccounting(pi, true);
 	});
@@ -847,6 +928,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// Exactly one bounded wrap-up, then the Goal stops for good.
 			const delivered = store.consumeWrapUp(pi);
 			if (!delivered.ok) return;
+			// The wrap-up run is Goal-owned work: its one response is charged.
+			store.beginGoalWork(delivered.goal.id);
 			wrapUpArmed = true;
 			return {
 				entries: [
@@ -878,6 +961,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// The next run is Goal work, whether Pi starts it for our continuation or
 		// for queued work that already satisfies the decision.
 		pendingRunKind = "automatic";
+		store.beginGoalWork(goal.id);
 		return {
 			entries: [
 				...event.entries,
@@ -909,6 +993,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// A Goal turn that reported no blocker breaks the blocked audit, so the
 			// next report starts a fresh chain instead of resuming an old one.
 			reportAuditResetFailure("a Goal turn that reported no blocker", ctx);
+		}
+		// The admitted Goal turn is over at its settlement boundary, so its
+		// ownership segment must not leak into later user actions or runs (e.g. a
+		// bare `/goal` edit dialog, or an ordinary prompt before a closing user
+		// message is delivered). Continuations reopen their own segment explicitly.
+		if (wasGoalTurn) {
+			store.endGoalWork();
 		}
 	}
 
@@ -1136,6 +1227,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				);
 			}
 			const goal = store.create(validation.objective, "tool", { tokenBudget: budget.tokenBudget });
+			// A superseded identity's open tail must be durable before a new Goal takes the
+			// session's Goal slot: creating a Goal leaves no marker of its own on the
+			// branch, so replay only closes that admission at a durable freeze. Refuse
+			// rather than lose admitted work or let the two paths disagree about it.
+			if (!store.closeSupersededForCreation(pi)) {
+				return goalToolError(
+					"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
+						"Nothing was stored.",
+					null,
+				);
+			}
 			try {
 				// Stage before announcing: a write failure here abandons creation with no
 				// visible state change, and the attempt can simply be retried.
@@ -1400,12 +1502,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				toPublicState(goal),
 			);
 		}
-		const result = store.markBlockedReport(pi, {
-			blocker: validation.blocker,
-			turn: safety.currentTurn,
-		});
+		const result = store.markBlockedReport(
+			pi,
+			{
+				blocker: validation.blocker,
+				turn: safety.currentTurn,
+			},
+			turnGoal ?? undefined,
+		);
 		if (result.ok && !result.repeat) blockerCountedThisRun = true;
 		if (!result.ok) {
+			if (result.reason === "stale") {
+				const current = store.get();
+				return goalToolError(
+					"Blocker not recorded: this call was prepared against a Goal state that has since changed " +
+						`(expected ${turnGoal?.id ?? "unknown"} revision ${turnGoal?.revision ?? "unknown"}, ` +
+						`current ${current?.id ?? "none"} revision ${current?.revision ?? "none"}). ` +
+						"Call get_goal, re-read the current objective, and report again if the blocker persists.",
+					current ? toPublicState(current) : null,
+				);
+			}
 			const message =
 				result.reason === "persistence"
 					? `Blocker not recorded: writing the Goal to the session failed (${describeError(result.error)}). The Goal is still active; fix the cause and call update_goal again.`
@@ -1494,6 +1610,45 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 
 	/**
+	 * Open or close the admission segment for a user message Pi has just delivered.
+	 *
+	 * This is the live half of `ownershipMarker`, and drawing the line here rather
+	 * than at `input` is what makes live accounting and branch replay converge:
+	 *
+	 * - `input` fires while the provider request is still streaming, so an ordinary
+	 *   prompt typed during an admitted Goal response would close the segment before
+	 *   that response is finalized and drop it live, while the replay — where the
+	 *   assistant message is appended *before* the prompt that interrupted it —
+	 *   charges it. A budget that only the live path failed to stop would then be
+	 *   crossed on reload.
+	 * - a queued steer is appended only after the in-flight assistant message and its
+	 *   tool results, so opening the segment when the message is *queued* would
+	 *   charge the previous identity's (or the previous turn's) work to this Goal.
+	 *
+	 * Pi appends the message in the same event, so the entry this sees is the entry
+	 * the replay reads. The segment is opened for the Goal that is current at
+	 * delivery — the identity whose newest snapshot precedes it — which is what stops
+	 * a work message queued for a Goal that has since been replaced, cleared, or
+	 * completed from opening anything.
+	 *
+	 * This is also the boundary that closes a superseded identity's admission: the
+	 * replacement kept the old segment open for its in-flight tail, and the first
+	 * delivered user message is where that tail is frozen onto the old identity's
+	 * durable record (see `GoalStore.closeSupersededSegment`).
+	 */
+	function applyDeliveredUserMessage(message: { content: unknown }, pi: ExtensionAPI): void {
+		const goal = store.get();
+		const isGoalWork =
+			goal != null && goal.status !== "complete" && messageText(message.content).startsWith(GOAL_MESSAGE_PREFIX);
+		store.closeSupersededAdmission(pi);
+		if (isGoalWork) {
+			store.beginGoalWork(goal.id);
+			return;
+		}
+		store.endGoalWork();
+	}
+
+	/**
 	 * Deliver a work-start (or work-redirect) message without ever waiting for an
 	 * active run to finish.
 	 *
@@ -1505,6 +1660,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * change of an active run is supposed to use. `pi.sendUserMessage` is
 	 * fire-and-forget: delivery failures surface as Pi extension errors, never as
 	 * a state lie ("steered" is reported only for the queueing itself).
+	 *
+	 * The admission segment is *not* opened here. It opens when the message is
+	 * delivered, in {@link applyDeliveredUserMessage}, because a steer reaches the
+	 * branch only after the work that was already in flight.
 	 */
 	function deliverWorkMessage(content: string, ctx: ExtensionCommandContext): "started" | "steered" {
 		if (ctx.isIdle()) {
@@ -1811,10 +1970,33 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const previous = store.get();
 			const replacing = previous != null;
 
+			// A fresh create (for example after a Clear) has no current Goal to preserve,
+			// but a superseded identity's open admission still has to be closed before the
+			// new snapshot. Creating a Goal leaves no marker of its own on the branch, so
+			// replay only closes that admission at a durable freeze: refuse rather than
+			// lose admitted work, or let the live path and the replay disagree about it.
+			if (!replacing) {
+				if (!store.closeSupersededForCreation(pi)) {
+					ctx.ui.notify(
+						"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
+							"Nothing was stored; fix the cause and run /goal again.",
+						"error",
+					);
+					return;
+				}
+			}
+
 			const goal = store.create(validation.objective, "command", { tokenBudget: budget.tokenBudget });
 			const sameRecord = (candidate: GoalRecord | null | undefined) =>
 				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
 			try {
+				// Replacement must preserve the superseded Goal's already-accounted
+				// totals as a durable historical record before the new identity takes
+				// over the session's Goal slot and resets the live ledger. If that
+				// freeze fails, the replacement must not proceed.
+				if (replacing && !store.preserveSupersededForReplacement(pi)) {
+					throw new Error("could not freeze the replaced Goal's admitted work");
+				}
 				// Stage and commit before any wait: the new record is what a
 				// concurrent /goal clear, edit, pause, or resume acts on, and
 				// revalidating it after the wait detects exactly that change.
@@ -1883,6 +2065,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// allows.
 				safety.reset();
 				pendingRunKind = "kickoff";
+				// The admission segment opens when the kickoff is delivered, in
+				// `applyDeliveredUserMessage`, like every other work message.
 				pi.sendUserMessage(formatKickoffMessage(goal));
 				delivery = "started";
 			}

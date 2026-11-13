@@ -168,9 +168,24 @@ export interface GoalSnapshot {
 	version: 1;
 	/**
 	 * Full Goal record, or `null` for a durable tombstone (clearing a Goal).
-	 * The last goal-state entry on the active branch wins.
+	 * The last *current* goal-state entry on the active branch wins; an entry
+	 * marked `superseded` never does.
 	 */
 	goal: GoalRecord | null;
+	/**
+	 * True when this snapshot was written by the repaired (post-cutover) writer.
+	 * A version-1 snapshot without it is a loadable 0.1.0 snapshot whose later
+	 * work must be attributed under the repaired rules after a one-time cutover.
+	 */
+	repaired?: boolean;
+	/**
+	 * True for a finalized historical snapshot of a superseded identity. It is
+	 * loadable and replayable, but never selects the current Goal: reconstruction
+	 * falls back to the newest non-superseded snapshot, so a crash immediately after
+	 * this append still reconstructs the replacement and cannot resurrect the
+	 * replaced identity.
+	 */
+	superseded?: boolean;
 }
 
 export const CUSTOM_ENTRY_TYPE = "goal-state";
@@ -181,6 +196,81 @@ export const CUSTOM_ENTRY_TYPE = "goal-state";
  * of Goal activity, and at shutdown) without polluting it.
  */
 export const USAGE_ENTRY_TYPE = "goal-usage";
+/**
+ * Branch-local marker that a pre-repair (0.1.0) Goal snapshot has been cut over
+ * to the repaired attribution rules.
+ *
+ * A version-1 `goal-state` snapshot is *loadable* whether or not it carries a
+ * cutover, but only a cut-over snapshot has its later work attributed under the
+ * repaired Goal-owned-work rules. The marker is written immediately after the
+ * repaired snapshot, so "the latest snapshot or tombstone controls branch
+ * state" stays true while the branch still records whether that latest snapshot
+ * was migrated. It is branch-local on purpose: a fork copied before the cutover
+ * performs its own migration when selected, and a fork copied after it inherits
+ * the baseline.
+ */
+export const CUTOVER_ENTRY_TYPE = "goal-cutover";
+
+/** Payload persisted in `goal-cutover` custom session entries. */
+export interface GoalCutover {
+	version: 1;
+	/** The Goal identity whose legacy prefix was reconstructed and frozen. */
+	goalId: string;
+}
+
+/** Structural validity of a `goal-cutover` entry. */
+export function isGoalCutover(value: unknown): value is GoalCutover {
+	if (!value || typeof value !== "object") return false;
+	const record = value as Record<string, unknown>;
+	return record.version === 1 && typeof record.goalId === "string" && record.goalId !== "";
+}
+
+/**
+ * Ownership marker carried by a session entry, used to reconstruct which work
+ * belongs to a Goal.
+ *
+ * Attribution is scoped to *Goal-owned work*: a run started by a Goal lifecycle
+ * message (kickoff, edit, resume), an automatic Continuation, or the one Budget
+ * wrap-up. An ordinary user prompt is never Goal work, whatever the Goal's
+ * status. The markers are read back from the branch so live accounting and
+ * reconstruction draw the same line.
+ */
+export type OwnershipMarker =
+	| { kind: "goal-work" }
+	| { kind: "ordinary-user" }
+	| { kind: "none" };
+
+/** Structural shape of a custom-message session entry, so goal.ts stays Pi-free. */
+export interface CustomMessageEntryLike {
+	type?: unknown;
+	customType?: unknown;
+}
+
+/**
+ * The ownership marker a session entry carries, if any.
+ *
+ * pi-goal's own user messages (kickoff, objective edit, resume) all start with
+ * {@link GOAL_MESSAGE_PREFIX}; a human-typed prompt never does, which is the same
+ * trust boundary the pause corroboration uses. The Continuation and Budget
+ * wrap-up travel as custom messages on their own channels.
+ */
+export function ownershipMarker(entry: BranchEntryLike | CustomMessageEntryLike): OwnershipMarker {
+	if (entry.type === "message") {
+		const message = (entry as BranchEntryLike).message;
+		if (message && message.role === "user") {
+			const text = messageText(message.content);
+			return text.startsWith(GOAL_MESSAGE_PREFIX) ? { kind: "goal-work" } : { kind: "ordinary-user" };
+		}
+		return { kind: "none" };
+	}
+	if (entry.type === "custom_message") {
+		const customType = (entry as CustomMessageEntryLike).customType;
+		if (customType === CUSTOM_MESSAGE_TYPE || customType === CUSTOM_WRAPUP_MESSAGE_TYPE) {
+			return { kind: "goal-work" };
+		}
+	}
+	return { kind: "none" };
+}
 /**
  * Custom-message channel for the automatic-continuation seam. `agent_before_settle`
  * drafts are custom messages, and a custom message participates in model context.

@@ -127,6 +127,22 @@ observable Pi events, with thresholds that are constants rather than settings.
    the counters and the blocked audit start over. A replacement Goal starts from a
    fresh record for the same reason.
 
+### Repair batch 1: attribution around a stop, and legacy audits
+
+Batch 1 of the V1 repair (issue #24) changes what work is *charged*, not when a
+Goal stops. A conservative stop still ends automatic continuation at the next
+settlement, but work already admitted before the stop stays attributable: the
+Goal-owned segment opened by the run's work message remains open until a genuine
+user prompt or a new identity closes it, so an in-flight response or tool result
+that was already admitted is accounted even though no new substantive work is
+admitted after the stop. Ordinary prompts are never Goal work, whatever the
+Goal's status.
+
+The batch also preserves the durable audit across the 0.1.0 cutover: a valid
+legacy open audit keeps its description and count for the Blocker-identity handoff
+in batch 3, and the extension does not introduce text-similarity equivalence to
+recover it. Nothing in this ADR's thresholds or reset rules changes.
+
 ## Consequences
 
 - Stopping needs no model cooperation and no judge service: the same events Pi

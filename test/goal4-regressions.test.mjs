@@ -38,6 +38,23 @@ function goalSnapshots(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
+/**
+ * The newest *current* goal-state snapshot: the one that selects the session's Goal.
+ *
+ * A snapshot marked `superseded` is a finalized historical record of a replaced
+ * identity. It is valid and replayable, but it never becomes the current Goal, so
+ * the newest goal-state entry on the branch is not necessarily this one.
+ */
+function currentGoalSnapshot(entries) {
+	let snapshot;
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
+			snapshot = entry;
+		}
+	}
+	return snapshot;
+}
+
 function submitCommand(session, id, message) {
 	const responsePromise = session.waitFor(
 		`response for ${id}`,
@@ -58,7 +75,18 @@ async function waitForStoredGoal(session, predicate, description = "stored Goal"
 	const file = await session.sessionFile();
 	const deadline = Date.now() + 5000;
 	while (Date.now() < deadline) {
-		const snapshot = lastGoalSnapshot(readSessionEntries(file));
+		let entries;
+		try {
+			entries = readSessionEntries(file);
+		} catch (error) {
+			// Pi defers creating the session file until the first user/assistant
+			// message, so the path can be reported before it exists. Treat that as
+			// "not written yet" and keep polling instead of failing the first read:
+			// under a full parallel `npm test` that window is reachable.
+			if (error.code !== "ENOENT") throw error;
+			entries = [];
+		}
+		const snapshot = lastGoalSnapshot(entries);
 		const goal = snapshot?.data?.goal;
 		if (goal && predicate(goal)) return goal;
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -170,12 +198,24 @@ test("a held completion cannot complete a Goal the user replaced while it was in
 		await replacePromise;
 
 		const entries = readSessionEntries(await session.sessionFile());
+		// The freeze of the old identity's in-flight tail is the last snapshot, and it is
+		// historical: the replacement is re-selected as the current Goal from its own
+		// snapshot rather than from a second, re-affirming append.
 		assert.deepEqual(
-			goalSnapshots(entries).map((s) => s.data.goal.id === replacement.id ? `new:${s.data.goal.status}:${s.data.goal.revision}` : `old:${s.data.goal.status}:${s.data.goal.revision}`),
-			["old:active:0", "new:active:0"],
-			"the replacement Goal was not completed by the stale call",
+			goalSnapshots(entries).map((s) => `${s.data.goal.id === replacement.id ? "new" : "old"}:${s.data.goal.status}:${s.data.goal.revision}:${s.data.superseded === true ? "superseded" : "current"}`),
+			["old:active:0:current", "old:active:0:current", "new:active:0:current", "old:active:0:superseded"],
+			"replacement preserves a durable superseded old-goal record and the stale completion cannot complete the replacement",
 		);
-		assert.equal(lastGoalSnapshot(entries).data.goal.id, replacement.id);
+		const oldSnapshots = goalSnapshots(entries).filter((s) => s.data.goal.id !== replacement.id);
+		assert.equal(oldSnapshots[0].data.goal.usage.totalTokens, 0, "the creation snapshot is not polluted");
+		assert.equal(oldSnapshots[1].data.goal.usage.totalTokens, 15, "the superseded snapshot carries the exact already-accounted kickoff total");
+		assert.equal(
+			oldSnapshots.at(-1).data.goal.usage.totalTokens,
+			30,
+			"the finalized superseded record carries the in-flight completion turn's response",
+		);
+		assert.equal(currentGoalSnapshot(entries).data.goal.id, replacement.id);
+		assert.equal(lastGoalSnapshot(entries).data.superseded, true, "the newest goal-state entry is the historical freeze");
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
