@@ -59,6 +59,7 @@ import {
 	type GoalUsage,
 	isBudgetExhausted,
 	normalizeUsage,
+	resolveResumeTokenBudget,
 	UsageLedger,
 	type UsageSource,
 	zeroGoalUsage,
@@ -1576,32 +1577,86 @@ export class GoalStore {
 	 * decision, so all three restart the same objective with the same identity and
 	 * history.
 	 *
-	 * The transition is durable before it is visible; restarting work is the
-	 * caller's job (a resume kickoff message), so resuming while a run is in flight
-	 * can steer instead of waiting for idle.
-	 * The revision bump records the resume as its own transition, giving later
-	 * accounting a fresh baseline at this snapshot. Work restarts, so the
-	 * active-time clock restarts with it.
+	 * A `budget_limited` Goal is different: it can only be resumed by raising its
+	 * cumulative token ceiling. `options.tokenBudget` is the new absolute total, so
+	 * it must be strictly greater than the usage already accounted (positive
+	 * headroom) and at most the configured maximum; the default budget is never
+	 * implicit resume authority. A successful resume is one durable transition: it
+	 * keeps the identity, creation time, origin, objective, and complete usage
+	 * history, sets the new ceiling and `active`, cancels any pending old-episode
+	 * wrap-up, advances the revision exactly once, and starts a fresh active-time
+	 * segment. A preceding objective edit has its own revision.
 	 *
-	 * A `blocked` or `usage_limited` Goal also carries a blocked audit that explains
-	 * why it stopped. That audit belongs to the stop, not to the Goal: it is dropped
-	 * here so the resumed Goal starts a fresh audit rather than inheriting a count
-	 * the user has already overruled, and `lastBlockerTurn` goes with it so the next
-	 * report starts at one instead of continuing the broken chain.
+	 * The budget option is valid only for `budget_limited`; every other status keeps
+	 * its existing bare-resume behavior.
 	 *
-	 * `complete` is terminal for the identity — a finished Goal is replaced, not
-	 * resumed — so it is refused along with every other status.
+	 * A validation or persistence failure leaves the Goal exactly as it was and
+	 * admits no resumed work: the caller sends the resume message only after a
+	 * successful commit.
 	 */
-	markResumed(pi: ExtensionAPI): GoalMutationResult {
+	markResumed(
+		pi: ExtensionAPI,
+		options: { tokenBudget?: number; maxTokenBudget?: number } = {},
+	): GoalMutationResult {
 		const current = this.current;
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
+		}
+		const raising = options.tokenBudget !== undefined;
+		if (current.status === "budget_limited") {
+			if (!raising) {
+				return {
+					ok: false,
+					reason: "not-eligible",
+					message:
+						"a budget_limited Goal can only be resumed with a higher cumulative token budget " +
+						"(/goal resume --budget <new-total>)",
+				};
+			}
+			const requested = options.tokenBudget!;
+			const resolution = resolveResumeTokenBudget(
+				requested,
+				{
+					defaultTokenBudget: undefined,
+					maxTokenBudget: options.maxTokenBudget,
+					problems: [],
+				},
+				this.ledger.usage.totalTokens,
+			);
+			if (!resolution.ok) {
+				return { ok: false, reason: "not-eligible", message: resolution.error };
+			}
+			this.lastBlockerTurn = undefined;
+			this.lastBlockerRevision = undefined;
+			const result = this.commitSnapshot(pi, {
+				...current,
+				status: "active",
+				tokenBudget: resolution.tokenBudget,
+				// The old episode's wrap-up is cancelled by the resume, whether it was
+				// still owed, in flight, or already delivered.
+				wrapUpPending: false,
+				blockedAudit: undefined,
+				updatedAt: Date.now(),
+				revision: current.revision + 1,
+			});
+			if (!result.ok) return result;
+			this.clock.start();
+			return result;
+		}
+		if (raising) {
+			return {
+				ok: false,
+				reason: "not-eligible",
+				message:
+					`the --budget option only resumes a budget_limited Goal (current status: ${current.status}); ` +
+					"use /goal resume without --budget",
+			};
 		}
 		if (current.status !== "paused" && current.status !== "blocked" && current.status !== "usage_limited") {
 			return {
 				ok: false,
 				reason: "not-eligible",
-				message: `only a paused, blocked, or usage-limited Goal can be resumed (current status: ${current.status})`,
+				message: `only a paused, blocked, usage-limited, or budget-limited Goal can be resumed (current status: ${current.status})`,
 			};
 		}
 		this.lastBlockerTurn = undefined;

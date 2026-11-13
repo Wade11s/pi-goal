@@ -472,6 +472,54 @@ export function remainingTokens(tokenBudget: number | undefined, usedTokens: num
 	return Math.max(0, tokenBudget - usedTokens);
 }
 
+/**
+ * Validate and resolve a cumulative budget raise for a `budget_limited` Goal.
+ *
+ * The requested value is the Goal's new **absolute cumulative ceiling**, not an
+ * increment and not a fresh allowance: all Goal-owned usage already accounted —
+ * including overshoot and every admitted wrap-up — stays charged against it. So
+ * the value must be a whole-token budget strictly greater than the current
+ * accounted total, which is what guarantees the resumed Goal has positive
+ * headroom instead of resuming straight into another stop.
+ *
+ * The configured maximum remains a hard cap and is never clamped.
+ * `goal.defaultTokenBudget` is deliberately absent from this path: it applies to
+ * new Goals only and is never implicit resume authority.
+ */
+export function resolveResumeTokenBudget(
+	requested: number,
+	settings: BudgetSettings,
+	currentUsage: number,
+): BudgetResolution {
+	if (!Number.isSafeInteger(requested) || requested < MIN_TOKEN_BUDGET) {
+		return {
+			ok: false,
+			error:
+				`a token budget must be a whole number of at least ${MIN_TOKEN_BUDGET} tokens ` +
+				`(got ${Number.isFinite(requested) ? requested : String(requested)}).`,
+		};
+	}
+	if (requested <= currentUsage) {
+		return {
+			ok: false,
+			error:
+				`the new budget of ${requested} tokens must be strictly greater than the Goal's ` +
+				`current usage of ${currentUsage} tokens, so the resumed Goal has positive headroom. Request a ` +
+				`higher cumulative total.`,
+		};
+	}
+	const max = settings.maxTokenBudget;
+	if (max !== undefined && requested > max) {
+		return {
+			ok: false,
+			error:
+				`a token budget of ${requested} tokens exceeds the configured maximum of ${max} ` +
+				"tokens. Raise goal.maxTokenBudget or resume with a budget of at most that maximum.",
+		};
+	}
+	return { ok: true, tokenBudget: requested };
+}
+
 /** Whether the accounted usage has reached the Goal's token budget. */
 export function isBudgetExhausted(tokenBudget: number | undefined, usedTokens: number): boolean {
 	return tokenBudget !== undefined && usedTokens >= tokenBudget;
