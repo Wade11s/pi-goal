@@ -15,7 +15,6 @@ Implementation issues are delegated through `rex-subagent` to this worker pool, 
 | `magpie/longcat/LongCat-2.5:max` |
 | `magpie/stepfun-cn/step-5-preview:high` |
 | `magpie/deepai/deepseek-v4.1-flash:high` |
-| `magpie/openrouter/baidu/ernie-5.5-flash-preview:free:high` |
 
 Balance assignments across the pool by active workload, issue size, and relevant experience. Do not assign all tickets to one model. Keep each issue assignment and result traceable to its subagent handle.
 
