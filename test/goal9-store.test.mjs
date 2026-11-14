@@ -137,14 +137,14 @@ function ordinaryUserEntry(text) {
 	return { type: "message", id: "ordinary-user", message: { role: "user", content: text } };
 }
 
-/** A pi-goal work message on the branch, which opens a Goal-owned segment. */
-function goalWorkEntry(id = "kickoff") {
+/** A pi-goal work message on the branch, which opens a Goal-owned segment for `goalId`. */
+function goalWorkEntry(id = "kickoff", goalId = "goal_aaaaaaaa") {
 	return {
 		type: "message",
 		id,
 		message: {
 			role: "user",
-			content: "[pi-goal] Working toward Goal goal_aaaaaaaa (active, revision 0).",
+			content: `[pi-goal] Working toward Goal ${goalId} (active, revision 0).`,
 		},
 	};
 }
@@ -994,7 +994,7 @@ it("a reload does not rewrite a tail that is already durable", () => {
 			}),
 			{ repaired: true, superseded: true },
 		),
-		goalWorkEntry("steer-new"),
+		goalWorkEntry("steer-new", replacement.id),
 		assistantEntry(2, usageReport(20, 2)),
 	];
 	const store = new GoalStore();
@@ -1021,7 +1021,7 @@ it("a recovered open tail does not steal the replacement's own open segment", ()
 		goalEntry(replacement, { repaired: true }),
 		assistantEntry(0, usageReport(100, 10)),
 		toolResultEntry("call_1", usageReport(40, 7, { cacheWrite: 3 })),
-		goalWorkEntry("steer-new"),
+		goalWorkEntry("steer-new", replacement.id),
 		assistantEntry(2, usageReport(20, 2)),
 	];
 	const store = new GoalStore();
@@ -1088,7 +1088,7 @@ it("replay attributes the superseded tail to the old identity and keeps the repl
 			}),
 			{ repaired: true, superseded: true },
 		),
-		goalWorkEntry("steer-new"),
+		goalWorkEntry("steer-new", replacement.id),
 		assistantEntry(2, usageReport(20, 2)),
 	];
 	store.reconstruct(fakeCtx(branch));

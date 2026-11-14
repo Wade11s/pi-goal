@@ -243,9 +243,14 @@ export function isGoalCutover(value: unknown): value is GoalCutover {
  * wrap-up. An ordinary user prompt is never Goal work, whatever the Goal's
  * status. The markers are read back from the branch so live accounting and
  * reconstruction draw the same line.
+ *
+ * A `goal-work` marker carries the Goal identity the message was admitted for.
+ * The identity is what keeps a work message queued for a Goal that has since
+ * been cleared or replaced from opening the *current* Goal's admission: the
+ * generic {@link GOAL_MESSAGE_PREFIX} alone authorizes nothing.
  */
 export type OwnershipMarker =
-	| { kind: "goal-work" }
+	| { kind: "goal-work"; goalId: string }
 	| { kind: "ordinary-user" }
 	| { kind: "none" };
 
@@ -253,29 +258,57 @@ export type OwnershipMarker =
 export interface CustomMessageEntryLike {
 	type?: unknown;
 	customType?: unknown;
+	content?: unknown;
+}
+
+/** A Goal identity as it appears in a work message: `goal_` plus 8 hex chars. */
+const GOAL_ID_PATTERN = /\bgoal_[0-9a-f]{8}\b/;
+
+/**
+ * The Goal identity a pi-goal work message names, or null.
+ *
+ * Only the first line is read: it is the extension-authored header that every
+ * work message carries (`Working toward Goal …`, `The user resumed Goal …`,
+ * `Continue Goal …`, `Goal … exhausted its token budget`). The objective is
+ * delimited data further down the message, so a user-controlled objective can
+ * never smuggle a second identity into the header. A message that carries the
+ * prefix but names no Goal is not admitted work.
+ */
+export function goalWorkGoalId(text: string): string | null {
+	const newline = text.indexOf("\n");
+	const header = newline === -1 ? text : text.slice(0, newline);
+	if (!header.startsWith(GOAL_MESSAGE_PREFIX)) return null;
+	const match = GOAL_ID_PATTERN.exec(header);
+	return match ? match[0] : null;
 }
 
 /**
  * The ownership marker a session entry carries, if any.
  *
  * pi-goal's own user messages (kickoff, objective edit, resume) all start with
- * {@link GOAL_MESSAGE_PREFIX}; a human-typed prompt never does, which is the same
- * trust boundary the pause corroboration uses. The Continuation and Budget
- * wrap-up travel as custom messages on their own channels.
+ * {@link GOAL_MESSAGE_PREFIX} and name the Goal they were admitted for; a
+ * human-typed prompt never does, which is the same trust boundary the pause
+ * corroboration uses. The Continuation and Budget wrap-up travel as custom
+ * messages on their own channels and name the same identity in their header.
+ * A prefixed message that names no Goal is never admitted work, so it closes
+ * the segment like an ordinary prompt.
  */
 export function ownershipMarker(entry: BranchEntryLike | CustomMessageEntryLike): OwnershipMarker {
 	if (entry.type === "message") {
 		const message = (entry as BranchEntryLike).message;
 		if (message && message.role === "user") {
 			const text = messageText(message.content);
-			return text.startsWith(GOAL_MESSAGE_PREFIX) ? { kind: "goal-work" } : { kind: "ordinary-user" };
+			if (!text.startsWith(GOAL_MESSAGE_PREFIX)) return { kind: "ordinary-user" };
+			const goalId = goalWorkGoalId(text);
+			return goalId ? { kind: "goal-work", goalId } : { kind: "ordinary-user" };
 		}
 		return { kind: "none" };
 	}
 	if (entry.type === "custom_message") {
 		const customType = (entry as CustomMessageEntryLike).customType;
 		if (customType === CUSTOM_MESSAGE_TYPE || customType === CUSTOM_WRAPUP_MESSAGE_TYPE) {
-			return { kind: "goal-work" };
+			const goalId = goalWorkGoalId(messageText((entry as CustomMessageEntryLike).content));
+			if (goalId) return { kind: "goal-work", goalId };
 		}
 	}
 	return { kind: "none" };

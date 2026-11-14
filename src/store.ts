@@ -543,23 +543,32 @@ export class GoalStore {
 	 * Only a Goal work message that sits *after* the newest snapshot can leave a
 	 * segment open: the snapshot is a durable transition that supersedes whatever
 	 * came before it. A marker before the baseline therefore leaves ownership
-	 * closed, and a genuine user prompt after the baseline closes it again.
+	 * closed, and a genuine user prompt after the baseline closes it again. The
+	 * message must also name the *current* identity: a stale work message for a
+	 * cleared or replaced Goal is a delivered user message, so it closes whatever
+	 * the branch had open instead of binding the current Goal's turns to it.
 	 */
 	private applyBranchOwnership(
 		branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>,
 		baselineIndex: number,
 	): void {
 		let lastMarkerIndex = -1;
-		let lastMarker: "goal-work" | "ordinary-user" | "none" = "none";
+		let lastMarkerId: string | null = null;
 		for (let index = 0; index < branch.length; index++) {
 			const marker = ownershipMarker(branch[index]!);
-			if (marker.kind !== "none") {
-				lastMarker = marker.kind;
+			if (marker.kind === "goal-work") {
+				lastMarkerId = marker.goalId;
+				lastMarkerIndex = index;
+			} else if (marker.kind === "ordinary-user") {
+				lastMarkerId = null;
 				lastMarkerIndex = index;
 			}
 		}
 		this.goalOwned =
-			lastMarker === "goal-work" && lastMarkerIndex > baselineIndex && this.current != null;
+			lastMarkerId !== null &&
+			lastMarkerIndex > baselineIndex &&
+			this.current != null &&
+			lastMarkerId === this.current.id;
 		this.ownerId = this.goalOwned ? this.current?.id ?? null : null;
 	}
 
@@ -623,7 +632,13 @@ export class GoalStore {
 			const entry = branch[index]!;
 			const marker = ownershipMarker(entry);
 			if (marker.kind === "goal-work") {
-				segmentOwner = snapshotGoalId;
+				// A delivered user message is the freeze boundary for the superseded
+				// identity's open tail, exactly as the live path closes it. The message
+				// opens a segment only for the identity it names, and only when that
+				// identity is the current snapshot's; a stale message for a cleared or
+				// replaced Goal opens nothing and cannot charge the new Goal.
+				supersededOpen = false;
+				segmentOwner = marker.goalId === snapshotGoalId ? marker.goalId : null;
 				deliveredSinceSupersede = true;
 			} else if (marker.kind === "ordinary-user") {
 				segmentOwner = null;

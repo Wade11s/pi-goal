@@ -355,7 +355,11 @@ re-charging them.
 A report is Goal work only inside an open **admission segment**. A segment opens
 when Pi delivers a Goal work message — the `/goal` kickoff, an objective edit, a
 resume, an automatic Continuation, or the one Budget wrap-up — and closes when Pi
-delivers a genuine user prompt or a new Goal identity. `/goal <objective>` therefore
+delivers a genuine user prompt or a new Goal identity. Every work message names the
+Goal identity it was admitted for, and the delivery seam opens the segment only when
+that identity is the current Goal. A work message queued for a Goal that has since
+been cleared or replaced therefore opens nothing: the generic `[pi-goal]` prefix
+alone never authorizes admission. `/goal <objective>` therefore
 starts attribution at its actual kickoff: the ordinary run the command waited for
 is never adopted. `create_goal` leaves its creating run ordinary, and attribution
 starts at the first subsequent Continuation; pre-creation responses, creation
