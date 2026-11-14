@@ -218,6 +218,32 @@ test("a Pi custom message authorizes creation", async () => {
 	}
 });
 
+test("create_goal accepts the snake_case user_request spelling a model drifts into", async () => {
+	const session = await PiRpcSession.start();
+	script(
+		[
+			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE, user_request: REQUEST } }] },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Created." },
+		],
+		session,
+	);
+	try {
+		await session.prompt(REQUEST);
+		await session.waitForToolResult("create_goal", 1);
+		await session.waitForSettled(1);
+		const create = toolResults(session, "create_goal")[0];
+		assert.equal(create.isError, false, "the snake_case spelling is accepted");
+		assert.equal(structuredGoal(create.result).origin, "tool");
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 3);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
 test("a newer Pi custom message replaces prior authority", async () => {
 	const session = await PiRpcSession.start({ extraExtensions: [PEER] });
 	script(

@@ -98,6 +98,22 @@ failures:
 The complete captured run is quoted in the PR description. After the repair,
 the same suite passes (92/92) and `npm run typecheck` passes.
 
+## Limitations
+
+- The quotation rules are deliberately conservative deterministic English rules.
+  Unusual phrasing can be refused, a request delivered only as an image cannot be
+  corroborated, and other languages retain `/goal <objective>` as the direct
+  creation path.
+- The raw input is captured at the `input` seam and applied when the user
+  message is delivered. An extension that handles input (returns `handled`)
+  before pi-goal's own `input` handler could leave a stale pending entry; this
+  narrow extension-authored edge is outside the approved seams and is not
+  covered by the suite.
+- Settlement, restart, and tree-navigation expiry are observable as a refused
+  old quotation, but a new execution always starts from its own request source,
+  so those boundaries are not isolated from ordinary replacement in the RPC
+  scenarios.
+
 ## Compatibility landing constraint
 
 Batch 4 depends on the complete batch 1–3 compatibility landing unit (see #23).
