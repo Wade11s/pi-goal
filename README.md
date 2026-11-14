@@ -637,6 +637,33 @@ On top of that:
   and its count. A prompt the user sends after a restart is itself a user action,
   so it starts a fresh audit.
 
+Every model-side transition is bound to the Goal **identity** the execution that
+proposed it was admitted against, not to whatever Goal exists when the call
+finally runs. A run's follow-up provider turns are prepared against the context
+that run started with plus its tool results, so a `complete`, `blocked`, or
+`pause` proposed in a follow-up turn of a run whose Goal the user cleared or
+replaced while it was in flight is refused with the current state instead of
+being applied to a Goal the model never saw — no mutation, no extra revision, no
+newly admitted work, and the new Goal's kickoff and Continuations are untouched.
+A **revision** change inside the same execution is still accepted, for two
+different reasons: an edit or a resume (including a budget raise) of an active
+Goal delivers or steers the revised state into the running work, so the model
+has seen it, while an un-steered change — a user pause, a `budget_limited`
+transition, or a blocker reaching the threshold — leaves the Goal in a
+non-active status whose gate refuses the model's transitions anyway. A
+transition in a run Pi starts to retry the one before it (a failed provider
+request, or a response compaction recovered) is accepted because that run is the
+same execution. A new execution — a kickoff, a Continuation, a resume, or a
+prompt the user types — is admitted against the Goal that is current when it
+starts.
+
+A report needs a binding too. `blocked` is refused exactly like `complete` and
+`pause` when the execution holds no Goal binding, so an ordinary prompt whose
+turn started before `/goal <objective>` landed cannot record a blocker against a
+Goal the model never saw. A run whose own `create_goal` built the Goal is bound
+to it at its next turn, because the tool result is what showed the model that
+Goal.
+
 Structured `update_goal` and `get_goal` responses expose the open audit's current
 identity, latest description, and count, and every Continuation restates them
 while an audit is open. Tool descriptions and guidelines require a report on every

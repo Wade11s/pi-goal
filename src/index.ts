@@ -352,13 +352,40 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	/**
 	 * The Goal (identity + revision) the model's current request was prepared
-	 * against, snapshotted at every `turn_start` — before the provider request,
-	 * hence before the model could have seen anything newer. Model-side lifecycle
-	 * transitions (`update_goal`) are bound to this snapshot: a held response
-	 * released after a user edit, replacement, pause, or resume executes against
-	 * a revised Goal and must be refused instead of mutating it, because the
-	 * model decided on state it can no longer see reflected. `null` while no
-	 * turn has started or no Goal existed when the turn began.
+	 * against, admitted at the first provider turn of an execution and kept for the
+	 * rest of it. Model-side lifecycle transitions (`update_goal`) are bound to it:
+	 * a held response released after a user edit, replacement, pause, or resume
+	 * executes against a revised Goal and must be refused instead of mutating it,
+	 * because the model decided on state it can no longer see reflected.
+	 *
+	 * A run's *follow-up* turns are prepared against the context the run started with
+	 * plus its tool results, never against a Goal that appeared meanwhile, so
+	 * re-admitting the Goal at every `turn_start` would hand an old run whatever Goal
+	 * the user created while it was in flight — `/goal clear` plus
+	 * `/goal <objective>`, or a replacement — and its `complete`, `blocked`, or
+	 * explicit-`pause` would be accepted against an identity the run never saw. The
+	 * binding is therefore re-admitted only to the identity it already holds; a
+	 * different identity is never adopted.
+	 *
+	 * A same-identity revision change is admitted, but not because the model has
+	 * necessarily seen it. An edit or a resume (including a budget raise) of an active
+	 * Goal is delivered or steered into the running work, so the model has seen that
+	 * revision. A user `/goal pause`, an automatic `budget_limited` transition, or an
+	 * automatic blocked-threshold transition is not steered, and is safe for a
+	 * different reason: each leaves the Goal in a non-active status, and every
+	 * model-side transition (`complete`, `blocked`, and explicit `pause`) requires an
+	 * `active` Goal, so the status gate refuses it.
+	 *
+	 * `null` while no turn of this execution has started, or while no Goal existed
+	 * when it did. A later turn of that execution may then admit whatever Goal exists,
+	 * which is what lets the run whose own `create_goal` built one act on it: the tool
+	 * result is what showed the model that Goal.
+	 *
+	 * Cleared when an execution ends (settlement) and when a new one starts, so a
+	 * kickoff, a Continuation, a resume, or a prompt the user types is admitted
+	 * against the Goal that is current then. A run Pi starts to retry the one before
+	 * it — a failed provider request, or a response compaction recovered — is the
+	 * *same* execution, so it keeps the binding.
 	 */
 	let turnGoal: GoalBinding | null = null;
 
@@ -479,7 +506,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_start", () => {
 		const goal = store.get();
-		turnGoal = goal ? { id: goal.id, revision: goal.revision } : null;
+		const admitted = goal ? { id: goal.id, revision: goal.revision } : null;
+		// Re-admit the Goal for this turn only while this execution may still be
+		// admitted to it. A follow-up turn of a run whose Goal the user cleared or
+		// replaced while it was in flight keeps the identity the run started with, so
+		// its model-side transitions are refused instead of applied to a Goal it never
+		// saw. A same-identity revision change is admitted: an edit or a resume was
+		// steered into the running work, so the model has seen it, and an un-steered
+		// pause / budget_limited / blocked-threshold change leaves a non-active status
+		// whose gate refuses the model's transitions anyway.
+		if (turnGoal === null || (admitted !== null && admitted.id === turnGoal.id)) {
+			turnGoal = admitted;
+		}
 		// The Goal identity that owned the segment when this provider request started.
 		// A replacement steered into an in-flight run must not steal the response that
 		// was already on the wire for the old identity, so the assistant report is
@@ -680,12 +718,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * changed, so abandoned-branch isolation is visible rather than implicit.
 	 *
 	 * `turnGoal` is deliberately *not* reset here. It is the binding the current
-	 * turn's model transitions were prepared against; Pi rejects navigation while
+	 * execution's model transitions were prepared against; Pi rejects navigation while
 	 * a turn is streaming, so at this point the binding is either already fresh
-	 * for the selected branch or will be refreshed at the next `turn_start`. If a
-	 * turn somehow raced a navigation, leaving the binding untouched keeps the
-	 * execute-time identity+revision check refusing the stale transition instead
-	 * of handing it a fresh binding it was never prepared against.
+	 * for the selected branch or will be re-admitted at the first turn of the next
+	 * execution. If a turn somehow raced a navigation, leaving the binding untouched
+	 * keeps the execute-time identity+revision check refusing the stale transition
+	 * instead of handing it a fresh binding it was never prepared against.
 	 */
 	pi.on("session_tree", (_event, ctx) => {
 		clearCreationAuthority();
@@ -748,6 +786,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * and the blocked audit on a transient error Pi is about to retry.
 	 */
 	pi.on("agent_start", () => {
+		// Whether this run continues the execution that just ended rather than opening a
+		// new one: Pi's retry of a failed provider request, or of a response compaction
+		// recovered, is the same execution and keeps its Goal binding.
+		const retriesCurrentExecution = pendingRunKind === undefined && continuesGoalTurn;
 		if (pendingRunKind !== undefined) {
 			safety.beginRun(pendingRunKind);
 			pendingRunKind = undefined;
@@ -758,6 +800,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		} else {
 			safety.beginRun("user");
 		}
+		// A new execution is admitted against the Goal that is current when it starts.
+		if (!retriesCurrentExecution) turnGoal = null;
 		continuesGoalTurn = false;
 		providerFailure = undefined;
 		runOutcome = undefined;
@@ -783,6 +827,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("agent_settled", (event, ctx) => {
 		pendingRunKind = undefined;
 		continuesGoalTurn = false;
+		// The execution is over, so its Goal binding is too: the next one is admitted
+		// against whatever Goal is current when it starts, which is what lets the Goal
+		// a user created in the meantime kick off and continue normally.
+		turnGoal = null;
 		if (!event.aborted) return;
 		// An abort is the strongest possible user action: the Goal turn the user
 		// stopped must not be counted as a Goal malfunction, and it never reached
@@ -1631,15 +1679,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (!goal) {
 				return goalToolError(formatNoGoal(), null);
 			}
-			if (params?.action === "blocked") {
-				return reportBlocker(goal, params.blocker, params.blockerId, ctx);
-			}
 			/**
 			 * Refuse a call whose decision was prepared against a different Goal
-			 * state. The binding comes from `turn_start` of the turn whose model
-			 * request proposed this call, so a held response released after a user
-			 * edit / replacement / pause / resume is refused instead of mutating
-			 * the revised Goal the model never saw.
+			 * state. The binding is the Goal identity and revision the execution this
+			 * call belongs to was admitted against, so a held response released after a
+			 * user edit / replacement / pause / resume — and a follow-up turn of a run
+			 * whose Goal was cleared or replaced while it was in flight — is refused
+			 * instead of mutating a Goal the model never saw.
 			 */
 			const staleRefusal = (binding: GoalBinding | null) => {
 				if (!binding) {
@@ -1657,6 +1703,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					toPublicState(goal),
 				);
 			};
+			if (params?.action === "blocked") {
+				// The blocker report is bound exactly like `complete` and `pause`: a
+				// report whose execution holds no Goal binding belongs to a run admitted
+				// before any Goal existed, so it must not mutate a Goal the model never
+				// saw. A run whose own `create_goal` built the Goal is re-admitted at its
+				// next `turn_start`, because the tool result is what showed it that Goal.
+				// The revision is left to `markBlockedReport`, which must still read a
+				// repeated report inside one Goal turn as one audit step.
+				if (!turnGoal || goal.id !== turnGoal.id) {
+					return staleRefusal(turnGoal);
+				}
+				return reportBlocker(goal, params.blocker, params.blockerId, ctx);
+			}
 			const reportMutationFailure = (action: string, failure: GoalMutationFailure) => {
 				if (failure.reason === "persistence") {
 					return goalToolError(
