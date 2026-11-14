@@ -26,7 +26,7 @@ reworded report at all.
 | Unknown/non-current ID refused | An unrecognized or non-current ID is rejected without Goal mutation: no snapshot, no revision, no reset, no replacement | `test/goal11-blocker-identity.test.mjs` ("an unknown identity is refused without Goal mutation…"; "a stale identity from an ended chain is refused…"); `test/goal11-blocker-identity-store.test.mjs` ("an unrecognized or non-current identity is rejected…"; "a superseded chain's identity is refused…") |
 | Rejection guidance | The refusal names the offending ID, the open identity (or that none is open), and tells the model to read `get_goal` and retry | `test/goal11-blocker-identity.test.mjs` ("an unknown identity is refused…"); `test/goal11-blocker-identity-store.test.mjs` (same row's store test) |
 | Rejection does not own the turn | A rejected call does not own the turn, so a corrected call in the same turn records the turn's first valid report | `test/goal11-blocker-identity.test.mjs` ("an unknown identity is refused without Goal mutation and does not own the turn"); `test/goal5.test.mjs` ("a rejected report does not own its turn…"); `test/goal11-blocker-identity-store.test.mjs` ("a rejected identity does not own the turn…") |
-| Per-turn idempotence | The first valid report owns its turn; later reports in that turn are idempotent and cannot advance, reset, or replace the audit, even with different text or an ID | `test/goal11-blocker-identity.test.mjs` ("only the third consecutive Goal turn transitions…"); `test/goal5.test.mjs` ("two blocker reports inside one Goal turn count as one audit step"; "a rejected report does not own its turn…"); `test/goal11-blocker-identity-store.test.mjs` ("a same-turn repeat is idempotent…") |
+| Per-turn idempotence | The first valid report owns its turn; later reports in that turn are idempotent and cannot advance, reset, or replace the audit, even with different text or an ID | `test/goal11-blocker-identity.test.mjs` ("only the third consecutive Goal turn transitions…"); `test/goal5.test.mjs` ("two blocker reports inside one Goal turn count as one audit step": the same-turn repeat carries different wording and a foreign identity; "a rejected report does not own its turn…"); `test/goal11-blocker-identity-store.test.mjs` ("a same-turn repeat is idempotent…") |
 | Exact third-turn transition | Only the third consecutive Goal turn transitions; several calls in one turn cannot satisfy the threshold | `test/goal11-blocker-identity.test.mjs` ("only the third consecutive Goal turn transitions…"; "the first report issues an opaque identity…"); `test/goal5.test.mjs` ("update_goal(blocked) needs the same blocker for three consecutive Goal turns"); `test/goal11-blocker-identity-store.test.mjs` ("only the third consecutive Goal turn transitions…") |
 | Reset: no-report turn | A Goal turn that makes progress, verifies a wait, or reports no blocker breaks the chain durably | `test/goal5.test.mjs` ("a Goal turn without a blocker report breaks the blocked audit"; "a durable audit reset survives a restart…"); `test/goal11-blocker-identity-store.test.mjs` ("every reset drops the identity durably…") |
 | Reset: user action | A prompt the user types and an abort reset the audit durably | `test/goal5.test.mjs` ("a queued user prompt restarts the blocked audit at one"; "an abort resets the anti-loop counters…"); `test/goal11-blocker-identity.test.mjs` ("the legacy handoff grants no extra unattended turns…") |
@@ -49,14 +49,34 @@ reworded report at all.
 | Legacy stopped Goal | A stopped Goal's audit describes the stop, is never advanced again, and gets no identity | `test/goal11-blocker-identity.test.mjs` ("a stopped legacy Goal keeps its audit as history and is never advanced"); `test/goal11-blocker-identity-store.test.mjs` ("a non-active legacy audit is preserved as history and gets no identity") |
 | Batch 1/2 behavior preserved | Durable ownership, cutover, and cumulative budget recovery are unchanged | `test/goal9-*.test.mjs`, `test/goal10-*.test.mjs`, `test/accounting.test.mjs` — all still green, with only their blocked-audit scenarios re-driven by identity |
 
+### Why the legacy same-condition row is store-only
+
+Real RPC cannot drive a representative legacy same-condition Goal turn. After
+loading a 0.1.0 session, the first run can only be started by a typed prompt (a
+user action that durably resets the audit before any report) or `/goal resume`
+(which drops the audit); the one promptless seam, `/goal edit` on an idle active
+Goal, classifies its run as `user`-kind rather than as a representative Goal
+turn. The store seam therefore carries this row under #21's "impractical through
+RPC" allowance. Identity survival across reconstruction is separately covered
+through RPC by the legacy reload test.
+
 ## Pre-repair failure evidence
 
 The new and rewritten regressions were run against the pre-repair `src/` (the
 `integration/spec-1-v1-repair` tip, commit `36790ca`) with the new tests in place.
-Every narrow store test that touches identity fails, and every RPC scenario that
-passes an identity back fails, because the pre-repair command surface has no
-`blocker_id` and the pre-repair store compares blocker text after normalizing case,
-whitespace, and trailing punctuation. Representative failures:
+Reproduce it by exporting the current tree (`git archive HEAD`), overwriting
+`src/` with `git archive 36790ca src`, symlinking `node_modules`, then running
+`node --test test/goal11-blocker-identity-store.test.mjs` and
+`node --test test/goal11-blocker-identity.test.mjs`. Measured that way: **16 of the 20** new
+narrow store tests and **9 of the 12** new RPC scenarios fail; across the five
+rewritten existing regression files (`goal5`, `goal7`, `goal8`, `goal9-legacy`,
+`goal10-budget-recovery`) **11 of the 76** scenarios fail. They fail because the
+pre-repair command surface has no `blocker_id` and the pre-repair store compares
+blocker text after normalizing case, whitespace, and trailing punctuation. The
+four passing store tests and three passing RPC scenarios assert behavior the
+pre-repair code already had: per-turn repeat idempotence, persistence-failure
+rollback, legacy-audit loading and stopped-Goal history, the plain third-turn
+threshold, and the identity-free human status. Representative failures:
 
 ```text
 ✖ the first report issues an opaque identity that every later turn passes back
@@ -81,13 +101,7 @@ whitespace, and trailing punctuation. Representative failures:
   AssertionError: The "string" argument must be of type string. Received type undefined (undefined)
 
 ✖ a legacy open audit is preserved for the Blocker-identity handoff without text equivalence
-  AssertionError: Expected values to be strictly deep-equal:
-  + actual - expected
-    {
-      blocker: 'The test database is unavailable',
-  +   blockerId: 'blocker_8c0c3668',
-      turns: 2
-    }
+  AssertionError: the cutover issues a fresh opaque Blocker identity
 ```
 
 The narrow store failures are the same shape at the store seam, for example:
@@ -103,10 +117,10 @@ The narrow store failures are the same shape at the store seam, for example:
     ]
 
 ✖ an unrecognized or non-current identity is rejected without Goal mutation
-  AssertionError: Expected values to be strictly equal: 'not-current' !== undefined
+  AssertionError: Expected values to be strictly equal: true !== false
 
 ✖ the cutover preserves the legacy description and count and issues a fresh identity
-  AssertionError: the handoff is reported
+  AssertionError: a fresh identity is issued
 ```
 
 The complete captured run is quoted in the PR description. After the repair, the

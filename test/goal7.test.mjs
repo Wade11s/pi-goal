@@ -836,15 +836,16 @@ test("a blocked Goal reconstructed from a branch keeps its audit, and /goal resu
 		await session.notifyAfter(markBlocked, (r) => r.message.includes("blocked at revision 3"));
 
 		// The reconstructed Goal is read through the model tool, which reports the
-		// audit as the public state. A blocked Goal is the one status a user prompt
-		// cannot reset (the audit reset only applies to an active Goal), so this
-		// reads the reconstruction itself rather than a reset of it.
+		// audit and its identity as the public state. A blocked Goal is the one status
+		// a user prompt cannot reset (the audit reset only applies to an active Goal), so
+		// this reads the reconstruction itself rather than a reset of it.
 		await session.prompt("what is the current goal?");
 		const read = await session.waitForToolResult("get_goal");
 		const state = read.result.structuredContent?.goal ?? read.result.details?.goal;
 		assert.equal(state.status, "blocked", "the selected branch reconstructs the blocked Goal");
 		assert.equal(state.blockedTurns, 3, "the blocked audit survived branch reconstruction");
 		assert.equal(state.blocker, BLOCKER);
+		assert.equal(state.blockerId, issued, "the selected branch reconstructs the audit's Blocker identity");
 
 		await session.prompt("/goal resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));

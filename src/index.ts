@@ -1400,7 +1400,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			"Mark the current Goal complete after an evidence audit, blocked after a persistent blocker, or paused at the user's explicit request",
 		promptGuidelines: [
 			"Call update_goal with action complete only after every explicit requirement of the objective is verified by current-state evidence.",
-			`Call update_goal with action blocked only when the same genuine blocker has persisted for at least ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns, and never because the work is merely hard, slow, uncertain, or incomplete.`,
+			`Call update_goal with action blocked on every Goal turn in which a genuine blocker persists, from the first turn onward; never wait until ${BLOCKED_AUDIT_THRESHOLD} consecutive turns have passed before reporting one. Never report a blocker merely because the work is hard, slow, uncertain, or incomplete.`,
 			"Report the blocker on every Goal turn it persists: the first report omits blocker_id and pi-goal issues an opaque Blocker identity, and every later report of that same condition passes it back verbatim. Omit it only for a genuinely different condition.",
 			"Never guess or reuse an old Blocker identity: call get_goal for the current one. The extension never compares blocker text, so wording alone can never advance the blocked audit.",
 			"Completing or blocking a Goal stops its automatic continuation, so never use either to escape a difficult or merely tiring task.",

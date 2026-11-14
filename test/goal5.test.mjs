@@ -342,32 +342,57 @@ test("update_goal(blocked) requires a blocker description and refuses user-owned
 test("two blocker reports inside one Goal turn count as one audit step", async () => {
 	const session = await PiRpcSession.start();
 	// A model that repeats its own tool call in one assistant turn must not be able
-	// to satisfy a three-turn threshold inside a single turn. The repeat also
-	// arrives with a foreign identity and different wording, which must neither
-	// replace the audit nor start a new chain.
-	const reports = [
-		{ blocker: BLOCKER },
-		{ blocker: BLOCKER, id: "issued" },
+	// to satisfy a three-turn threshold inside a single turn. The repeat arrives
+	// with a foreign identity and different wording, which must neither replace the
+	// audit nor start a new chain: the same-turn idempotence check runs before the
+	// identity check, so it reads as one audit step.
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	const build = (currentId) => [
+		{ text: "Kickoff answer." },
+		{
+			toolCalls: [
+				{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } },
+				{
+					name: "update_goal",
+					args: { action: "blocked", blocker: REWORDED_BLOCKER, blocker_id: FOREIGN_ID },
+				},
+			],
+		},
+		{ text: "Waiting (Goal turn 1).", waitForFile: gate },
+		{
+			toolCalls: [
+				{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: currentId } },
+			],
+		},
+		{ text: "Waiting (Goal turn 2)." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+		{ text: "Wrapping up." },
 	];
+	writeFileSync(session.scriptPath, JSON.stringify(build("@issued")), "utf8");
 	try {
-		await runAuditChain(
-			session,
-			reports,
-			[{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] }, { text: "Wrapping up." }],
-			() => startGoal(session),
-		);
+		await startGoal(session);
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		assert.match(issued, /^blocker_[0-9a-f]{8}$/);
+		writeFileSync(session.scriptPath, JSON.stringify(build(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
-		assert.equal(results.length, 3);
+		assert.equal(results.length, 4);
 		assert.match(String(results[0].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
-		assert.equal(results[1].isError, true, "the second Goal turn is still below the threshold");
-		assert.match(String(results[1].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
-		assert.equal(results[2].isError, false, "the Goal completed normally");
+		assert.equal(results[1].isError, true, "the same-turn repeat is refused as a repeat, not counted");
+		assert.match(
+			String(results[1].result.content[0].text),
+			/already recorded for the current Goal turn/,
+			"the same-turn repeat is idempotent even with different text and a foreign identity",
+		);
+		assert.equal(results[2].isError, true, "the second Goal turn is still below the threshold");
+		assert.match(String(results[2].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
+		assert.equal(results[3].isError, false, "the Goal completed normally");
 
 		const entries = readSessionEntries(await session.sessionFile());
 		const snapshots = entries.filter((e) => e.customType === "goal-state");
-		// Two Goal turns, one audit step each: the count advanced only once per turn.
+		// Three Goal turns, one audit step each: the two calls in turn 1 counted once.
 		const audits = snapshots.map((e) => e.data.goal.blockedAudit?.turns).filter((t) => t !== undefined);
 		assert.deepEqual(audits, [1, 2], "each Goal turn advanced the audit exactly once");
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete");
