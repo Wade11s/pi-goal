@@ -163,20 +163,26 @@ recorded here, not repaired in this branch.
 
 **Symptom.** A model `update_goal { action: "complete" }` call made in a
 *follow-up provider turn* of an old Goal's in-flight run completes a Replacement
-Goal that the old run never saw. The replacement's own kickoff is suppressed
-because the creation command waited for the old run to finish, so the new Goal is
-marked `complete` without its work and with zero accounted usage.
+Goal that the old run never saw. The creation command waits for the old run to
+finish before delivering the new Goal's kickoff, so the new Goal is marked
+`complete` without its work and with zero accounted usage.
 
 **Deterministic reproduction** (real `pi --mode rpc`, scripted provider): the
-old Goal's first turn is held at a provider gate; a confirmed replacement is
-committed; the gate is released; the old run's next turn starts (after the
-replacement) and calls `update_goal { action: "complete" }`. The call succeeds and
-the replacement snapshot becomes `complete`:
+old Goal's first turn runs a shell command and is held at a provider gate;
+`/goal clear` then `/goal <new objective>` are issued while that run is in flight;
+the gate is released; the old run's next turn starts (after the replacement) and
+calls `update_goal { action: "complete" }` without any `get_goal` call. The call
+succeeds and the new Goal's snapshot becomes `complete`. The session branch shows
+the old kickoff, the tombstone, the new snapshot, the old run's tool result, and
+the new Goal's completion — with no new-Goal kickoff and no `get_goal` read:
 
 ```text
-UPDATE_IS_ERROR false
-UPDATE_RESULT {"content":[{"type":"text","text":"Goal goal_33dc0b92 marked complete."}], ... "objective":"A replacement objective","status":"complete", ...}
-SNAP goal_33dc0b92 complete 1 A replacement objective
+STATE goal_00b2d4ee active rev 0   (old Goal)
+user  [pi-goal] Working toward Goal goal_00b2d4ee
+STATE null                         (clear tombstone)
+STATE goal_9acb1f73 active rev 0   (new Goal)
+assistant / toolResult (bash true) (old run's held turn)
+STATE goal_9acb1f73 complete rev 1 (completed by the old run's follow-up turn)
 ```
 
 **Why it is a defect.** The `turnGoal` binding is snapshotted at every
@@ -189,9 +195,9 @@ the replacement kickoff. Issue #24's contract requires stale model-requested
 (`test/goal4-regressions.test.mjs`) only covers a *held* response whose turn
 started before the replacement.
 
-**Impact.** A user who replaces an unfinished Goal while its run is in flight can
-have the replacement falsely completed by the old run, with no work done and the
-replacement's kickoff suppressed.
+**Impact.** A user who clears a Goal and creates a new one while the old run is
+in flight can have the new Goal falsely completed by the old run, with no work
+done and the new Goal's kickoff suppressed.
 
 **Evidence.** Real-provider session: the old run's assistant thinking still
 described the old objective while its `update_goal` completed the new identity
