@@ -1090,3 +1090,5 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] the compact status indicator for `active`, `paused`, `blocked`,
       `usage_limited`, `budget_limited`, and `complete`
 - [ ] restart persistence and the clear tombstone
+- [ ] a `blocked` Goal's active time is frozen across idle time and a restart,
+      and the `usage_limited` freeze is covered by the deterministic regressions
