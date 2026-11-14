@@ -62,6 +62,7 @@ import {
 	BLOCKED_AUDIT_THRESHOLD,
 	CUSTOM_MESSAGE_TYPE,
 	CUSTOM_WRAPUP_MESSAGE_TYPE,
+	corroborateGoalCreationRequest,
 	corroboratePauseRequest,
 	formatBudgetWrapUpMessage,
 	formatContinuationMessage,
@@ -80,6 +81,7 @@ import {
 	MIN_OBJECTIVE_LENGTH,
 	MIN_USER_REQUEST_LENGTH,
 	type GoalBinding,
+	type GoalCreationCorroboration,
 	type GoalPublicState,
 	type GoalRecord,
 	previewObjective,
@@ -373,6 +375,99 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let pendingInitialKickoff: GoalBinding | null = null;
 
 	/**
+	 * Execution-time Goal-creation authority.
+	 *
+	 * `create_goal` may create a Goal only from an explicit request, and the
+	 * request must be corroborated at execution time against the one currently
+	 * authoritative source. The source is either the raw interactive/RPC user
+	 * input that started the current execution or a Pi custom message;
+	 * skill/template expansion and other transformed prompt text are not
+	 * evidence, and an extension calling `pi.sendUserMessage()` never acquires
+	 * human-user authority through that API.
+	 *
+	 * The authority belongs to the execution started by the request and survives
+	 * later model turns, Pi retries, compaction, and overflow recovery inside it.
+	 * A newer interactive/RPC user message or Pi custom message replaces it, even
+	 * when unrelated. Settlement, session restart, branch navigation, a successful
+	 * Goal creation, and direct Goal lifecycle operations clear it. It is one-shot:
+	 * a successful creation consumes it, while a rejection leaves it valid so a
+	 * corrected call can retry. Nothing about it is persisted — a snapshot keeps
+	 * `origin: "tool"` and gains no quotation, source id, or reusable marker.
+	 */
+	type GoalCreationAuthoritySource =
+		| { kind: "user"; text: string }
+		| { kind: "custom"; customType: string; text: string };
+
+	let creationAuthority: GoalCreationAuthoritySource | null = null;
+	/**
+	 * Raw user inputs seen at the `input` seam, matched to delivered user messages
+	 * in order. The `input` event fires before skill/template expansion and (for a
+	 * queued steer) before delivery, while the model sees the expanded text; the
+	 * quote must match the raw input, so it is captured here and applied when the
+	 * message is delivered, which is the same boundary the branch replay reads.
+	 */
+	const pendingUserInputs: Array<{ text: string; source: string }> = [];
+
+	function clearCreationAuthority(): void {
+		creationAuthority = null;
+		pendingUserInputs.length = 0;
+	}
+
+	/**
+	 * Apply the raw input of a delivered user message. An interactive/RPC prompt is
+	 * an accepted source; an extension-originated `sendUserMessage` is not, and it
+	 * starts a new execution, so it clears the previous authority. A user message
+	 * delivered with no matching input fails closed.
+	 */
+	function applyDeliveredUserAuthority(): void {
+		const pending = pendingUserInputs.shift();
+		if (!pending) {
+			creationAuthority = null;
+			return;
+		}
+		if (pending.source === "interactive" || pending.source === "rpc") {
+			creationAuthority = { kind: "user", text: pending.text };
+			return;
+		}
+		creationAuthority = null;
+	}
+
+	/** The tool error for a Goal-creation request whose evidence is not corroborated. */
+	function goalCreationAuthorityError(
+		corroboration: Extract<GoalCreationCorroboration, { ok: false }>,
+		quote: string,
+	): string {
+		switch (corroboration.reason) {
+			case "quote-empty":
+				return (
+					"Goal not created: create_goal requires a quotation of the explicit Goal-creation request. " +
+					'Pass user_request with the exact words of the request (for example "please create a goal for the release").'
+				);
+			case "quote-not-request":
+				return (
+					"Goal not created: the quoted text is not a complete affirmative Goal-creation instruction " +
+					`(${JSON.stringify(previewObjective(quote, 120))} does not expressly ask to create, set, or start a Goal). ` +
+					'Quote the instruction itself — for example "please create a goal for the release" — not a keyword, a fragment, ' +
+					"a mention, a question, a hypothetical, or a negation."
+				);
+			case "not-found":
+				return (
+					"Goal not created: no currently authoritative request contains " +
+					`${JSON.stringify(previewObjective(quote, 200))}. The quotation must come from the raw interactive/RPC user message ` +
+					"or Pi custom message that started this execution, and a newer message replaces an older one. " +
+					"Ask the user to repeat the request, or use /goal <objective>."
+				);
+			case "not-an-instruction":
+				return (
+					"Goal not created: the quoted Goal-creation instruction is not affirmative in the currently authoritative source — " +
+					"it is negated, cancelled, hypothetical, a question, or superseded by a later correction or cancellation. " +
+					"If the user did ask, ask them to repeat the request; otherwise keep working. " +
+					"The user can also create a Goal directly with /goal <objective>."
+				);
+		}
+	}
+
+	/**
 	 * Extension-level budget configuration, read from Pi's effective settings at
 	 * every session start (so a reload picks up a changed configuration).
 	 */
@@ -464,6 +559,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		clearCreationAuthority();
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
@@ -592,6 +688,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * of handing it a fresh binding it was never prepared against.
 	 */
 	pi.on("session_tree", (_event, ctx) => {
+		clearCreationAuthority();
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
 		// A tail recovered from the selected branch belongs to an identity that is no
@@ -630,6 +727,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
 	pi.on("input", (event, ctx) => {
+		pendingUserInputs.push({ text: event.text, source: event.source });
 		continuesGoalTurn = false;
 		// A prompt the user actually typed is never Goal-owned work, so the
 		// admission segment closes — but at *delivery*, not here: Pi dispatches this
@@ -773,6 +871,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// closes it. A delivered message also closes the superseded identity's
 			// admission, freezing its in-flight tail before the new segment opens.
 			applyDeliveredUserMessage(message, pi);
+			// The raw input of the delivered message is what authorizes a Goal creation
+			// in this execution. Applying it here (rather than at the `input` seam) keeps
+			// a queued steer from replacing the authority of the response already in
+			// flight, and matches the branch-replay boundary.
+			applyDeliveredUserAuthority();
+			return;
+		}
+		if (message.role === "custom") {
+			// A Pi custom message is an accepted authority source of any customType:
+			// the type identifies the custom-message path, not a trust allowlist. It
+			// replaces prior authority even when unrelated, because it is newer.
+			creationAuthority = {
+				kind: "custom",
+				customType: message.customType,
+				text: messageText(message.content),
+			};
 			return;
 		}
 		const goal = store.get();
@@ -890,6 +1004,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	/** Refresh the status line and persist accounting once Pi will not continue. */
 	pi.on("agent_settled", (_event, ctx) => {
+		// Settlement ends the execution, so its creation authority is over: a later
+		// run needs a new request, even one Pi starts for a queued message.
+		clearCreationAuthority();
 		budgetGateActive = false;
 		wrapUpArmed = false;
 		store.flushAccounting(pi);
@@ -1261,7 +1378,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Create Goal",
 		description:
 			"Create a persistent Goal for an explicit user or system request. " +
-			"Refuses when this session already has a Goal, and refuses a token budget above the configured maximum.",
+			"Requires user_request: the exact words of the request, quoted verbatim from the raw interactive/RPC " +
+			"user message or Pi custom message that started this execution. The quote is corroborated at execution " +
+			"time against that source, so a paraphrase, a fragment, a forged request, or a request from an earlier " +
+			"message is refused with goal: null. Refuses when this session already has a Goal, and refuses a token " +
+			"budget above the configured maximum.",
 		parameters: Type.Object({
 			objective: Type.String({ minLength: MIN_OBJECTIVE_LENGTH, maxLength: MAX_OBJECTIVE_LENGTH }),
 			tokenBudget: Type.Optional(
@@ -1272,15 +1393,49 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						"Reaching it makes the Goal budget_limited, which stops continuation and is not completion.",
 				}),
 			),
+			userRequest: Type.Optional(
+				Type.String({
+					description:
+						"Required for creation: the exact words of the explicit Goal-creation request, quoted verbatim " +
+						"from the currently authoritative raw interactive/RPC user message or Pi custom message (for example " +
+						'"please create a goal for the release"). The quote is corroborated against that source; a paraphrase, ' +
+						"a keyword, a fragment, a mention, a question, a hypothetical, a negation, or a request from an earlier " +
+						"message is refused. The objective remains model-written and need not repeat the quotation.",
+				}),
+			),
 		}),
 		outputSchema: getGoalOutputSchema,
 		promptSnippet: "Create a persistent session Goal from an explicit user or system request",
 		promptGuidelines: [
 			"Call create_goal only when the user or the system explicitly asked for a Goal. Never infer one because a task looks large.",
+			"Pass user_request with the exact words of the explicit Goal-creation request, quoted verbatim from the raw interactive/RPC user message or Pi custom message that started this execution. The quote is corroborated against that source; a paraphrase, a fragment, or an older message is refused with goal: null.",
 			"Do not call create_goal while this session already has a Goal; it is refused. Use get_goal to inspect the current Goal instead.",
 			"Only set tokenBudget when the user asked for a specific budget; otherwise omit it and let the configured default apply.",
 		],
-		async execute(_toolCallId: string, params: { objective: string; tokenBudget?: number }, _signal, _onUpdate, ctx) {
+		/**
+		 * Accept the snake_case spelling a model drifts into, matching update_goal's
+		 * `user_request` compatibility shim. The canonical spelling is camelCase.
+		 */
+		prepareArguments: (args: unknown): { objective: string; tokenBudget?: number; userRequest?: string } => {
+			if (typeof args !== "object" || args === null) return { objective: "" };
+			const record = args as Record<string, unknown>;
+			const objective = typeof record.objective === "string" ? record.objective : "";
+			const tokenBudget = typeof record.tokenBudget === "number" ? record.tokenBudget : undefined;
+			const rawRequest = record.userRequest ?? record.user_request;
+			const userRequest = typeof rawRequest === "string" ? rawRequest : undefined;
+			return {
+				objective,
+				...(tokenBudget === undefined ? {} : { tokenBudget }),
+				...(userRequest === undefined ? {} : { userRequest }),
+			};
+		},
+		async execute(
+			_toolCallId: string,
+			params: { objective: string; tokenBudget?: number; userRequest?: string },
+			_signal,
+			_onUpdate,
+			ctx,
+		) {
 			const validation = validateObjective(String(params.objective ?? ""));
 			if (!validation.ok) {
 				return goalToolError(validation.error, null);
@@ -1311,6 +1466,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					toPublicState(existing),
 				);
 			}
+			// Execution-time creation authority. The request must be corroborated
+			// against the one currently authoritative source; a missing, forged,
+			// stale, non-explicit, or ambiguous quote is refused with goal: null and
+			// no state change. A rejection does not consume the authority, so a
+			// corrected call can retry while the same request remains valid.
+			if (!creationAuthority) {
+				return goalToolError(
+					"Goal not created: no explicit user or system request is currently authoritative. " +
+					"create_goal may be called only in the execution started by a raw interactive/RPC user message " +
+					"or a Pi custom message. Ask the user to make the request, or use /goal <objective>.",
+					null,
+				);
+			}
+			const quote = typeof params.userRequest === "string" ? params.userRequest : "";
+			const corroboration = corroborateGoalCreationRequest(creationAuthority.text, quote);
+			if (!corroboration.ok) {
+				return goalToolError(goalCreationAuthorityError(corroboration, quote), null);
+			}
 			const goal = store.create(validation.objective, "tool", { tokenBudget: budget.tokenBudget });
 			// A superseded identity's open tail must be durable before a new Goal takes the
 			// session's Goal slot: creating a Goal leaves no marker of its own on the
@@ -1336,6 +1509,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				const reason = error instanceof Error ? error.message : String(error);
 				return goalToolError(`Goal not created: ${reason}`, null);
 			}
+			// A successful creation consumes the one-shot authority. The Goal now
+			// occupies the session's single slot, so a second call is refused anyway,
+			// but clearing the authority also prevents a replayed model request from
+			// being treated as fresh evidence.
+			clearCreationAuthority();
 			// No separate durability poll is needed here, unlike the /goal command whose
 			// kickoff is what creates the session file: a tool call implies a running
 			// session whose file already exists, and appendEntry writes synchronously
@@ -1707,6 +1885,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			try {
 				const command = parseGoalCommand(args);
+				// A direct Goal lifecycle operation is a user decision that supersedes
+				// any model-held creation authority. A bare status read is not a
+				// lifecycle operation and leaves the authority alone.
+				if (command.kind !== "status" && command.kind !== "invalid") {
+					clearCreationAuthority();
+				}
 				switch (command.kind) {
 					case "status":
 						await reportStatus(ctx);

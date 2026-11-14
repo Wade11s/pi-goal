@@ -595,9 +595,11 @@ function contradictsPause(text: string): boolean {
  * Politeness, modal, and first-person lead-ins that may precede an imperative
  * pause verb ("please", "can you", "I want you to", "let's", ...). Each is
  * stripped in turn, so "could you please just pause" resolves to "pause".
+ * "actually"/"in fact" are discourse markers a correction may carry ("Actually,
+ * create a goal"), so they are stripped for the creation rules too.
  */
 const REQUEST_LEAD =
-	/^(?:(?:please|kindly|pls|now|then|just|also|okay|ok|so|and|but|maybe|perhaps|quickly|immediately|hey|alright|all\s+right|do|go\s+ahead(?:\s+and)?|feel\s+free\s+to|i(?:'d| would)\s+(?:like|want|need|prefer)(?:\s+you)?\s+to|i\s+(?:want|need|would\s+like|would\s+prefer)(?:\s+you)?\s+to|i(?:'m| am)\s+asking\s+you\s+to|i\s+ask\s+you\s+to|i\s+think|you\s+(?:should|must|need\s+to|can|could|may|have\s+to|will|are\s+to|want\s+to)|we\s+(?:should|must|need\s+to|can|could|may|have\s+to|will|want\s+to)|(?:can|could|would|will|should|may)\s+(?:you|we)|let'?s|let\s+us|time\s+to|it(?:'s| is)\s+time\s+to|it\s+would\s+be\s+(?:good|best|helpful|great|wise)|it\s+should\s+be\s+(?:good|best|helpful|great|wise)))(?:\s+|$)/i;
+	/^(?:(?:please|kindly|pls|now|then|just|also|okay|ok|so|and|but|maybe|perhaps|quickly|immediately|hey|alright|all\s+right|actually|in\s+fact|do|go\s+ahead(?:\s+and)?|feel\s+free\s+to|i(?:'d| would)\s+(?:like|want|need|prefer)(?:\s+you)?\s+to|i\s+(?:want|need|would\s+like|would\s+prefer)(?:\s+you)?\s+to|i(?:'m| am)\s+asking\s+you\s+to|i\s+ask\s+you\s+to|i\s+think|you\s+(?:should|must|need\s+to|can|could|may|have\s+to|will|are\s+to|want\s+to)|we\s+(?:should|must|need\s+to|can|could|may|have\s+to|will|want\s+to)|(?:can|could|would|will|should|may)\s+(?:you|we)|let'?s|let\s+us|time\s+to|it(?:'s| is)\s+time\s+to|it\s+would\s+be\s+(?:good|best|helpful|great|wise)|it\s+should\s+be\s+(?:good|best|helpful|great|wise)))(?:\s+|$)/i;
 
 /** Base-form pause verbs that start an imperative request. */
 const IMPERATIVE_PAUSE =
@@ -712,6 +714,182 @@ export function corroboratePauseRequest(
 		return { ok: true, message: human[index]! };
 	}
 	return { ok: false, reason: "not-found" };
+}
+
+/**
+ * Goal-creation request vocabulary and conservative clause-order rules.
+ *
+ * `create_goal` may create a Goal only from an explicit request, so the model
+ * must quote the complete affirmative instruction and the extension corroborates
+ * it against the single currently authoritative source (the raw interactive/RPC
+ * user input, or a Pi custom message). Matching is case-sensitive and permits
+ * only whitespace-folding differences; a paraphrase, a keyword, or a convenient
+ * fragment is not evidence.
+ *
+ * The rules are deliberately narrow and deterministic: an express request to
+ * create, set, or start a Goal. Ordinary work, mere mentions, questions,
+ * hypotheticals, negations, and requests merely to keep working do not qualify.
+ * Intent is evaluated in clause order, so a later explicit correction may
+ * supersede an earlier negation while a later cancellation or negation
+ * supersedes the quoted request. Ambiguity fails closed.
+ */
+const GOAL_CREATION_ACTION =
+	/\b(?:create|creates|created|creating|set|sets|setting|start|starts|started|starting|establish|establishes|established|establishing|make|makes|made|making|open|opens|opened|opening)\b/i;
+/** Global variant for `matchAll`; the plain regex keeps `test()` free of lastIndex state. */
+const GOAL_CREATION_ACTION_GLOBAL = new RegExp(GOAL_CREATION_ACTION.source, "gi");
+const GOAL_NOUN = /\bgoals?\b/i;
+const GOAL_DETERMINER =
+	"(?:a|an|the|this|that|one|new|another|fresh|our|my|your|shared|team|single)";
+const IMPERATIVE_GOAL_CREATION = new RegExp(
+	`^(?:create|set|start|establish|make|open)(?:\\s+up)?(?:\\s+${GOAL_DETERMINER})*\\s*goals?\\b`,
+	"i",
+);
+const PASSIVE_GOAL_CREATION =
+	/^(?:(?:a|an|the|this|that|new|another|fresh|our|my|your|shared|team|single)\s+)?goals?\s+(?:should|must|can|could|may|will|would|needs?\s+to|has\s+to|is\s+to|gets?)\s+(?:be\s+)?(?:created|set|started|established|made|opened)\b/i;
+const DESIRE_GOAL_CREATION =
+	/\b(?:i|we)\s+(?:want|need|would\s+like|would\s+prefer)\b[\s\S]{0,40}?\bgoals?\b[\s\S]{0,20}?\b(?:created|set|started|established|made|opened)\b/i;
+
+/** A later cancellation of the request, with or without the Goal named. */
+const CREATION_CANCELLATION =
+	/\b(?:never\s*mind|cancel(?:\s+that)?|scratch\s+that|forget\s+(?:it|that|i\s+said\s+that)?|disregard\s+(?:that|it)|changed\s+my\s+mind|didn'?t\s+mean\s+(?:it|that)|didn'?t\s+mean\s+to|don'?t\s+do\s+it|do\s+not\s+do\s+it|don'?t\s+want\s+(?:that|it|this)|do\s+not\s+want\s+(?:that|it|this))\b/i;
+
+/** A clause that is nothing but a cancellation or a bare negation. */
+const BARE_CANCELLATION =
+	/^(?:(?:but\s+)?(?:don'?t|do\s+not|never\s*mind|forget\s+it)|no|nope|not|enough(?:\s+already)?)[.!]?$/i;
+
+/** A conditional or tentative clause is a hypothetical, not a request. */
+const HYPOTHETICAL_CLAUSE =
+	/^(?:if|when|whenever|suppose|supposing|assuming|in\s+case|what\s+if|whether|maybe|perhaps|probably|possibly)\b/i;
+
+/** A conditional subordinator anywhere in the clause makes it hypothetical. */
+const CONDITIONAL_CLAUSE =
+	/\b(?:if|unless|whether|when|whenever|provided\s+that|as\s+long\s+as|on\s+condition\s+that)\b/i;
+
+/** Whether one clause is an affirmative instruction to create a Goal. */
+function isGoalCreationRequestClause(clause: string): boolean {
+	let rest = clause.trim();
+	if (!rest) return false;
+	if (HYPOTHETICAL_CLAUSE.test(rest)) return false;
+	if (CONDITIONAL_CLAUSE.test(rest)) return false;
+	if (CREATION_CANCELLATION.test(rest)) return false;
+	if (BARE_CANCELLATION.test(rest)) return false;
+	// A negation anywhere in the clause is conservative: "create a goal, not a
+	// task" is split at the comma, and a mid-clause negation is ambiguous, so it
+	// fails closed rather than guessing at the scope.
+	if (NEGATION_ANYWHERE.test(rest)) return false;
+	for (let pass = 0; pass < 20; pass++) {
+		const lead = rest.match(REQUEST_LEAD);
+		if (!lead) break;
+		rest = rest.slice(lead[0].length).trimStart();
+	}
+	return (
+		IMPERATIVE_GOAL_CREATION.test(rest) ||
+		PASSIVE_GOAL_CREATION.test(rest) ||
+		DESIRE_GOAL_CREATION.test(rest)
+	);
+}
+
+/** Whether one clause decides against a Goal-creation request. */
+function isNegativeCreationClause(clause: string): boolean {
+	const text = clause.trim();
+	if (!text) return false;
+	if (CREATION_CANCELLATION.test(text)) return true;
+	if (BARE_CANCELLATION.test(text)) return true;
+	if (
+		(HYPOTHETICAL_CLAUSE.test(text) || CONDITIONAL_CLAUSE.test(text)) &&
+		(GOAL_CREATION_ACTION.test(text) || GOAL_NOUN.test(text))
+	) {
+		return true;
+	}
+	if (!GOAL_NOUN.test(text)) return false;
+	for (const match of text.matchAll(GOAL_CREATION_ACTION_GLOBAL)) {
+		if (hasNegationBefore(text, match.index)) return true;
+	}
+	return NEGATION_ANYWHERE.test(text);
+}
+
+/** One clause of the authoritative source, and whether it was a question. */
+interface GoalCreationClause {
+	text: string;
+	question: boolean;
+}
+
+/** Split on the same clause separators the pause rules use, keeping question shape. */
+function splitGoalCreationClauses(text: string): GoalCreationClause[] {
+	const clauses: GoalCreationClause[] = [];
+	let start = 0;
+	for (let index = 0; index < text.length; index++) {
+		const char = text[index]!;
+		if (CLAUSE_SEPARATORS.test(char)) {
+			const piece = normalizeWhitespace(text.slice(start, index));
+			if (piece) clauses.push({ text: piece, question: char === "?" });
+			start = index + 1;
+		}
+	}
+	const rest = normalizeWhitespace(text.slice(start));
+	if (rest) clauses.push({ text: rest, question: false });
+	return clauses;
+}
+
+/** Outcome of verifying a model-supplied Goal-creation quotation. */
+export type GoalCreationCorroboration =
+	| { ok: true; source: string }
+	| { ok: false; reason: "quote-empty" | "quote-not-request" | "not-found" | "not-an-instruction" };
+
+/**
+ * Verify a model-supplied Goal-creation quotation against the one currently
+ * authoritative source.
+ *
+ * All of these must hold:
+ *
+ * 1. the quote is a complete affirmative Goal-creation instruction (not a
+ *    keyword, a fragment, a mention, a question, a hypothetical, or a negation);
+ * 2. the quote occurs in the source, case-sensitively and modulo whitespace
+ *    folding;
+ * 3. the source's clause order leaves the request standing: the last clause
+ *    that decides Goal creation is affirmative. A later correction may
+ *    supersede an earlier negation; a later cancellation or negation supersedes
+ *    the quoted request; a question or hypothetical never qualifies.
+ *
+ * The objective is model-written and never has to repeat the quotation.
+ */
+export function corroborateGoalCreationRequest(
+	source: string,
+	quote: string,
+): GoalCreationCorroboration {
+	const needle = normalizeWhitespace(quote);
+	if (needle.length < MIN_USER_REQUEST_LENGTH) return { ok: false, reason: "quote-empty" };
+	if (!GOAL_CREATION_ACTION.test(needle) || !GOAL_NOUN.test(needle)) {
+		return { ok: false, reason: "quote-not-request" };
+	}
+	if (needle.endsWith("?")) return { ok: false, reason: "quote-not-request" };
+	if (!isGoalCreationRequestClause(needle)) return { ok: false, reason: "quote-not-request" };
+
+	const normalizedSource = normalizeWhitespace(source);
+	if (!normalizedSource.includes(needle)) return { ok: false, reason: "not-found" };
+
+	let decision: "affirmative" | "negative" | undefined;
+	for (const clause of splitGoalCreationClauses(normalizedSource)) {
+		if (clause.question) {
+			// A question is never an affirmative instruction. One that contains the
+			// quote, or that concerns Goal creation at all, decides against it.
+			if (
+				clause.text.includes(needle) ||
+				GOAL_CREATION_ACTION.test(clause.text) ||
+				GOAL_NOUN.test(clause.text)
+			) {
+				decision = "negative";
+			}
+			continue;
+		}
+		if (isGoalCreationRequestClause(clause.text)) {
+			decision = "affirmative";
+			continue;
+	}
+		if (isNegativeCreationClause(clause.text)) decision = "negative";
+	}
+	if (decision !== "affirmative") return { ok: false, reason: "not-an-instruction" };
+	return { ok: true, source: normalizedSource };
 }
 
 /**
