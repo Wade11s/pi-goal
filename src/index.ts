@@ -364,9 +364,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * the user created while it was in flight — `/goal clear` plus
 	 * `/goal <objective>`, or a replacement — and its `complete`, `blocked`, or
 	 * explicit-`pause` would be accepted against an identity the run never saw. The
-	 * binding is therefore re-admitted only to the identity it already holds: a
-	 * revision change is admitted, because pi-goal steers the revised state into the
-	 * running work and the model has seen it, while a different identity is not.
+	 * binding is therefore re-admitted only to the identity it already holds; a
+	 * different identity is never adopted.
+	 *
+	 * A same-identity revision change is admitted, but not because the model has
+	 * necessarily seen it. An edit or a resume (including a budget raise) of an active
+	 * Goal is delivered or steered into the running work, so the model has seen that
+	 * revision. A user `/goal pause`, an automatic `budget_limited` transition, or an
+	 * automatic blocked-threshold transition is not steered, and is safe for a
+	 * different reason: each leaves the Goal in a non-active status, and every
+	 * model-side transition (`complete`, `blocked`, and explicit `pause`) requires an
+	 * `active` Goal, so the status gate refuses it.
 	 *
 	 * `null` while no turn of this execution has started, or while no Goal existed
 	 * when it did. A later turn of that execution may then admit whatever Goal exists,
@@ -503,8 +511,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// admitted to it. A follow-up turn of a run whose Goal the user cleared or
 		// replaced while it was in flight keeps the identity the run started with, so
 		// its model-side transitions are refused instead of applied to a Goal it never
-		// saw; a revision change is admitted, because the revised state was steered
-		// into the running work and the model has seen it.
+		// saw. A same-identity revision change is admitted: an edit or a resume was
+		// steered into the running work, so the model has seen it, and an un-steered
+		// pause / budget_limited / blocked-threshold change leaves a non-active status
+		// whose gate refuses the model's transitions anyway.
 		if (turnGoal === null || (admitted !== null && admitted.id === turnGoal.id)) {
 			turnGoal = admitted;
 		}
@@ -1669,9 +1679,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (!goal) {
 				return goalToolError(formatNoGoal(), null);
 			}
-			if (params?.action === "blocked") {
-				return reportBlocker(goal, params.blocker, params.blockerId, ctx);
-			}
 			/**
 			 * Refuse a call whose decision was prepared against a different Goal
 			 * state. The binding is the Goal identity and revision the execution this
@@ -1696,6 +1703,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					toPublicState(goal),
 				);
 			};
+			if (params?.action === "blocked") {
+				// The blocker report is bound exactly like `complete` and `pause`: a
+				// report whose execution holds no Goal binding belongs to a run admitted
+				// before any Goal existed, so it must not mutate a Goal the model never
+				// saw. A run whose own `create_goal` built the Goal is re-admitted at its
+				// next `turn_start`, because the tool result is what showed it that Goal.
+				// The revision is left to `markBlockedReport`, which must still read a
+				// repeated report inside one Goal turn as one audit step.
+				if (!turnGoal || goal.id !== turnGoal.id) {
+					return staleRefusal(turnGoal);
+				}
+				return reportBlocker(goal, params.blocker, params.blockerId, ctx);
+			}
 			const reportMutationFailure = (action: string, failure: GoalMutationFailure) => {
 				if (failure.reason === "persistence") {
 					return goalToolError(

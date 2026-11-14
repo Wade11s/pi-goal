@@ -8,6 +8,14 @@
  * that started after the replacement re-bound to the new identity and its
  * `complete` / `blocked` / `pause` was accepted.
  *
+ * The same rule closes the null-binding case: a turn that started before any Goal
+ * existed holds no binding, so a `blocked` report it prepared must not record an
+ * audit on a Goal that a `/goal <objective>` created while the response was in
+ * flight. And because Pi's retry of a failed request, and its retry after a
+ * compaction, are the *same* execution, the binding must survive both windows:
+ * a Clear/creation that lands inside one cannot become the target of the retried
+ * run's transition either.
+ *
  * Every test drives a real `pi --mode rpc` subprocess with the pi-goal package
  * loaded and the scripted provider, holds the old run open at a provider gate
  * while the lifecycle commands run, and asserts the new Goal is untouched and
@@ -437,6 +445,265 @@ test("an old run's follow-up turn cannot pause a Goal created after Clear", asyn
 		assert.equal(continuationEntries(entries).length, 1, "the new Goal continued exactly once");
 		assert.equal(runCount(session), 4, "the request run, the old kickoff, the new kickoff, and one continuation");
 		assertStepsConsumed(session, 6, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a run admitted before any Goal cannot report a blocker against a Goal it never saw", async () => {
+	// The null-binding asymmetry: an ordinary prompt's turn starts with no Goal, so
+	// its execution holds no Goal binding. A `/goal <objective>` that lands while
+	// that turn's response is still in flight must not become the target of a
+	// `blocked` report the model prepared before the Goal existed. `complete` and
+	// `pause` are already refused for want of a binding; `blocked` used to fall
+	// through to the store and mutate the new Goal's audit and revision.
+	const session = await PiRpcSession.start();
+	const gate = join(session.cwd, "provider-gate");
+	script(
+		[
+			// The ordinary turn's response is held at the gate, so the Goal is created
+			// after the turn that carries this report already started.
+			{
+				toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: "Nothing could be verified." } }],
+				waitForFile: gate,
+			},
+			{ text: "The blocker report was refused." },
+			{ text: "Working on the new objective." },
+			{ hang: true },
+		],
+		session,
+	);
+	try {
+		const prompt = await session.prompt("Inspect the repository without a Goal");
+		assert.equal(prompt.data.disposition, "started");
+		await waitForTurns(session, 1);
+
+		const createPromise = submitCommand(session, "create-new", `/goal ${NEW_OBJECTIVE}`);
+		const created = await waitForStoredGoal(
+			session,
+			(goal) => goal.objective === NEW_OBJECTIVE && goal.status === "active",
+			"the Goal created during the ordinary run",
+		);
+
+		writeFileSync(gate, "", "utf8");
+		const stale = await session.waitForToolResult("update_goal", 1);
+		assert.equal(stale.isError, true, "the unbound blocker report is refused");
+		assert.match(String(stale.result.content[0].text), /cannot verify which Goal revision/);
+		assert.ok(!/Blocker recorded/.test(String(stale.result.content[0].text)), "nothing was recorded");
+		const refused = structuredGoal(stale.result);
+		assert.equal(refused.id, created.id);
+		assert.equal(refused.status, "active", "the new Goal keeps running");
+		assert.equal(refused.revision, 0, "the unbound report bumped no revision");
+		assert.ok(!refused.blockedAudit, "the unbound report opened no blocked audit");
+		assert.ok(!refused.blockerId, "the unbound report issued no Blocker identity");
+
+		await createPromise;
+		await abortRun(session, 3);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.deepEqual(
+			goalSnapshots(entries).map((s) => (s.data.goal === null ? "tombstone" : `${s.data.goal.status}:${s.data.goal.revision}`)),
+			["active:0"],
+			"the unbound blocker report added no snapshot",
+		);
+		const current = currentGoal(entries);
+		assert.equal(current.id, created.id);
+		assert.equal(current.status, "active");
+		assert.equal(current.revision, 0);
+		assert.ok(!current.blockedAudit, "the new Goal opened no blocked audit");
+		const live = await reportStatus(session);
+		assert.equal(live.goalId, created.id);
+		assert.equal(live.status, "active");
+		assert.equal(live.revision, 0);
+		assert.equal(live.objective, NEW_OBJECTIVE);
+		assert.equal(
+			entries.filter(
+				(e) => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes(NEW_OBJECTIVE),
+			).length,
+			1,
+			"the new Goal's kickoff was delivered exactly once",
+		);
+		assert.equal(continuationEntries(entries).length, 1, "the new Goal continued exactly once");
+		assert.equal(runCount(session), 3, "the ordinary run, the new kickoff, and one continuation");
+		assertStepsConsumed(session, 4, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a Pi retry of a run whose Goal was cleared keeps its old binding", async () => {
+	// The retry window is the *same* execution, so the binding the failed attempt was
+	// admitted against must survive it. Clear plus a new Goal landing inside that
+	// window therefore leaves the retried run bound to the cleared identity: its
+	// completion is refused instead of completing a Goal it never saw.
+	const session = await PiRpcSession.start({
+		settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 10 } },
+	});
+	const gate = join(session.cwd, "provider-gate");
+	script(
+		[
+			// The old Goal's kickoff request fails, held at the gate so the Clear and the
+			// new Goal land while the old execution is still in flight.
+			{ error: "503 upstream overloaded", waitForFile: gate },
+			// Pi's retry is the same execution and proposes a completion.
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "The stale completion was refused." },
+			{ text: "Working on the new objective." },
+			{ hang: true },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal ${OLD_OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await waitForTurns(session, 1);
+
+		const cleared = await session.prompt("/goal clear");
+		assert.equal(cleared.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("cleared"));
+
+		const createPromise = submitCommand(session, "create-new", `/goal ${NEW_OBJECTIVE}`);
+		const created = await waitForStoredGoal(
+			session,
+			(goal) => goal.objective === NEW_OBJECTIVE && goal.status === "active",
+			"the Goal created inside the retry window",
+		);
+
+		writeFileSync(gate, "", "utf8");
+		const stale = await session.waitForToolResult("update_goal", 1);
+		assert.ok(
+			session.records.some((r) => r.type === "auto_retry_start"),
+			"Pi retried the failed request inside one execution",
+		);
+		assert.equal(stale.isError, true, "the retried run's stale completion is refused");
+		assert.match(String(stale.result.content[0].text), /prepared against/);
+		const refused = structuredGoal(stale.result);
+		assert.equal(refused.id, created.id);
+		assert.equal(refused.objective, NEW_OBJECTIVE);
+		assert.equal(refused.status, "active", "the new Goal is not completed");
+		assert.equal(refused.revision, 0, "the new Goal is not mutated");
+
+		await createPromise;
+		await abortRun(session, 4);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.deepEqual(
+			goalSnapshots(entries).map((s) => (s.data.goal === null ? "tombstone" : `${s.data.goal.status}:${s.data.goal.revision}`)),
+			["active:0", "tombstone", "active:0"],
+			"the stale completion added no snapshot",
+		);
+		const current = currentGoal(entries);
+		assert.equal(current.id, created.id);
+		assert.equal(current.status, "active");
+		assert.equal(current.revision, 0);
+		const live = await reportStatus(session);
+		assert.equal(live.goalId, created.id);
+		assert.equal(live.status, "active");
+		assert.equal(live.revision, 0);
+		assert.equal(live.objective, NEW_OBJECTIVE);
+		assert.equal(
+			entries.filter(
+				(e) => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes(NEW_OBJECTIVE),
+			).length,
+			1,
+			"the new Goal's kickoff was delivered exactly once",
+		);
+		assert.equal(continuationEntries(entries).length, 1, "the new Goal continued exactly once");
+		assert.equal(runCount(session), 4, "the failed run, its retry, the new kickoff, and one continuation");
+		assertStepsConsumed(session, 5, [
+			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
+			{ stopReason: "aborted" },
+		]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a compaction retry of a run whose Goal was cleared keeps its old binding", async () => {
+	// A recoverable length stop compacts and retries the response inside the same
+	// execution, so that retried run keeps the binding too. A Clear plus a new Goal
+	// landing inside the compaction window therefore cannot turn the retried run's
+	// blocker report into an audit on a Goal it never saw.
+	const session = await PiRpcSession.start({ settings: { compaction: { keepRecentTokens: 1 } } });
+	const gate = join(session.cwd, "provider-gate");
+	script(
+		[
+			// The old Goal's kickoff response is truncated, held at the gate so the Clear
+			// and the new Goal land before Pi compacts and retries it.
+			{ text: "Held response.", stopReason: "length", waitForFile: gate },
+			{ text: "Compaction summary A." },
+			// The retried run reports a blocker it decided on before the Clear.
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: "The old run could not verify anything." } }] },
+			{ text: "The stale blocker report was refused." },
+			{ text: "Working on the new objective." },
+			{ hang: true },
+		],
+		session,
+	);
+	try {
+		await session.prompt(`/goal ${OLD_OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await waitForTurns(session, 1);
+
+		const cleared = await session.prompt("/goal clear");
+		assert.equal(cleared.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("cleared"));
+
+		const createPromise = submitCommand(session, "create-new", `/goal ${NEW_OBJECTIVE}`);
+		const created = await waitForStoredGoal(
+			session,
+			(goal) => goal.objective === NEW_OBJECTIVE && goal.status === "active",
+			"the Goal created inside the compaction window",
+		);
+
+		writeFileSync(gate, "", "utf8");
+		const stale = await session.waitForToolResult("update_goal", 1);
+		assert.ok(
+			session.records.some((r) => r.type === "compaction_start") ||
+				session.records.some((r) => r.type === "session_compact"),
+			"Pi compacted the truncated response and retried it",
+		);
+		assert.equal(stale.isError, true, "the retried run's blocker report is refused");
+		assert.match(String(stale.result.content[0].text), /prepared against/);
+		const refused = structuredGoal(stale.result);
+		assert.equal(refused.id, created.id);
+		assert.equal(refused.status, "active");
+		assert.equal(refused.revision, 0, "the stale report recorded no audit and bumped no revision");
+		assert.ok(!refused.blockedAudit, "the stale report opened no blocked audit");
+		assert.ok(!refused.blockerId, "the stale report issued no Blocker identity");
+
+		await createPromise;
+		await abortRun(session, 4);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.deepEqual(
+			goalSnapshots(entries).map((s) => (s.data.goal === null ? "tombstone" : `${s.data.goal.status}:${s.data.goal.revision}`)),
+			["active:0", "tombstone", "active:0"],
+			"the stale blocker report added no snapshot",
+		);
+		const current = currentGoal(entries);
+		assert.equal(current.id, created.id);
+		assert.equal(current.status, "active");
+		assert.equal(current.revision, 0);
+		assert.ok(!current.blockedAudit, "the new Goal opened no blocked audit");
+		const live = await reportStatus(session);
+		assert.equal(live.goalId, created.id);
+		assert.equal(live.status, "active");
+		assert.equal(live.revision, 0);
+		assert.equal(live.objective, NEW_OBJECTIVE);
+		assert.equal(
+			entries.filter(
+				(e) => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes(NEW_OBJECTIVE),
+			).length,
+			1,
+			"the new Goal's kickoff was delivered exactly once",
+		);
+		assert.equal(continuationEntries(entries).length, 1, "the new Goal continued exactly once");
+		assert.equal(runCount(session), 4, "the truncated run, its retry, the new kickoff, and one continuation");
+		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();
