@@ -112,6 +112,10 @@ each rejects unexpected extension errors and unconsumed scripted steps:
 No scenario can pass through script exhaustion, timeout, accidental abort, or an
 unplanned settle. The full suite reports zero unconsumed scripted steps.
 
+Each of the four #28 cross-contract tests also asserts its exact run and
+Continuation counts, in table order: **6 runs / 2 continuations**, **3 / 2**,
+**6 / 3**, and **5 / 4**.
+
 ## Automated gates (integrated commit `45f7efc`)
 
 | Gate | Result |
@@ -133,6 +137,20 @@ that settles before its final report is recorded, so the snapshot of collected
 tool results is one short — and it is a harness race, not product behavior: the
 persisted branch for that session shows the third report and the blocked stop.
 No test was skipped, retried, or given a longer timeout to obtain the clean runs.
+
+## Automated gates (PR review follow-up)
+
+The four low findings from the PR #36 review change only
+`test/goal13-integrated-acceptance.test.mjs` (the dead imports became exact run
+and Continuation-count assertions, the replacement total is now read after the
+kickoff's accounting boundary, and one comment was corrected) and this document.
+Both gates and the focused file were re-run with these fixes in place:
+
+| Gate | Result |
+| --- | --- |
+| `npm test` | **463 tests, 463 pass, 0 fail, 0 skipped** (47.6 s; 52.9 s on a repeat of the committed head) |
+| `npm run typecheck` | **exit 0** (`tsc --noEmit`, no output) |
+| `node --test test/goal13-integrated-acceptance.test.mjs` (3 repeats) | **4 pass, 0 fail** each |
 
 ## Documentation audit
 
@@ -163,9 +181,22 @@ Verified against the integrated commit:
 - `docs/adr/0001-conservative-stopping.md` — the deterministic stopping rules and
   the four repair-batch amendments match the implementation.
 
-No inaccuracy was found. The only documentation changes in this branch are the
-smoke-test section 20 procedure, its two checklist items in
-`docs/smoke-test.md` and `README.md`, and this integrated traceability document.
+No inaccuracy was found. The documentation changes have two layers:
+
+- The final evidence commit `8057d6c` adds smoke-test section 20 (the two hostile
+  orderings across a Goal boundary), the two matching checklist items in
+  `docs/smoke-test.md` and `README.md` (a stale queued work message opens
+  nothing; a stale execution cannot drive the replacing Goal's lifecycle), and
+  rewrites this integrated traceability document.
+- The acceptance branch as a whole, on top of the integration merge `f2a4e67`,
+  also adds smoke-test section 19 (blocked and `usage_limited` active time) and
+  the third matching checklist item in both `docs/smoke-test.md` and `README.md`
+  (the non-active Active-time freeze).
+
+Every other documentation change the branch carries arrived through the merged
+repair PRs (#29–#40): the per-batch and per-issue traceability documents and the
+#37/#39 README, `GLOSSARY.md`, and smoke-test updates. The branch-own diff
+(`f2a4e67..HEAD`) touches no `src/` file and no behavior.
 
 ## Final real-Pi interactive smoke
 

@@ -192,6 +192,16 @@ test("a held model transition is stale after a budget-raising resume", async () 
 
 		await session.sendSimple("abort");
 		await session.waitForSettled(1);
+		assert.equal(
+			runCount(session),
+			6,
+			"the kickoff, the failed continuation, the ordinary prompt, its wrap-up, the held run, and the resumed continuation",
+		);
+		assert.equal(
+			continuationEntries(readSessionEntries(await session.sessionFile())).length,
+			2,
+			"the kickoff's continuation and the one after the resumed run; the wrap-up is a budget message",
+		);
 		assertStepsConsumed(session, 7, [{ stopReason: "error", errorMessage: "invalid api key" }, { stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 		assertOnlyFailures(session, [
@@ -232,7 +242,8 @@ test("a tool-created Goal replaced by /goal charges only its Goal-owned Continua
 			records.filter((r) => r.type === "turn_start").length >= 3 ? true : undefined,
 		);
 
-		// Replace the idle Goal. The confirmation describes the tool-created Goal.
+		// Replace the Goal while its first Continuation is still in flight, held at
+		// the gate. The confirmation describes the tool-created Goal.
 		const replacePromise = session.prompt(`/goal A replacement objective`);
 		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
 		assert.equal((await replacePromise).data.disposition, "handled");
@@ -251,12 +262,34 @@ test("a tool-created Goal replaced by /goal charges only its Goal-owned Continua
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 
+		// The scripted turns so far: 1–2 the creating run, 3 the held Continuation, and
+		// 4 the replacement kickoff, delivered as that run's steered next turn. Turn 5
+		// is the replacement's own Continuation, and it can only start after turn 4's
+		// `turn_end` — the boundary Pi emits after appending the kickoff message and
+		// pi-goal flushes accounting. Waiting for it keeps the 22-token read below
+		// deterministic (an early read can catch the kickoff mid-flight and see 0) and
+		// makes the final abort land on this run's hanging tail instead of its start.
+		await session.waitFor("the replacement's continuation after its accounted kickoff", (records) =>
+			records.filter((r) => r.type === "turn_start").length >= 5 ? true : undefined,
+		);
+
 		// The replacement's own kickoff is the only work charged to the new identity.
 		const replacementTotal = await liveUsage(session);
 		assert.equal(replacementTotal, 22, "the replacement accounts only its own kickoff");
 
 		await session.sendSimple("abort");
 		await session.waitForSettled(1);
+
+		assert.equal(
+			runCount(session),
+			3,
+			"the creating run, the run carrying the held Continuation and the replacement kickoff, and the replacement's continuation",
+		);
+		assert.equal(
+			continuationEntries(readSessionEntries(await session.sessionFile())).length,
+			2,
+			"the old identity's Continuation and the replacement's",
+		);
 
 		entries = readSessionEntries(await session.sessionFile());
 		const oldRecords = entries.filter((e) => e.type === "custom" && e.customType === "goal-state" && e.data?.goal?.id === created.id);
@@ -336,6 +369,16 @@ test("a tool-created Goal's budget exhaustion recovers through a cumulative rais
 		const final = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 		assert.equal(final.status, "active");
 		assert.equal(await liveUsage(session), 180, "135 + the resumed run's 30 + the aborted continuation's 15");
+		assert.equal(
+			runCount(session),
+			6,
+			"the creating run, its continuation, the crossing continuation, the wrap-up, the resumed run, and the continuation after it",
+		);
+		assert.equal(
+			continuationEntries(readSessionEntries(await session.sessionFile())).length,
+			3,
+			"the kickoff's continuation, the crossing continuation, and the one after the resumed run",
+		);
 		assertStepsConsumed(session, 7, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
@@ -389,6 +432,16 @@ test("a tool-created Goal's blocked audit issues and advances a Blocker identity
 		assert.equal(blocked.data.goal.blockedAudit.blockerId, issued, "the issued identity is persisted");
 		assert.equal(blocked.data.goal.blockedAudit.turns, 3);
 
+		assert.equal(
+			runCount(session),
+			5,
+			"the creating run, the kickoff, and the three audited Goal turns",
+		);
+		assert.equal(
+			continuationEntries(readSessionEntries(await session.sessionFile())).length,
+			4,
+			"the kickoff plus one continuation per audited Goal turn",
+		);
 		assertStepsConsumed(session, 9);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 		assertCleanRun(session);
