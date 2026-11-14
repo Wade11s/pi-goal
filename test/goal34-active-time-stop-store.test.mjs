@@ -10,7 +10,8 @@
  * These are the narrow seams real RPC cannot reach deterministically: the exact
  * millisecond value the stop snapshot carries, what a *later* checkpoint and a
  * reconstruction read, and the failure path that must leave the clock running
- * because the Goal is still active. The observable end-to-end behavior (the
+ * with the folded interval still unpersisted because the Goal is still active and
+ * no snapshot carries it yet. The observable end-to-end behavior (the
  * blocked transition, post-block idle time, and a restart) is covered in
  * `test/goal34-active-time-stop.test.mjs` against a real Pi subprocess.
  */
@@ -211,22 +212,71 @@ test("a failed stop leaves the Goal active and its clock running", async () => {
 	const first = store.markBlockedReport(pi, { blocker: BLOCKER, turn: 1 });
 	const identity = first.goal.blockedAudit?.blockerId;
 	assert.equal(store.markBlockedReport(pi, { blocker: BLOCKER, blockerId: identity, turn: 2 }).thresholdMet, false);
+	await sleep(40);
 
+	const beforeFailure = store.getUsage().activeMs;
 	pi.failAfter = pi.entries.length;
 	const failed = store.markBlockedReport(pi, { blocker: BLOCKER, blockerId: identity, turn: 3 });
 	assert.equal(failed.ok, false);
 	assert.equal(failed.reason, "persistence", "a write failure is reported as persistence");
 	assert.equal(store.get()?.status, "active", "the Goal is still active, so nothing was stopped");
-	const before = store.getUsage().activeMs;
+	assert.ok(
+		store.unpersistedActiveMs() >= beforeFailure,
+		"the folded interval is still unpersisted, so the durable watermark did not run ahead of the branch",
+	);
 	await sleep(40);
-	assert.ok(store.getUsage().activeMs > before, "the clock keeps running while the Goal is still active");
+	assert.ok(store.getUsage().activeMs > beforeFailure, "the clock keeps running while the Goal is still active");
 
+	const beforeLimitFailure = store.getUsage().activeMs;
 	pi.failAfter = pi.entries.length;
 	const limited = store.stopGoal(pi, { status: "usage_limited", blocker: USAGE_LIMIT, turns: 0 });
 	assert.equal(limited.ok, false);
 	assert.equal(limited.reason, "persistence");
 	assert.equal(store.get()?.status, "active");
-	const beforeLimit = store.getUsage().activeMs;
+	assert.ok(
+		store.unpersistedActiveMs() >= beforeLimitFailure,
+		"a failed usage-limited stop also leaves its folded interval unpersisted",
+	);
 	await sleep(40);
-	assert.ok(store.getUsage().activeMs > beforeLimit, "and it keeps running after a failed usage-limited stop too");
+	assert.ok(store.getUsage().activeMs > beforeLimitFailure, "and it keeps running after a failed usage-limited stop too");
+});
+
+test("a failed stop write leaves the folded interval check-pointable instead of losing it", async () => {
+	const pi = fakePi();
+	const { store } = startedGoal(pi);
+	account(store, 100);
+	await sleep(40);
+	const folded = store.getUsage().activeMs;
+	assert.ok(folded > 0, "the Goal accrued active time before the stop attempt");
+
+	// Fail exactly the stop snapshot write.
+	pi.failAfter = pi.entries.length;
+	const failed = store.stopGoal(pi, { status: "usage_limited", blocker: USAGE_LIMIT, turns: 0 });
+	assert.equal(failed.ok, false);
+	assert.equal(failed.reason, "persistence");
+	assert.equal(store.get()?.status, "active", "the Goal is still active, so nothing was stopped");
+	assert.ok(
+		store.unpersistedActiveMs() >= folded,
+		"the interval the failed write folded is still owed, not claimed durable",
+	);
+	assert.equal(
+		pi.entries.some((entry) => entry.data?.goal?.status === "usage_limited"),
+		false,
+		"nothing on the branch records the failed stop",
+	);
+
+	// The next boundary can still checkpoint the interval the failed write folded, so a
+	// crash after that checkpoint recovers it instead of losing it with the write.
+	pi.failAfter = undefined;
+	store.flushAccounting(pi, true);
+	const checkpoint = checkpoints(pi).at(-1);
+	assert.ok(checkpoint, "the boundary writes a checkpoint");
+	assert.equal(checkpoint.data.usage.totalTokens, 100, "the checkpoint carries the exact token total");
+	assert.ok(checkpoint.data.usage.activeMs >= folded, "the checkpoint carries the folded interval");
+
+	const reloaded = new GoalStore();
+	reloaded.reconstruct(fakeCtx(pi.entries));
+	assert.equal(reloaded.get()?.status, "active", "the Goal is still active on the reloaded branch");
+	assert.ok(reloaded.getUsage().activeMs >= Math.floor(folded), "the reloaded clock recovers the folded interval");
+	assert.equal(reloaded.getUsage().totalTokens, 100, "exact token accounting survives the reload");
 });

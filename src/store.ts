@@ -848,6 +848,20 @@ export class GoalStore {
 	}
 
 	/**
+	 * The usage a snapshot carries for a clock that has just been stopped: the live
+	 * totals with the folded active time in the form the durable watermark records it.
+	 *
+	 * `persisted` floors an accounted total, so stamping the precise folded value
+	 * would make the snapshot disagree with the clock it just froze by a fraction of a
+	 * millisecond. Stamping the durable form keeps the snapshot, the watermark, and
+	 * `getUsage` identical — the same value the pre-fix order produced by reading the
+	 * clock after marking it durable.
+	 */
+	private stoppedUsage(activeMs: number): GoalUsage {
+		return { ...this.liveUsage(), activeMs: Math.floor(activeMs) };
+	}
+
+	/**
 	 * Publish the live accounting view onto the in-memory record.
 	 *
 	 * The durable snapshot freezes usage at the moment it is written; the record in
@@ -2085,11 +2099,16 @@ export class GoalStore {
 		// trailing response of the turn that reported the blocker, to a Goal that is no
 		// longer working. A report below the threshold leaves the Goal active, so its
 		// clock keeps running.
+		//
+		// The folded interval is only marked durable *after* the snapshot that carries
+		// it is written, exactly like completion and pause: the write is what makes it
+		// durable. Advancing the watermark first would claim time the branch does not
+		// record, so an unclean exit between a failed write and the next boundary would
+		// lose it silently instead of letting a checkpoint recover it.
 		const activeMs = thresholdMet ? this.clock.stop() : undefined;
-		if (activeMs !== undefined) this.clock.persisted(activeMs);
 		const updated: GoalRecord = {
 			...current,
-			...(thresholdMet ? { status: "blocked" as const, usage: this.liveUsage() } : {}),
+			...(activeMs !== undefined ? { status: "blocked" as const, usage: this.stoppedUsage(activeMs) } : {}),
 			blockedAudit: { blockerId: auditId, blocker, turns },
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
@@ -2099,12 +2118,14 @@ export class GoalStore {
 		} catch (error) {
 			if (activeMs !== undefined) {
 				// Nothing was written, so the Goal is still active and the clock runs on.
+				// The folded interval stays unpersisted, so the next checkpoint still owes it.
 				this.clock.start();
 			}
 			this.lastBlockerTurn = undefined;
 			this.lastBlockerRevision = undefined;
 			return { ok: false, reason: "persistence", error };
 		}
+		if (activeMs !== undefined) this.clock.persisted(activeMs);
 		this.current = this.adopt(updated);
 		return { ok: true, goal: updated, turns, thresholdMet, repeat: false };
 	}
@@ -2121,7 +2142,8 @@ export class GoalStore {
 	 * here and the snapshot carries the folded value: a stopped Goal is not working,
 	 * and the interval after the stop — the trailing response of the run that hit the
 	 * limit, the user reading the notice, a restart — is not Goal work. A write
-	 * failure leaves the Goal active, so the clock is restarted and nothing is lost.
+	 * failure leaves the Goal active, so the clock is restarted and the folded
+	 * interval stays unpersisted, which lets the next checkpoint recover it.
 	 */
 	stopGoal(
 		pi: ExtensionAPI,
@@ -2129,13 +2151,16 @@ export class GoalStore {
 	): StopGoalResult {
 		const current = this.current;
 		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
+		// The folded interval is marked durable only once the snapshot carrying it is
+		// written (see `markComplete` and `markPaused`). Marking it first would claim
+		// time that is not on the branch, so a crash between a failed write and the
+		// next boundary would lose it instead of leaving it to a checkpoint.
 		const activeMs = this.clock.stop();
-		this.clock.persisted(activeMs);
 		const updated: GoalRecord = {
 			...current,
 			status: stop.status,
 			blockedAudit: { blocker: stop.blocker, turns: stop.turns ?? 0 },
-			usage: this.liveUsage(),
+			usage: this.stoppedUsage(activeMs),
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		};
@@ -2143,9 +2168,11 @@ export class GoalStore {
 			this.persistSnapshot(pi, updated);
 		} catch (error) {
 			// Nothing was written, so the Goal is still active and the clock runs on.
+			// The folded interval stays unpersisted, so the next checkpoint still owes it.
 			this.clock.start();
 			return { ok: false, reason: "persistence", error };
 		}
+		this.clock.persisted(activeMs);
 		this.current = this.adopt(updated);
 		this.lastBlockerTurn = undefined;
 		this.lastBlockerRevision = undefined;

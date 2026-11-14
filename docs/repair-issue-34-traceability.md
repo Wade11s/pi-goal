@@ -27,6 +27,7 @@ exact run/continuation counts, and asserts the persisted entries.
 | Live and replay converge after a restart | A restart resumes from the frozen value and adds neither the stopped interval nor process downtime | `test/goal34-active-time-stop.test.mjs` ("a blocked Goal stops its active-time clock, and a restart never resumes it") |
 | Pre-threshold reports keep the clock running | A recorded report below the threshold leaves the Goal active and accruing | `test/goal34-active-time-stop-store.test.mjs` ("a Goal blocked at the audit threshold…") |
 | A failed stop keeps the clock running | A persistence failure at either transition leaves the Goal active with its clock running | `test/goal34-active-time-stop-store.test.mjs` ("a failed stop leaves the Goal active and its clock running") |
+| A failed stop leaves the folded interval recoverable | The durable watermark advances only *after* the stop snapshot is written, so a crash window cannot lose the folded interval: it stays unpersisted, the next checkpoint carries it, and a reconstruction recovers it | `test/goal34-active-time-stop-store.test.mjs` ("a failed stop leaves the Goal active…" for both transitions, and "a failed stop write leaves the folded interval check-pointable instead of losing it") |
 | Preserved behavior | Token totals, revision/identity, continuation stopping, pause/complete/budget-limited stops, replay and cutover | `test/goal6.test.mjs` (active-time, restart, and checkpoint tests); `test/goal9-store.test.mjs`; `test/goal10-budget-recovery-store.test.mjs`; `test/goal11-blocker-identity.test.mjs`; `test/goal34-active-time-stop.test.mjs` (105 accounted tokens, revision 3, three continuations) |
 | Documentation | README's active-time wording names every non-active status | `README.md` ("Active time" in **Usage accounting**) |
 
@@ -74,6 +75,14 @@ passes; the exact gate output is recorded in the PR description.
 `markBlockedReport` and `stopGoal` now stop the active-time clock at the
 transition, exactly as `markComplete`, `markPaused`, and `markBudgetLimited`
 already did, and the snapshot they commit carries the folded value rather than the
-record's last-refreshed view. A write failure restarts the clock, because the Goal
-is still active and nothing was stopped. Nothing else changes: no lifecycle
-status, threshold, token rule, revision rule, or replay rule is touched.
+record's last-refreshed view.
+
+The folded interval is marked durable only **after** that snapshot is written, in
+the same order as `markComplete` and `markPaused`: the write is what makes it
+durable. Marking it first would advance the watermark past what the branch
+records, so an unclean exit between a failed write and the next boundary would
+silently lose the interval instead of leaving it for a checkpoint. A write failure
+now restarts the clock with the folded interval still unpersisted, so the next
+boundary checkpoints it and a reconstruction recovers it. Nothing else changes:
+no lifecycle status, threshold, token rule, revision rule, or replay rule is
+touched.
