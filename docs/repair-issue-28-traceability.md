@@ -167,9 +167,9 @@ deterministic suite does not cover. Per #28's verification-only rule it is
 recorded here, not repaired in this branch.
 
 **Symptom.** A model `update_goal { action: "complete" }` call made in a
-*follow-up provider turn* of an old Goal's in-flight run completes a Replacement
-Goal that the old run never saw. The creation command waits for the old run to
-finish before delivering the new Goal's kickoff, so the new Goal is marked
+*follow-up provider turn* of an old Goal's in-flight run completes a newly
+created Goal that the old run never saw. The creation command waits for the old
+run to finish before delivering the new Goal's kickoff, so the new Goal is marked
 `complete` without its work and with zero accounted usage.
 
 **Deterministic reproduction** (real `pi --mode rpc`, scripted provider): the
@@ -193,9 +193,10 @@ STATE goal_9acb1f73 complete rev 1 (completed by the old run's follow-up turn)
 **Why it is a defect.** The `turnGoal` binding is snapshotted at every
 `turn_start` (`src/index.ts`), and `update_goal` refuses a call whose bound
 identity/revision differs from the current Goal. A follow-up turn starts after
-the replacement, so it re-binds to the new Goal and the completion is accepted,
-even though the model is still working the replaced objective and never received
-the replacement kickoff. Issue #24's contract requires stale model-requested
+the creation, so it re-binds to the new Goal and the completion is accepted,
+even though the model is still working the cleared Goal's objective and never
+received the new Goal's kickoff. Issue #24's contract requires stale
+model-requested
 `complete` to be rejected after an identity change; the existing regression
 (`test/goal4-regressions.test.mjs`) only covers a *held* response whose turn
 started before the replacement.
