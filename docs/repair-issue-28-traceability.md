@@ -10,12 +10,14 @@ every reviewed V1 defect and behavioral decision maps to named test evidence and
 the repair PR that supplied it, plus the clean-outcome audit, the automated
 gates, the documentation audit, and the final real-Pi smoke record.
 
-The integrated commit is `85bb636219e9261bed8a1c93c0c67b57239dec33`
+The integrated commit is `45f7efcb0559acd43055986bd9161aba3217935d`
 (`repair/28-integrated-acceptance`, the merge of
 `origin/integration/spec-1-v1-repair` at
-`35063e0da0aa384a86fd4c7d3694e53602593dd2`, the merge of PR #38). The four
-cross-contract regressions from the initial acceptance attempt are preserved on
-top of it.
+`f2a4e6785e82e468124121c7b6b61da11a995cbd`, the merge of PR #40, which repaired
+#39). The four cross-contract regressions from the initial acceptance attempt are
+preserved on top of it. Every behavior repair batch is merged and reviewed:
+batches 1–3 landed as one compatibility unit (PR #29/#31/#32), batch 4 as PR #33,
+#34 as PR #35, #37 as PR #38, and #39 as PR #40.
 
 ## Integrated decision-to-evidence matrix
 
@@ -28,6 +30,7 @@ pre-repair failure captures:
 - `docs/repair-batch-4-traceability.md` — PR #33 (#27), decisions #17/#18/#21/#23.
 - `docs/repair-issue-34-traceability.md` — PR #35 (#34), decisions #21/#24.
 - `docs/repair-issue-37-traceability.md` — PR #38 (#37), decisions #21/#24.
+- `docs/repair-issue-39-traceability.md` — PR #40 (#39), decisions #17/#21/#24.
 
 | Decision / defect | Contract | Named test evidence | Repair PR |
 | --- | --- | --- | --- |
@@ -46,16 +49,21 @@ pre-repair failure captures:
 | #22 Legacy audit handoff | A valid open legacy audit is preserved and issued a fresh identity; no extra turns | `test/goal9-legacy.test.mjs`; `test/goal11-blocker-identity.test.mjs`; `test/goal11-blocker-identity-store.test.mjs` | #32 |
 | #34 Blocked/usage-limited active time | The clock stops at the blocked threshold and on `usage_limited`, before the stop snapshot; no interval after | `test/goal34-active-time-stop.test.mjs`; `test/goal34-active-time-stop-store.test.mjs` | #35 |
 | #37 Execution binding | A follow-up turn of a run admitted against a cleared/replaced identity cannot complete, report a blocker against, or pause the new Goal; legitimate same-execution transitions survive Pi retries, compaction, edits, and model-created Goals | `test/goal37-stale-execution.test.mjs` (ten RPC scenarios: seven rejections, three preservation guards) | #38 |
+| #39 Stale work messages | A delivered Goal work message opens an admission only for the Goal identity it names; the generic `[pi-goal]` prefix alone never authorizes admission, so a message queued for a cleared or replaced Goal opens nothing and its run's later turns are charged to nobody | `test/goal39-work-message-identity.test.mjs` (three gated RPC scenarios: cleared identity, replaced identity, legitimate same-identity delivery); `test/goal39-work-message-identity-store.test.mjs` (six replay/marker tests); the rewritten `test/goal9-ownership.test.mjs` regression and the updated `test/goal9-store.test.mjs` / `test/store.test.mjs` replay rows | #40 |
 | #28 cross-contract | Stale transition across a budget-raising resume | `test/goal13-integrated-acceptance.test.mjs` ("a held model transition is stale after a budget-raising resume") | #28 (this branch) |
 | #28 cross-contract | Tool-created Goal replacement ownership and superseded attribution | `test/goal13-integrated-acceptance.test.mjs` ("a tool-created Goal replaced by /goal charges only its Goal-owned Continuation work…") | #28 (this branch) |
 | #28 cross-contract | Tool-created Goal cumulative budget recovery | `test/goal13-integrated-acceptance.test.mjs` ("a tool-created Goal's budget exhaustion recovers through a cumulative raise") | #28 (this branch) |
 | #28 cross-contract | Tool-created Goal Blocker identity issuance and advancement | `test/goal13-integrated-acceptance.test.mjs` ("a tool-created Goal's blocked audit issues and advances a Blocker identity") | #28 (this branch) |
 
+The four #28 cross-contract tests were prepared during the initial acceptance
+attempt and re-run against the repaired integrated commit; all four pass. They
+are additive and follow the suite's honesty rules.
+
 ## Pre-repair failure evidence
 
 Every new regression was demonstrated failing on the pre-repair `src/` before its
 repair merged. The exact captured failures are quoted in the per-batch
-traceability documents and in PR #35:
+traceability documents and in PRs #35, #38, and #40:
 
 - Batch 1: `docs/repair-batch-1-traceability.md` ("Pre-repair failure evidence"
   and the four review follow-ups).
@@ -65,10 +73,16 @@ traceability documents and in PR #35:
 - Issue #34: `docs/repair-issue-34-traceability.md` (5 store probes, 1 pass / 4
   fail, plus the real-Pi RPC regression).
 - Issue #37: `docs/repair-issue-37-traceability.md` (10 tests, 3 pass / 7 fail).
+- Issue #39: `docs/repair-issue-39-traceability.md` (the two stale-message
+  regressions fail with `C's own kickoff was not suppressed` and `177 !== 37`;
+  the rewritten `goal9-ownership` regression fails `37 !== 15`; the legitimate
+  same-identity delivery passes).
 
-The four #28 cross-contract tests were prepared during the initial acceptance
-attempt and re-run against the repaired integrated commit; all four pass. They
-are additive and follow the suite's honesty rules.
+No test encoding superseded behavior was weakened or deleted for a pass: the one
+existing regression that encoded the superseded work-message rule
+(`test/goal9-ownership.test.mjs`, "creating a Goal after a Clear closes the old
+admission so live and replay agree") was rewritten for the corrected contract,
+as recorded in `docs/repair-issue-39-traceability.md`.
 
 ## Clean-outcome audit
 
@@ -84,25 +98,41 @@ asserts exact continuation/run counts, and asserts persisted entries. The four
 | tool-created Goal budget recovery | `assertStepsConsumed(session, 7, [aborted])` + `assertOnlyFailures` | exact |
 | tool-created Goal Blocker identity | `assertStepsConsumed(session, 9)` + `assertCleanRun` | exact |
 
-The ten issue-#37 RPC scenarios follow the same rules: each asserts the exact
-number of provider responses, the exact failed outcomes, the persisted
-snapshots, and the exact run/continuation counts. No scenario can pass through
-script exhaustion, timeout, accidental abort, or an unplanned settle. The full
-suite reports zero unconsumed scripted steps.
+The ten issue-#37 RPC scenarios and the three issue-#39 RPC scenarios follow the
+same rules: each asserts the exact number of provider responses, the exact failed
+outcomes, the persisted snapshots, and the exact run/continuation counts, and
+each rejects unexpected extension errors and unconsumed scripted steps:
 
-## Automated gates (integrated commit `85bb636`)
+| Test | End-of-run assertion | Script consumed |
+| --- | --- | --- |
+| `goal39` stale queued resume for a cleared Goal | `assertStepsConsumed(session, 4, [{ stopReason: "aborted" }])` | exact |
+| `goal39` stale queued resume for a replaced Goal | `assertStepsConsumed(session, 4, [{ stopReason: "aborted" }])` | exact |
+| `goal39` legitimate same-identity resume | `assertStepsConsumed(session, 3, [{ stopReason: "aborted" }])` | exact |
+
+No scenario can pass through script exhaustion, timeout, accidental abort, or an
+unplanned settle. The full suite reports zero unconsumed scripted steps.
+
+## Automated gates (integrated commit `45f7efc`)
 
 | Gate | Result |
 | --- | --- |
-| `npm test` | **454 tests, 454 pass, 0 fail, 0 skipped** (49.3 s) |
+| `npm test` | **463 tests, 463 pass, 0 fail, 0 skipped** (46.9 s) |
+| `npm test` (repeat) | **463 tests, 463 pass, 0 fail, 0 skipped** (60.5 s) |
 | `npm run typecheck` | **exit 0** (`tsc --noEmit`, no output) |
-| `node --test test/goal34-active-time-stop.test.mjs test/goal34-active-time-stop-store.test.mjs test/goal37-stale-execution.test.mjs test/goal13-integrated-acceptance.test.mjs` | **21 pass, 0 fail** |
+| `node --test test/goal34-active-time-stop.test.mjs test/goal34-active-time-stop-store.test.mjs test/goal37-stale-execution.test.mjs test/goal39-work-message-identity.test.mjs test/goal39-work-message-identity-store.test.mjs test/goal13-integrated-acceptance.test.mjs` | **30 pass, 0 fail** |
 
-One earlier default run under host load hit an assertion flake (`actual: 3,
-expected: 5`); five subsequent consecutive default runs passed 444/444. The
-batch-4 traceability records the same resource-contention flake class and the
-`--test-concurrency=4` bound that addresses it. The merged integrated commit
-adds the ten #37 tests to that total (444 + 10 = 454).
+The #39 repair added 9 tests to the merged #38 total (454 + 9 = 463).
+
+One earlier default run on this host hit an assertion flake in the unrelated
+`test/goal5.test.mjs` blocked-audit chain (`actual: 2, expected: 3` on
+`toolResults(session, "update_goal").length`) while the machine was under
+external load (load average ≈ 6.3 on 8 cores). The file passes in isolation
+(41/41) and the two default runs recorded above are consecutive and clean. This
+is the same contention class the batch-4 traceability documents — an audit chain
+that settles before its final report is recorded, so the snapshot of collected
+tool results is one short — and it is a harness race, not product behavior: the
+persisted branch for that session shows the third report and the blocked stop.
+No test was skipped, retried, or given a longer timeout to obtain the clean runs.
 
 ## Documentation audit
 
@@ -116,151 +146,172 @@ Verified against the integrated commit:
   durable branch-local cutover, migration notices, and lifecycle preservation;
   the #37 execution-binding rule for model-side transitions (including the two
   distinct reasons a same-identity revision change is accepted and the
-  no-binding refusal); current command/tool surfaces, limitations, and
-  verification commands.
+  no-binding refusal); the #39 admission-segment rule ("Every work message names
+  the Goal identity it was admitted for… a work message queued for a Goal that
+  has since been cleared or replaced therefore opens nothing"); current
+  command/tool surfaces, limitations, and verification commands.
 - `docs/smoke-test.md` — procedure and checklist synchronized; includes the
-  blocked/`usage_limited` active-time verification step.
+  blocked/`usage_limited` active-time verification step (section 19) and the new
+  section 20 for the two hostile orderings across a Goal boundary (a stale queued
+  work message, and a stale execution's lifecycle call).
 - `GLOSSARY.md` — the Active elapsed time and Blocker identity definitions match
   the repaired behavior; the invariant already read "excluding every non-active
-  status".
+  status". The **Admission segment** entry now states that every work message
+  names the Goal identity it was admitted for and that a generic `[pi-goal]`
+  prefix alone never authorizes admission, and the **Replacement Goal** entry
+  still describes the superseded-tail freeze boundaries.
 - `docs/adr/0001-conservative-stopping.md` — the deterministic stopping rules and
   the four repair-batch amendments match the implementation.
 
 No inaccuracy was found. The only documentation changes in this branch are the
-smoke-test/README active-time checklist item and this integrated traceability
-document.
+smoke-test section 20 procedure, its two checklist items in
+`docs/smoke-test.md` and `README.md`, and this integrated traceability document.
 
 ## Final real-Pi interactive smoke
 
-Run against the integrated commit `85bb636` with a real configured Pi
-installation and a real provider.
+Run against the integrated commit `45f7efc` with a real configured Pi
+installation and a real provider, through the documented project install.
 
 | Field | Value |
 | --- | --- |
-| Date | 2026-11-14T21:17:34Z (2026-11-15 05:17 +08:00) |
+| Date | 2026-11-14T23:31:44Z → 2026-11-14T23:37:27Z (2026-11-15 07:31 → 07:37 +08:00) |
 | Pi version | **1.5.2** (`pi --version`) |
 | Node | v26.13.1 |
-| Environment | macOS (Darwin arm64), `pi --mode rpc`, extension loaded from the acceptance worktree |
+| Environment | macOS (Darwin arm64), `pi --mode rpc`, extension loaded from the project install |
 | Provider | `magpie/deepai/deepseek-v4.1-flash` (configured, ready; local Magpie endpoint) |
-| Package install | `pi install --local <worktree>` in a clean project; `pi list` shows it under Project packages |
-| Commit | `85bb636219e9261bed8a1c93c0c67b57239dec33` |
+| Package install | `pi install --local <worktree>` in a clean project; `pi list` shows it under **Project packages** |
+| Commit | `45f7efcb0559acd43055986bd9161aba3217935d` |
 
-Checklist results (real provider, one persisted session):
+Checklist results (real provider, one persisted session per phase):
+**29 checks, 29 pass, 0 fail.**
 
 | # | Checklist item | Result |
 | --- | --- | --- |
-| 1 | Install and version visibility | PASS — Pi 1.5.2, project package listed |
-| 2 | Bare `/goal` with no Goal | PASS — "No Goal is set…" |
-| 3 | `/goal <objective>` creation and initial work | PASS — "created and activated", work ran |
-| 4 | Automatic continuation at settlement | PASS — 2 `goal-continuation` entries |
-| 5 | Status indicator | PASS — `active · <tokens> tok · <active time>` |
-| 6 | Evidence-based completion | PASS — all three files verified, `complete` revision 1, 28,545 accounted tokens |
-| 7 | Accurate `/goal` report | PASS — objective, revision, usage, active time |
-| 8 | `/goal clear` and durable tombstone | PASS — tombstone snapshot; bare `/goal` reports none |
-| 9 | Bare `/goal edit` editor | PASS — prefilled dialog answered; revision 0 → 1; usage preserved |
-| 10 | `/goal pause` | PASS — paused; continuation and run counts unchanged over 8 s idle |
-| 11 | `/goal resume` | PASS — resumed (revision 3); work restarted |
-| 12–20 | Budget exhaustion, refusals, cumulative raise, restart persistence, clear/tombstone reload, blocked active-time freeze | NOT COMPLETED — the budget phase exposed a new behavior defect (below), so the run stopped per #28's verification-only rule |
+| C01 | Bare `/goal` with no Goal | PASS — "No Goal is set in this session." |
+| C02 | Direct `/goal <objective>` creation and initial work | PASS — "created and activated. Initial work started." |
+| C03 | Compact status indicator shows `active` | PASS — `goal_<id> · active · 0 tok · 0s` |
+| C04 | Automatic continuation at settlement | PASS — 2 `goal-continuation` entries |
+| C05 | Evidence-based completion with verified artifacts | PASS — `complete`, revision 1, 20,731 accounted tokens, all three files written |
+| C06 | Accurate `/goal` report | PASS — objective, revision 1, usage, Active time |
+| C07 | `/goal clear` and durable tombstone | PASS — tombstone snapshot; bare `/goal` reports none |
+| C08 | Bare `/goal` after clear | PASS |
+| C09 | Bare `/goal edit` prefilled editor | PASS — prefill equals the current objective; revision 0 → 1; usage preserved |
+| C10 | `/goal pause` stops continuation | PASS — continuations 2→2 and runs 4→4 over 8 s idle; status `paused` |
+| C11 | `/goal resume` restarts work | PASS — "resumed (revision 3)… Work steered into the running work" |
+| C11b | Replacement confirmation answered No | PASS — "Replacement cancelled"; the Goal identity, objective, and revision unchanged |
+| C12 | Budget exhaustion and one wrap-up | PASS — `budget_limited`, 784 accounted tokens, exactly 1 `goal-budget-wrapup` |
+| C13 | Bare `/goal resume` of `budget_limited` refused | PASS — guidance names `/goal resume --budget <new-total>` |
+| C14 | No-headroom raise refused | PASS — positive-headroom reason; still `budget_limited` |
+| C15 | Cumulative `--budget=100000` recovery preserves usage | PASS — ceiling 1 → 100000, usage 784 → 784, status `active` |
+| C16 | Restart persistence | PASS — "restored (active)", budget and usage intact, **0 runs on load** |
+| C17 | Clear + tombstone survive a reload | PASS — no `restored` notification after the reload; bare `/goal` reports none |
+| C21 | Clean process outcomes | PASS — 0 extension errors, 2 dialogs both expected and answered (one replacement confirmation answered No, one answered Yes), 1 editor |
 
-Supplementary real-provider checks run against the same commit while isolating
-the two focused repairs:
+### #34 — non-active Active-time freeze (explicit confirmation)
 
-- **Blocked active time frozen.** A real-provider Goal reached `blocked` through
-  the three-turn Blocker-identity chain (`Blocked audit: 3 of 3`). Its reported
-  Active time stayed at **88 s** across 8 s of idle time and across a process
-  restart, with 0 runs on load. `usage_limited` needs a real provider usage-limit
-  error and is covered by the deterministic `test/goal34-active-time-stop.test.mjs`
-  / `-store.test.mjs` regressions (both pass).
-- **Old run's follow-up cannot complete/block/pause a newly created Goal.**
-  Confirmed by the existing deterministic regressions
-  `test/goal37-stale-execution.test.mjs`: "an old run's follow-up turn cannot
-  complete a Goal created after Clear", "…cannot report a blocker against a Goal
-  created after Clear", and "…cannot pause a Goal created after Clear" (all pass),
-  plus the retry-window and preservation guards.
+| Check | Result |
+| --- | --- |
+| D34a Real-provider Blocker identity chain reaches `blocked` | PASS — `Blocked audit: 3 of 3 consecutive Goal turns reported this blocker`; snapshot `blocked` |
+| D34b `blocked` Active time frozen across idle time | PASS — **35 s → 35 s** across 10 s idle |
+| D34c `blocked` Active time frozen across restart, no run on load | PASS — **35 s → 35 s** after a process restart; "restored (blocked)"; **0 runs on load** |
+
+`usage_limited` needs a real provider usage-limit error, so it stays covered by
+the deterministic `test/goal34-active-time-stop.test.mjs` /
+`-store.test.mjs` regressions (both pass on this commit).
+
+### #37 — stale execution lifecycle refusal (explicit confirmation)
+
+A Goal whose single run keeps taking turns was replaced by `/goal <objective>`
+(confirmation answered **Yes**) while that run was in flight, so the new Goal
+committed before the old execution's later turns. The old execution then called
+`update_goal { action: "complete" }` twice; **both were refused**:
+
+```text
+Goal not updated: this call was prepared against a Goal state that has since
+changed (expected goal_2867ec94 revision 0, current goal_a42e1842 revision 0).
+The user may have edited, replaced, paused, or resumed the Goal while your
+response was in flight. …
+Goal not updated: this call was prepared against a Goal state that has since
+changed (expected goal_2867ec94 revision 0, current goal_a42e1842 revision 1). …
+```
+
+Persisted branch:
+
+```text
+SNAPSHOTS: [
+  'goal_2867ec94:active:rev0:tok0',
+  'goal_2867ec94:active:rev0:tok4171',
+  'goal_a42e1842:active:rev0:tok0',
+  'goal_2867ec94:active:rev0:tok5454:superseded',
+  'goal_a42e1842:paused:rev1:tok921'
+]
+```
+
+| Check | Result |
+| --- | --- |
+| D37a The old execution's `complete` did not complete the new Goal | PASS — the new Goal's first snapshot is `active` at revision 0; it ends the window `paused` at revision 1 from the smoke's own freeze, never `complete` |
+| D37b The stale execution's lifecycle call was refused | PASS — 2 `update_goal` calls, **2 refused**, 0 applied |
+| D37c The replaced identity kept its own durable superseded record | PASS — 1 `superseded` snapshot carrying the old identity's accounted tail |
+
+### #39 — stale queued work messages never open or charge a new Goal (explicit confirmation)
+
+A Goal was created whose run stays busy for many turns; it was paused and then
+resumed while that run was in flight, so the resume work message was queued as a
+steer; it was then cleared and a `--budget 1` Goal was created while the queued
+message was still undelivered. The stale message landed after the new Goal
+committed:
+
+```text
+SNAPSHOTS: [
+  'goal_6903ba4b:active:rev0:tok0',
+  'goal_6903ba4b:paused:rev1:tok13499',
+  'goal_6903ba4b:active:rev2:tok13499',
+  'tombstone',
+  'goal_67dfb762:active:rev0:tok0',
+  'goal_67dfb762:budget_limited:rev1:tok6483',
+  'goal_67dfb762:budget_limited:rev2:tok6483'
+]
+PI-GOAL WORK MESSAGES: goal_6903ba4b kickoff, goal_6903ba4b resume (delivered
+after the new Goal committed), goal_67dfb762 kickoff, goal_67dfb762 wrap-up
+```
+
+| Check | Result |
+| --- | --- |
+| D39a Hostile ordering exercised | PASS — the stale `goal_6903ba4b` resume message was delivered after `goal_67dfb762` committed |
+| D39b The new Goal's own kickoff was delivered exactly once | PASS — 1 kickoff, no "was not started" creation warning |
+| D39c The cleared identity earned no continuation after the clear | PASS — 0 continuations for `goal_6903ba4b` after the tombstone |
+| D39d The new Goal was not charged the old identity's work | PASS — `goal_67dfb762` reached `budget_limited` with 6,483 tokens from its own kickoff and its own single wrap-up, and its own kickoff ran; the cleared identity's 13,499-token tail stayed on the superseded side |
 
 The deterministic RPC suite remains the automated gate; this smoke does not
 replace it.
 
 ## Defect status
 
-### Former defect (fixed): stale follow-up transitions
+### Fixed: stale follow-up transitions (#37, PR #38)
 
 The initial acceptance attempt found that a model `update_goal` complete in a
 follow-up provider turn of an old Goal's in-flight run completed a newly created
-Goal. That was filed as #37 and fixed by PR #38 (`turnGoal` is now the
-execution's binding, re-admitted only to the identity it holds; `blocked` is
-bound like `complete`/`pause`). The ten `test/goal37-stale-execution.test.mjs`
-scenarios pass on `85bb636`. It no longer blocks acceptance.
+Goal. PR #38 fixed it (`turnGoal` is now the execution's binding, re-admitted
+only to the identity it holds; `blocked` is bound like `complete`/`pause`). The
+ten `test/goal37-stale-execution.test.mjs` scenarios pass on `45f7efc`, and the
+real-provider smoke above reproduces the refusal directly.
 
-### Newly found defect (not fixed here): a stale queued work message adopts a newly created Goal
+### Fixed: a stale queued work message adopted a newly created Goal (#39, PR #40)
 
-While rerunning the final smoke, the budget phase exposed a second hostile-order
-defect in the same family. It is recorded here per #28's verification-only rule
-and is **not repaired in this branch**.
+The rerun of the final smoke found that a pi-goal work message queued for a Goal
+that is then cleared or replaced was delivered after the new Goal committed, and
+because it carried only the generic `[pi-goal]` prefix, `applyDeliveredUserMessage`
+opened the new Goal's admission segment and charged the old run's turns to the new
+identity. PR #40 fixed it: every delivered Goal work message now names the Goal
+identity it was admitted for, and both the live delivery seam and the branch
+replay open an admission segment only when that identity is the current Goal. The
+three `test/goal39-work-message-identity.test.mjs` scenarios and the six
+`test/goal39-work-message-identity-store.test.mjs` replay/marker tests pass on
+`45f7efc`, and the real-provider smoke above reproduces the corrected behavior
+directly.
 
-**Symptom.** A pi-goal work message that was queued for a Goal which is then
-cleared or replaced is delivered after the new Goal is committed. Because it
-carries the `[pi-goal]` prefix, `applyDeliveredUserMessage` treats it as the new
-Goal's own admission segment, and the old run's subsequent provider turns are
-charged to the new identity. A Goal created with `--budget 1` becomes
-`budget_limited` from the old run's usage even though its own kickoff was never
-started.
-
-**Deterministic reproduction** (real `pi --mode rpc`, scripted provider, from the
-repo harness):
-
-1. `/goal Objective B`; hold the kickoff response at a provider gate.
-2. `/goal pause`, then `/goal resume` while the run is busy — the resume work
-   message is queued as a steer.
-3. `/goal clear`, then `/goal --budget 1 New objective C` — C commits
-   `active:0` and waits for the in-flight run.
-4. Release the gate. The queued Goal-B resume message is delivered after C
-   exists; the old run's next response carries scripted usage `input 100 /
-   output 40`.
-
-Observed result:
-
-```text
-SNAPSHOTS: [
-  'goal_96ed0497:active:rev0:tok0',
-  'goal_96ed0497:paused:rev1:tok0',
-  'goal_96ed0497:active:rev2:tok0',
-  'tombstone',
-  'goal_c5457d17:active:rev0:tok0',
-  'goal_c5457d17:budget_limited:rev1:tok140'
-]
-PI-GOAL WORK MESSAGES: B kickoff, B resume   (no C kickoff, 0 continuations)
-CREATION WARNING: Goal goal_c5457d17 was not started: it changed while creation
-waited for the current run to finish (now budget_limited, revision 1). Initial
-work was not started; the current state stands.
-```
-
-C's ledger absorbed 140 tokens from B's resumed run even though C never started
-and B had been cleared. The same interleaving occurred in the real-provider smoke
-with a real model (C reached `budget_limited` with 505 accounted tokens and the
-same "was not started" warning).
-
-**Why it violates the decided contract.** Decision #17 says Clear "never
-reassigns that work to a future Goal", that `/goal` "starts attribution at its
-actual kickoff", and that "an ordinary run that the command waited for is never
-adopted." `applyDeliveredUserMessage`'s own comment states that opening the
-segment at delivery is what "stops a work message queued for a Goal that has
-since been replaced, cleared, or completed from opening anything"; the
-implementation checks only the `[pi-goal]` prefix and the Goal current at
-delivery, not the identity named in the message.
-
-**Impact.** A user who resumes a Goal while a run is in flight and then clears or
-replaces that Goal before the queued resume/edit/kickoff lands can have the new
-Goal charged the old run's usage. With a small budget the new Goal is instantly
-`budget_limited` with no work done; with any budget the new identity inherits
-usage it never owned.
-
-**Relationship to #37.** #37's known boundary covers a run admitted against *no*
-Goal adopting a Goal created mid-run. This defect is different: the execution was
-admitted against the cleared identity, and the reassignment happens through a
-queued pi-goal work message rather than a model lifecycle transition.
-
-Acceptance is **not declared** while this defect is open. The integrated matrix,
-clean-outcome audit, automated gates, and documentation audit above are
-complete; the final real-Pi checklist stopped at the budget phase because of this
-defect. It needs a focused repair issue; #1 and #28 stay open.
+No behavior defect is open. All four behavior repair batches are merged and
+reviewed, the integrated matrix is complete, both automated gates pass on the
+integrated commit, the documentation audit found no inaccuracy, and the final
+real-Pi smoke evidence is recorded and passing. #1 and #28 remain open until the
+orchestrator verifies the above and closes the Spec.

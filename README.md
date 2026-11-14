@@ -1123,3 +1123,9 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] restart persistence and the clear tombstone
 - [ ] a `blocked` Goal's active time is frozen across idle time and a restart,
       and the `usage_limited` freeze is covered by the deterministic regressions
+- [ ] a work message queued for a cleared or replaced Goal is delivered after the
+      new Goal commits but opens nothing: the new Goal's own kickoff runs exactly
+      once and only its own work is charged
+- [ ] a run admitted against a replaced identity cannot complete, report a
+      blocker against, or pause the Goal that replaced it, and the replaced
+      identity keeps its own durable superseded record
