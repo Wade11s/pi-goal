@@ -23,6 +23,8 @@ behavior plus the narrow combinatorial unit tests named in the ticket.
 | Clause order: later correction | A later explicit correction supersedes an earlier negation | `test/goal12-creation-authority-store.test.mjs` ("Do not create a goal. Create a goal." rows) |
 | Clause order: later cancellation | A later cancellation or negation supersedes the quoted request | `test/goal12-creation-authority-store.test.mjs` (cancellation rows); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: later-cancelled request") |
 | Fragment cannot be lifted from a negation | A quote found only inside a negated sentence is refused | `test/goal12-creation-authority-store.test.mjs` ("I did not say create a goal"); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: negated request") |
+| Typographic apostrophes | A cancellation or negation written with U+2018/U+2019 cancels exactly like the straight-apostrophe form, so a later "Don’t." cannot authorize the Goal or pause it cancels | `test/goal12-creation-authority-store.test.mjs` (typographic-apostrophe rows); `test/goal12-pause-corroboration.test.mjs` ("a later typographic-apostrophe cancellation cannot corroborate a pause") |
+| Shared pause vocabulary | The shared `REQUEST_LEAD` widening accepts a comma-less discourse-marker lead ("Actually pause the goal") on the pause path | `test/goal12-pause-corroboration.test.mjs` ("a comma-less discourse-marker lead corroborates a pause") |
 | Hypotheticals and questions | Conditional, tentative, and question-shaped clauses do not qualify | `test/goal12-creation-authority-store.test.mjs` (hypothetical/question rows); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: hypothetical request"; "…question"; "…tentative request") |
 | Non-explicit ordinary work | Ordinary work, mentions, and keep-working requests do not qualify | `test/goal12-creation-authority-store.test.mjs` (mention/ordinary-work rows); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: non-explicit ordinary work") |
 | Extension-originated user message | `pi.sendUserMessage()` never acquires human-user authority | `test/goal12-creation-authority.test.mjs` ("an extension sendUserMessage does not acquire human-user authority") |
@@ -46,7 +48,7 @@ behavior plus the narrow combinatorial unit tests named in the ticket.
 | No persisted reusable evidence | Snapshots keep `origin: "tool"` and gain no quotation, source id, or authority marker | `test/goal12-creation-authority.test.mjs` ("a successful tool creation persists no reusable authorization evidence") |
 | Unchanged direct `/goal` creation | `/goal <objective>` creates without model quotation | `test/goal12-creation-authority.test.mjs` ("direct /goal creation remains available without model quotation"); `test/goal.test.mjs`, `test/goal4.test.mjs` |
 | Non-retroactive accounting | The creating run stays ordinary; attribution starts at the first Continuation | `test/goal12-creation-authority.test.mjs` ("a raw interactive/RPC request authorizes…" asserts only the completing turn is charged); `test/goal6.test.mjs` ("create_goal leaves its creating run ordinary…") |
-| Extension error cleanliness | No unexpected extension errors or unconsumed scripted steps | Every RPC test asserts `session.extensionErrors().length === 0` and every script is sized to its run count |
+| Extension error cleanliness | No unexpected extension errors or unconsumed scripted steps | Every RPC test asserts `session.extensionErrors().length === 0` and `assertStepsConsumed` with the exact provider-response count, so a scripted step left unconsumed fails the test. The compaction scenario asserts four: its summary request consumes a step but leaves no assistant turn |
 
 ## Pre-repair failure evidence
 
@@ -104,6 +106,10 @@ the same suite passes (92/92) and `npm run typecheck` passes.
   Unusual phrasing can be refused, a request delivered only as an image cannot be
   corroborated, and other languages retain `/goal <objective>` as the direct
   creation path.
+- The typographic-apostrophe fold is confined to the negation and cancellation
+  vocabulary, so it can only make recognition stricter: a curly-apostrophe lead
+  ("Let’s create a goal") is refused rather than read as its straight-apostrophe
+  twin, and the byte-exact quotation match is unchanged. Both fail closed.
 - The raw input is captured at the `input` seam and applied when the user
   message is delivered. An extension that handles input (returns `handled`)
   before pi-goal's own `input` handler could leave a stale pending entry; this

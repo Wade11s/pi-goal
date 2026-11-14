@@ -535,6 +535,31 @@ function normalizeWhitespace(text: string): string {
 }
 
 /**
+ * Typographic apostrophes (U+2018/U+2019) folded onto a straight one.
+ *
+ * Users paste from chat clients and word processors, so a cancellation arrives
+ * as "Don’t do it" about as often as "Don't do it". The negation and
+ * cancellation vocabulary below is written with straight apostrophes, so a curly
+ * one would slip past every one of those rules: a later "Don’t." would stop
+ * cancelling the request it follows, and the ambiguity would fail open instead of
+ * closed. Folding restores the straight-apostrophe reading.
+ *
+ * The fold is deliberately confined to the negation and cancellation
+ * recognition (`hasNegationBefore`, `contradictsPause`,
+ * `isGoalCreationRequestClause`, and `isNegativeCreationClause`). It can only
+ * make a clause look more negated, so it never turns a refusal into an
+ * acceptance: an affirmative pattern, a lead-in, or the byte-exact quotation
+ * match is left untouched, and a curly-apostrophe phrasing that the rules do not
+ * recognize still fails closed.
+ */
+const TYPOGRAPHIC_APOSTROPHE = /[\u2018\u2019]/g;
+
+/** Fold U+2018/U+2019 onto U+0027 so the negation vocabulary sees one apostrophe. */
+function foldApostrophes(text: string): string {
+	return text.replace(TYPOGRAPHIC_APOSTROPHE, "'");
+}
+
+/**
  * Pause-instruction vocabulary. A quote only counts toward pausing when it
  * actually names the act of pausing this work; a common word or an incidental
  * fragment of an unrelated sentence is not an instruction.
@@ -573,7 +598,7 @@ const NEGATION_ANYWHERE =
  * negations a user writes, not to perform natural-language inference.
  */
 function hasNegationBefore(text: string, index: number): boolean {
-	const before = text.slice(Math.max(0, index - 64), index);
+	const before = foldApostrophes(text.slice(Math.max(0, index - 64), index));
 	return /\b(?:not|never|no|none|without|avoid|avoids|avoiding|refuse|refuses|refused|don'?t|dont|doesn'?t|didn'?t|won'?t|wouldn'?t|can'?t|couldn'?t|shouldn'?t|isn'?t|aren'?t|wasn'?t|weren'?t|hasn'?t|haven'?t|hadn'?t)\b(?:\s+\w+){0,4}\s*$/i.test(
 		before,
 	);
@@ -581,14 +606,18 @@ function hasNegationBefore(text: string, index: number): boolean {
 
 /** Whether text contradicts pausing: a negation, keep-working word, or deferral. */
 function contradictsPause(text: string): boolean {
-	if (NEGATION_ANYWHERE.test(text)) return true;
-	for (const match of text.matchAll(PAUSE_ACTION)) {
-		if (hasNegationBefore(text, match.index)) return true;
+	// Folded first, so "Don’t" negates exactly like "Don't" (see
+	// `foldApostrophes`). Folding is one character for one, so the indices the
+	// `PAUSE_ACTION` scan reports still address the original text.
+	const folded = foldApostrophes(text);
+	if (NEGATION_ANYWHERE.test(folded)) return true;
+	for (const match of folded.matchAll(PAUSE_ACTION)) {
+		if (hasNegationBefore(folded, match.index)) return true;
 	}
-	for (const match of text.matchAll(KEEP_WORKING)) {
-		if (!hasNegationBefore(text, match.index)) return true;
+	for (const match of folded.matchAll(KEEP_WORKING)) {
+		if (!hasNegationBefore(folded, match.index)) return true;
 	}
-	return PAUSE_DEFERRAL.test(text);
+	return PAUSE_DEFERRAL.test(folded);
 }
 
 /**
@@ -782,13 +811,17 @@ function isGoalCreationRequestClause(clause: string): boolean {
 	if (!rest) return false;
 	if (HYPOTHETICAL_CLAUSE.test(rest)) return false;
 	if (CONDITIONAL_CLAUSE.test(rest)) return false;
-	if (CREATION_CANCELLATION.test(rest)) return false;
-	if (BARE_CANCELLATION.test(rest)) return false;
+	// The cancellation and negation tests read the apostrophe-folded text, so a
+	// curly "Don’t do it" cancels like "Don't do it". The affirmative patterns
+	// below keep reading `rest` itself: the fold can only add refusals.
+	const folded = foldApostrophes(rest);
+	if (CREATION_CANCELLATION.test(folded)) return false;
+	if (BARE_CANCELLATION.test(folded)) return false;
 	if (DEFERRAL_CLAUSE.test(rest)) return false;
 	// A negation that governs the creation verb ("do not create", "never set",
 	// "no need to start") is conservative. A negation elsewhere in the clause
 	// ("create a goal with no budget") does not negate the request.
-	if (hasNegationGoverningAction(rest)) return false;
+	if (hasNegationGoverningAction(folded)) return false;
 	for (let pass = 0; pass < 20; pass++) {
 		const lead = rest.match(REQUEST_LEAD);
 		if (!lead) break;
@@ -803,7 +836,9 @@ function isGoalCreationRequestClause(clause: string): boolean {
 
 /** Whether one clause decides against a Goal-creation request. */
 function isNegativeCreationClause(clause: string): boolean {
-	const text = clause.trim();
+	// Every test below decides against the request, so folding the apostrophes
+	// first can only make the clause look more negative (see `foldApostrophes`).
+	const text = foldApostrophes(clause.trim());
 	if (!text) return false;
 	if (CREATION_CANCELLATION.test(text)) return true;
 	if (BARE_CANCELLATION.test(text)) return true;
@@ -898,7 +933,7 @@ export function corroborateGoalCreationRequest(
 		if (isGoalCreationRequestClause(clause.text)) {
 			decision = "affirmative";
 			continue;
-	}
+		}
 		if (isNegativeCreationClause(clause.text)) decision = "negative";
 	}
 	if (decision !== "affirmative") return { ok: false, reason: "not-an-instruction" };

@@ -87,6 +87,26 @@ const ROWS = [
 	["Create a goal. Don't do it.", "Create a goal", "not-an-instruction"],
 	["Create a goal. I don't want that.", "Create a goal", "not-an-instruction"],
 	["Create a goal, not now", "Create a goal", "not-an-instruction"],
+	// --- typographic apostrophes -------------------------------------------
+	// A cancellation pasted from a chat client or a word processor arrives with a
+	// curly apostrophe. It has to cancel exactly like the straight-apostrophe
+	// form, so the negation and cancellation vocabulary is matched against
+	// apostrophe-folded text: a later "Don’t" can never authorize the Goal it
+	// explicitly cancels.
+	["Create a goal. Don’t.", "Create a goal", "not-an-instruction"],
+	["Create a goal. Don’t do it.", "Create a goal", "not-an-instruction"],
+	["Create a goal. I didn’t mean it.", "Create a goal", "not-an-instruction"],
+	["Create a goal. I don’t want that.", "Create a goal", "not-an-instruction"],
+	["Create a goal, don’t", "Create a goal", "not-an-instruction"],
+	["Create a goal. Wait, don’t.", "Create a goal", "not-an-instruction"],
+	["Don’t create a goal", "create a goal", "not-an-instruction"],
+	["Create a goal for X. Don’t do it.", "Create a goal for X", "not-an-instruction"],
+	// The fold is confined to the negation and cancellation vocabulary, so it
+	// cannot widen what counts as an instruction: a curly-apostrophe lead is still
+	// refused (its straight twin is accepted above), and the quotation match stays
+	// byte-exact, so a curly source still refuses a straight-apostrophe quote.
+	["Let’s create a goal for the launch", "create a goal", "not-an-instruction"],
+	["Let’s create a goal for the launch", "Let's create a goal for the launch", "not-found"],
 	// --- hypotheticals and questions ------------------------------------
 	["If you create a goal, we can track it", "create a goal", "not-an-instruction"],
 	["Create a goal if the user approves", "Create a goal", "not-an-instruction"],

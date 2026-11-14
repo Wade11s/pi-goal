@@ -474,6 +474,11 @@ test("authority survives compaction and overflow recovery inside one execution",
 		assert.equal(create.isError, false, "the authority survives compaction and overflow recovery");
 		assert.equal(structuredGoal(create.result).origin, "tool");
 		assert.equal(runCount(session), 2, "one run before compaction and one retried run");
+		// Five scripted steps are consumed, but the compaction summary request is
+		// not an assistant turn: it leaves no `message_end`, so exactly four
+		// provider responses reach the transcript. A step left unconsumed would
+		// drop this below four.
+		assertStepsConsumed(session, 4);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
