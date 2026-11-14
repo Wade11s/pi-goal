@@ -66,8 +66,10 @@ The new and rewritten regressions were run against the pre-repair `src/` (the
 `integration/spec-1-v1-repair` tip, commit `36790ca`) with the new tests in place.
 Reproduce it by exporting the current tree (`git archive HEAD`), overwriting
 `src/` with `git archive 36790ca src`, symlinking `node_modules`, then running
-`node --test test/goal11-blocker-identity-store.test.mjs` and
-`node --test test/goal11-blocker-identity.test.mjs`. Measured that way: **16 of the 20** new
+`node --test` on the two new test files plus the five rewritten existing
+regression files (`test/goal5.test.mjs`, `test/goal7.test.mjs`,
+`test/goal8.test.mjs`, `test/goal9-legacy.test.mjs`,
+`test/goal10-budget-recovery.test.mjs`). Measured that way: **16 of the 20** new
 narrow store tests and **9 of the 12** new RPC scenarios fail; across the five
 rewritten existing regression files (`goal5`, `goal7`, `goal8`, `goal9-legacy`,
 `goal10-budget-recovery`) **11 of the 76** scenarios fail. They fail because the
