@@ -741,7 +741,7 @@ const GOAL_NOUN = /\bgoals?\b/i;
 const GOAL_DETERMINER =
 	"(?:a|an|the|this|that|one|new|another|fresh|our|my|your|shared|team|single)";
 const IMPERATIVE_GOAL_CREATION = new RegExp(
-	`^(?:create|set|start|establish|make|open)(?:\\s+up)?(?:\\s+${GOAL_DETERMINER})*\\s*goals?\\b`,
+	`^(?:create|set|start|establish|make|open)(?:\\s+up)?(?:\\s+${GOAL_DETERMINER})*\\s*goals?\\b(?!['-])`,
 	"i",
 );
 const PASSIVE_GOAL_CREATION =

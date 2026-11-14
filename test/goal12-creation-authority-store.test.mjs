@@ -45,6 +45,8 @@ const ROWS = [
 	["Actually, create a goal for the launch", "create a goal", "ok"],
 	["create   a\ngoal for the launch", "create a goal", "ok"],
 	["create a goal, then set a budget", "create a goal", "ok"],
+	["Set the goal's budget to 5000", "Set the goal", "not-an-instruction"],
+	["Set the goal's budget to 5000", "Set the goal's budget", "quote-not-request"],
 	["Create a goal with no budget", "Create a goal", "ok"],
 	["Create a goal without a budget", "Create a goal", "ok"],
 	// A later explicit correction supersedes an earlier negation.
