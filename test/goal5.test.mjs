@@ -36,12 +36,21 @@ import {
 	readSessionEntries,
 	runCount,
 } from "./helpers/rpc-harness.mjs";
+import {
+	FOREIGN_ID,
+	assertAudit,
+	auditChainStepCount,
+	lastAudit,
+	runAuditChain,
+	structuredGoal,
+} from "./helpers/blocked-audit.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
 /** The one genuine blocker the model reports across Goal turns. */
 const BLOCKER = "the upstream release API token has not been issued yet";
-/** The same blocker, reworded: equivalent, so the audit must still advance. */
-const REWORDED_BLOCKER = "The upstream release API token has not been issued yet.";
+/** The same blocker, reworded: the same condition, so reusing its identity must still advance. */
+const REWORDED_BLOCKER =
+	"Still blocked on the release API token: the upstream maintainers have not issued it, and requesting it again would unblock the work";
 /** A genuinely different blocker, which must restart the audit at one. */
 const OTHER_BLOCKER = "the test database migration has not been written";
 /** A model response with nothing in it: no text, no tool call, no reasoning. */
@@ -64,19 +73,9 @@ function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
 }
 
-/** The structured `{ goal }` payload of a finalized tool call. */
-function structuredGoal(result) {
-	return result.structuredContent?.goal ?? result.details?.goal;
-}
-
 /** Every persisted Goal snapshot, in the order the session recorded them. */
 function goalSnapshots(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
-/** The audit of the last persisted snapshot. */
-function lastAudit(entries) {
-	return lastGoalSnapshot(entries).data.goal.blockedAudit;
 }
 
 /**
@@ -140,11 +139,15 @@ test("the continuation contract distinguishes progress, verified waits, and no p
 		);
 		assert.match(message, /an observation timeout or a transient polling failure is not terminal/);
 
-		// Equivalent blockers are described as one condition across turns.
+		// Identity, not wording, decides whether two reports are the same condition.
+		assert.match(message, /Identity, not wording, decides equivalence\./);
 		assert.match(
 			message,
-			/Treat equivalent blockers as the same condition across turns even when their wording or stated next step changes\./,
+			/every later report of that same condition passes it back verbatim in blocker_id, so a reworded description or a changed next step still advances the audit/,
 		);
+		assert.match(message, /Omitting blocker_id reports a genuinely different condition/);
+		assert.match(message, /An unrecognized or non-current blocker_id is refused without changing the Goal/);
+		assert.match(message, /pi-goal never compares blocker text, so wording alone can never advance the audit/);
 
 		// The blocked audit states the threshold, and the prompt agrees with what the
 		// extension enforces: report every turn the blocker persists, and the
@@ -156,7 +159,6 @@ test("the continuation contract distinguishes progress, verified waits, and no p
 			message,
 			/a Goal turn that makes progress, verifies a wait, or reports no blocker breaks it and the count starts again/,
 		);
-		assert.match(message, /a reworded repetition still advances the audit; a genuinely different blocker restarts it at one/);
 		assert.match(message, /A blocked Goal never continues automatically and only the user can resume it/);
 
 		// The extension-enforced conservative stops are stated too, including the
@@ -185,22 +187,16 @@ test("the continuation contract distinguishes progress, verified waits, and no p
 test("update_goal(blocked) needs the same blocker for three consecutive Goal turns", async () => {
 	const session = await PiRpcSession.start();
 	// Kickoff, then one blocker report per Goal turn: the first two are refused
-	// and the Goal keeps working, the third satisfies the audit and blocks it.
-	script(
-		[
-			{ text: "Kickoff answer." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Still waiting for the token." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Still waiting for the token." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Reporting the blocker to the user." },
-			{ text: "Nothing else to do." },
-		],
-		session,
-	);
+	// and the Goal keeps working, the third satisfies the audit and blocks it. The
+	// first report omits blocker_id, so the extension issues the identity the
+	// later turns pass back.
+	const reports = [
+		{ blocker: BLOCKER },
+		{ blocker: BLOCKER, id: "issued" },
+		{ blocker: BLOCKER, id: "issued" },
+	];
 	try {
-		await startGoal(session);
+		await runAuditChain(session, reports, [{ text: "Nothing else to do." }], () => startGoal(session));
 		// The first settle happens only when the Goal is blocked.
 		await session.waitForSettled(1);
 
@@ -209,6 +205,10 @@ test("update_goal(blocked) needs the same blocker for three consecutive Goal tur
 		assert.equal(results[0].isError, true, "the first report is below the threshold");
 		assert.match(String(results[0].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
 		assert.equal(structuredGoal(results[0].result).status, "active", "the Goal stays active");
+		// The issued identity is published to the model on every report, so it can be
+		// reused without guessing it.
+		assert.match(structuredGoal(results[0].result).blockerId, /^blocker_[0-9a-f]{8}$/);
+		assert.match(String(results[0].result.content[0].text), /Blocker identity blocker_[0-9a-f]{8}/);
 		assert.equal(results[1].isError, true, "the second report is still below the threshold");
 		assert.match(String(results[1].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
 		assert.match(String(results[1].result.content[0].text), /the same genuine blocker must persist/);
@@ -222,7 +222,7 @@ test("update_goal(blocked) needs the same blocker for three consecutive Goal tur
 		assert.equal(continuationEntries(entries).length, 3, "one continuation per Goal turn before the stop");
 		assert.equal(runCount(session), 4, "kickoff plus exactly three Goal turns");
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "blocked");
-		assert.deepEqual(lastAudit(entries), { blocker: BLOCKER, turns: 3 });
+		assertAudit(lastAudit(entries), BLOCKER, 3);
 
 		// The user is told why the Goal stopped.
 		const blocked = await session.waitForNotify((r) => r.message.includes("is now blocked"));
@@ -237,7 +237,7 @@ test("update_goal(blocked) needs the same blocker for three consecutive Goal tur
 		assert.equal(runCount(session), 5, "the new prompt ran once and settled");
 		assert.equal(lastGoalSnapshot(after).data.goal.status, "blocked");
 
-		assertStepsConsumed(session, 8);
+		assertStepsConsumed(session, auditChainStepCount(reports) + 1);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -245,49 +245,46 @@ test("update_goal(blocked) needs the same blocker for three consecutive Goal tur
 	}
 });
 
-test("a reworded equivalent blocker advances the audit, a different one restarts it", async () => {
+test("a reworded report reusing the current identity advances the audit, an omitted one restarts it", async () => {
 	const session = await PiRpcSession.start();
-	// Turn 1 reports the blocker, turn 2 reports the same condition with only its
-	// case and trailing punctuation changed, and turn 3 reports a genuinely
-	// different blocker, which restarts the audit.
-	script(
-		[
-			{ text: "Kickoff answer." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: REWORDED_BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: OTHER_BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: OTHER_BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: OTHER_BLOCKER } }] },
-			{ text: "Reporting the blocker." },
-		],
-		session,
-	);
+	// Turn 1 reports the blocker, turn 2 reports the same condition with entirely
+	// different wording *and* the current identity, and turn 3 reports a genuinely
+	// different condition by omitting it. Turns 4 and 5 reuse the new identity, so
+	// the third consecutive report of that condition satisfies the audit.
+	const reports = [
+		{ blocker: BLOCKER },
+		{ blocker: REWORDED_BLOCKER, id: "issued" },
+		{ blocker: OTHER_BLOCKER },
+		{ blocker: OTHER_BLOCKER, id: "issued" },
+		{ blocker: OTHER_BLOCKER, id: "issued" },
+	];
 	try {
-		await startGoal(session);
+		await runAuditChain(session, reports, [], () => startGoal(session));
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
 		assert.equal(results.length, 5);
-		// Reworded but equivalent: the audit advanced instead of restarting.
+		// Reworded but the same condition: the audit advanced instead of restarting.
 		assert.match(String(results[1].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
 		assert.equal(structuredGoal(results[1].result).blocker, REWORDED_BLOCKER);
 		assert.equal(structuredGoal(results[1].result).status, "active");
-		// A genuinely different blocker restarts the audit at one.
+		// A genuinely different condition restarts the audit at one with a fresh identity.
 		assert.match(String(results[2].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
 		assert.equal(structuredGoal(results[2].result).blocker, OTHER_BLOCKER);
+		assert.notEqual(
+			structuredGoal(results[2].result).blockerId,
+			structuredGoal(results[1].result).blockerId,
+			"the old chain cannot resume",
+		);
 		assert.match(String(results[3].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
-		assert.equal(results[4].isError, false, "the same new blocker for three turns satisfies the audit");
+		assert.equal(results[4].isError, false, "the same new condition for three turns satisfies the audit");
 		assert.equal(structuredGoal(results[4].result).status, "blocked");
 
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "blocked");
-		assert.deepEqual(lastAudit(entries), { blocker: OTHER_BLOCKER, turns: 3 });
+		assertAudit(lastAudit(entries), OTHER_BLOCKER, 3);
 		assert.equal(runCount(session), 6, "kickoff plus five Goal turns");
-		assertStepsConsumed(session, 11);
+		assertStepsConsumed(session, auditChainStepCount(reports));
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -345,47 +342,152 @@ test("update_goal(blocked) requires a blocker description and refuses user-owned
 test("two blocker reports inside one Goal turn count as one audit step", async () => {
 	const session = await PiRpcSession.start();
 	// A model that repeats its own tool call in one assistant turn must not be able
-	// to satisfy a three-turn threshold inside a single turn.
-	script(
-		[
-			{ text: "Kickoff answer." },
-			{
-				toolCalls: [
-					{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } },
-					{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } },
-				],
-			},
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-			{ text: "Wrapping up." },
-		],
-		session,
-	);
+	// to satisfy a three-turn threshold inside a single turn. The repeat arrives
+	// with a foreign identity and different wording, which must neither replace the
+	// audit nor start a new chain: the same-turn idempotence check runs before the
+	// identity check, so it reads as one audit step.
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	const build = (currentId) => [
+		{ text: "Kickoff answer." },
+		{
+			toolCalls: [
+				{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } },
+				{
+					name: "update_goal",
+					args: { action: "blocked", blocker: REWORDED_BLOCKER, blocker_id: FOREIGN_ID },
+				},
+			],
+		},
+		{ text: "Waiting (Goal turn 1).", waitForFile: gate },
+		{
+			toolCalls: [
+				{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: currentId } },
+			],
+		},
+		{ text: "Waiting (Goal turn 2)." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+		{ text: "Wrapping up." },
+	];
+	writeFileSync(session.scriptPath, JSON.stringify(build("@issued")), "utf8");
 	try {
 		await startGoal(session);
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		assert.match(issued, /^blocker_[0-9a-f]{8}$/);
+		writeFileSync(session.scriptPath, JSON.stringify(build(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
 		assert.equal(results.length, 4);
 		assert.match(String(results[0].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
-		assert.equal(results[1].isError, true, "the repeat is refused too");
+		assert.equal(results[1].isError, true, "the same-turn repeat is refused as a repeat, not counted");
 		assert.match(
 			String(results[1].result.content[0].text),
-			/already recorded for the current Goal turn \(1 of 3 consecutive Goal turns\)/,
+			/already recorded for the current Goal turn/,
+			"the same-turn repeat is idempotent even with different text and a foreign identity",
 		);
+		assert.equal(results[2].isError, true, "the second Goal turn is still below the threshold");
 		assert.match(String(results[2].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
 		assert.equal(results[3].isError, false, "the Goal completed normally");
 
 		const entries = readSessionEntries(await session.sessionFile());
 		const snapshots = entries.filter((e) => e.customType === "goal-state");
-		// Two reports, one audit step: the first Goal turn left exactly one audit
-		// snapshot, and the second Goal turn advanced it to two.
+		// Three Goal turns, one audit step each: the two calls in turn 1 counted once.
 		const audits = snapshots.map((e) => e.data.goal.blockedAudit?.turns).filter((t) => t !== undefined);
 		assert.deepEqual(audits, [1, 2], "each Goal turn advanced the audit exactly once");
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete");
 		assert.equal(runCount(session), 4, "kickoff plus three Goal turns");
+		assertStepsConsumed(session, 7);
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("a rejected report does not own its turn, and a same-turn repeat is idempotent", async () => {
+	const session = await PiRpcSession.start();
+	// Goal turn 2 makes three calls in one assistant step: a foreign identity (which
+	// must be refused without owning the turn), the current identity (which must then
+	// record the turn's first valid report), and a reworded repeat with a foreign
+	// identity (which must read as one audit step, not as a new chain).
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	try {
+		// The gate holds Goal turn 1's trailing response, so the issued identity is read
+		// and the later turns scripted before any of them is requested.
+		writeFileSync(
+			session.scriptPath,
+			JSON.stringify([
+				{ text: "Kickoff answer." },
+				{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+				{ text: "Waiting (Goal turn 1).", waitForFile: gate },
+				{ text: "Waiting (Goal turn 2)." },
+				{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+				{ text: "Wrapping up." },
+			]),
+			"utf8",
+		);
+		await startGoal(session);
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		assert.match(issued, /^blocker_[0-9a-f]{8}$/);
+
+		writeFileSync(
+			session.scriptPath,
+			JSON.stringify([
+				{ text: "Kickoff answer." },
+				{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+				{ text: "Waiting (Goal turn 1).", waitForFile: gate },
+				{
+					toolCalls: [
+						{
+							name: "update_goal",
+							args: { action: "blocked", blocker: BLOCKER, blocker_id: FOREIGN_ID },
+						},
+						{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: issued } },
+						{
+							name: "update_goal",
+							args: {
+								action: "blocked",
+								blocker: "A completely different wording of the same blocker",
+								blocker_id: FOREIGN_ID,
+							},
+						},
+					],
+				},
+				{ text: "Waiting (Goal turn 2)." },
+				{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+				{ text: "Wrapping up." },
+			]),
+			"utf8",
+		);
+		writeFileSync(gate, "", "utf8");
+		await session.waitForSettled(1);
+
+		const results = toolResults(session, "update_goal");
+		assert.equal(results.length, 5, "one report, three calls in Goal turn 2, and the completion");
+		// The foreign identity is refused without owning the turn or touching the Goal.
+		assert.equal(results[1].isError, true);
+		assert.match(String(results[1].result.content[0].text), /is not the Blocker identity of the audit currently open/);
+		assert.match(String(results[1].result.content[0].text), /never compares blocker text/);
+		// The corrected call in the same turn records the turn's first valid report.
+		assert.equal(results[2].isError, true);
+		assert.match(String(results[2].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
+		// The reworded repeat with a foreign identity is still one audit step: it can
+		// neither advance the count nor replace the description or the identity.
+		assert.equal(results[3].isError, true);
+		assert.match(
+			String(results[3].result.content[0].text),
+			/already recorded for the current Goal turn \(2 of 3 consecutive Goal turns\)/,
+		);
+		assert.equal(structuredGoal(results[3].result).blocker, BLOCKER, "the repeat replaced no description");
+		assert.equal(structuredGoal(results[3].result).blockerId, issued, "the repeat replaced no identity");
+		assert.equal(results[4].isError, false, "the Goal completed normally");
+
+		const audits = goalSnapshots(readSessionEntries(await session.sessionFile()))
+			.map((e) => e.data.goal.blockedAudit?.turns)
+			.filter((turns) => turns !== undefined);
+		assert.deepEqual(audits, [1, 2], "four calls in two Goal turns are one audit step per turn");
+		assert.equal(runCount(session), 4, "kickoff plus two reporting Goal turns and the completion");
 		assertStepsConsumed(session, 7);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
@@ -789,6 +891,7 @@ test("a blocker reported by Pi's retry of a Goal turn keeps the audit chain", as
 	const session = await PiRpcSession.start({
 		settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 } },
 	});
+	const gate = join(session.cwd, "pi-goal-audit-gate");
 	// Two consecutive Goal turns report the blocker, then a Goal turn whose first
 	// response fails transiently and whose retry reports the same blocker. The
 	// transient failure is not a Goal turn that reported nothing, so the chain
@@ -797,11 +900,11 @@ test("a blocker reported by Pi's retry of a Goal turn keeps the audit chain", as
 		[
 			{ text: "Kickoff answer." },
 			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting.", waitForFile: gate },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: "@issued" } }] },
 			{ text: "Waiting." },
 			{ error: "503 upstream overloaded" },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: "@issued" } }] },
 			{ text: "Reporting the blocker." },
 			{ text: "Unrequested." },
 		],
@@ -809,6 +912,35 @@ test("a blocker reported by Pi's retry of a Goal turn keeps the audit chain", as
 	);
 	try {
 		await startGoal(session);
+		// The gate holds Goal turn 1's trailing response, so the issued identity is
+		// read and substituted before any later step is requested.
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		writeFileSync(
+			session.scriptPath,
+			JSON.stringify(
+				[
+					{ text: "Kickoff answer." },
+					{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+					{ text: "Waiting.", waitForFile: gate },
+					{
+						toolCalls: [
+							{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: issued } },
+						],
+					},
+					{ text: "Waiting." },
+					{ error: "503 upstream overloaded" },
+					{
+						toolCalls: [
+							{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: issued } },
+						],
+					},
+					{ text: "Reporting the blocker." },
+					{ text: "Unrequested." },
+				],
+			),
+			"utf8",
+		);
+		writeFileSync(gate, "", "utf8");
 		await session.waitForSettled(1);
 
 		assert.equal(session.records.filter((r) => r.type === "auto_retry_start").length, 1, "Pi retried once");
@@ -825,7 +957,7 @@ test("a blocker reported by Pi's retry of a Goal turn keeps the audit chain", as
 		assert.equal(structuredGoal(results[2].result).blockedTurns, 3);
 
 		const entries = readSessionEntries(await session.sessionFile());
-		assert.deepEqual(lastAudit(entries), { blocker: BLOCKER, turns: 3 });
+		assertAudit(lastAudit(entries), BLOCKER, 3);
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "blocked");
 		assert.equal(continuationEntries(entries).length, 3, "three Goal turns ran");
 		assert.equal(runCount(session), 5, "kickoff, two Goal turns, and one two-run Goal turn");
@@ -1290,25 +1422,47 @@ test("a Goal turn without a blocker report breaks the blocked audit", async () =
 test("three consecutive reports after a broken chain still reach the threshold", async () => {
 	const session = await PiRpcSession.start();
 	// The complement of the test above: once the chain restarts, three consecutive
-	// Goal turns with the same blocker do reach the threshold.
-	script(
-		[
-			{ text: "Kickoff answer." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "get_goal", args: {} }] },
-			{ text: "I inspected the repository and kept working." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Reporting the blocker." },
-		],
-		session,
-	);
+	// Goal turns with the same condition do reach the threshold. The productive turn
+	// in between resets the audit durably, so the identity the first report was
+	// issued is spent: the restarted chain must omit it and then reuse the new one.
+	const firstGate = join(session.cwd, "pi-goal-audit-gate-1");
+	const secondGate = join(session.cwd, "pi-goal-audit-gate-3");
+	const steps = (restartId, chainedId) => [
+		{ text: "Kickoff answer." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+		{ text: "Waiting.", waitForFile: firstGate },
+		{ toolCalls: [{ name: "get_goal", args: {} }] },
+		{ text: "I inspected the repository and kept working." },
+		{
+			toolCalls: [
+				restartId === null
+					? { name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }
+					: { name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: restartId } },
+			],
+		},
+		{ text: "Waiting.", waitForFile: secondGate },
+		{
+			toolCalls: [
+				{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: chainedId } },
+			],
+		},
+		{ text: "Waiting." },
+		{
+			toolCalls: [
+				{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: chainedId } },
+			],
+		},
+		{ text: "Reporting the blocker." },
+	];
 	try {
+		writeFileSync(session.scriptPath, JSON.stringify(steps(null, null)), "utf8");
 		await startGoal(session);
+		writeFileSync(session.scriptPath, JSON.stringify(steps(null, "@chained")), "utf8");
+		writeFileSync(firstGate, "", "utf8");
+		// The restarted chain issues its own identity, which the last two turns reuse.
+		const chained = structuredGoal((await session.waitForToolResult("update_goal", 2)).result).blockerId;
+		writeFileSync(session.scriptPath, JSON.stringify(steps(null, chained)), "utf8");
+		writeFileSync(secondGate, "", "utf8");
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
@@ -1322,10 +1476,7 @@ test("three consecutive reports after a broken chain still reach the threshold",
 		assert.match(String(results[2].result.content[0].text), /Blocker recorded \(2 of 3 consecutive Goal turns\)/);
 		assert.equal(results[3].isError, false, "the third consecutive report satisfies the audit");
 		assert.equal(structuredGoal(results[3].result).status, "blocked");
-		assert.deepEqual(lastAudit(readSessionEntries(await session.sessionFile())), {
-			blocker: BLOCKER,
-			turns: 3,
-		});
+		assertAudit(lastAudit(readSessionEntries(await session.sessionFile())), BLOCKER, 3);
 		assert.equal(runCount(session), 6, "kickoff plus five Goal turns");
 		assertStepsConsumed(session, 11);
 		assertCleanRun(session);
@@ -1343,20 +1494,24 @@ test("a partial blocked audit survives a restart", async () => {
 	const session = await PiRpcSession.start({ sessionDir, cwd: workDir });
 	// Two consecutive Goal turns report the blocker, then the process is killed
 	// mid-run: the durable record has to carry the partial audit on its own.
-	script(
-		[
-			{ text: "Kickoff answer." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ hang: true },
-		],
-		session,
-	);
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	// The gate holds Goal turn 1's trailing response, so the issued identity is read
+	// and substituted before the second report is requested.
+	const chained = (id) => [
+		{ text: "Kickoff answer." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+		{ text: "Waiting.", waitForFile: gate },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }] },
+		{ text: "Waiting." },
+		{ hang: true },
+	];
+	writeFileSync(session.scriptPath, JSON.stringify(chained("@issued")), "utf8");
 	let sessionFile;
 	try {
 		await startGoal(session);
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		writeFileSync(session.scriptPath, JSON.stringify(chained(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
 		// Kickoff plus both reporting Goal turns have started; the sixth turn is the
 		// hanging one, so nothing further can be written while this holds.
 		await session.waitFor(
@@ -1378,7 +1533,7 @@ test("a partial blocked audit survives a restart", async () => {
 		session.killNow();
 		await session.waitForExit();
 		sessionFile = session.findSessionFile();
-		assert.deepEqual(lastAudit(readSessionEntries(sessionFile)), { blocker: BLOCKER, turns: 2 });
+		assertAudit(lastAudit(readSessionEntries(sessionFile)), BLOCKER, 2);
 	} finally {
 		await session.stop();
 	}
@@ -1833,34 +1988,34 @@ test("/goal resume restarts a blocked Goal with a fresh audit", async () => {
 	const session = await PiRpcSession.start();
 	// Three consecutive reports block the Goal, the user resumes it, and the
 	// resumed work reports the same blocker again: the audit that stopped the Goal
-	// described that stop, so the next report has to start at one.
-	script(
-		[
-			{ text: "Kickoff answer." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Reporting the blocker." },
-			{ text: "Resumed work after the blocker was resolved." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-			{ text: "Wrapping up." },
-		],
-		session,
-	);
+	// described that stop, so the next report has to start at one. The resumed
+	// report omits blocker_id, which is what a fresh chain means.
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	const chained = (id) => [
+		{ text: "Kickoff answer." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+		{ text: "Waiting.", waitForFile: gate },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }] },
+		{ text: "Waiting." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }] },
+		{ text: "Reporting the blocker." },
+		{ text: "Resumed work after the blocker was resolved." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+		{ text: "Waiting." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+		{ text: "Wrapping up." },
+	];
+	writeFileSync(session.scriptPath, JSON.stringify(chained("@issued")), "utf8");
 	try {
 		await startGoal(session);
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		writeFileSync(session.scriptPath, JSON.stringify(chained(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
+		// The automatic loop only settles once the Goal stops continuing, which for
+		// this chain is the third consecutive report.
 		await session.waitForSettled(1);
-
-		await session.waitFor("the Goal is blocked", async (records) => {
-			const entries = readSessionEntries(await session.sessionFile());
-			return lastGoalSnapshot(entries).data.goal.status === "blocked" ? true : undefined;
-		});
 		const blocked = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
-		assert.deepEqual(blocked.blockedAudit, { blocker: BLOCKER, turns: 3 });
+		assertAudit(blocked.blockedAudit, BLOCKER, 3);
 
 		await session.prompt("/goal resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
@@ -2016,36 +2171,46 @@ test("/goal resume restarts a Goal stopped by an anti-loop bound without re-stop
 	}
 });
 
-test("/goal resume restarts a blocked Goal with a budget, and refuses a budget-limited one", async () => {
+test("/goal resume restarts a blocked Goal with a budget, and a budget-limited one needs a higher total", async () => {
 	const session = await PiRpcSession.start();
 	// A Goal with a token budget: three blocker reports block it, the resume
 	// restarts it, the resumed work crosses the budget, and the wrap-up is the last
-	// thing that runs. The budget-limited Goal is then refused a resume, which is
-	// the one non-continuing status a user decision does not end yet.
-	script(
-		[
-			{ text: "Kickoff answer.", usage: { input: 10, output: 5 } },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }], usage: { input: 5, output: 5 } },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }], usage: { input: 5, output: 5 } },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }], usage: { input: 5, output: 5 } },
-			{ text: "Reporting the blocker." },
-			{ text: "Resumed work after the blocker was resolved.", usage: { input: 20, output: 10 } },
-			{ text: "Wrap-up summary.", usage: { input: 20, output: 10 } },
-			{ text: "After the wrap-up." },
-		],
-		session,
-	);
+	// thing that runs. A bare resume of the budget-limited Goal is then refused with
+	// guidance: only a higher cumulative total can resume it.
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	const chained = (id) => [
+		{ text: "Kickoff answer.", usage: { input: 10, output: 5 } },
+		{
+			toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }],
+			usage: { input: 5, output: 5 },
+		},
+		{ text: "Waiting.", waitForFile: gate },
+		{
+			toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }],
+			usage: { input: 5, output: 5 },
+		},
+		{ text: "Waiting." },
+		{
+			toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }],
+			usage: { input: 5, output: 5 },
+		},
+		{ text: "Reporting the blocker." },
+		{ text: "Resumed work after the blocker was resolved.", usage: { input: 20, output: 10 } },
+		{ text: "Wrap-up summary.", usage: { input: 20, output: 10 } },
+		{ text: "After the wrap-up." },
+	];
+	writeFileSync(session.scriptPath, JSON.stringify(chained("@issued")), "utf8");
 	try {
 		await session.prompt(`/goal --budget 100 ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await session.waitFor("the third report blocked the Goal", async () => {
-			const entries = readSessionEntries(await session.sessionFile());
-			return lastGoalSnapshot(entries).data.goal.status === "blocked" ? true : undefined;
-		});
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		writeFileSync(session.scriptPath, JSON.stringify(chained(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
+		// The automatic loop only settles once the Goal stops continuing, which for
+		// this chain is the third consecutive report.
+		await session.waitForSettled(1);
 		const blocked = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
-		assert.deepEqual(blocked.blockedAudit, { blocker: BLOCKER, turns: 3 });
+		assertAudit(blocked.blockedAudit, BLOCKER, 3);
 		assert.equal(blocked.tokenBudget, 100, "the budget survives the stop");
 
 		// The resume keeps the budget and the identity, and clears the audit.
@@ -2066,11 +2231,12 @@ test("/goal resume restarts a blocked Goal with a budget, and refuses a budget-l
 		assert.equal(limited.blockedAudit, undefined, "the resumed Goal kept no audit out of the stop");
 		assert.equal(limited.wrapUpPending, false, "the one bounded wrap-up was delivered");
 
-		// budget_limited is the one non-continuing status a user decision does not
-		// end yet, so the resume is refused and the Goal keeps its state.
+		// budget_limited cannot be resumed bare: the resume needs a higher cumulative
+		// total, so the refusal is guidance and the Goal keeps its state.
 		await session.prompt("/goal resume");
-		const refused = await session.waitForNotify((r) => r.message.includes("cannot be resumed"));
+		const refused = await session.waitForNotify((r) => r.message.includes("higher cumulative total"));
 		assert.match(refused.message, /budget_limited/);
+		assert.match(refused.message, /--budget <new-total>/);
 		const stillLimited = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 		assert.equal(stillLimited.status, "budget_limited");
 		assert.equal(stillLimited.revision, limited.revision, "the refused resume persisted nothing");

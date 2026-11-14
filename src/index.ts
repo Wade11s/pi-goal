@@ -62,6 +62,7 @@ import {
 	BLOCKED_AUDIT_THRESHOLD,
 	CUSTOM_MESSAGE_TYPE,
 	CUSTOM_WRAPUP_MESSAGE_TYPE,
+	corroborateGoalCreationRequest,
 	corroboratePauseRequest,
 	formatBudgetWrapUpMessage,
 	formatContinuationMessage,
@@ -72,12 +73,15 @@ import {
 	formatNoGoal,
 	formatResumeMessage,
 	getGoalOutputSchema,
+	GOAL_MESSAGE_PREFIX,
 	MAX_BLOCKER_LENGTH,
 	MAX_OBJECTIVE_LENGTH,
+	messageText,
 	MIN_BLOCKER_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
 	MIN_USER_REQUEST_LENGTH,
 	type GoalBinding,
+	type GoalCreationCorroboration,
 	type GoalPublicState,
 	type GoalRecord,
 	previewObjective,
@@ -129,6 +133,70 @@ export type GoalBudgetRequest =
 	| { kind: "none" }
 	/** `--budget <n>`: an explicit budget. */
 	| { kind: "value"; value: number };
+
+/**
+ * Parsed `/goal resume` request.
+ *
+ * The budget option is the only way to resume a `budget_limited` Goal, and only
+ * the two explicit spellings are recognized. Everything else after `resume`
+ * keeps its pre-repair meaning as an objective, so an objective that merely
+ * starts with the word "resume" is never swallowed.
+ */
+export type ResumeBudgetRequest =
+	| { kind: "none" }
+	| { kind: "value"; value: number };
+
+const RESUME_BUDGET_GUIDANCE =
+	"Goal not resumed: use /goal resume --budget <new-total> (or --budget=<new-total>) to raise a " +
+	"budget_limited Goal's cumulative token ceiling.";
+
+/**
+ * Parse the argument of `/goal resume --budget <new-total>`.
+ *
+ * Strict on purpose: exactly one flag, one value, no trailing argument. A
+ * malformed request is refused with guidance rather than being read as an
+ * objective or silently ignored.
+ */
+function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string } {
+	const text = raw.trim();
+	const match = /^--budget(?:=(\S+))?(?:\s+|$)/.exec(text);
+	if (!match) return { error: RESUME_BUDGET_GUIDANCE };
+	const inline = match[1];
+	let valueText: string;
+	let consumed = match[0].length;
+	if (inline !== undefined) {
+		valueText = inline;
+	} else {
+		const rest = text.slice(consumed);
+		const value = /^(\S+)/.exec(rest);
+		if (!value) {
+			return {
+				error:
+				"Goal not resumed: /goal resume --budget needs a new total, for example " +
+				"/goal resume --budget 150.",
+			};
+		}
+		valueText = value[1]!;
+		consumed += value[0].length;
+	}
+	const trailing = text.slice(consumed).trim();
+	if (trailing !== "") {
+		return {
+			error:
+				`Goal not resumed: unexpected argument ${JSON.stringify(trailing)} after --budget ${valueText}. ` +
+				"Use /goal resume --budget <new-total>.",
+		};
+	}
+	const value = Number(valueText);
+	if (!Number.isFinite(value)) {
+		return {
+			error:
+			`Goal not resumed: ${JSON.stringify(valueText)} is not a number. Use ` +
+				"/goal resume --budget <new-total>.",
+		};
+	}
+	return { kind: "value", value };
+}
 
 function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequest } {
 	let rest = raw.trim();
@@ -188,7 +256,7 @@ type GoalCommand =
 	| { kind: "edit"; objective: string }
 	| { kind: "edit-dialog" }
 	| { kind: "pause" }
-	| { kind: "resume" }
+	| { kind: "resume"; budget: ResumeBudgetRequest }
 	| { kind: "clear" }
 	| { kind: "invalid"; message: string };
 
@@ -208,8 +276,18 @@ function parseGoalCommand(args: string): GoalCommand {
 	const first = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
 	const remainder = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex).trim();
 	const word = first.toLowerCase();
-	if (remainder === "" && (word === "pause" || word === "resume" || word === "clear")) {
+	if (remainder === "" && (word === "pause" || word === "clear")) {
 		return { kind: word };
+	}
+	if (word === "resume") {
+		if (remainder === "") return { kind: "resume", budget: { kind: "none" } };
+		if (/^--budget(?:=|\s|$)/.test(remainder)) {
+			const parsed = parseResumeBudget(remainder);
+			if ("error" in parsed) return { kind: "invalid", message: parsed.error };
+			return { kind: "resume", budget: parsed };
+		}
+		// `resume <other>` keeps its pre-repair meaning as an objective.
+		return { kind: "create", objective: trimmed };
 	}
 	if (word === "edit") {
 		if (remainder === "") {
@@ -274,13 +352,40 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	/**
 	 * The Goal (identity + revision) the model's current request was prepared
-	 * against, snapshotted at every `turn_start` — before the provider request,
-	 * hence before the model could have seen anything newer. Model-side lifecycle
-	 * transitions (`update_goal`) are bound to this snapshot: a held response
-	 * released after a user edit, replacement, pause, or resume executes against
-	 * a revised Goal and must be refused instead of mutating it, because the
-	 * model decided on state it can no longer see reflected. `null` while no
-	 * turn has started or no Goal existed when the turn began.
+	 * against, admitted at the first provider turn of an execution and kept for the
+	 * rest of it. Model-side lifecycle transitions (`update_goal`) are bound to it:
+	 * a held response released after a user edit, replacement, pause, or resume
+	 * executes against a revised Goal and must be refused instead of mutating it,
+	 * because the model decided on state it can no longer see reflected.
+	 *
+	 * A run's *follow-up* turns are prepared against the context the run started with
+	 * plus its tool results, never against a Goal that appeared meanwhile, so
+	 * re-admitting the Goal at every `turn_start` would hand an old run whatever Goal
+	 * the user created while it was in flight — `/goal clear` plus
+	 * `/goal <objective>`, or a replacement — and its `complete`, `blocked`, or
+	 * explicit-`pause` would be accepted against an identity the run never saw. The
+	 * binding is therefore re-admitted only to the identity it already holds; a
+	 * different identity is never adopted.
+	 *
+	 * A same-identity revision change is admitted, but not because the model has
+	 * necessarily seen it. An edit or a resume (including a budget raise) of an active
+	 * Goal is delivered or steered into the running work, so the model has seen that
+	 * revision. A user `/goal pause`, an automatic `budget_limited` transition, or an
+	 * automatic blocked-threshold transition is not steered, and is safe for a
+	 * different reason: each leaves the Goal in a non-active status, and every
+	 * model-side transition (`complete`, `blocked`, and explicit `pause`) requires an
+	 * `active` Goal, so the status gate refuses it.
+	 *
+	 * `null` while no turn of this execution has started, or while no Goal existed
+	 * when it did. A later turn of that execution may then admit whatever Goal exists,
+	 * which is what lets the run whose own `create_goal` built one act on it: the tool
+	 * result is what showed the model that Goal.
+	 *
+	 * Cleared when an execution ends (settlement) and when a new one starts, so a
+	 * kickoff, a Continuation, a resume, or a prompt the user types is admitted
+	 * against the Goal that is current then. A run Pi starts to retry the one before
+	 * it — a failed provider request, or a response compaction recovered — is the
+	 * *same* execution, so it keeps the binding.
 	 */
 	let turnGoal: GoalBinding | null = null;
 
@@ -297,6 +402,99 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let pendingInitialKickoff: GoalBinding | null = null;
 
 	/**
+	 * Execution-time Goal-creation authority.
+	 *
+	 * `create_goal` may create a Goal only from an explicit request, and the
+	 * request must be corroborated at execution time against the one currently
+	 * authoritative source. The source is either the raw interactive/RPC user
+	 * input that started the current execution or a Pi custom message;
+	 * skill/template expansion and other transformed prompt text are not
+	 * evidence, and an extension calling `pi.sendUserMessage()` never acquires
+	 * human-user authority through that API.
+	 *
+	 * The authority belongs to the execution started by the request and survives
+	 * later model turns, Pi retries, compaction, and overflow recovery inside it.
+	 * A newer interactive/RPC user message or Pi custom message replaces it, even
+	 * when unrelated. Settlement, session restart, branch navigation, a successful
+	 * Goal creation, and direct Goal lifecycle operations clear it. It is one-shot:
+	 * a successful creation consumes it, while a rejection leaves it valid so a
+	 * corrected call can retry. Nothing about it is persisted — a snapshot keeps
+	 * `origin: "tool"` and gains no quotation, source id, or reusable marker.
+	 */
+	type GoalCreationAuthoritySource =
+		| { kind: "user"; text: string }
+		| { kind: "custom"; customType: string; text: string };
+
+	let creationAuthority: GoalCreationAuthoritySource | null = null;
+	/**
+	 * Raw user inputs seen at the `input` seam, matched to delivered user messages
+	 * in order. The `input` event fires before skill/template expansion and (for a
+	 * queued steer) before delivery, while the model sees the expanded text; the
+	 * quote must match the raw input, so it is captured here and applied when the
+	 * message is delivered, which is the same boundary the branch replay reads.
+	 */
+	const pendingUserInputs: Array<{ text: string; source: string }> = [];
+
+	function clearCreationAuthority(): void {
+		creationAuthority = null;
+		pendingUserInputs.length = 0;
+	}
+
+	/**
+	 * Apply the raw input of a delivered user message. An interactive/RPC prompt is
+	 * an accepted source; an extension-originated `sendUserMessage` is not, and it
+	 * starts a new execution, so it clears the previous authority. A user message
+	 * delivered with no matching input fails closed.
+	 */
+	function applyDeliveredUserAuthority(): void {
+		const pending = pendingUserInputs.shift();
+		if (!pending) {
+			creationAuthority = null;
+			return;
+		}
+		if (pending.source === "interactive" || pending.source === "rpc") {
+			creationAuthority = { kind: "user", text: pending.text };
+			return;
+		}
+		creationAuthority = null;
+	}
+
+	/** The tool error for a Goal-creation request whose evidence is not corroborated. */
+	function goalCreationAuthorityError(
+		corroboration: Extract<GoalCreationCorroboration, { ok: false }>,
+		quote: string,
+	): string {
+		switch (corroboration.reason) {
+			case "quote-empty":
+				return (
+					"Goal not created: create_goal requires a quotation of the explicit Goal-creation request. " +
+					'Pass user_request with the exact words of the request (for example "please create a goal for the release").'
+				);
+			case "quote-not-request":
+				return (
+					"Goal not created: the quoted text is not a complete affirmative Goal-creation instruction " +
+					`(${JSON.stringify(previewObjective(quote, 120))} does not expressly ask to create, set, or start a Goal). ` +
+					'Quote the instruction itself — for example "please create a goal for the release" — not a keyword, a fragment, ' +
+					"a mention, a question, a hypothetical, or a negation."
+				);
+			case "not-found":
+				return (
+					"Goal not created: no currently authoritative request contains " +
+					`${JSON.stringify(previewObjective(quote, 200))}. The quotation must come from the raw interactive/RPC user message ` +
+					"or Pi custom message that started this execution, and a newer message replaces an older one. " +
+					"Ask the user to repeat the request, or use /goal <objective>."
+				);
+			case "not-an-instruction":
+				return (
+					"Goal not created: the quoted Goal-creation instruction is not affirmative in the currently authoritative source — " +
+					"it is negated, cancelled, hypothetical, a question, or superseded by a later correction or cancellation. " +
+					"If the user did ask, ask them to repeat the request; otherwise keep working. " +
+					"The user can also create a Goal directly with /goal <objective>."
+				);
+		}
+	}
+
+	/**
 	 * Extension-level budget configuration, read from Pi's effective settings at
 	 * every session start (so a reload picks up a changed configuration).
 	 */
@@ -308,7 +506,23 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_start", () => {
 		const goal = store.get();
-		turnGoal = goal ? { id: goal.id, revision: goal.revision } : null;
+		const admitted = goal ? { id: goal.id, revision: goal.revision } : null;
+		// Re-admit the Goal for this turn only while this execution may still be
+		// admitted to it. A follow-up turn of a run whose Goal the user cleared or
+		// replaced while it was in flight keeps the identity the run started with, so
+		// its model-side transitions are refused instead of applied to a Goal it never
+		// saw. A same-identity revision change is admitted: an edit or a resume was
+		// steered into the running work, so the model has seen it, and an un-steered
+		// pause / budget_limited / blocked-threshold change leaves a non-active status
+		// whose gate refuses the model's transitions anyway.
+		if (turnGoal === null || (admitted !== null && admitted.id === turnGoal.id)) {
+			turnGoal = admitted;
+		}
+		// The Goal identity that owned the segment when this provider request started.
+		// A replacement steered into an in-flight run must not steal the response that
+		// was already on the wire for the old identity, so the assistant report is
+		// bound to this identity (see the `message_end` handler).
+		turnOwnerId = store.currentOwnerId();
 	});
 
 	/**
@@ -383,9 +597,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		clearCreationAuthority();
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
+		// A hard crash can leave the superseded identity's in-flight tail on the branch
+		// with no freeze boundary after it. Reconstruction recovers that tail into
+		// memory; freezing it now makes the reload converge durably with the live path
+		// rather than waiting for another boundary that a later crash could lose.
+		store.closeSupersededAdmission(pi);
+		surfaceReconstructionNotice(ctx);
+		applyCutover(ctx);
 		// Runtime-only counters must not survive into a new runtime; the durable
 		// blocked audit is reconstructed with the Goal.
 		safety.reset();
@@ -395,6 +617,45 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 		updateStatus(ctx);
 	});
+
+	/**
+	 * Surface actionable guidance when reconstruction failed closed on a malformed
+	 * or unrecognized newest snapshot. Reconstruction itself is silent; the user is
+	 * told what to do instead of silently losing the Goal.
+	 */
+	function surfaceReconstructionNotice(ctx: ExtensionContext): void {
+		const notice = store.takeNotice();
+		if (notice) notify(ctx, notice, "error");
+	}
+
+	/**
+	 * Perform the one-time branch-local cutover of a pre-repair snapshot before any
+	 * repaired Goal work is admitted, and surface its migration notices. Loading and
+	 * migration send no message and trigger no provider request.
+	 */
+	function applyCutover(ctx: ExtensionContext): void {
+		if (!store.needsLegacyCutover()) return;
+		const result = store.applyLegacyCutover(pi, budgetSettings);
+		if (!result.ok) {
+			notify(ctx, `pi-goal could not cut over the legacy Goal state: ${describeError(result.error)}. ` + "No repaired Goal work was admitted; fix the cause and reload the session.", "error");
+			return;
+	}
+		for (const notice of result.notices) notify(ctx, notice, "warning");
+		if (result.markerError !== undefined) {
+			// The repaired snapshot is durable, so the cutover stands and the Goal keeps
+			// working under the repaired rules. What is missing is only the branch-local
+			// record that this snapshot was migrated, which a fork copied in this window
+			// would otherwise inherit instead of migrating itself.
+			notify(
+				ctx,
+				`pi-goal migrated the legacy Goal state but could not record the branch-local cutover marker ` +
+					`(${describeError(result.markerError)}). The migrated snapshot is durable, so no usage was lost; ` +
+					"a fork of this branch taken now may migrate itself again instead of inheriting the baseline.",
+				"warning",
+			);
+		}
+		updateStatus(ctx);
+	}
 	/** Whether two reconstructed states are observably the same Goal state. */
 	function sameBranchGoal(
 		a: GoalRecord | null | undefined,
@@ -457,16 +718,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * changed, so abandoned-branch isolation is visible rather than implicit.
 	 *
 	 * `turnGoal` is deliberately *not* reset here. It is the binding the current
-	 * turn's model transitions were prepared against; Pi rejects navigation while
+	 * execution's model transitions were prepared against; Pi rejects navigation while
 	 * a turn is streaming, so at this point the binding is either already fresh
-	 * for the selected branch or will be refreshed at the next `turn_start`. If a
-	 * turn somehow raced a navigation, leaving the binding untouched keeps the
-	 * execute-time identity+revision check refusing the stale transition instead
-	 * of handing it a fresh binding it was never prepared against.
+	 * for the selected branch or will be re-admitted at the first turn of the next
+	 * execution. If a turn somehow raced a navigation, leaving the binding untouched
+	 * keeps the execute-time identity+revision check refusing the stale transition
+	 * instead of handing it a fresh binding it was never prepared against.
 	 */
 	pi.on("session_tree", (_event, ctx) => {
+		clearCreationAuthority();
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
+		// A tail recovered from the selected branch belongs to an identity that is no
+		// longer current. Freeze it at this durable boundary so the branch records the
+		// old identity's already-admitted work instead of leaving it for a later crash
+		// to lose.
+		store.closeSupersededAdmission(pi);
+		surfaceReconstructionNotice(ctx);
+		applyCutover(ctx);
 		notifyBranchChange(ctx, before, after);
 		// The status line follows the selected branch too, and the accounting
 		// baseline is rebuilt with it.
@@ -495,8 +764,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * so every anti-loop counter starts over. Extension commands (`/goal ...`) do
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
-	pi.on("input", (_event, ctx) => {
+	pi.on("input", (event, ctx) => {
+		pendingUserInputs.push({ text: event.text, source: event.source });
 		continuesGoalTurn = false;
+		// A prompt the user actually typed is never Goal-owned work, so the
+		// admission segment closes — but at *delivery*, not here: Pi dispatches this
+		// while the provider request is still streaming, and closing now would drop
+		// the in-flight response the Goal had already admitted. `message_end` for the
+		// delivered user message is the seam that matches the branch replay (see
+		// `applyDeliveredUserMessage`). pi-goal's own messages arrive with source
+		// "extension" and never close a segment.
 		safety.reset();
 		reportAuditResetFailure("the prompt you just sent", ctx);
 	});
@@ -509,6 +786,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * and the blocked audit on a transient error Pi is about to retry.
 	 */
 	pi.on("agent_start", () => {
+		// Whether this run continues the execution that just ended rather than opening a
+		// new one: Pi's retry of a failed provider request, or of a response compaction
+		// recovered, is the same execution and keeps its Goal binding.
+		const retriesCurrentExecution = pendingRunKind === undefined && continuesGoalTurn;
 		if (pendingRunKind !== undefined) {
 			safety.beginRun(pendingRunKind);
 			pendingRunKind = undefined;
@@ -519,6 +800,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		} else {
 			safety.beginRun("user");
 		}
+		// A new execution is admitted against the Goal that is current when it starts.
+		if (!retriesCurrentExecution) turnGoal = null;
 		continuesGoalTurn = false;
 		providerFailure = undefined;
 		runOutcome = undefined;
@@ -544,6 +827,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("agent_settled", (event, ctx) => {
 		pendingRunKind = undefined;
 		continuesGoalTurn = false;
+		// The execution is over, so its Goal binding is too: the next one is admitted
+		// against whatever Goal is current when it starts, which is what lets the Goal
+		// a user created in the meantime kick off and continue normally.
+		turnGoal = null;
 		if (!event.aborted) return;
 		// An abort is the strongest possible user action: the Goal turn the user
 		// stopped must not be counted as a Goal malfunction, and it never reached
@@ -596,6 +883,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	const chargedMessages = new WeakSet<object>();
 	let modelMessageSeq = 0;
+	/** The Goal identity owning the segment at the start of the current turn. */
+	let turnOwnerId: string | null = null;
 
 	/**
 	 * Token accounting, at the only seams where Pi reports finalized usage.
@@ -612,12 +901,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * belongs to. A Goal can be created while a tool of an ordinary turn is still in
 	 * flight — `/goal` commits before it waits for idle, and `create_goal` runs inside
 	 * a tool batch — so the turn's own assistant `message_end` predates the Goal while
-	 * its tool results land after it. Those results are Goal work: the branch replay
-	 * charges every entry after the creation snapshot, and a live path that skipped
-	 * them would disagree with the replay it is supposed to converge with (a probe
-	 * measured 17 live against 67 restored). The `complete` guard inside
-	 * `accountUsage` keeps the completing batch aligned with the replay, which skips
-	 * everything after a completion snapshot.
+	 * its tool results land after it. Those results are not Goal work either: the
+	 * creating run stays ordinary, and the branch replay charges nothing between the
+	 * creation snapshot and the first Goal work message, so a live path that charged
+	 * them would disagree with the replay it is supposed to converge with.
+	 * `applyDeliveredUserMessage` is what keeps the two on the same line.
 	 */
 	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
@@ -625,17 +913,42 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// A genuine user turn is not Goal work: the budget gate must not block the
 			// tools the user's own request needs, even inside a gated run.
 			budgetGateActive = false;
+			// This is also the ownership seam. Pi appends the message in this very event,
+			// so what happens here is exactly what `ownershipMarker` reads back on replay:
+			// a pi-goal work message opens its admission segment, and every other prompt
+			// closes it. A delivered message also closes the superseded identity's
+			// admission, freezing its in-flight tail before the new segment opens.
+			applyDeliveredUserMessage(message, pi);
+			// The raw input of the delivered message is what authorizes a Goal creation
+			// in this execution. Applying it here (rather than at the `input` seam) keeps
+			// a queued steer from replacing the authority of the response already in
+			// flight, and matches the branch-replay boundary.
+			applyDeliveredUserAuthority();
+			return;
+		}
+		if (message.role === "custom") {
+			// A Pi custom message is an accepted authority source of any customType:
+			// the type identifies the custom-message path, not a trust allowlist. It
+			// replaces prior authority even when unrelated, because it is newer.
+			creationAuthority = {
+				kind: "custom",
+				customType: message.customType,
+				text: messageText(message.content),
+			};
 			return;
 		}
 		const goal = store.get();
 		// A report is Goal work exactly when a non-complete Goal exists as it is
 		// finalized. Completion is terminal for accounting, so the completing turn is
 		// charged at its own `message_end` and nothing after the completion snapshot is.
-		if (!goal || goal.status === "complete") return;
+		// A Clear that lands while the superseded identity's request is still in flight
+		// leaves no current Goal, but its admitted tail must still be charged, so an
+		// open superseded tail keeps the seam alive.
+		if ((!goal || goal.status === "complete") && !store.hasOpenSupersededTail()) return;
 		if (message.role === "assistant") {
 			if (chargedMessages.has(message)) return;
 			chargedMessages.add(message);
-			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model");
+			store.accountUsage(`model:${++modelMessageSeq}`, message.usage, "model", turnOwnerId);
 			afterAccounting(ctx);
 			return;
 		}
@@ -650,7 +963,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	pi.on("session_compact", (event, ctx) => {
 		const goal = store.get();
-		if (!goal || goal.status === "complete") return;
+		if ((!goal || goal.status === "complete") && !store.hasOpenSupersededTail()) return;
 		store.accountUsage(event.compactionEntry.id, event.compactionEntry.usage, "nested");
 		afterAccounting(ctx);
 	});
@@ -661,7 +974,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * silently restarting the clock.
 	 */
 	pi.on("session_shutdown", (event, ctx) => {
-		if (!store.get()) return;
+		if (!store.get() && !store.hasOpenSupersededTail()) return;
 		// Pi fires this both when the process quits and when a session is *replaced*
 		// (fork, clone, switch, resume, reload). The two are not the same event for a
 		// durable writer, and telling them apart by the destination rather than the
@@ -686,6 +999,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const currentFile = ctx.sessionManager.getSessionFile();
 		const keepsFile = event.targetSessionFile === undefined || event.targetSessionFile === currentFile;
 		if (!keepsFile) return;
+		// A superseded identity's in-flight tail is frozen at this last durable
+		// boundary too, so a quit or reload cannot lose work that never saw another
+		// delivered user message.
+		store.closeSupersededAdmission(pi);
 		store.stopClock();
 		store.flushAccounting(pi, true);
 	});
@@ -735,6 +1052,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	/** Refresh the status line and persist accounting once Pi will not continue. */
 	pi.on("agent_settled", (_event, ctx) => {
+		// Settlement ends the execution, so its creation authority is over: a later
+		// run needs a new request, even one Pi starts for a queued message.
+		clearCreationAuthority();
 		budgetGateActive = false;
 		wrapUpArmed = false;
 		store.flushAccounting(pi);
@@ -847,6 +1167,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// Exactly one bounded wrap-up, then the Goal stops for good.
 			const delivered = store.consumeWrapUp(pi);
 			if (!delivered.ok) return;
+			// The wrap-up run is Goal-owned work: its one response is charged.
+			store.beginGoalWork(delivered.goal.id);
 			wrapUpArmed = true;
 			return {
 				entries: [
@@ -878,6 +1200,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// The next run is Goal work, whether Pi starts it for our continuation or
 		// for queued work that already satisfies the decision.
 		pendingRunKind = "automatic";
+		store.beginGoalWork(goal.id);
 		return {
 			entries: [
 				...event.entries,
@@ -909,6 +1232,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// A Goal turn that reported no blocker breaks the blocked audit, so the
 			// next report starts a fresh chain instead of resuming an old one.
 			reportAuditResetFailure("a Goal turn that reported no blocker", ctx);
+		}
+		// The admitted Goal turn is over at its settlement boundary, so its
+		// ownership segment must not leak into later user actions or runs (e.g. a
+		// bare `/goal` edit dialog, or an ordinary prompt before a closing user
+		// message is delivered). Continuations reopen their own segment explicitly.
+		if (wasGoalTurn) {
+			store.endGoalWork();
 		}
 	}
 
@@ -1054,13 +1384,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Get Goal",
 		description:
 			"Get the current session Goal: objective, lifecycle status, revision, token budget, accounted " +
-			"usage, remaining capacity, and active time. Returns goal: null when no Goal is set.",
+			"usage, remaining capacity, active time, and the open blocked audit's Blocker identity, latest " +
+			"description, and count. Returns goal: null when no Goal is set.",
 		parameters: Type.Object({}),
 		outputSchema: getGoalOutputSchema,
 		promptSnippet: "Fetch the current session Goal objective, lifecycle status, and budget",
 		promptGuidelines: [
 			"Use get_goal when the session Goal objective or its lifecycle status is absent or truncated in the current context.",
 			"Check get_goal's usage.remainingTokens before starting expensive work: a Goal that reaches its token budget becomes budget_limited and stops continuing.",
+			"Call get_goal before re-reporting a blocker: it carries the open audit's Blocker identity, which update_goal's blocker_id must repeat verbatim for the same condition. The extension never compares blocker text.",
 		],
 		async execute() {
 			const goal = store.get();
@@ -1072,8 +1404,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				};
 			}
 			const state = toPublicState(goal);
+			// The model-facing text carries the open audit's identity on top of the
+			// human-facing summary: reusing it is the only way a reworded report advances
+			// the audit, and this is the tool the model reads it from. The human status
+			// deliberately does not show the opaque identity.
+			const identity =
+				state.blockerId === null
+					? ""
+					: `\nBlocker identity: ${state.blockerId} (pass it back verbatim in update_goal's blocker_id for the ` +
+						"same condition; omit it for a genuinely different one)";
 			return {
-				content: [{ type: "text", text: formatGoalSummary(state) }],
+				content: [{ type: "text", text: `${formatGoalSummary(state)}${identity}` }],
 				structuredContent: { goal: state },
 				details: { goal: state },
 			};
@@ -1085,7 +1426,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Create Goal",
 		description:
 			"Create a persistent Goal for an explicit user or system request. " +
-			"Refuses when this session already has a Goal, and refuses a token budget above the configured maximum.",
+			"Requires user_request: the exact words of the request, quoted verbatim from the raw interactive/RPC " +
+			"user message or Pi custom message that started this execution. The quote is corroborated at execution " +
+			"time against that source, so a paraphrase, a fragment, a forged request, or a request from an earlier " +
+			"message is refused with goal: null. Refuses when this session already has a Goal, and refuses a token " +
+			"budget above the configured maximum.",
 		parameters: Type.Object({
 			objective: Type.String({ minLength: MIN_OBJECTIVE_LENGTH, maxLength: MAX_OBJECTIVE_LENGTH }),
 			tokenBudget: Type.Optional(
@@ -1096,15 +1441,49 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						"Reaching it makes the Goal budget_limited, which stops continuation and is not completion.",
 				}),
 			),
+			userRequest: Type.Optional(
+				Type.String({
+					description:
+						"Required for creation: the exact words of the explicit Goal-creation request, quoted verbatim " +
+						"from the currently authoritative raw interactive/RPC user message or Pi custom message (for example " +
+						'"please create a goal for the release"). The quote is corroborated against that source; a paraphrase, ' +
+						"a keyword, a fragment, a mention, a question, a hypothetical, a negation, or a request from an earlier " +
+						"message is refused. The objective remains model-written and need not repeat the quotation.",
+				}),
+			),
 		}),
 		outputSchema: getGoalOutputSchema,
 		promptSnippet: "Create a persistent session Goal from an explicit user or system request",
 		promptGuidelines: [
 			"Call create_goal only when the user or the system explicitly asked for a Goal. Never infer one because a task looks large.",
+			"Pass user_request with the exact words of the explicit Goal-creation request, quoted verbatim from the raw interactive/RPC user message or Pi custom message that started this execution. The quote is corroborated against that source; a paraphrase, a fragment, or an older message is refused with goal: null.",
 			"Do not call create_goal while this session already has a Goal; it is refused. Use get_goal to inspect the current Goal instead.",
 			"Only set tokenBudget when the user asked for a specific budget; otherwise omit it and let the configured default apply.",
 		],
-		async execute(_toolCallId: string, params: { objective: string; tokenBudget?: number }, _signal, _onUpdate, ctx) {
+		/**
+		 * Accept the snake_case spelling a model drifts into, matching update_goal's
+		 * `user_request` compatibility shim. The canonical spelling is camelCase.
+		 */
+		prepareArguments: (args: unknown): { objective: string; tokenBudget?: number; userRequest?: string } => {
+			if (typeof args !== "object" || args === null) return { objective: "" };
+			const record = args as Record<string, unknown>;
+			const objective = typeof record.objective === "string" ? record.objective : "";
+			const tokenBudget = typeof record.tokenBudget === "number" ? record.tokenBudget : undefined;
+			const rawRequest = record.userRequest ?? record.user_request;
+			const userRequest = typeof rawRequest === "string" ? rawRequest : undefined;
+			return {
+				objective,
+				...(tokenBudget === undefined ? {} : { tokenBudget }),
+				...(userRequest === undefined ? {} : { userRequest }),
+			};
+		},
+		async execute(
+			_toolCallId: string,
+			params: { objective: string; tokenBudget?: number; userRequest?: string },
+			_signal,
+			_onUpdate,
+			ctx,
+		) {
 			const validation = validateObjective(String(params.objective ?? ""));
 			if (!validation.ok) {
 				return goalToolError(validation.error, null);
@@ -1135,7 +1514,36 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					toPublicState(existing),
 				);
 			}
+			// Execution-time creation authority. The request must be corroborated
+			// against the one currently authoritative source; a missing, forged,
+			// stale, non-explicit, or ambiguous quote is refused with goal: null and
+			// no state change. A rejection does not consume the authority, so a
+			// corrected call can retry while the same request remains valid.
+			if (!creationAuthority) {
+				return goalToolError(
+					"Goal not created: no explicit user or system request is currently authoritative. " +
+					"create_goal may be called only in the execution started by a raw interactive/RPC user message " +
+					"or a Pi custom message. Ask the user to make the request, or use /goal <objective>.",
+					null,
+				);
+			}
+			const quote = typeof params.userRequest === "string" ? params.userRequest : "";
+			const corroboration = corroborateGoalCreationRequest(creationAuthority.text, quote);
+			if (!corroboration.ok) {
+				return goalToolError(goalCreationAuthorityError(corroboration, quote), null);
+			}
 			const goal = store.create(validation.objective, "tool", { tokenBudget: budget.tokenBudget });
+			// A superseded identity's open tail must be durable before a new Goal takes the
+			// session's Goal slot: creating a Goal leaves no marker of its own on the
+			// branch, so replay only closes that admission at a durable freeze. Refuse
+			// rather than lose admitted work or let the two paths disagree about it.
+			if (!store.closeSupersededForCreation(pi)) {
+				return goalToolError(
+					"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
+						"Nothing was stored.",
+					null,
+				);
+			}
 			try {
 				// Stage before announcing: a write failure here abandons creation with no
 				// visible state change, and the attempt can simply be retried.
@@ -1149,6 +1557,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				const reason = error instanceof Error ? error.message : String(error);
 				return goalToolError(`Goal not created: ${reason}`, null);
 			}
+			// A successful creation consumes the one-shot authority. The Goal now
+			// occupies the session's single slot, so a second call is refused anyway,
+			// but clearing the authority also prevents a replayed model request from
+			// being treated as fresh evidence.
+			clearCreationAuthority();
 			// No separate durability poll is needed here, unlike the /goal command whose
 			// kickoff is what creates the session file: a tool call implies a running
 			// session whose file already exists, and appendEntry writes synchronously
@@ -1170,10 +1583,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Update Goal",
 		description:
 			"Update the current Goal. Supported actions: \"complete\" after an evidence-based completion audit, " +
-			"\"blocked\" once the same genuine blocker has persisted for at least three consecutive Goal turns, " +
+			"\"blocked\" while the same genuine blocker persists across consecutive Goal turns (identify it with " +
+			"blocker_id, which pi-goal issues on the first report and which reworded reports must pass back), " +
 			"and \"pause\" after an explicit user request, which must be quoted verbatim in user_request. " +
 			"Complete and blocked are terminal: they stop the Goal's automatic continuation. " +
-			"The model cannot resume, clear, replace, or budget-limit a Goal.",
+			"The model cannot resume, clear, replace, budget-limit, or raise the token budget of a Goal.",
 		parameters: Type.Object({
 			action: Type.String({
 				description:
@@ -1185,6 +1599,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					description:
 						`Required for action blocked: the genuine blocker in plain language (${MIN_BLOCKER_LENGTH}-${MAX_BLOCKER_LENGTH} characters). ` +
 						"Say what is actually blocking the work and what would unblock it.",
+				}),
+			),
+			blocker_id: Type.Optional(
+				Type.String({
+					description:
+						"The Blocker identity of the condition being reported, for action blocked. Omit it for the first " +
+						"report of a condition and pi-goal issues one; pass the current identity back verbatim on every " +
+						"later report of that same condition, so differently worded descriptions still advance the " +
+						"blocked audit. Omitting it reports a genuinely different condition and starts a fresh chain at " +
+						"one. An identity the extension did not issue for the currently open audit is refused without " +
+						"changing the Goal. The extension never compares blocker text.",
 				}),
 			),
 			userRequest: Type.Optional(
@@ -1201,10 +1626,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			"Mark the current Goal complete after an evidence audit, blocked after a persistent blocker, or paused at the user's explicit request",
 		promptGuidelines: [
 			"Call update_goal with action complete only after every explicit requirement of the objective is verified by current-state evidence.",
-			`Call update_goal with action blocked only when the same genuine blocker has persisted for at least ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns, and never because the work is merely hard, slow, uncertain, or incomplete.`,
+			`Call update_goal with action blocked on every Goal turn in which a genuine blocker persists, from the first turn onward; never wait until ${BLOCKED_AUDIT_THRESHOLD} consecutive turns have passed before reporting one. Never report a blocker merely because the work is hard, slow, uncertain, or incomplete.`,
+			"Report the blocker on every Goal turn it persists: the first report omits blocker_id and pi-goal issues an opaque Blocker identity, and every later report of that same condition passes it back verbatim. Omit it only for a genuinely different condition.",
+			"Never guess or reuse an old Blocker identity: call get_goal for the current one. The extension never compares blocker text, so wording alone can never advance the blocked audit.",
 			"Completing or blocking a Goal stops its automatic continuation, so never use either to escape a difficult or merely tiring task.",
 			"Call update_goal with action pause only when the user explicitly asked to pause this Goal, and quote their exact words in user_request. Never pause on your own initiative.",
-			"Never call update_goal to resume or clear a Goal; the user owns those transitions.",
+			"Never call update_goal to resume or clear a Goal; the user owns those transitions, and a budget-raising resume is /goal resume --budget <new-total>.",
 		],
 		/**
 		 * Compatibility shim for the spellings a model reaches for: `{ status: … }`
@@ -1213,16 +1640,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		 * error, and the Goal keeps burning turns. Anything else is passed through
 		 * with an empty action so an unsupported action is refused with a real
 		 * explanation instead of being silently ignored.
+		 *
+		 * `blocker_id` gets the same treatment as `user_request`: the canonical
+		 * spelling is snake_case — the one the tool description, the guidelines, and
+		 * every Continuation use — and the camelCase a model drifts into is accepted
+		 * too.
 		 */
-		prepareArguments: (args: unknown): { action: string; blocker?: string; userRequest?: string } => {
+		prepareArguments: (
+			args: unknown,
+		): { action: string; blocker?: string; blockerId?: string; userRequest?: string } => {
 			if (typeof args !== "object" || args === null) return { action: "" };
 			const record = args as Record<string, unknown>;
 			const blocker = typeof record.blocker === "string" ? record.blocker : undefined;
+			const rawBlockerId = record.blocker_id ?? record.blockerId;
+			const blockerId = typeof rawBlockerId === "string" ? rawBlockerId : undefined;
 			const rawRequest = record.userRequest ?? record.user_request;
 			const userRequest = typeof rawRequest === "string" ? rawRequest : undefined;
 			const withBlocker = (action: string) => ({
 				action,
 				...(blocker === undefined ? {} : { blocker }),
+				...(blockerId === undefined ? {} : { blockerId }),
 				...(userRequest === undefined ? {} : { userRequest }),
 			});
 			if (record.action !== undefined) return withBlocker(String(record.action));
@@ -1233,7 +1670,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		},
 		async execute(
 			_toolCallId: string,
-			params: { action: string; blocker?: string; userRequest?: string },
+			params: { action: string; blocker?: string; blockerId?: string; userRequest?: string },
 			_signal,
 			_onUpdate,
 			ctx: ExtensionToolContext,
@@ -1242,15 +1679,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (!goal) {
 				return goalToolError(formatNoGoal(), null);
 			}
-			if (params?.action === "blocked") {
-				return reportBlocker(goal, params.blocker, ctx);
-			}
 			/**
 			 * Refuse a call whose decision was prepared against a different Goal
-			 * state. The binding comes from `turn_start` of the turn whose model
-			 * request proposed this call, so a held response released after a user
-			 * edit / replacement / pause / resume is refused instead of mutating
-			 * the revised Goal the model never saw.
+			 * state. The binding is the Goal identity and revision the execution this
+			 * call belongs to was admitted against, so a held response released after a
+			 * user edit / replacement / pause / resume — and a follow-up turn of a run
+			 * whose Goal was cleared or replaced while it was in flight — is refused
+			 * instead of mutating a Goal the model never saw.
 			 */
 			const staleRefusal = (binding: GoalBinding | null) => {
 				if (!binding) {
@@ -1268,6 +1703,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					toPublicState(goal),
 				);
 			};
+			if (params?.action === "blocked") {
+				// The blocker report is bound exactly like `complete` and `pause`: a
+				// report whose execution holds no Goal binding belongs to a run admitted
+				// before any Goal existed, so it must not mutate a Goal the model never
+				// saw. A run whose own `create_goal` built the Goal is re-admitted at its
+				// next `turn_start`, because the tool result is what showed it that Goal.
+				// The revision is left to `markBlockedReport`, which must still read a
+				// repeated report inside one Goal turn as one audit step.
+				if (!turnGoal || goal.id !== turnGoal.id) {
+					return staleRefusal(turnGoal);
+				}
+				return reportBlocker(goal, params.blocker, params.blockerId, ctx);
+			}
 			const reportMutationFailure = (action: string, failure: GoalMutationFailure) => {
 				if (failure.reason === "persistence") {
 					return goalToolError(
@@ -1384,12 +1832,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * The extension — not the model — decides when the audit is satisfied, so an
 	 * eager or drifted `blocked` call cannot end a Goal that has only seen a
 	 * blocker once. Before the threshold the report is persisted (making the audit
-	 * durable across compaction and a session restore) and refused with the
-	 * current count, which is also what tells the model to keep working.
+	 * durable across compaction and a session restore) and refused with the current
+	 * count, which is also what tells the model to keep working.
+	 *
+	 * The refusal carries the open audit's Blocker identity, latest description,
+	 * and count, because that is the only way the model can report the *same*
+	 * condition on the next turn: it must pass the identity back in `blocker_id`.
+	 * The extension never compares blocker text, so a refusal that omitted the
+	 * identity would leave a reworded repetition unable to advance the audit.
 	 */
 	function reportBlocker(
 		goal: GoalRecord,
 		rawBlocker: string | undefined,
+		rawBlockerId: string | undefined,
 		ctx: ExtensionToolContext,
 	) {
 		const validation = validateBlocker(String(rawBlocker ?? ""));
@@ -1400,12 +1855,31 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				toPublicState(goal),
 			);
 		}
-		const result = store.markBlockedReport(pi, {
-			blocker: validation.blocker,
-			turn: safety.currentTurn,
-		});
+		const result = store.markBlockedReport(
+			pi,
+			{
+				blocker: validation.blocker,
+				...(rawBlockerId === undefined ? {} : { blockerId: rawBlockerId }),
+				turn: safety.currentTurn,
+			},
+			turnGoal ?? undefined,
+		);
 		if (result.ok && !result.repeat) blockerCountedThisRun = true;
 		if (!result.ok) {
+			if (result.reason === "not-current") {
+				const current = store.get();
+				return goalToolError(result.message, current ? toPublicState(current) : null);
+			}
+			if (result.reason === "stale") {
+				const current = store.get();
+				return goalToolError(
+					"Blocker not recorded: this call was prepared against a Goal state that has since changed " +
+						`(expected ${turnGoal?.id ?? "unknown"} revision ${turnGoal?.revision ?? "unknown"}, ` +
+						`current ${current?.id ?? "none"} revision ${current?.revision ?? "none"}). ` +
+						"Call get_goal, re-read the current objective, and report again if the blocker persists.",
+					current ? toPublicState(current) : null,
+				);
+			}
 			const message =
 				result.reason === "persistence"
 					? `Blocker not recorded: writing the Goal to the session failed (${describeError(result.error)}). The Goal is still active; fix the cause and call update_goal again.`
@@ -1413,6 +1887,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return goalToolError(message, toPublicState(goal));
 		}
 		const state = toPublicState(result.goal);
+		// The model-facing identity line: reuse this verbatim for the same condition,
+		// omit it for a genuinely different one. It is deliberately *not* part of the
+		// human-facing status, where the opaque identity says nothing useful.
+		const identity = state.blockerId
+			? `Blocker identity ${state.blockerId}: pass it back verbatim in blocker_id on every later report of ` +
+				"this same condition, so a reworded description still advances the audit. Omit it only to report a " +
+				"genuinely different condition. "
+			: "";
 		if (result.thresholdMet) {
 			ctx.ui.notify(
 				`Goal ${result.goal.id} is now blocked: ${validation.blocker} ` +
@@ -1442,7 +1924,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			? `This blocker was already recorded for the current Goal turn (${result.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns), so it was not counted again.`
 			: `Blocker recorded (${result.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns).`;
 		return goalToolError(
-			`${counted} The Goal stays active: the same genuine blocker must persist for at least ` +
+			`${counted} ${identity}The Goal stays active: the same genuine blocker must persist for at least ` +
 				`${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns before it may be marked blocked, so a transient ` +
 				"failure cannot stop useful work. " +
 				(result.turns > 1
@@ -1457,10 +1939,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("goal", {
 		description:
-			"Create (/goal <objective>), inspect (bare /goal), edit (/goal edit <objective>), pause, resume, or clear the session Goal",
+			"Create (/goal <objective>), inspect (bare /goal), edit (/goal edit <objective>), pause, resume " +
+			"(/goal resume, or /goal resume --budget <new-total> for a budget_limited Goal), or clear the session Goal",
 		handler: async (args, ctx) => {
 			try {
 				const command = parseGoalCommand(args);
+				// A direct Goal lifecycle operation is a user decision that supersedes
+				// any model-held creation authority. A bare status read is not a
+				// lifecycle operation and leaves the authority alone.
+				if (command.kind !== "status" && command.kind !== "invalid") {
+					clearCreationAuthority();
+				}
 				switch (command.kind) {
 					case "status":
 						await reportStatus(ctx);
@@ -1478,7 +1967,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						pauseGoal(ctx);
 						return;
 					case "resume":
-						resumeGoal(ctx);
+						resumeGoal(ctx, command.budget);
 						return;
 					case "clear":
 						clearGoal(ctx);
@@ -1494,6 +1983,45 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 
 	/**
+	 * Open or close the admission segment for a user message Pi has just delivered.
+	 *
+	 * This is the live half of `ownershipMarker`, and drawing the line here rather
+	 * than at `input` is what makes live accounting and branch replay converge:
+	 *
+	 * - `input` fires while the provider request is still streaming, so an ordinary
+	 *   prompt typed during an admitted Goal response would close the segment before
+	 *   that response is finalized and drop it live, while the replay — where the
+	 *   assistant message is appended *before* the prompt that interrupted it —
+	 *   charges it. A budget that only the live path failed to stop would then be
+	 *   crossed on reload.
+	 * - a queued steer is appended only after the in-flight assistant message and its
+	 *   tool results, so opening the segment when the message is *queued* would
+	 *   charge the previous identity's (or the previous turn's) work to this Goal.
+	 *
+	 * Pi appends the message in the same event, so the entry this sees is the entry
+	 * the replay reads. The segment is opened for the Goal that is current at
+	 * delivery — the identity whose newest snapshot precedes it — which is what stops
+	 * a work message queued for a Goal that has since been replaced, cleared, or
+	 * completed from opening anything.
+	 *
+	 * This is also the boundary that closes a superseded identity's admission: the
+	 * replacement kept the old segment open for its in-flight tail, and the first
+	 * delivered user message is where that tail is frozen onto the old identity's
+	 * durable record (see `GoalStore.closeSupersededSegment`).
+	 */
+	function applyDeliveredUserMessage(message: { content: unknown }, pi: ExtensionAPI): void {
+		const goal = store.get();
+		const isGoalWork =
+			goal != null && goal.status !== "complete" && messageText(message.content).startsWith(GOAL_MESSAGE_PREFIX);
+		store.closeSupersededAdmission(pi);
+		if (isGoalWork) {
+			store.beginGoalWork(goal.id);
+			return;
+		}
+		store.endGoalWork();
+	}
+
+	/**
 	 * Deliver a work-start (or work-redirect) message without ever waiting for an
 	 * active run to finish.
 	 *
@@ -1505,6 +2033,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * change of an active run is supposed to use. `pi.sendUserMessage` is
 	 * fire-and-forget: delivery failures surface as Pi extension errors, never as
 	 * a state lie ("steered" is reported only for the queueing itself).
+	 *
+	 * The admission segment is *not* opened here. It opens when the message is
+	 * delivered, in {@link applyDeliveredUserMessage}, because a steer reaches the
+	 * branch only after the work that was already in flight.
 	 */
 	function deliverWorkMessage(content: string, ctx: ExtensionCommandContext): "started" | "steered" {
 		if (ctx.isIdle()) {
@@ -1561,17 +2093,39 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		);
 	}
 
-	function resumeGoal(ctx: ExtensionCommandContext): void {
+	function resumeGoal(ctx: ExtensionCommandContext, budget: ResumeBudgetRequest): void {
 		const goal = store.get();
 		if (!goal) {
 			ctx.ui.notify(formatNoGoal(), "info");
+			return;
+		}
+		if (budget.kind === "value" && goal.status !== "budget_limited") {
+			ctx.ui.notify(
+				`Goal ${goal.id} is ${goal.status}; the --budget option only resumes a budget_limited Goal. ` +
+					"Use /goal resume without --budget.",
+				"warning",
+			);
+			return;
+		}
+		if (budget.kind === "none" && goal.status === "budget_limited") {
+			ctx.ui.notify(
+				`Goal ${goal.id} is budget_limited at ${store.getUsage().totalTokens} tokens of its ` +
+					`${goal.tokenBudget}-token budget. Resume it with a higher cumulative total: ` +
+					"/goal resume --budget <new-total>.",
+				"warning",
+			);
 			return;
 		}
 		if (goal.status === "active") {
 			ctx.ui.notify(`Goal ${goal.id} is already active; work continues at every settlement.`, "info");
 			return;
 		}
-		if (goal.status !== "paused" && goal.status !== "blocked" && goal.status !== "usage_limited") {
+		if (
+			goal.status !== "paused" &&
+			goal.status !== "blocked" &&
+			goal.status !== "usage_limited" &&
+			goal.status !== "budget_limited"
+		) {
 			ctx.ui.notify(
 				`Goal ${goal.id} is ${goal.status} and cannot be resumed. A complete Goal is finished — use /goal <objective> to set a new one.`,
 				"warning",
@@ -1583,22 +2137,36 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// audit itself is dropped by the store, so what resumes is the objective and
 		// its retained progress rather than the count that stopped it.
 		safety.reset();
-		const resumed = store.markResumed(pi);
+		const resumed = store.markResumed(
+			pi,
+			budget.kind === "value"
+				? { tokenBudget: budget.value, maxTokenBudget: budgetSettings.maxTokenBudget }
+				: {},
+		);
 		if (!resumed.ok) {
 			notifyMutationFailure(ctx, "resumed", resumed);
 			return;
 		}
+		// The old budget gate is lifted only after the new ceiling is durably
+		// authorized. An in-flight old-episode wrap-up keeps its admitted usage, and
+		// the steered resume message is what runs the resumed work; no second
+		// old-budget wrap-up is sent.
+		budgetGateActive = false;
+		wrapUpArmed = false;
 		updateStatus(ctx);
 		const updated = resumed.goal!;
+		const previousStatus = goal.status;
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
-		const delivery = deliverWorkMessage(formatResumeMessage(updated), ctx);
+		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus), ctx);
 		const restarted =
-			goal.status === "paused"
+			previousStatus === "paused"
 				? "Work restarted from retained progress."
-				: goal.status === "blocked"
+				: previousStatus === "blocked"
 					? "The blocked audit that ended it is cleared, so work restarts from retained progress with a fresh audit."
-					: "The usage-limit stop that ended it is cleared, so work restarts from retained progress.";
+					: previousStatus === "usage_limited"
+						? "The usage-limit stop that ended it is cleared, so work restarts from retained progress."
+						: `The cumulative token ceiling is now ${updated.tokenBudget} tokens with ${store.getUsage().totalTokens} tokens already accounted; the old episode's wrap-up is cancelled.`;
 		ctx.ui.notify(
 			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
 			"info",
@@ -1715,7 +2283,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		ctx.ui.notify(
-			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; /goal resume restarts work.`,
+			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ` +
+				(updated.status === "budget_limited"
+					? "/goal resume --budget <new-total> restarts work with a higher cumulative ceiling."
+					: "/goal resume restarts work."),
 			"info",
 		);
 	}
@@ -1811,10 +2382,33 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const previous = store.get();
 			const replacing = previous != null;
 
+			// A fresh create (for example after a Clear) has no current Goal to preserve,
+			// but a superseded identity's open admission still has to be closed before the
+			// new snapshot. Creating a Goal leaves no marker of its own on the branch, so
+			// replay only closes that admission at a durable freeze: refuse rather than
+			// lose admitted work, or let the live path and the replay disagree about it.
+			if (!replacing) {
+				if (!store.closeSupersededForCreation(pi)) {
+					ctx.ui.notify(
+						"Goal not created: the replaced Goal's admitted work could not be written to the session. " +
+							"Nothing was stored; fix the cause and run /goal again.",
+						"error",
+					);
+					return;
+				}
+			}
+
 			const goal = store.create(validation.objective, "command", { tokenBudget: budget.tokenBudget });
 			const sameRecord = (candidate: GoalRecord | null | undefined) =>
 				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
 			try {
+				// Replacement must preserve the superseded Goal's already-accounted
+				// totals as a durable historical record before the new identity takes
+				// over the session's Goal slot and resets the live ledger. If that
+				// freeze fails, the replacement must not proceed.
+				if (replacing && !store.preserveSupersededForReplacement(pi)) {
+					throw new Error("could not freeze the replaced Goal's admitted work");
+				}
 				// Stage and commit before any wait: the new record is what a
 				// concurrent /goal clear, edit, pause, or resume acts on, and
 				// revalidating it after the wait detects exactly that change.
@@ -1883,6 +2477,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// allows.
 				safety.reset();
 				pendingRunKind = "kickoff";
+				// The admission segment opens when the kickoff is delivered, in
+				// `applyDeliveredUserMessage`, like every other work message.
 				pi.sendUserMessage(formatKickoffMessage(goal));
 				delivery = "started";
 			}

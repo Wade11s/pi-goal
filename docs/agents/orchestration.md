@@ -24,10 +24,9 @@ Pull requests are reviewed through `rex-subagent` by this reviewer pool, using h
 
 | Reviewer model |
 | --- |
-| `magpie/deepai/deepseek-v4.1-flash:high` |
-| `magpie/grok/grok-4.7@500k:high` |
-
-Grok temporarily replaces `workbuddy/hy4free:high` until that reviewer's usage limit resets. Completed hy4free reviews remain valid; new or unfinished review assignments use Grok.
+| `magpie/workbuddy/deepseek-v4.1-flash:high` |
+| `magpie/workbuddy/hy4free:high` |
+| `magpie/zcode/GLM-5.3:max` |
 
 The orchestrator dispatches reviews, routes requested changes back to the implementation worker, and verifies the resulting updates.
 
