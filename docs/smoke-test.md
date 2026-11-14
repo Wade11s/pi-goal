@@ -259,6 +259,29 @@ installed. Expect:
   chain at one. The handoff grants no extra unattended turns and changes no reset
   rule — the first user prompt is still a user action that starts a fresh audit.
 
+## 18. Optional: model-tool creation authority
+
+`create_goal` creates a Goal only from an explicit request, corroborated at
+execution time. With no Goal set, type a request that expressly asks for a Goal:
+
+```
+Please create a Goal for writing the release notes
+```
+
+Expect the model to call `create_goal` with `user_request` quoting your words
+verbatim, and a `Goal ... created and activated` notification. The objective the
+model writes need not repeat your quotation.
+
+Then try the negative controls:
+
+- ask the model to create a Goal **without** an explicit request (for example
+  "work on the release notes") and it must refuse with `goal: null`, change
+  nothing, and start no continuation;
+- send a newer message that does not ask for a Goal, then have the model quote
+  the earlier request: the newer message replaces the authority, so the call is
+  refused;
+- use `/goal <objective>` directly: it still creates a Goal with no quotation.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -283,3 +306,8 @@ installed. Expect:
       starts a fresh chain.
 - [ ] A legacy open audit is preserved with its description and count and is issued
       a fresh Blocker identity at cutover, granting no extra unattended turns.
+- [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
+      authoritative request, and refuses forged, stale, negated, hypothetical,
+      question-shaped, non-explicit, and wrong-source quotations with
+      `goal: null` and no state change.
+- [ ] `/goal <objective>` still creates a Goal without a quotation.

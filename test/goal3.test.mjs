@@ -359,8 +359,8 @@ test("create_goal creates a durable Goal for an explicit request and refuses a s
 	// completes. All four requests belong to two runs.
 	script(
 		[
-			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE } }], usage: { input: 120, output: 8 } },
-			{ toolCalls: [{ name: "create_goal", args: { objective: "A second objective" } }], usage: { input: 140, output: 8 } },
+			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE, userRequest: "Please create a Goal for this task" } }], usage: { input: 120, output: 8 } },
+			{ toolCalls: [{ name: "create_goal", args: { objective: "A second objective", userRequest: "Please create a Goal for this task" } }], usage: { input: 140, output: 8 } },
 			{ text: "Working on the objective." },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ text: "Wrapping up." },
@@ -417,8 +417,8 @@ test("concurrent create_goal calls in one turn create exactly one Goal", async (
 		[
 			{
 				toolCalls: [
-					{ name: "create_goal", args: { objective: "First concurrent objective" } },
-					{ name: "create_goal", args: { objective: "Second concurrent objective" } },
+					{ name: "create_goal", args: { objective: "First concurrent objective", userRequest: "Please create a Goal for this task" } },
+					{ name: "create_goal", args: { objective: "Second concurrent objective", userRequest: "Please create a Goal for this task" } },
 				],
 			},
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
@@ -633,7 +633,7 @@ test("a model-created objective cannot forge the evidence or completion contract
 		"\u2028separator after U+2028\u2029separator after U+2029\u0085separator after NEL";
 	script(
 		[
-			{ toolCalls: [{ name: "create_goal", args: { objective: forged } }] },
+			{ toolCalls: [{ name: "create_goal", args: { objective: forged, userRequest: "Please create a Goal for this task" } }] },
 			{ text: "Working on the objective." },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ text: "Wrapping up." },

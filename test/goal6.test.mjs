@@ -418,8 +418,8 @@ test("create_goal validates its token budget against the configured maximum", as
 	const session = await PiRpcSession.start({ settings: { goal: { maxTokenBudget: 500 } } });
 	script(
 		[
-			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE, tokenBudget: 900 } }] },
-			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE, tokenBudget: 400 } }] },
+			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE, tokenBudget: 900, userRequest: "Please create a Goal with a huge budget" } }] },
+			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE, tokenBudget: 400, userRequest: "Please create a Goal with a huge budget" } }] },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ text: "Wrapping up." },
 		],
@@ -676,7 +676,7 @@ test("concurrent nested usage that lands after the budget crossing survives an u
 const MID_TURN_STEPS = [
 	{
 		toolCalls: [
-			{ name: "create_goal", args: { objective: OBJECTIVE } },
+			{ name: "create_goal", args: { objective: OBJECTIVE, userRequest: "create a Goal and run the gated tool" } },
 			{ name: NESTED_GATED_TOOL, args: {} },
 		],
 		usage: { input: 10, output: 5 },

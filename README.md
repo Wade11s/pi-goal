@@ -477,14 +477,52 @@ objective is absent or truncated in context.
 ### Model tool: `create_goal`
 
 `create_goal` lets the model create a Goal, but only for an **explicit user or
-system request** — the tool description and its prompt guidelines say so, and
-nothing in the extension infers a Goal from an ordinary task. It validates the
-objective, refuses an ephemeral session that could not restore the Goal, refuses
-while this session already has a Goal (including when two calls arrive in the
-same assistant turn), and persists the snapshot before reporting success.
-Creating a Goal through the tool does not send a kickoff message: the model is
-already mid-run, and the continuation seam picks the Goal up at the next
-settlement.
+system request**, corroborated at execution time. The tool description and its
+prompt guidelines say so, and nothing in the extension infers a Goal from an
+ordinary task. It validates the objective, refuses an ephemeral session that
+could not restore the Goal, refuses while this session already has a Goal
+(including when two calls arrive in the same assistant turn), and persists the
+snapshot before reporting success. Creating a Goal through the tool does not
+send a kickoff message: the model is already mid-run, and the continuation seam
+picks the Goal up at the next settlement.
+
+#### Creation authority
+
+`create_goal` requires `user_request`: the exact words of the explicit
+Goal-creation request, quoted verbatim. The extension checks the quote against
+**one currently authoritative source** — the raw interactive/RPC user input
+that started the current execution, or a Pi custom message (any `customType`).
+Skill/template expansion and other transformed prompt text are not evidence,
+and an extension calling `pi.sendUserMessage()` never acquires human-user
+authority through that API. Standing system-prompt instructions do not
+authorize a specific Goal.
+
+The quote must be the complete affirmative instruction, not a keyword or a
+convenient fragment. Matching is **case-sensitive** and permits only
+whitespace-folding differences; a paraphrase is not evidence. The rules are
+conservative and deterministic: an express request to create, set, or start a
+Goal. Ordinary work, mere mentions, questions, hypotheticals, negations, and
+requests merely to keep working do not qualify. Intent is evaluated in clause
+order, so a later explicit correction may supersede an earlier negation, while
+a later cancellation or negation supersedes the quoted request. Ambiguity fails
+closed, and a fragment cannot be lifted out of a negated sentence. The
+objective remains model-written and need not repeat the quotation.
+
+Authority belongs to the execution started by the request and survives later
+model turns, Pi retries, compaction, and overflow recovery inside it. A newer
+interactive/RPC user message or Pi custom message replaces it, even when
+unrelated. Settlement, session restart, branch navigation, a successful Goal
+creation, and direct Goal lifecycle operations clear it. Authority is
+one-shot: a successful creation consumes it, while a rejection leaves it valid
+so a corrected call can retry.
+
+A missing, forged, stale, non-explicit, or ambiguous quote is refused with a
+tool error carrying `goal: null` and no Goal state is created or mutated. The
+refusal opens no interactive confirmation (including in headless/RPC hosts) and
+starts no Goal, Continuation, or admitted Goal work. Evidence is checked only
+at execution time: snapshots retain `origin: "tool"` and gain no persisted
+quotation, source-message id, or reusable authorization marker. The direct
+`/goal <objective>` path is unchanged and needs no quotation.
 
 ### The objective's trust boundary
 
@@ -910,6 +948,15 @@ test settles on a provider error.
   the request: unusual phrasing can be refused, and a pause request delivered
   only as an image, or one whose exact words were never sent as text, cannot be
   corroborated. The user can always pause directly with `/goal pause`.
+- `create_goal` is corroborated by exact-quote matching plus a conservative
+  deterministic clause-order check. The extension does not semantically
+  understand the request: unusual phrasing can be refused, a request delivered
+  only as an image cannot be corroborated, and other languages retain
+  `/goal <objective>` as the direct creation path. A quotation is checked
+  against the one currently authoritative raw interactive/RPC input or Pi
+  custom message, so a request whose exact words were never sent as text, or
+  one that a newer message has replaced, is refused with `goal: null`. The user
+  can always create a Goal directly with `/goal <objective>`.
 - An edit preserves the Goal identity, creation time, origin, budget, and usage
   history: only the objective changes and the revision advances. Replacement of
   an unfinished Goal gives the session a fresh identity and fresh revisions, and

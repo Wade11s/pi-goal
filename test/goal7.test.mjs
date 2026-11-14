@@ -610,7 +610,7 @@ test("fork from before the Goal inherits no Goal, and that branch's slot is free
 		// hold that the test aborts.
 		script(
 			[
-				{ toolCalls: [{ name: "create_goal", args: { objective: "Fresh goal created in the fork" } }] },
+				{ toolCalls: [{ name: "create_goal", args: { objective: "Fresh goal created in the fork", userRequest: "please create a goal" } }] },
 				{ text: "created in fork" },
 				{ hang: true },
 			],
