@@ -349,8 +349,22 @@ test("a legacy open audit is preserved for the Blocker-identity handoff without 
 		assert.equal(status.blocker, "The test database is unavailable");
 		assert.equal(status.blockedTurns, 2);
 		const repaired = goalStates(readSessionEntries(sessionFile)).at(-1).data.goal;
-		assert.deepEqual(repaired.blockedAudit, { blocker: "The test database is unavailable", turns: 2 });
+		assert.equal(repaired.blockedAudit.blocker, "The test database is unavailable", "description preserved");
+		assert.equal(repaired.blockedAudit.turns, 2, "count preserved");
+		assert.match(
+			repaired.blockedAudit.blockerId,
+			/^blocker_[0-9a-f]{8}$/,
+			"the cutover issues a fresh opaque Blocker identity",
+		);
+		assert.notEqual(
+			repaired.blockedAudit.blockerId,
+			"The test database is unavailable",
+			"the identity is not derived from the blocker text",
+		);
+		// The handoff grants no extra unattended turns: the count is unchanged and no
+		// work was admitted by loading and migrating alone.
 		assertStepsConsumed(session, 0, []);
+		assert.equal(runCount(session), 0, "the cutover admits no work");
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();

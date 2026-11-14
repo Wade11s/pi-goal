@@ -28,6 +28,7 @@ import {
 	readSessionEntries,
 	runCount,
 } from "./helpers/rpc-harness.mjs";
+import { structuredGoal } from "./helpers/blocked-audit.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
 const EDITED_OBJECTIVE = "Land the refined objective end to end";
@@ -488,22 +489,26 @@ test("a bare resume of a budget_limited Goal is guidance, and the budget option 
 		t.after(async () => {
 			await session.stop();
 		});
-		script(
-			[
-				{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-				{ text: "Waiting." },
-				{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-				{ text: "Waiting." },
-				{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-				{ text: "Reporting the blocker." },
-				{ text: "Resumed answer." },
-				{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-				{ text: "Done." },
-			],
-			session,
-		);
+		// The first report omits blocker_id and the extension issues the identity the
+		// later turns pass back, so this is the same three-consecutive-turn audit.
+		const gate = join(session.cwd, "pi-goal-audit-gate");
+		const chained = (id) => [
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Waiting.", waitForFile: gate },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }] },
+			{ text: "Waiting." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }] },
+			{ text: "Reporting the blocker." },
+			{ text: "Resumed answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		];
+		writeFileSync(session.scriptPath, JSON.stringify(chained("@issued")), "utf8");
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		writeFileSync(session.scriptPath, JSON.stringify(chained(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "blocked", "the blocked Goal");
 		await session.prompt("/goal resume --budget 100");
 		await session.waitForNotify((r) => r.message.includes("--budget option only resumes a budget_limited Goal"));
