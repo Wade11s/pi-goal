@@ -1219,13 +1219,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Get Goal",
 		description:
 			"Get the current session Goal: objective, lifecycle status, revision, token budget, accounted " +
-			"usage, remaining capacity, and active time. Returns goal: null when no Goal is set.",
+			"usage, remaining capacity, active time, and the open blocked audit's Blocker identity, latest " +
+			"description, and count. Returns goal: null when no Goal is set.",
 		parameters: Type.Object({}),
 		outputSchema: getGoalOutputSchema,
 		promptSnippet: "Fetch the current session Goal objective, lifecycle status, and budget",
 		promptGuidelines: [
 			"Use get_goal when the session Goal objective or its lifecycle status is absent or truncated in the current context.",
 			"Check get_goal's usage.remainingTokens before starting expensive work: a Goal that reaches its token budget becomes budget_limited and stops continuing.",
+			"Call get_goal before re-reporting a blocker: it carries the open audit's Blocker identity, which update_goal's blocker_id must repeat verbatim for the same condition. The extension never compares blocker text.",
 		],
 		async execute() {
 			const goal = store.get();
@@ -1237,8 +1239,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				};
 			}
 			const state = toPublicState(goal);
+			// The model-facing text carries the open audit's identity on top of the
+			// human-facing summary: reusing it is the only way a reworded report advances
+			// the audit, and this is the tool the model reads it from. The human status
+			// deliberately does not show the opaque identity.
+			const identity =
+				state.blockerId === null
+					? ""
+					: `\nBlocker identity: ${state.blockerId} (pass it back verbatim in update_goal's blocker_id for the ` +
+						"same condition; omit it for a genuinely different one)";
 			return {
-				content: [{ type: "text", text: formatGoalSummary(state) }],
+				content: [{ type: "text", text: `${formatGoalSummary(state)}${identity}` }],
 				structuredContent: { goal: state },
 				details: { goal: state },
 			};
@@ -1346,7 +1357,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		label: "Update Goal",
 		description:
 			"Update the current Goal. Supported actions: \"complete\" after an evidence-based completion audit, " +
-			"\"blocked\" once the same genuine blocker has persisted for at least three consecutive Goal turns, " +
+			"\"blocked\" while the same genuine blocker persists across consecutive Goal turns (identify it with " +
+			"blocker_id, which pi-goal issues on the first report and which reworded reports must pass back), " +
 			"and \"pause\" after an explicit user request, which must be quoted verbatim in user_request. " +
 			"Complete and blocked are terminal: they stop the Goal's automatic continuation. " +
 			"The model cannot resume, clear, replace, budget-limit, or raise the token budget of a Goal.",
@@ -1361,6 +1373,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					description:
 						`Required for action blocked: the genuine blocker in plain language (${MIN_BLOCKER_LENGTH}-${MAX_BLOCKER_LENGTH} characters). ` +
 						"Say what is actually blocking the work and what would unblock it.",
+				}),
+			),
+			blocker_id: Type.Optional(
+				Type.String({
+					description:
+						"The Blocker identity of the condition being reported, for action blocked. Omit it for the first " +
+						"report of a condition and pi-goal issues one; pass the current identity back verbatim on every " +
+						"later report of that same condition, so differently worded descriptions still advance the " +
+						"blocked audit. Omitting it reports a genuinely different condition and starts a fresh chain at " +
+						"one. An identity the extension did not issue for the currently open audit is refused without " +
+						"changing the Goal. The extension never compares blocker text.",
 				}),
 			),
 			userRequest: Type.Optional(
@@ -1378,6 +1401,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Call update_goal with action complete only after every explicit requirement of the objective is verified by current-state evidence.",
 			`Call update_goal with action blocked only when the same genuine blocker has persisted for at least ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns, and never because the work is merely hard, slow, uncertain, or incomplete.`,
+			"Report the blocker on every Goal turn it persists: the first report omits blocker_id and pi-goal issues an opaque Blocker identity, and every later report of that same condition passes it back verbatim. Omit it only for a genuinely different condition.",
+			"Never guess or reuse an old Blocker identity: call get_goal for the current one. The extension never compares blocker text, so wording alone can never advance the blocked audit.",
 			"Completing or blocking a Goal stops its automatic continuation, so never use either to escape a difficult or merely tiring task.",
 			"Call update_goal with action pause only when the user explicitly asked to pause this Goal, and quote their exact words in user_request. Never pause on your own initiative.",
 			"Never call update_goal to resume or clear a Goal; the user owns those transitions, and a budget-raising resume is /goal resume --budget <new-total>.",
@@ -1389,16 +1414,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		 * error, and the Goal keeps burning turns. Anything else is passed through
 		 * with an empty action so an unsupported action is refused with a real
 		 * explanation instead of being silently ignored.
+		 *
+		 * `blocker_id` gets the same treatment as `user_request`: the canonical
+		 * spelling is snake_case — the one the tool description, the guidelines, and
+		 * every Continuation use — and the camelCase a model drifts into is accepted
+		 * too.
 		 */
-		prepareArguments: (args: unknown): { action: string; blocker?: string; userRequest?: string } => {
+		prepareArguments: (
+			args: unknown,
+		): { action: string; blocker?: string; blockerId?: string; userRequest?: string } => {
 			if (typeof args !== "object" || args === null) return { action: "" };
 			const record = args as Record<string, unknown>;
 			const blocker = typeof record.blocker === "string" ? record.blocker : undefined;
+			const rawBlockerId = record.blocker_id ?? record.blockerId;
+			const blockerId = typeof rawBlockerId === "string" ? rawBlockerId : undefined;
 			const rawRequest = record.userRequest ?? record.user_request;
 			const userRequest = typeof rawRequest === "string" ? rawRequest : undefined;
 			const withBlocker = (action: string) => ({
 				action,
 				...(blocker === undefined ? {} : { blocker }),
+				...(blockerId === undefined ? {} : { blockerId }),
 				...(userRequest === undefined ? {} : { userRequest }),
 			});
 			if (record.action !== undefined) return withBlocker(String(record.action));
@@ -1409,7 +1444,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		},
 		async execute(
 			_toolCallId: string,
-			params: { action: string; blocker?: string; userRequest?: string },
+			params: { action: string; blocker?: string; blockerId?: string; userRequest?: string },
 			_signal,
 			_onUpdate,
 			ctx: ExtensionToolContext,
@@ -1419,7 +1454,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				return goalToolError(formatNoGoal(), null);
 			}
 			if (params?.action === "blocked") {
-				return reportBlocker(goal, params.blocker, ctx);
+				return reportBlocker(goal, params.blocker, params.blockerId, ctx);
 			}
 			/**
 			 * Refuse a call whose decision was prepared against a different Goal
@@ -1560,12 +1595,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * The extension — not the model — decides when the audit is satisfied, so an
 	 * eager or drifted `blocked` call cannot end a Goal that has only seen a
 	 * blocker once. Before the threshold the report is persisted (making the audit
-	 * durable across compaction and a session restore) and refused with the
-	 * current count, which is also what tells the model to keep working.
+	 * durable across compaction and a session restore) and refused with the current
+	 * count, which is also what tells the model to keep working.
+	 *
+	 * The refusal carries the open audit's Blocker identity, latest description,
+	 * and count, because that is the only way the model can report the *same*
+	 * condition on the next turn: it must pass the identity back in `blocker_id`.
+	 * The extension never compares blocker text, so a refusal that omitted the
+	 * identity would leave a reworded repetition unable to advance the audit.
 	 */
 	function reportBlocker(
 		goal: GoalRecord,
 		rawBlocker: string | undefined,
+		rawBlockerId: string | undefined,
 		ctx: ExtensionToolContext,
 	) {
 		const validation = validateBlocker(String(rawBlocker ?? ""));
@@ -1580,12 +1622,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			pi,
 			{
 				blocker: validation.blocker,
+				...(rawBlockerId === undefined ? {} : { blockerId: rawBlockerId }),
 				turn: safety.currentTurn,
 			},
 			turnGoal ?? undefined,
 		);
 		if (result.ok && !result.repeat) blockerCountedThisRun = true;
 		if (!result.ok) {
+			if (result.reason === "not-current") {
+				const current = store.get();
+				return goalToolError(result.message, current ? toPublicState(current) : null);
+			}
 			if (result.reason === "stale") {
 				const current = store.get();
 				return goalToolError(
@@ -1603,6 +1650,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return goalToolError(message, toPublicState(goal));
 		}
 		const state = toPublicState(result.goal);
+		// The model-facing identity line: reuse this verbatim for the same condition,
+		// omit it for a genuinely different one. It is deliberately *not* part of the
+		// human-facing status, where the opaque identity says nothing useful.
+		const identity = state.blockerId
+			? `Blocker identity ${state.blockerId}: pass it back verbatim in blocker_id on every later report of ` +
+				"this same condition, so a reworded description still advances the audit. Omit it only to report a " +
+				"genuinely different condition. "
+			: "";
 		if (result.thresholdMet) {
 			ctx.ui.notify(
 				`Goal ${result.goal.id} is now blocked: ${validation.blocker} ` +
@@ -1632,7 +1687,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			? `This blocker was already recorded for the current Goal turn (${result.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns), so it was not counted again.`
 			: `Blocker recorded (${result.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns).`;
 		return goalToolError(
-			`${counted} The Goal stays active: the same genuine blocker must persist for at least ` +
+			`${counted} ${identity}The Goal stays active: the same genuine blocker must persist for at least ` +
 				`${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns before it may be marked blocked, so a transient ` +
 				"failure cannot stop useful work. " +
 				(result.turns > 1

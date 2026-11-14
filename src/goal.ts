@@ -122,8 +122,8 @@ export interface GoalRecord {
 	 */
 	wrapUpPending?: boolean;
 	/**
-	 * The blocker that stopped (or is stopping) this Goal, and how many
-	 * consecutive Goal turns have reported it.
+	 * The Blocker identity and the blocker that stopped (or is stopping) this Goal,
+	 * and how many consecutive Goal turns have reported it.
 	 *
 	 * Durable because the three-turn audit has to survive compaction and a
 	 * session restore: a reload must not hand the model a fresh three turns to
@@ -137,8 +137,17 @@ export interface GoalRecord {
 /**
  * The model-reported blocker audit: the same genuine blocker, counted across
  * consecutive Goal turns.
+ *
+ * `blockerId` is the opaque Blocker identity the extension issued for this chain.
+ * It is what makes two differently worded reports the same condition: the model
+ * chooses to reuse it, and the extension alone enforces identity, consecutiveness,
+ * and the threshold. It is absent for an audit an extension-enforced conservative
+ * stop synthesized (that Goal is already stopped, so no chain can be advanced)
+ * and for a pre-repair 0.1.0 audit before its one-time cutover handoff.
  */
 export interface BlockedAudit {
+	/** Opaque identity the extension issued for this audit chain. */
+	blockerId?: string;
 	/** The blocker as the model reported it (trimmed), or the synthesized reason for an extension-enforced stop. */
 	blocker: string;
 	/** Consecutive Goal turns that reported this same blocker. */
@@ -310,6 +319,13 @@ export const goalPublicStateSchema = Type.Object({
 	 * (the provider's usage-limit evidence), and while an audit is still running.
 	 */
 	blocker: Type.Union([Type.Null(), Type.String()]),
+	/**
+	 * The open audit's opaque Blocker identity, or null when no audit is open.
+	 * Passing it back verbatim in `update_goal`'s `blocker_id` is how the model
+	 * reports the same condition with different wording; omitting it reports a
+	 * genuinely different condition and starts a fresh chain.
+	 */
+	blockerId: Type.Union([Type.Null(), Type.String()]),
 	/** Consecutive Goal turns that reported `blocker`; 0 when no audit has run. */
 	blockedTurns: Type.Integer(),
 	usage: Type.Object({
@@ -360,6 +376,7 @@ export function toPublicState(goal: GoalRecord): GoalPublicState {
 		revision: goal.revision,
 		tokenBudget,
 		blocker: goal.blockedAudit?.blocker ?? null,
+		blockerId: goal.blockedAudit?.blockerId ?? null,
 		blockedTurns: goal.blockedAudit?.turns ?? 0,
 		usage: {
 			totalTokens: used,
@@ -784,10 +801,13 @@ export function formatObjectiveData(goal: GoalRecord): string {
  * never impersonate the audit or the completion contract.
  *
  * Beyond the completion audit it carries the two contracts this milestone adds:
- * the no-progress classification (progress / verified wait / no progress, with
- * equivalent blockers treated as one condition across turns) and the blocked
- * audit, whose three-consecutive-Goal-turn threshold the extension enforces
- * itself so an eager report cannot end the Goal early.
+ * the no-progress classification (progress / verified wait / no progress) and the
+ * blocked audit, whose three-consecutive-Goal-turn threshold the extension
+ * enforces itself so an eager report cannot end the Goal early. The audit is
+ * scoped by the opaque Blocker identity the extension issues, and while one is
+ * open the message restates that identity, the latest description, and the count,
+ * because compaction and a restart are exactly when they would otherwise be
+ * missing from the model's context.
  */
 export function formatContinuationMessage(goal: GoalRecord): string {
 	return [
@@ -811,7 +831,7 @@ export function formatContinuationMessage(goal: GoalRecord): string {
 		"No-progress check (classify the previous Goal turn before choosing the next action):",
 		"- Progress changes authoritative state, completes work, or yields evidence that changes the next action. Restating status and unexecuted plans are not progress.",
 		"- A verified wait polls a specific process, session, job, or tool handle confirmed live now. Conversation, intent, prior output, or a lock or state file alone is not enough. Treat the work as stopped only when authoritative state says it is terminal or its handle is missing; an observation timeout or a transient polling failure is not terminal, so re-poll the same handle or inspect other authoritative state.",
-		"- On a no-progress turn, revalidate it and take the next available safe action. If none exists because the same genuine blocker remains, report the blocker and leave the Goal active until the blocked audit threshold below is met. Treat equivalent blockers as the same condition across turns even when their wording or stated next step changes.",
+		"- On a no-progress turn, revalidate it and take the next available safe action. If none exists because the same genuine blocker remains, report the blocker with its current Blocker identity and leave the Goal active until the blocked audit threshold below is met, so a reworded description or a changed next step still advances the audit.",
 		"",
 		"Completion contract:",
 		"- Only when every requirement is verified by current-state evidence, call update_goal to mark the Goal complete.",
@@ -821,7 +841,21 @@ export function formatContinuationMessage(goal: GoalRecord): string {
 		`Blocked audit (${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns with the same genuine blocker):`,
 		`- Report the blocker on every Goal turn it persists, with update_goal action "blocked" and a plain-language description of what is blocking the work and what would unblock it. pi-goal counts the consecutive Goal turns that reported it and only marks the Goal blocked on the ${BLOCKED_AUDIT_THRESHOLD}rd, so an early report is recorded rather than acted on.`,
 		"- The chain is consecutive: a Goal turn that makes progress, verifies a wait, or reports no blocker breaks it and the count starts again.",
-		"- Equivalent blockers count as the same condition, so a reworded repetition still advances the audit; a genuinely different blocker restarts it at one.",
+		"- Identity, not wording, decides equivalence. The first report of a condition omits blocker_id and pi-goal issues an opaque Blocker identity; every later report of that same condition passes it back verbatim in blocker_id, so a reworded description or a changed next step still advances the audit.",
+		"- Omitting blocker_id reports a genuinely different condition: it starts a new chain at one with a fresh identity, and the old chain can never resume.",
+		"- An unrecognized or non-current blocker_id is refused without changing the Goal. Call get_goal for the current identity, then retry with it for the same condition or without one for a different condition. pi-goal never compares blocker text, so wording alone can never advance the audit.",
+		// While an audit is open, the Continuation restates its identity, latest
+		// description, and count: they are the three things the model needs to report
+		// the *same* condition on the next turn, and compaction or a restart is
+		// exactly when they would otherwise be missing from its context.
+		...(goal.blockedAudit?.blockerId === undefined
+			? []
+			: [
+				"Open blocked audit on this Goal right now:",
+				`- Blocker identity: ${goal.blockedAudit.blockerId} — pass it back verbatim in blocker_id on every later report of this same condition.`,
+				`- Latest description: ${goal.blockedAudit.blocker}`,
+				`- Count: ${goal.blockedAudit.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns.`,
+			]),
 		'- Use "blocked" only at a genuine impasse where no defensible path remains without user input or an external-state change. Never use it because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.',
 		'- A blocked Goal never continues automatically and only the user can resume it (/goal resume, which starts a fresh audit), so never reach for "blocked" to escape a difficult or merely tiring task.',
 		"",

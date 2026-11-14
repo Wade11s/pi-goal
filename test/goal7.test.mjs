@@ -30,6 +30,7 @@ import {
 	lastGoalSnapshot,
 	readSessionEntries,
 } from "./helpers/rpc-harness.mjs";
+import { structuredGoal } from "./helpers/blocked-audit.mjs";
 
 const TREE_NAV = fileURLToPath(new URL("./extensions/tree-nav.ts", import.meta.url));
 
@@ -784,31 +785,32 @@ test("a blocked Goal reconstructed from a branch keeps its audit, and /goal resu
 	// reconstructed branch, then the resumed work: its kickoff, one continuation,
 	// and the completion.
 	const BLOCKER = "the upstream release API token has not been issued yet";
-	script(
-		[
-			{ text: "Kickoff answer." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Waiting." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
-			{ text: "Reporting the blocker." },
-			{ toolCalls: [{ name: "get_goal", args: {} }] },
-			{ text: "The Goal is blocked." },
-			{ text: "Resumed work after the blocker was resolved." },
-			{ text: "Still working." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-			{ text: "Wrapping up." },
-		],
-		session,
-	);
+	// The first report omits blocker_id and the extension issues the identity the
+	// later turns pass back, so this is the same three-consecutive-turn audit.
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	const chained = (id) => [
+		{ text: "Kickoff answer." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+		{ text: "Waiting.", waitForFile: gate },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }] },
+		{ text: "Waiting." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER, blocker_id: id } }] },
+		{ text: "Reporting the blocker." },
+		{ toolCalls: [{ name: "get_goal", args: {} }] },
+		{ text: "The Goal is blocked." },
+		{ text: "Resumed work after the blocker was resolved." },
+		{ text: "Still working." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+		{ text: "Wrapping up." },
+	];
+	writeFileSync(session.scriptPath, JSON.stringify(chained("@issued")), "utf8");
 	try {
 		await session.prompt(`/goal Make the full test suite pass in this repository`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await session.waitFor("the third report blocked the Goal", async () => {
-			const entries = readSessionEntries(await session.sessionFile());
-			return lastGoalSnapshot(entries).data.goal.status === "blocked" ? true : undefined;
-		});
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		writeFileSync(session.scriptPath, JSON.stringify(chained(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
+		await session.waitForSettled(1);
 
 		// Every snapshot of the chain is a branch point, so each is navigable.
 		const states = goalStateEntries(readSessionEntries(await session.sessionFile()));

@@ -306,9 +306,10 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
 - The same message carries the no-progress contract: classify the previous Goal
   turn as **progress** (authoritative state changed, work completed, or evidence
   that changes the next action), a **verified wait** (a specific live handle was
-  polled), or **no progress** (status narration and unexecuted plans). It states
-  that equivalent blockers count as one condition across turns, and it states the
-  three-consecutive-Goal-turn blocked audit the extension enforces.
+  polled), or **no progress** (status narration and unexecuted plans). While a
+  blocked audit is open it restates that audit's Blocker identity, latest
+  description, and count, and it states the three-consecutive-Goal-turn blocked
+  audit the extension enforces.
 - The continuation requests exactly one further provider request per
   settlement. If queued work already causes that request, Pi satisfies the
   decision with it and makes no extra one.
@@ -551,28 +552,57 @@ those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
 <objective>`).
 
 `blocked` is the blocker contract. The model calls it with
-`{ action: "blocked", blocker: "…" }` once the same genuine blocker has persisted
-for at least **three consecutive Goal turns**. `complete` and `blocked` are both
-terminal: the Goal is persisted as `complete` or `blocked` and never continues
-again, including after a restart or reload. Any other action (`resume`, `clear`, a
-usage-limit or budget-limit transition) is refused with an explanation, because
-those transitions stay with the user.
+`{ action: "blocked", blocker: "…" }` — plus `blocker_id` on every later report of
+the same condition — while the same genuine blocker persists across consecutive
+Goal turns. `complete` and `blocked` are both terminal: the Goal is persisted as
+`complete` or `blocked` and never continues again, including after a restart or
+reload. Any other action (`resume`, `clear`, a usage-limit or budget-limit
+transition) is refused with an explanation, because those transitions stay with
+the user.
 
-The extension, not the model, decides when the blocked audit is satisfied:
+The extension, not the model, decides when the blocked audit is satisfied, and it
+decides it by **identity**, never by wording:
+
+- the first valid report of a condition omits `blocker_id`; pi-goal issues and
+  persists an opaque **Blocker identity** together with the latest
+  plain-language description and count;
+- a later report of the same condition passes that identity back verbatim in
+  `blocker_id`, so a reworded description or a changed next step still advances
+  the audit;
+- omitting `blocker_id` reports a genuinely different condition: it replaces the
+  open audit with a fresh identity and count one, and the old chain can never
+  resume;
+- an identity the extension did not issue for the currently open audit is refused
+  without Goal mutation, and the refusal does not own the turn, so a corrected
+  call in the same turn records the turn's first valid report;
+- there is no free-text normalization, similarity, or hashing anywhere in the
+  decision. The model judges semantic equivalence by choosing whether to reuse
+  the identity; the extension alone enforces identity, consecutiveness, and the
+  threshold. Incorrect reuse can merge different blockers, while an omitted
+  identity can split one condition and delay stopping — the latter is the safer
+  direction.
+
+On top of that:
 
 - a report is recorded per **Goal turn**, so several calls inside one turn count
   once and cannot satisfy the threshold on their own;
 - the chain is **consecutive**: a Goal turn that makes progress, verifies a wait,
   or reports no blocker breaks it, and the count starts again;
-- blockers are compared after normalizing case, whitespace, and trailing
-  punctuation, so a reworded repetition still advances the audit while a genuinely
-  different blocker restarts it at one;
-- below the threshold the report is persisted and refused with the current count,
-  which is what keeps a transient failure from stopping useful work. Both the audit
-  and every break in it are durable, so compaction neither hands the model three
-  fresh turns nor resurrects a chain it already invalidated, and bare `/goal` after
-  a restart still reports the blocker and its count. A prompt the user sends after
-  a restart is itself a user action, so it starts a fresh audit.
+- below the threshold the report is persisted and refused with the current count
+  and the open audit's identity, which is what keeps a transient failure from
+  stopping useful work while telling the model exactly how to report the same
+  condition next turn. Both the audit and every break in it are durable, so
+  compaction neither hands the model three fresh turns nor resurrects a chain it
+  already invalidated, and bare `/goal` after a restart still reports the blocker
+  and its count. A prompt the user sends after a restart is itself a user action,
+  so it starts a fresh audit.
+
+Structured `update_goal` and `get_goal` responses expose the open audit's current
+identity, latest description, and count, and every Continuation restates them
+while an audit is open. Tool descriptions and guidelines require a report on every
+Goal turn a genuine blocker persists — never a wait until the threshold is
+satisfied. The human-facing status shows the description and the count; the
+opaque identity says nothing useful there and is not displayed.
 
 ### Stopping safely on blockers and failures
 
@@ -582,7 +612,7 @@ mistaken for a malfunction.
 
 | Stop | Status | Why it is not ordinary work |
 | --- | --- | --- |
-| Same genuine blocker for three **consecutive** Goal turns | `blocked` | reported by the model through `update_goal`, enforced by the extension |
+| Same genuine blocker for three **consecutive** Goal turns, identified by the Blocker identity the extension issued | `blocked` | reported by the model through `update_goal`, enforced by the extension |
 | Three consecutive activity-free **automatic** Goal turns | `blocked` | no tool call, no output, and no reasoning: the continuation loop is malfunctioning |
 | Three consecutive automatic turns in which commands could not be executed | `blocked` | the shell itself failed to run |
 | Provider usage limit | `usage_limited` | the error says the plan or budget is exhausted |
@@ -696,6 +726,9 @@ unambiguous for programmatic callers:
   "goal": {
     "id": "goal_1a2b3c4d",
     "status": "active",
+    "blocker": "the upstream release API token has not been issued yet",
+    "blockerId": "blocker_9f2c1a77",
+    "blockedTurns": 2,
     "tokenBudget": 250000,
     "usage": {
       "totalTokens": 48210,
@@ -717,6 +750,12 @@ unambiguous for programmatic callers:
 the budget is reached; `budgetExhausted` is the explicit signal. The objective,
 identity, origin, timestamps, and revision are part of the same payload.
 
+While a blocked audit is open, the same payload carries its **Blocker identity**
+(`blockerId`), the latest plain-language `blocker`, and `blockedTurns`, and
+`get_goal`'s text repeats the identity so the model can pass it back verbatim in
+`update_goal`'s `blocker_id`. The human-facing status deliberately shows only the
+description and the count.
+
 ## Persistence model
 
 - Goal snapshots are stored as **custom session entries** (`goal-state`), which
@@ -736,11 +775,15 @@ identity, origin, timestamps, and revision are part of the same payload.
   so freezing the old identity's tail can never make it the current Goal. A
   branch change is announced only when the reconstructed state observably
   changed.
-- A snapshot carries the optional `blockedAudit` (`{ blocker, turns }`): the
-  blocker that stopped the Goal, or that is accumulating toward the blocked
-  threshold, and how many consecutive Goal turns reported it. It is durable for
-  the same reason the audit has to survive compaction, and a malformed one is
-  dropped during reconstruction rather than trusted.
+- A snapshot carries the optional `blockedAudit`
+  (`{ blockerId?, blocker, turns }`): the Blocker identity the extension issued for
+  the chain, the blocker that stopped the Goal or that is accumulating toward the
+  blocked threshold, and how many consecutive Goal turns reported it. It is durable
+  for the same reason the audit has to survive compaction, and a malformed one —
+  including a `blockerId` that is not a usable opaque token — is dropped during
+  reconstruction rather than trusted. A pre-repair 0.1.0 audit carries no
+  `blockerId`; it is preserved verbatim for the one-time cutover handoff and can
+  never be advanced by identity before it.
 - The kickoff is delivered as a **user message** carrying the user's own
   objective (attributed as user-provided Goal data). As the session's first
   conversation entry it also makes Pi create and flush the session file, which
@@ -818,10 +861,16 @@ message and triggers no provider request.
   retroactively. An active Goal whose reconstructed usage already reached its
   effective budget becomes `budget_limited` and earns one bounded wrap-up; a
   pending legacy wrap-up is delivered at most once.
-- A valid legacy open-audit description and count are preserved for the
-  Blocker-identity handoff; no text-similarity equivalence is introduced. An
-  existing `origin: "tool"` Goal remains a valid historical Goal, but migration
-  grants no fresh Goal-creation authority.
+- A valid legacy open audit is preserved for the Blocker-identity handoff, and an
+  **active** legacy Goal with a structurally valid count of one or two is issued a
+  fresh opaque Blocker identity in the same durable cutover transition. The
+  description and the count are carried over unchanged, the identity is not
+  derived from the blocker text, and no extra unattended turns are granted: the
+  next report of that condition must reuse the identity to advance, and omitting
+  it starts a fresh chain at one. A stopped Goal's audit describes its stop, is
+  never advanced again, and gets no identity. An existing `origin: "tool"` Goal
+  remains a valid historical Goal, but migration grants no fresh Goal-creation
+  authority.
 
 ## How the tests stay honest
 
@@ -942,12 +991,23 @@ replay, tombstones — are unit-tested in `test/store.test.mjs` against a fake P
 API that reproduces Pi's object-retention semantics, which is the only way to
 exercise the same-process reconstruction ordering an RPC test cannot reach. The
 budget-recovery durability and injected-fault seams are unit-tested in
-`test/goal10-budget-recovery-store.test.mjs`. The RPC tests cover everything
+`test/goal10-budget-recovery-store.test.mjs`. The Blocker-identity lifecycle, the
+reset combinatorics, an injected persistence failure, and the legacy open-audit
+handoff against the immutable 0.1.0 fixtures are unit-tested in
+`test/goal11-blocker-identity-store.test.mjs`. The RPC tests cover everything
 observable, including real nested usage (`test/extensions/nested-usage.ts`), real
 budget exhaustion with an attempted tool call during the wrap-up, cumulative
 budget-raising recovery and per-episode wrap-ups
-(`test/goal10-budget-recovery.test.mjs`), and recovery after both a graceful and
-an unclean restart.
+(`test/goal10-budget-recovery.test.mjs`), the whole Blocker-identity contract
+through real Pi turns (`test/goal11-blocker-identity.test.mjs`), and recovery
+after both a graceful and an unclean restart.
+
+A blocked-audit chain is scripted through `test/helpers/blocked-audit.mjs`: the
+scripted provider re-reads its script on every request and a `waitForFile` step
+holds its response until the test releases it, so the identity the extension
+issues can be read out of a structured tool result and passed back by the later
+turns — exactly what a real model does after calling `get_goal`, and race-free
+because no request after the gate is made until the gate file exists.
 
 ### Interactive smoke test
 

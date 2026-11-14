@@ -72,6 +72,19 @@ function goalId(): string {
 	return `goal_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
 }
 
+/**
+ * A fresh opaque Blocker identity for a new blocked-audit chain.
+ *
+ * Opaque and issued, never computed: nothing about the blocker's wording can
+ * predict, forge, or reproduce it, which is what keeps identity a decision the
+ * *model* makes (reuse it or not) rather than something the extension infers
+ * from text. There is deliberately no normalization, similarity, or hashing of
+ * the description anywhere in this file.
+ */
+function blockerId(): string {
+	return `blocker_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+}
+
 /** Payload persisted in `goal-usage` custom session entries. */
 export interface UsageCheckpoint {
 	version: 1;
@@ -177,6 +190,11 @@ export type BlockedReportResult =
 		repeat: boolean;
 	}
 	| { ok: false; reason: "not-active"; message?: string }
+	| {
+		ok: false;
+		reason: "not-current";
+		message: string;
+	}
 	| { ok: false; reason: "stale"; message: string }
 	| { ok: false; reason: "persistence"; error: unknown };
 
@@ -196,19 +214,6 @@ export type StopGoalResult =
 	| { ok: true; goal: GoalRecord }
 	| { ok: false; reason: "not-active" }
 	| { ok: false; reason: "persistence"; error: unknown };
-
-/**
- * How a blocker description is compared across Goal turns.
- *
- * "Equivalent blockers" have to count as the same condition, or a model that
- * reworded its report would restart the audit forever and the Goal would never
- * reach the threshold. Only case, whitespace, and trailing sentence punctuation
- * are normalized: the wording itself stays meaningful, so a genuinely different
- * blocker still restarts the audit at one.
- */
-export function normalizeBlocker(blocker: string): string {
-	return blocker.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!?;,]+$/, "");
-}
 
 /** The failure side of {@link GoalMutationResult}. */
 export type GoalMutationFailure = Extract<GoalMutationResult, { ok: false }>;
@@ -1341,6 +1346,38 @@ export class GoalStore {
 			);
 		}
 
+		// Legacy open-audit handoff (issue #26). An *active* legacy Goal whose audit is
+		// still open — a structurally valid count of one or two — keeps its description
+		// and count and is issued a fresh opaque Blocker identity here, in the same
+		// durable transition as the rest of the cutover. The model can then advance the
+		// preserved chain by identity instead of by wording.
+		//
+		// This grants no extra unattended turns: the count is carried over unchanged,
+		// so the legacy chain still needs its remaining turns, and omitting the identity
+		// still starts a fresh chain at one. A stopped Goal's audit describes the stop
+		// and is never advanced again, so it gets no identity.
+		const legacyAudit = updated.blockedAudit;
+		if (
+			updated.status === "active" &&
+			legacyAudit !== undefined &&
+			legacyAudit.blockerId === undefined &&
+			legacyAudit.turns >= 1 &&
+			legacyAudit.turns < BLOCKED_AUDIT_THRESHOLD
+		) {
+			const freshId = blockerId();
+			updated = {
+				...updated,
+				blockedAudit: { ...legacyAudit, blockerId: freshId },
+			};
+			notices.push(
+				`pi-goal issued a fresh Blocker identity (${freshId}) for Goal ${updated.id}'s preserved legacy ` +
+					`blocked audit — ${legacyAudit.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns: ` +
+					`"${legacyAudit.blocker}". The description and count are unchanged and no extra turns were ` +
+					"granted; reuse that identity in update_goal's blocker_id to advance the audit, or omit it to " +
+					"report a genuinely different condition.",
+			);
+		}
+
 		const record: GoalRecord = { ...updated, usage: frozen };
 		try {
 			this.persistSnapshot(pi, record);
@@ -1915,32 +1952,51 @@ export class GoalStore {
 	/**
 	 * Record the model reporting a blocker, and enforce the blocked audit.
 	 *
-	 * The audit counts consecutive Goal turns that reported the *same* blocker
-	 * (compared by `normalizeBlocker`, so a reworded repetition still advances
-	 * it). The Goal becomes `blocked` only when the count reaches
-	 * `BLOCKED_AUDIT_THRESHOLD`; before that the report is persisted and refused,
-	 * which keeps a transient blocker from stopping useful work while still
-	 * making the audit durable across compaction and a session restore.
+	 * *Identity*, not wording, decides whether two reports describe the same
+	 * condition. The first valid report of a chain omits `blockerId`; the extension
+	 * issues an opaque Blocker identity and persists it with the latest
+	 * plain-language description and count. A later report of the same condition
+	 * passes that identity back verbatim, so a reworded description or a changed
+	 * next step still advances the audit. A report that omits it is a genuinely
+	 * different condition: it replaces the open audit with a fresh identity and
+	 * count one, and the old chain can never resume. An identity the extension did
+	 * not issue for the currently open audit is refused with `not-current` and
+	 * writes nothing.
 	 *
-	 * A write failure leaves the Goal active and untouched, so the model can
-	 * simply report again.
+	 * There is no text normalization, similarity, or hashing anywhere in this
+	 * decision: the model judges semantic equivalence by choosing whether to reuse
+	 * the identity, and the extension alone enforces identity, consecutiveness, and
+	 * the threshold. Incorrect reuse can merge different blockers, while an omitted
+	 * identity can split one condition and delay stopping; the latter is the safer
+	 * direction.
+	 *
+	 * The Goal becomes `blocked` only when the count reaches
+	 * `BLOCKED_AUDIT_THRESHOLD`; before that the report is persisted and refused,
+	 * which keeps a transient blocker from stopping useful work while still making
+	 * the audit durable across compaction and a session restore.
+	 *
+	 * A write failure leaves the Goal active and untouched, so the model can simply
+	 * report again.
 	 */
 	markBlockedReport(
 		pi: ExtensionAPI,
-		params: { blocker: string; turn: number },
+		params: { blocker: string; blockerId?: string; turn: number },
 		expected?: GoalBinding,
 	): BlockedReportResult {
 		const current = this.current;
 		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
 		const blocker = params.blocker.trim();
 		const previous = current.blockedAudit;
+		const requestedId = params.blockerId?.trim() || undefined;
 
 		// A repeated report inside the same Goal turn is idempotent: it must not
-		// advance the audit, or a model that retries its own tool call could
-		// satisfy the threshold inside one turn. This check comes before the stale
-		// binding check precisely because the first report advanced the revision: a
-		// repeat prepared against the pre-report revision is still the same turn and
-		// must read as one audit step, not as a stale write.
+		// advance, reset, or replace the audit, or a model that retries its own tool
+		// call could satisfy the threshold inside one turn. This check comes before
+		// the stale binding check precisely because the first report advanced the
+		// revision: a repeat prepared against the pre-report revision is still the
+		// same turn and must read as one audit step, not as a stale write. It is also
+		// before the identity check, so a repeat that arrives with different text or
+		// a different identity is still one audit step rather than a new chain.
 		//
 		// The revision the counted report wrote is what keeps that sound. A Goal can
 		// advance for a reason that has nothing to do with the report — `/goal edit`
@@ -1975,6 +2031,33 @@ export class GoalStore {
 			};
 		}
 
+		// An identity the extension did not issue for the audit that is open *now* is
+		// refused without touching the Goal: no snapshot, no revision, no reset, and
+		// no replacement of the open audit. Because the refusal happens before the
+		// turn bookkeeping below, it does not own the turn either, so a corrected call
+		// in the same turn can still record the turn's first valid report.
+		//
+		// This is what stops a stale identity from resurrecting a chain that a reset,
+		// a resume, a replacement, or a completion already ended, and it is also what
+		// stops a forged or guessed identity from merging two different conditions.
+		const openId = previous?.blockerId;
+		if (requestedId !== undefined && requestedId !== openId) {
+			const open =
+				openId === undefined
+					? "no blocked audit is open on this Goal"
+					: `the open audit's Blocker identity is ${openId}`;
+			return {
+				ok: false,
+				reason: "not-current",
+				message:
+					`Blocker not recorded: ${requestedId} is not the Blocker identity of the audit currently open on ` +
+					`Goal ${current.id} (${open}). Call get_goal to read the current identity, then report the same ` +
+					"condition again with that identity in blocker_id, or report a genuinely different condition with " +
+					"no identity at all. An identity from an earlier chain can never resume it, and the extension never " +
+					"compares blocker text.",
+			};
+		}
+
 		// The audit is about *consecutive* Goal turns, so a report that does not
 		// follow the previous one immediately starts a new chain: the turns in
 		// between made progress, verified a wait, or reported nothing, and none of
@@ -1985,16 +2068,19 @@ export class GoalStore {
 		this.lastBlockerTurn = params.turn;
 		this.lastBlockerRevision = current.revision + 1;
 
-		const sameBlocker =
-			followsPreviousTurn &&
-			previous !== undefined &&
-			normalizeBlocker(previous.blocker) === normalizeBlocker(blocker);
-		const turns = sameBlocker ? previous.turns + 1 : 1;
+		// Reuse the open identity only when the model passed it back *and* the report
+		// follows the previous one. Anything else — an omitted identity, a gap in the
+		// chain, or no open audit — is a genuinely different condition and starts a
+		// fresh chain at one with a fresh identity.
+		const reusesIdentity =
+			requestedId !== undefined && requestedId === openId && followsPreviousTurn;
+		const turns = reusesIdentity && previous !== undefined ? previous.turns + 1 : 1;
+		const auditId = reusesIdentity && openId !== undefined ? openId : blockerId();
 		const thresholdMet = turns >= BLOCKED_AUDIT_THRESHOLD;
 		const updated: GoalRecord = {
 			...current,
 			...(thresholdMet ? { status: "blocked" as const } : {}),
-			blockedAudit: { blocker, turns },
+			blockedAudit: { blockerId: auditId, blocker, turns },
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		};
@@ -2225,8 +2311,12 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
  * Drop a malformed `blockedAudit` instead of trusting it.
  *
  * The audit is written by this extension, but a snapshot can be hand-edited or
- * written by a future version. A malformed one would break blocker comparison,
- * so it is dropped and the Goal keeps working with a fresh audit.
+ * written by a future version. A malformed one would break the identity contract
+ * — a chain the model can neither advance nor safely abandon — so it is dropped
+ * and the Goal keeps working with a fresh audit. An absent `blockerId` is *not*
+ * malformed: that is a pre-repair 0.1.0 audit, which batch 1 preserves verbatim
+ * for the one-time cutover handoff, and which no repaired writer can advance by
+ * identity (an omitted identity starts a fresh chain, so it grants nothing).
  */
 function withSanitizedAudit(goal: GoalRecord): GoalRecord {
 	const audit = goal.blockedAudit;
@@ -2241,7 +2331,11 @@ function withSanitizedAudit(goal: GoalRecord): GoalRecord {
 		// A legitimate audit can never exceed the threshold: reaching it transitions
 		// the Goal, so a larger count is a hand-edited or corrupt snapshot.
 		audit.turns < 0 ||
-		audit.turns > BLOCKED_AUDIT_THRESHOLD
+		audit.turns > BLOCKED_AUDIT_THRESHOLD ||
+		// An identity that is present must be a usable opaque token; one that is not
+		// could never be passed back, so the chain it names is not continuable.
+		(audit.blockerId !== undefined &&
+			(typeof audit.blockerId !== "string" || audit.blockerId.trim().length === 0))
 	) {
 		const { blockedAudit: _dropped, ...rest } = goal;
 		return rest;

@@ -39,7 +39,9 @@ observable Pi events, with thresholds that are constants rather than settings.
    Reports are counted per Goal turn and persisted on the Goal record so compaction
    cannot hand the model three fresh turns. The first valid report owns its turn;
    later calls in that turn are idempotent and cannot advance, reset, or replace
-   the audit. A Goal turn that reports no blocker — it made progress, verified a
+   the audit, even with different text or a different ID. A rejected call does not
+   own the turn, so a corrected call in the same turn records the turn's first
+   valid report. A Goal turn that reports no blocker — it made progress, verified a
    wait, or simply had nothing to report — breaks the chain, and that break is
    persisted too, because an in-memory-only reset would let a reload resurrect a
    count the model already invalidated. What durability cannot do is outlast a user
@@ -51,7 +53,9 @@ observable Pi events, with thresholds that are constants rather than settings.
    while a genuine blocker persists, rather than waiting until the threshold is
    already satisfied. Structured tool responses, `get_goal`, and continuations
    expose the open audit's current ID, latest description, and count so the model
-   can reuse the identity after compaction or restart. The third consecutive report
+   can reuse the identity after compaction or restart; the human-facing status
+   shows the description and the count and deliberately does not show the opaque
+   ID. The third consecutive report
    performs the transition; earlier reports are recorded and refused.
 2. **Activity-free turns are bounded.** An *automatic* Goal turn with no tool call,
    no output, and no reasoning is a malfunctioning continuation. Three in a row
@@ -142,6 +146,37 @@ The batch also preserves the durable audit across the 0.1.0 cutover: a valid
 legacy open audit keeps its description and count for the Blocker-identity handoff
 in batch 3, and the extension does not introduce text-similarity equivalence to
 recover it. Nothing in this ADR's thresholds or reset rules changes.
+
+### Repair batch 3: opaque Blocker identity and the legacy-audit handoff
+
+Batch 3 (issue #26) makes the audit's equivalence rule the model's *choice* rather
+than the extension's guess. The first valid report of a chain omits `blocker_id`
+and the extension issues an opaque **Blocker identity**; every later report of the
+same condition passes it back verbatim, so a reworded description or a changed
+next step still advances the audit. Omitting it reports a genuinely different
+condition and starts a fresh chain at one, and an identity the extension did not
+issue for the currently open audit is refused without Goal mutation — which also
+means the refusal does not own the turn, so a corrected call in the same turn
+records that turn's first valid report. There is no text normalization,
+similarity, or hashing anywhere in the decision: the model judges semantic
+equivalence by choosing whether to reuse the identity, and the extension alone
+enforces identity, consecutiveness, and the three-Goal-turn threshold. A same-turn
+repeat is idempotent even when it arrives with different text or a different ID.
+
+An *active* 0.1.0 Goal whose audit is still open (a structurally valid count of one
+or two) is handed a fresh identity in the same durable cutover transition. Its
+description and count are carried over unchanged, the identity is not derived from
+the blocker text, and nothing extra is granted: the preserved chain still needs its
+remaining turns, omitting the identity starts a fresh chain at one, and every reset
+rule — a Goal turn with no report, any user action, a resume, a Replacement Goal —
+still applies, so the prompt that follows a load is itself a user action and starts
+a fresh audit. A stopped Goal's audit describes its stop, is never advanced again,
+and gets no identity.
+
+This batch does not change any threshold or reset rule in this ADR, and it removes
+no conservative stop. It completes the mandatory batch 1–3 compatibility landing
+unit: cutover without it could not advance a preserved legacy audit by identity,
+and the audit could not recognize a reworded report at all.
 
 ### Repair batch 2: cumulative budget recovery and per-episode wrap-ups
 
