@@ -101,6 +101,56 @@ failures:
 The complete captured run is quoted in the PR description. After the repair,
 the same suite passes (92/92) and `npm run typecheck` passes.
 
+## Batch 5: concurrency-bounded default test seam
+
+The orchestrator observed a real flake on the default gate: while `npm test` ran
+with Node's default per-file concurrency (one worker per available core minus
+one), `test/goal11-blocker-identity.test.mjs` exhausted the RPC harness's 90s
+`PI_TIMEOUT_MS` wait. No assertion in that file failed and the same file passed
+when run alone (`node --test test/goal11-blocker-identity.test.mjs`), so the
+failure was resource contention, not product behavior. Every RPC test file
+spawns real `pi --mode rpc` subprocesses with their own temp agent, session, and
+work directories, so an unbounded number of co-scheduled files multiplies
+process and filesystem pressure on the machine.
+
+The default gate is now resource-bounded rather than timeout-tolerant:
+
+```text
+npm test  ->  node --test --test-concurrency=4 test/
+```
+
+Four concurrent test files is a conservative fixed limit: it caps how many live
+`pi` subprocesses the suite schedules at once and stays deterministic across
+machines (unlike a per-core default). No test was removed, skipped, marked todo,
+or given a longer timeout, and no failure is swallowed — a genuine assertion
+failure in any file still fails the run. Coverage is unchanged at **433 tests**.
+The flag is available from Node 20.10.0, and the gate already requires Node
+>=22.19.0 through the Pi 1.5.1 devDependency (enforced by Pi's own `engines`),
+so every environment that can run the suite accepts it.
+
+Verification at the final head of the branch, all with the new default command:
+
+| Command | Result |
+| --- | --- |
+| `npm test` (run 1) | 433 tests, 433 pass, 0 fail, 0 skipped |
+| `npm test` (run 2) | 433 tests, 433 pass, 0 fail, 0 skipped |
+| `npm run typecheck` | clean |
+| `node --test test/goal11-blocker-identity.test.mjs` (five times) | 12 tests, 12 pass, 0 fail each time |
+
+Raising `PI_GOAL_TEST_TIMEOUT_MS` was rejected for the default gate: it would
+leave the contention in place and only make a starvation symptom slower to
+report. The concurrency limit removes the contention at its source and keeps the
+default gate reproducible.
+
+The verification host was also running unrelated heavy work (load average above
+20 throughout, spiking above 30). During that window an intermediate default run
+hit the same 90s wait once, and the following run saw a batch-3 audit chain
+settle before its final report. Five subsequent full default runs were green, as
+were five isolated runs of the blocker-identity file. A fixed concurrency limit
+bounds the suite's own demand; it cannot shield a shared host from external
+starvation, which is why the harness still fails loudly with its record dump
+instead of silently retrying or extending a timeout.
+
 ## Limitations
 
 - The quotation rules are deliberately conservative deterministic English rules.
@@ -115,10 +165,11 @@ the same suite passes (92/92) and `npm run typecheck` passes.
   so "Set the goal’s budget to 5000" cannot be quoted as "Set the goal". Both
   fail closed.
 - The raw input is captured at the `input` seam and applied when the user
-  message is delivered. An extension that handles input (returns `handled`)
-  before pi-goal's own `input` handler could leave a stale pending entry; this
-  narrow extension-authored edge is outside the approved seams and is not
-  covered by the suite.
+  message is delivered. A later-loaded extension whose `input` handler runs
+  after pi-goal's own `input` handler and returns `handled` consumes a message
+  pi-goal already recorded, so the stale pending entry is matched to the next
+  delivered user message; this narrow extension-authored edge is outside the
+  approved seams and is not covered by the suite.
 - Settlement, restart, and tree-navigation expiry are observable as a refused
   old quotation, but a new execution always starts from its own request source,
   so those boundaries are not isolated from ordinary replacement in the RPC
