@@ -28,8 +28,9 @@
  *   of lost, and a reload can never charge it twice.
  * - **Active time** runs on a monotonic clock while a Goal is active in a live
  *   session. Folding a segment into the record is exact, so lifecycle boundaries
- *   neither lose nor double-count time, and a stopped Goal (complete,
- *   budget-limited) or a shut-down process stops the clock.
+ *   neither lose nor double-count time, and every transition to a non-active status
+ *   (paused, blocked, usage_limited, budget_limited, complete) or a shut-down
+ *   process stops the clock.
  */
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -2077,9 +2078,18 @@ export class GoalStore {
 		const turns = reusesIdentity && previous !== undefined ? previous.turns + 1 : 1;
 		const auditId = reusesIdentity && openId !== undefined ? openId : blockerId();
 		const thresholdMet = turns >= BLOCKED_AUDIT_THRESHOLD;
+		// Reaching the threshold is a transition to a non-active status, so the
+		// active-time clock stops here — exactly as it does for completion, a pause,
+		// and a budget stop — and the snapshot carries the folded value. Stopping only
+		// once the Goal is already stopped would bill every later second, including the
+		// trailing response of the turn that reported the blocker, to a Goal that is no
+		// longer working. A report below the threshold leaves the Goal active, so its
+		// clock keeps running.
+		const activeMs = thresholdMet ? this.clock.stop() : undefined;
+		if (activeMs !== undefined) this.clock.persisted(activeMs);
 		const updated: GoalRecord = {
 			...current,
-			...(thresholdMet ? { status: "blocked" as const } : {}),
+			...(thresholdMet ? { status: "blocked" as const, usage: this.liveUsage() } : {}),
 			blockedAudit: { blockerId: auditId, blocker, turns },
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
@@ -2087,6 +2097,10 @@ export class GoalStore {
 		try {
 			this.persistSnapshot(pi, updated);
 		} catch (error) {
+			if (activeMs !== undefined) {
+				// Nothing was written, so the Goal is still active and the clock runs on.
+				this.clock.start();
+			}
 			this.lastBlockerTurn = undefined;
 			this.lastBlockerRevision = undefined;
 			return { ok: false, reason: "persistence", error };
@@ -2102,6 +2116,12 @@ export class GoalStore {
 	 * Both are terminal for continuation, exactly like completion, and both are
 	 * recorded with the reason that produced them so `get_goal` and bare `/goal`
 	 * can explain why the Goal is not working.
+	 *
+	 * Both are also transitions to a non-active status, so the active-time clock stops
+	 * here and the snapshot carries the folded value: a stopped Goal is not working,
+	 * and the interval after the stop — the trailing response of the run that hit the
+	 * limit, the user reading the notice, a restart — is not Goal work. A write
+	 * failure leaves the Goal active, so the clock is restarted and nothing is lost.
 	 */
 	stopGoal(
 		pi: ExtensionAPI,
@@ -2109,16 +2129,21 @@ export class GoalStore {
 	): StopGoalResult {
 		const current = this.current;
 		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
+		const activeMs = this.clock.stop();
+		this.clock.persisted(activeMs);
 		const updated: GoalRecord = {
 			...current,
 			status: stop.status,
 			blockedAudit: { blocker: stop.blocker, turns: stop.turns ?? 0 },
+			usage: this.liveUsage(),
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		};
 		try {
 			this.persistSnapshot(pi, updated);
 		} catch (error) {
+			// Nothing was written, so the Goal is still active and the clock runs on.
+			this.clock.start();
 			return { ok: false, reason: "persistence", error };
 		}
 		this.current = this.adopt(updated);

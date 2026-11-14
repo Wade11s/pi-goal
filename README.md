@@ -413,8 +413,10 @@ post-completion work as Goal usage.
 
 **Active time.** A monotonic clock (`performance.now()`, sampled exactly once per
 operation and clamped to the highest value seen) runs while a Goal is active in a
-live session. Paused time, process downtime, and a stopped Goal (complete,
-budget-limited) do not accrue. Folding a segment into the record at a lifecycle
+live session. Every non-active status stops it — `paused`, `blocked`,
+`usage_limited`, `budget_limited`, and `complete` — as does process downtime, so
+the interval after a stop (including the trailing response of the run that caused
+it) is never billed. Folding a segment into the record at a lifecycle
 boundary neither loses nor double-counts time, and the accounted value is
 checkpointed durably at most once per accounted second of Goal activity, at every
 settlement, and at shutdown. Because the source is monotonic, a clock adjustment
