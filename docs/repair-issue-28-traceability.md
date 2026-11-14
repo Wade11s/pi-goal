@@ -90,6 +90,11 @@ unplanned settle. The full suite reports zero unconsumed scripted steps.
 | `node --test test/goal34-active-time-stop-store.test.mjs` | 6 pass, 0 fail |
 | `node --test test/goal34-active-time-stop.test.mjs` | 1 pass, 0 fail |
 
+One earlier default run under host load hit an assertion flake (`actual: 3,
+expected: 5`); five subsequent consecutive default runs passed 444/444. The
+batch-4 traceability records the same resource-contention flake class and the
+`--test-concurrency=4` bound that addresses it.
+
 ## Documentation audit
 
 Verified against the integrated commit:
