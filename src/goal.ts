@@ -769,8 +769,17 @@ const GOAL_CREATION_ACTION_GLOBAL = new RegExp(GOAL_CREATION_ACTION.source, "gi"
 const GOAL_NOUN = /\bgoals?\b/i;
 const GOAL_DETERMINER =
 	"(?:a|an|the|this|that|one|new|another|fresh|our|my|your|shared|team|single)";
+/**
+ * Imperative creation of the Goal itself. The trailing guard refuses an
+ * apostrophe or hyphen right after the Goal noun, so a possessive or a compound
+ * ("the goal's budget", "the goal-oriented plan") is not read as a request to
+ * create the Goal. Straight and typographic apostrophes are both refused: the
+ * curly ones are what a chat client or a word processor pastes, and leaving them
+ * out would let "Set the goal’s budget to 5000" authorize a Goal (see
+ * `foldApostrophes`).
+ */
 const IMPERATIVE_GOAL_CREATION = new RegExp(
-	`^(?:create|set|start|establish|make|open)(?:\\s+up)?(?:\\s+${GOAL_DETERMINER})*\\s*goals?\\b(?!['-])`,
+	`^(?:create|set|start|establish|make|open)(?:\\s+up)?(?:\\s+${GOAL_DETERMINER})*\\s*goals?\\b(?!['\\u2018\\u2019-])`,
 	"i",
 );
 const PASSIVE_GOAL_CREATION =

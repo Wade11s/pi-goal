@@ -24,6 +24,7 @@ behavior plus the narrow combinatorial unit tests named in the ticket.
 | Clause order: later cancellation | A later cancellation or negation supersedes the quoted request | `test/goal12-creation-authority-store.test.mjs` (cancellation rows); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: later-cancelled request") |
 | Fragment cannot be lifted from a negation | A quote found only inside a negated sentence is refused | `test/goal12-creation-authority-store.test.mjs` ("I did not say create a goal"); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: negated request") |
 | Typographic apostrophes | A cancellation or negation written with U+2018/U+2019 cancels exactly like the straight-apostrophe form, so a later "Don’t." cannot authorize the Goal or pause it cancels | `test/goal12-creation-authority-store.test.mjs` (typographic-apostrophe rows); `test/goal12-pause-corroboration.test.mjs` ("a later typographic-apostrophe cancellation cannot corroborate a pause") |
+| Possessive Goal noun | A possessive after the Goal noun is not a request to create the Goal, with straight or typographic apostrophes ("Set the goal’s budget to 5000" cannot be quoted as "Set the goal") | `test/goal12-creation-authority-store.test.mjs` (possessive rows) |
 | Shared pause vocabulary | The shared `REQUEST_LEAD` widening accepts a comma-less discourse-marker lead ("Actually pause the goal") on the pause path | `test/goal12-pause-corroboration.test.mjs` ("a comma-less discourse-marker lead corroborates a pause") |
 | Hypotheticals and questions | Conditional, tentative, and question-shaped clauses do not qualify | `test/goal12-creation-authority-store.test.mjs` (hypothetical/question rows); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: hypothetical request"; "…question"; "…tentative request") |
 | Non-explicit ordinary work | Ordinary work, mentions, and keep-working requests do not qualify | `test/goal12-creation-authority-store.test.mjs` (mention/ordinary-work rows); `test/goal12-creation-authority.test.mjs` ("rejection is fail-closed: non-explicit ordinary work") |
@@ -109,7 +110,10 @@ the same suite passes (92/92) and `npm run typecheck` passes.
 - The typographic-apostrophe fold is confined to the negation and cancellation
   vocabulary, so it can only make recognition stricter: a curly-apostrophe lead
   ("Let’s create a goal") is refused rather than read as its straight-apostrophe
-  twin, and the byte-exact quotation match is unchanged. Both fail closed.
+  twin, and the byte-exact quotation match is unchanged. The possessive guard in
+  `IMPERATIVE_GOAL_CREATION` refuses straight and typographic apostrophes alike,
+  so "Set the goal’s budget to 5000" cannot be quoted as "Set the goal". Both
+  fail closed.
 - The raw input is captured at the `input` seam and applied when the user
   message is delivered. An extension that handles input (returns `handled`)
   before pi-goal's own `input` handler could leave a stale pending entry; this

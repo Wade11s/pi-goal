@@ -47,6 +47,16 @@ const ROWS = [
 	["create a goal, then set a budget", "create a goal", "ok"],
 	["Set the goal's budget to 5000", "Set the goal", "not-an-instruction"],
 	["Set the goal's budget to 5000", "Set the goal's budget", "quote-not-request"],
+	// A possessive after the Goal noun is not a request to create the Goal, so the
+	// model may not quote "Set the goal" out of "Set the goal’s budget to 5000".
+	// Typographic apostrophes are pasted from chat clients and word processors as
+	// often as straight ones, so the guard refuses all three.
+	["Set the goal’s budget to 5000", "Set the goal", "not-an-instruction"],
+	["Set the goal‘s budget to 5000", "Set the goal", "not-an-instruction"],
+	["Set the goals’ budgets before Friday", "Set the goals", "not-an-instruction"],
+	// Naming the Goal itself is still an instruction to create it.
+	["Set the goal to ship the release", "Set the goal", "ok"],
+	["Set the goal", "Set the goal", "ok"],
 	["Create a goal with no budget", "Create a goal", "ok"],
 	["Create a goal without a budget", "Create a goal", "ok"],
 	// A later explicit correction supersedes an earlier negation.
