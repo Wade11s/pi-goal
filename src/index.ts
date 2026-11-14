@@ -73,7 +73,7 @@ import {
 	formatNoGoal,
 	formatResumeMessage,
 	getGoalOutputSchema,
-	GOAL_MESSAGE_PREFIX,
+	goalWorkGoalId,
 	MAX_BLOCKER_LENGTH,
 	MAX_OBJECTIVE_LENGTH,
 	messageText,
@@ -1999,10 +1999,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 *   charge the previous identity's (or the previous turn's) work to this Goal.
 	 *
 	 * Pi appends the message in the same event, so the entry this sees is the entry
-	 * the replay reads. The segment is opened for the Goal that is current at
-	 * delivery — the identity whose newest snapshot precedes it — which is what stops
-	 * a work message queued for a Goal that has since been replaced, cleared, or
-	 * completed from opening anything.
+	 * the replay reads. The segment is opened only when the message names the Goal
+	 * that is current at delivery — the identity whose newest snapshot precedes it.
+	 * A work message queued for a Goal that has since been replaced, cleared, or
+	 * completed names a different identity, so it opens nothing; the generic
+	 * `[pi-goal]` prefix alone never authorizes admission.
 	 *
 	 * This is also the boundary that closes a superseded identity's admission: the
 	 * replacement kept the old segment open for its in-flight tail, and the first
@@ -2011,8 +2012,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	function applyDeliveredUserMessage(message: { content: unknown }, pi: ExtensionAPI): void {
 		const goal = store.get();
+		const admittedId = goalWorkGoalId(messageText(message.content));
 		const isGoalWork =
-			goal != null && goal.status !== "complete" && messageText(message.content).startsWith(GOAL_MESSAGE_PREFIX);
+			goal != null && goal.status !== "complete" && admittedId !== null && admittedId === goal.id;
 		store.closeSupersededAdmission(pi);
 		if (isGoalWork) {
 			store.beginGoalWork(goal.id);

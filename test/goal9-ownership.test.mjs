@@ -652,7 +652,9 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 	// Creating a Goal is a boundary that leaves no marker of its own on the branch, so
 	// the old admission has to be closed durably there: a live path that merely dropped
 	// it would refuse A's response while the replay still charged it to A and froze a
-	// 110-token record the live path never accounted.
+	// 110-token record the live path never accounted. The replacement's own steered
+	// kickoff is queued for the cleared B identity, so it must not open C's admission
+	// either (issue #39); only C's own aborted kickoff is charged.
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
 	const session = await PiRpcSession.start({ cwd: workDir, sessionDir });
@@ -702,8 +704,9 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 		assert.equal(status.status, "active");
 		assert.equal(
 			status.totalTokens,
-			37,
-			"22 for the steered response + 15 for the aborted kickoff; A's late response is charged to nobody",
+			15,
+			"only the aborted C kickoff is charged; A's late response and the cleared B identity's " +
+				"steered kickoff are charged to nobody",
 		);
 		assert.equal(status.nestedTokens, 0);
 
@@ -727,7 +730,7 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 			await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
 			const restored = await reportStatus(resumed);
 			assert.equal(restored.status, "active");
-			assert.equal(restored.totalTokens, 37, "the reload converges on the live total");
+			assert.equal(restored.totalTokens, 15, "the reload converges on the live total");
 			assert.equal(
 				goalSnapshots(readSessionEntries(await resumed.sessionFile())).length,
 				liveStates.length,
