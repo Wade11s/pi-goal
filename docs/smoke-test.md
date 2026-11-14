@@ -282,6 +282,21 @@ Then try the negative controls:
   refused;
 - use `/goal <objective>` directly: it still creates a Goal with no quotation.
 
+## 19. Optional: blocked and usage_limited active time
+
+Active elapsed time must stop at *every* non-active status. The deterministic
+regressions `test/goal34-active-time-stop.test.mjs` (a real `pi --mode rpc`
+blocked Goal, idle time, an ordinary run, and a restart) and
+`test/goal34-active-time-stop-store.test.mjs` (the `usage_limited` stop, the
+conservative stop, and a reconstruction) pin the exact frozen values.
+
+To check it by hand with a real provider, drive a Goal to `blocked` (section
+16), then run `/goal` twice a few seconds apart: the `Active time` value must
+not change while the Goal is `blocked`. Restart Pi and run `/goal` again: the
+value must still be the frozen one. `usage_limited` needs a real provider
+usage-limit error, so the deterministic store/RPC regressions are the practical
+verification for that status.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -306,6 +321,8 @@ Then try the negative controls:
       starts a fresh chain.
 - [ ] A legacy open audit is preserved with its description and count and is issued
       a fresh Blocker identity at cutover, granting no extra unattended turns.
+- [ ] A `blocked` Goal's `Active time` is frozen across idle time and a restart,
+      and the `usage_limited` freeze is covered by the deterministic regressions.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with
