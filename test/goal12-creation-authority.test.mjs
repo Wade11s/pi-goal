@@ -26,6 +26,7 @@ import {
 	PiRpcSession,
 	assertCleanRun,
 	assertOnlyFailures,
+	assistantOutcomes,
 	continuationEntries,
 	lastGoalSnapshot,
 	readSessionEntries,
@@ -61,6 +62,13 @@ function dialogRequests(session) {
 	return session.records.filter(
 		(r) => r.type === "extension_ui_request" && (r.method === "confirm" || r.method === "editor"),
 	);
+}
+
+/** Fail unless exactly `steps` provider responses were consumed. */
+function assertStepsConsumed(session, steps, expectedFailures = []) {
+	const outcomes = assistantOutcomes(session);
+	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
+	assertOnlyFailures(session, expectedFailures);
 }
 
 test("a raw interactive/RPC request authorizes create_goal with an exact quotation and an independent objective", async () => {
@@ -102,6 +110,7 @@ test("a raw interactive/RPC request authorizes create_goal with an exact quotati
 			"no retroactive attribution to the creating run",
 		);
 		assert.equal(runCount(session), 2, "the prompt run plus one continuation run");
+		assertStepsConsumed(session, 5);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
@@ -126,6 +135,9 @@ test("whitespace folding accepts a reflowed quotation", async () => {
 		const create = toolResults(session, "create_goal")[0];
 		assert.equal(create.isError, false, "whitespace-only differences are folded");
 		assert.equal(structuredGoal(create.result).origin, "tool");
+		assert.equal(runCount(session), 1);
+		assert.equal(continuationEntries(readSessionEntries(await session.sessionFile())).length, 0);
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -156,6 +168,8 @@ test("a quotation with different casing is not evidence", async () => {
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 2);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -187,6 +201,9 @@ test("a Pi custom message authorizes creation", async () => {
 		const create = toolResults(session, "create_goal")[0];
 		assert.equal(create.isError, false, "a Pi custom message is an accepted authority source");
 		assert.equal(structuredGoal(create.result).origin, "tool");
+		assert.equal(runCount(session), 1);
+		assert.equal(continuationEntries(readSessionEntries(await session.sessionFile())).length, 0);
+		assertStepsConsumed(session, 3);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.ok(
 			entries.some(
@@ -227,6 +244,8 @@ test("a newer Pi custom message replaces prior authority", async () => {
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 2);
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -260,6 +279,8 @@ test("a newer interactive/RPC user message replaces prior authority even when un
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 2);
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -295,6 +316,8 @@ test("settlement ends the execution's authority", async () => {
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 2);
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -326,6 +349,9 @@ test("a corrected call retries while the same authority remains valid", async ()
 		assert.match(String(first.result.content[0].text), /no currently authoritative request contains/);
 		assert.equal(second.isError, false, "the corrected quotation succeeds on the same authority");
 		assert.equal(structuredGoal(second.result).objective, OBJECTIVE);
+		assert.equal(runCount(session), 1);
+		assert.equal(continuationEntries(readSessionEntries(await session.sessionFile())).length, 0);
+		assertStepsConsumed(session, 4);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -353,6 +379,9 @@ test("a successful creation is one-shot and a second call in the same execution 
 		assert.equal(second.isError, true, "the one-shot authority is consumed and the Goal slot is occupied");
 		assert.match(String(second.result.content[0].text), /already set/);
 		assert.equal(structuredGoal(second.result).id, structuredGoal(first.result).id);
+		assert.equal(runCount(session), 1);
+		assert.equal(continuationEntries(readSessionEntries(await session.sessionFile())).length, 0);
+		assertStepsConsumed(session, 4);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -383,7 +412,8 @@ test("authority survives a provider retry inside one execution", async () => {
 		const create = toolResults(session, "create_goal")[0];
 		assert.equal(create.isError, false, "the authority survives the retry");
 		assert.equal(structuredGoal(create.result).origin, "tool");
-		assertOnlyFailures(session, [
+		assert.equal(runCount(session), 3, "the initial run plus one run per provider retry");
+		assertStepsConsumed(session, 5, [
 			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
 			{ stopReason: "error", errorMessage: "503 upstream overloaded" },
 		]);
@@ -417,6 +447,7 @@ test("authority survives compaction and overflow recovery inside one execution",
 		const create = toolResults(session, "create_goal")[0];
 		assert.equal(create.isError, false, "the authority survives compaction and overflow recovery");
 		assert.equal(structuredGoal(create.result).origin, "tool");
+		assert.equal(runCount(session), 2, "one run before compaction and one retried run");
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -476,6 +507,7 @@ for (const row of REJECTION_ROWS) {
 			assert.equal(usageCheckpoints(entries).length, 0, "no usage was admitted");
 			assert.equal(dialogRequests(session).length, 0, "no dialog was opened");
 			assert.equal(runCount(session), 1, "the prompt run is the only run");
+			assertStepsConsumed(session, 2);
 			assertCleanRun(session);
 			assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 		} finally {
@@ -510,6 +542,8 @@ test("an extension sendUserMessage does not acquire human-user authority", async
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 2);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -555,6 +589,8 @@ test("transformed prompt text is not evidence", async () => {
 			),
 			"the model saw the transformed text",
 		);
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 2);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -598,6 +634,8 @@ test("a standing system-prompt instruction does not authorize a Goal", async () 
 			),
 			"the instruction really was in the system prompt",
 		);
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 2);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -636,6 +674,8 @@ test("a direct Goal lifecycle operation clears creation authority", async () => 
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -663,6 +703,8 @@ test("direct /goal creation remains available without model quotation", async ()
 		assert.equal(snapshot.data.goal.origin, "command", "direct command creation needs no quotation");
 		assert.equal(snapshot.data.goal.objective, OBJECTIVE);
 		assert.equal(continuationEntries(entries).length, 1);
+		assert.equal(runCount(session), 2, "the kickoff run plus one continuation run");
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -700,6 +742,8 @@ test("a successful tool creation persists no reusable authorization evidence", a
 			assert.equal(snapshot.data.goal[key], undefined, `the Goal record gains no ${key}`);
 			assert.equal(snapshot.data[key], undefined, `the snapshot gains no ${key}`);
 		}
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -737,6 +781,8 @@ test("a session restart expires the prior execution's authority", async () => {
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(sessionFile);
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(second), 1);
+		assertStepsConsumed(second, 2);
 		assertCleanRun(second);
 		assert.equal(second.extensionErrors().length, 0);
 	} finally {
@@ -782,6 +828,8 @@ test("tree navigation expires the prior branch's creation authority", async () =
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 3, "two user-prompt runs and one custom-message run");
+		assertStepsConsumed(session, 4);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
@@ -821,6 +869,8 @@ test("the objective data block is never a creation-authority source", async () =
 		assert.equal(structuredGoal(create.result), null);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(goalSnapshots(entries).length, 0);
+		assert.equal(runCount(session), 1);
+		assertStepsConsumed(session, 2);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {

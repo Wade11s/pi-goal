@@ -45,6 +45,8 @@ const ROWS = [
 	["Actually, create a goal for the launch", "create a goal", "ok"],
 	["create   a\ngoal for the launch", "create a goal", "ok"],
 	["create a goal, then set a budget", "create a goal", "ok"],
+	["Create a goal with no budget", "Create a goal", "ok"],
+	["Create a goal without a budget", "Create a goal", "ok"],
 	// A later explicit correction supersedes an earlier negation.
 	["Do not create a goal. Create a goal for the launch.", "create a goal", "ok"],
 	["Do not create a goal. Actually, create a goal for the launch.", "create a goal", "ok"],
@@ -82,6 +84,7 @@ const ROWS = [
 	["Create a goal. I didn't mean it.", "Create a goal", "not-an-instruction"],
 	["Create a goal. Don't do it.", "Create a goal", "not-an-instruction"],
 	["Create a goal. I don't want that.", "Create a goal", "not-an-instruction"],
+	["Create a goal, not now", "Create a goal", "not-an-instruction"],
 	// --- hypotheticals and questions ------------------------------------
 	["If you create a goal, we can track it", "create a goal", "not-an-instruction"],
 	["Create a goal if the user approves", "Create a goal", "not-an-instruction"],

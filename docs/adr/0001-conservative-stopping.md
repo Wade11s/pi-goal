@@ -211,6 +211,46 @@ This batch does not change any threshold or reset rule in this ADR. The
 conservative stops still end automatic continuation, and the blocked audit still
 starts fresh on a user resume.
 
+### Repair batch 4: explicit Goal creation authority
+
+Batch 4 (issue #27) repairs how `create_goal` proves an explicit request. The
+model must quote the complete affirmative Goal-creation instruction, and the
+extension corroborates the quote at execution time against the one currently
+authoritative source: the raw interactive/RPC user input that started the
+execution, or a Pi custom message of any `customType`. Skill/template expansion
+and other transformed prompt text are not evidence, and an extension calling
+`pi.sendUserMessage()` never acquires human-user authority through that API.
+Standing system-prompt instructions do not authorize a specific Goal.
+
+Matching is case-sensitive and permits only whitespace-folding differences; a
+paraphrase is not evidence. The rules are conservative and deterministic: an
+express request to create, set, or start a Goal. Ordinary work, mere mentions,
+questions, hypotheticals, negations, and requests merely to keep working do not
+qualify. Intent is evaluated in clause order, so a later explicit correction may
+supersede an earlier negation while a later cancellation or negation supersedes
+the quoted request. Ambiguity fails closed, and a fragment cannot be lifted out
+of a negated sentence. The objective remains model-written and need not repeat
+the quotation.
+
+Authority belongs to the execution started by the request and survives later
+model turns, Pi retries, compaction, and overflow recovery inside it. A newer
+interactive/RPC user message or Pi custom message replaces it, even when
+unrelated. Settlement, session restart, branch navigation, a successful Goal
+creation, and direct Goal lifecycle operations clear it. Authority is one-shot:
+a successful creation consumes it, while a rejection leaves it valid so a
+corrected call can retry. A missing, forged, stale, non-explicit, or ambiguous
+quote is refused with a tool error carrying `goal: null` and no Goal state is
+created or mutated; the refusal opens no interactive confirmation and starts no
+Goal, Continuation, or admitted Goal work. Evidence is checked only at
+execution time, so a snapshot retains `origin: "tool"` and gains no persisted
+quotation, source-message id, or reusable authorization marker. The direct
+`/goal <objective>` path is unchanged and needs no quotation, and batch 1's
+non-retroactive attribution is unchanged.
+
+This batch does not change any threshold or reset rule in this ADR, and it
+removes no conservative stop. It depends on the complete batch 1–3 compatibility
+landing unit.
+
 ## Consequences
 
 - Stopping needs no model cooperation and no judge service: the same events Pi

@@ -757,6 +757,9 @@ const CREATION_CANCELLATION =
 const BARE_CANCELLATION =
 	/^(?:(?:but\s+)?(?:don'?t|do\s+not|never\s*mind|forget\s+it)|no|nope|not|enough(?:\s+already)?)[.!]?$/i;
 
+/** A later deferral of the request ("create a goal, not now") is not an instruction. */
+const DEFERRAL_CLAUSE = /^not\s+(?:now|yet|today|anymore)[.!]?$/i;
+
 /** A conditional or tentative clause is a hypothetical, not a request. */
 const HYPOTHETICAL_CLAUSE =
 	/^(?:if|when|whenever|suppose|supposing|assuming|in\s+case|what\s+if|whether|maybe|perhaps|probably|possibly)\b/i;
@@ -764,6 +767,14 @@ const HYPOTHETICAL_CLAUSE =
 /** A conditional subordinator anywhere in the clause makes it hypothetical. */
 const CONDITIONAL_CLAUSE =
 	/\b(?:if|unless|whether|when|whenever|provided\s+that|as\s+long\s+as|on\s+condition\s+that)\b/i;
+
+/** Whether a negation governs any creation action in the clause. */
+function hasNegationGoverningAction(text: string): boolean {
+	for (const match of text.matchAll(GOAL_CREATION_ACTION_GLOBAL)) {
+		if (hasNegationBefore(text, match.index)) return true;
+	}
+	return false;
+}
 
 /** Whether one clause is an affirmative instruction to create a Goal. */
 function isGoalCreationRequestClause(clause: string): boolean {
@@ -773,10 +784,11 @@ function isGoalCreationRequestClause(clause: string): boolean {
 	if (CONDITIONAL_CLAUSE.test(rest)) return false;
 	if (CREATION_CANCELLATION.test(rest)) return false;
 	if (BARE_CANCELLATION.test(rest)) return false;
-	// A negation anywhere in the clause is conservative: "create a goal, not a
-	// task" is split at the comma, and a mid-clause negation is ambiguous, so it
-	// fails closed rather than guessing at the scope.
-	if (NEGATION_ANYWHERE.test(rest)) return false;
+	if (DEFERRAL_CLAUSE.test(rest)) return false;
+	// A negation that governs the creation verb ("do not create", "never set",
+	// "no need to start") is conservative. A negation elsewhere in the clause
+	// ("create a goal with no budget") does not negate the request.
+	if (hasNegationGoverningAction(rest)) return false;
 	for (let pass = 0; pass < 20; pass++) {
 		const lead = rest.match(REQUEST_LEAD);
 		if (!lead) break;
@@ -795,6 +807,7 @@ function isNegativeCreationClause(clause: string): boolean {
 	if (!text) return false;
 	if (CREATION_CANCELLATION.test(text)) return true;
 	if (BARE_CANCELLATION.test(text)) return true;
+	if (DEFERRAL_CLAUSE.test(text)) return true;
 	if (
 		(HYPOTHETICAL_CLAUSE.test(text) || CONDITIONAL_CLAUSE.test(text)) &&
 		(GOAL_CREATION_ACTION.test(text) || GOAL_NOUN.test(text))
