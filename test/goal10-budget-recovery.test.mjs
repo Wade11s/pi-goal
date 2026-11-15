@@ -21,12 +21,16 @@ import {
 	PiRpcSession,
 	assertCleanRun,
 	assertOnlyFailures,
-	assistantOutcomes,
+	assertStepsConsumed,
 	continuationEntries,
 	customMessageEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
+	liveUsage,
 	readSessionEntries,
 	runCount,
+	script,
+	waitForSnapshot,
 } from "./helpers/rpc-harness.mjs";
 import { structuredGoal } from "./helpers/blocked-audit.mjs";
 
@@ -36,20 +40,8 @@ const BLOCKER = "the upstream release API token has not been issued yet";
 const WRAPUP_CUSTOM_TYPE = "goal-budget-wrapup";
 const FIXTURES = join(import.meta.dirname, "fixtures", "legacy");
 
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
-
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function wrapUpEntries(entries) {
 	return customMessageEntries(entries, WRAPUP_CUSTOM_TYPE);
-}
-
-function goalStates(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
 function cutovers(entries) {
@@ -58,17 +50,7 @@ function cutovers(entries) {
 
 /** Find a durable Goal snapshot on the branch by predicate. */
 function findGoalSnapshot(entries, predicate) {
-	return goalStates(entries).find((s) => predicate(s.data.goal))?.data.goal;
-}
-
-/** Fail unless exactly `steps` provider responses were consumed. */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	assert.equal(
-		assistantOutcomes(session).length,
-		steps,
-		`expected exactly ${steps} provider responses, got ${assistantOutcomes(session).length}`,
-	);
-	assertOnlyFailures(session, expectedFailures);
+	return goalSnapshots(entries).find((s) => predicate(s.data.goal))?.data.goal;
 }
 
 /** Text of a session-entry message content (string or block array). */
@@ -92,34 +74,6 @@ function resumeMessages(entries) {
 			e.message?.role === "user" &&
 			messageText(e.message.content).startsWith("[pi-goal] The user resumed Goal"),
 	);
-}
-
-/** Poll the session file until the newest Goal snapshot satisfies `predicate`. */
-async function waitForSnapshot(session, predicate, description, timeoutMs = 15_000) {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		const snapshot = lastGoalSnapshot(readSessionEntries(await session.sessionFile()));
-		if (snapshot && predicate(snapshot)) return snapshot;
-		if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
-		await sleep(20);
-	}
-}
-
-/** The live accounted total reported by bare `/goal`. */
-async function liveUsage(session) {
-	const seen = session.records.filter(
-		(r) => r.type === "extension_ui_request" && r.method === "notify" && /Token usage: \d+ tokens/.test(r.message),
-	).length;
-	await session.prompt("/goal");
-	const notify = await session.waitFor("a fresh /goal report", (records) => {
-		const matches = records.filter(
-			(r) => r.type === "extension_ui_request" && r.method === "notify" && /Token usage: \d+ tokens/.test(r.message),
-		);
-		return matches.length > seen ? matches.at(-1) : undefined;
-	});
-	const match = /Token usage: (\d+) tokens/.exec(notify.message);
-	assert.ok(match, `no usage in: ${notify.message}`);
-	return Number(match[1]);
 }
 
 /** Copy one immutable legacy fixture into a fresh session dir and start Pi on it. */
@@ -167,7 +121,7 @@ test("/goal resume --budget <new-total> resumes a budget_limited Goal, cancels t
 	});
 	const before = await reachPendingWrapUp(session);
 	const revisionBefore = before.revision;
-	const snapshotsBefore = goalStates(readSessionEntries(await session.sessionFile())).length;
+	const snapshotsBefore = goalSnapshots(readSessionEntries(await session.sessionFile())).length;
 	// The resumed run starts immediately after the resume command, so the script
 	// must already carry its steps.
 	script(
@@ -198,7 +152,7 @@ test("/goal resume --budget <new-total> resumes a budget_limited Goal, cancels t
 	assert.equal(goal.tokenBudget, 200, "the new ceiling is absolute");
 	assert.equal(goal.wrapUpPending, false, "the pending old-episode wrap-up is cancelled");
 	assert.equal(goal.usage.totalTokens, 115, "complete usage history is preserved");
-	assert.equal(goalStates(entries).length, snapshotsBefore + 2, "one snapshot for the resume and one for the completion");
+	assert.equal(goalSnapshots(entries).length, snapshotsBefore + 2, "one snapshot for the resume and one for the completion");
 
 	// Commit-before-work: the resume snapshot precedes the resume work message and
 	// the resumed run's first assistant message.
@@ -352,7 +306,7 @@ test("malformed budget resume arguments are refused with guidance and change not
 		await session.stop();
 	});
 	const before = await reachPendingWrapUp(session);
-	const snapshotsBefore = goalStates(readSessionEntries(await session.sessionFile())).length;
+	const snapshotsBefore = goalSnapshots(readSessionEntries(await session.sessionFile())).length;
 	// The resumed run starts immediately after a valid resume command.
 	script(
 		[
@@ -375,7 +329,7 @@ test("malformed budget resume arguments are refused with guidance and change not
 		const refused = await session.notifyAfter(mark, (r) => r.message.includes("Goal not resumed"));
 		assert.match(refused.message, pattern, `${command} is refused with guidance`);
 		assert.equal(
-			goalStates(readSessionEntries(await session.sessionFile())).length,
+			goalSnapshots(readSessionEntries(await session.sessionFile())).length,
 			snapshotsBefore,
 			`${command} writes nothing`,
 		);

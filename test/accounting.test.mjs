@@ -321,34 +321,33 @@ test("remaining capacity and exhaustion are computed from the accounted total", 
 });
 
 test("a budget-raising resume is an absolute cumulative ceiling with positive headroom", () => {
-	const settings = parseBudgetSettings(undefined);
 	// The new value is a total, not an increment: 150 means 150 tokens overall
-	// when 130 are already accounted, leaving 20 tokens of headroom.
-	assert.deepEqual(resolveResumeTokenBudget(150, settings, 130), { ok: true, tokenBudget: 150 });
-	assert.deepEqual(resolveResumeTokenBudget(131, settings, 130), { ok: true, tokenBudget: 131 });
+	// when 130 are already accounted, leaving 20 tokens of headroom. No maximum is
+	// configured, so the only bound is the current usage.
+	assert.deepEqual(resolveResumeTokenBudget(150, undefined, 130), { ok: true, tokenBudget: 150 });
+	assert.deepEqual(resolveResumeTokenBudget(131, undefined, 130), { ok: true, tokenBudget: 131 });
 
 	// Equal to the current usage leaves no headroom and is refused.
-	const noHeadroom = resolveResumeTokenBudget(130, settings, 130);
+	const noHeadroom = resolveResumeTokenBudget(130, undefined, 130);
 	assert.equal(noHeadroom.ok, false);
 	assert.match(noHeadroom.ok ? "" : noHeadroom.error, /strictly greater than/);
 	assert.match(noHeadroom.ok ? "" : noHeadroom.error, /130 tokens/);
 
 	// Below the current usage would move the ceiling backwards.
-	const backwards = resolveResumeTokenBudget(120, settings, 130);
+	const backwards = resolveResumeTokenBudget(120, undefined, 130);
 	assert.equal(backwards.ok, false);
 	assert.match(backwards.ok ? "" : backwards.error, /strictly greater than/);
 });
 
 test("a budget-raising resume refuses invalid token counts and never clamps the maximum", () => {
-	const settings = parseBudgetSettings({ goal: { maxTokenBudget: 500 } });
 	for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
-		const result = resolveResumeTokenBudget(bad, settings, 100);
+		const result = resolveResumeTokenBudget(bad, 500, 100);
 		assert.equal(result.ok, false, `${bad} must be refused`);
 	}
-	assert.deepEqual(resolveResumeTokenBudget(500, settings, 100), { ok: true, tokenBudget: 500 });
+	assert.deepEqual(resolveResumeTokenBudget(500, 500, 100), { ok: true, tokenBudget: 500 });
 
 	// Above the configured maximum the request is refused, never clamped.
-	const tooBig = resolveResumeTokenBudget(501, settings, 100);
+	const tooBig = resolveResumeTokenBudget(501, 500, 100);
 	assert.equal(tooBig.ok, false);
 	assert.match(tooBig.ok ? "" : tooBig.error, /exceeds the configured maximum of 500/);
 	assert.match(tooBig.ok ? "" : tooBig.error, /Raise goal\.maxTokenBudget/);
@@ -356,10 +355,10 @@ test("a budget-raising resume refuses invalid token counts and never clamps the 
 
 test("a budget-raising resume never treats the configured default as implicit authority", () => {
 	// The default applies to new Goals only. A resume must carry an explicit total,
-	// and the default must not silently widen it.
-	const settings = parseBudgetSettings({ goal: { defaultTokenBudget: 5000, maxTokenBudget: 1000 } });
-	assert.deepEqual(resolveResumeTokenBudget(200, settings, 130), { ok: true, tokenBudget: 200 });
-	const tooBig = resolveResumeTokenBudget(2000, settings, 130);
+	// and the default must not silently widen it — which is why this path reads the
+	// maximum alone rather than a whole settings object.
+	assert.deepEqual(resolveResumeTokenBudget(200, 1000, 130), { ok: true, tokenBudget: 200 });
+	const tooBig = resolveResumeTokenBudget(2000, 1000, 130);
 	assert.equal(tooBig.ok, false, "the maximum still bounds the explicit request");
 });
 

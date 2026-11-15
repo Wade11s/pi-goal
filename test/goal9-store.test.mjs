@@ -98,15 +98,6 @@ function goalEntry(goal, extra = {}) {
 	};
 }
 
-function cutoverEntry(goalId) {
-	return {
-		type: "custom",
-		id: `co-${nextEntryId++}`,
-		customType: "goal-cutover",
-		data: { version: 1, goalId },
-	};
-}
-
 function usageReport(input, output, extra = {}) {
 	return {
 		input,

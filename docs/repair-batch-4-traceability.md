@@ -151,6 +151,47 @@ bounds the suite's own demand; it cannot shield a shared host from external
 starvation, which is why the harness still fails loudly with its record dump
 instead of silently retrying or extending a timeout.
 
+## Shared predicates: pause corroboration and creation authority
+
+The quotation rules and the pause-corroboration rules answer the same question
+about the same text — *is this clause an affirmative instruction, or is it negated,
+cancelled, deferred, or a mere mention?* — so they share two predicates instead of
+carrying two spellings of the same English:
+
+| Predicate | Pause path | Creation path |
+| --- | --- | --- |
+| `foldApostrophes` (U+2018/U+2019 → `'`) | `contradictsPause`, `hasNegationBefore` | `isGoalCreationRequestClause`, `isNegativeCreationClause`, `hasNegationGoverningAction` |
+| `REQUEST_LEAD` (politeness, modal, and discourse-marker lead-ins) | `isPauseRequestClause` | `isGoalCreationRequestClause` |
+
+Batch 4 widened both in service of the creation-authority contract (#27), which is
+this batch's scope: a cancellation written with a curly apostrophe must cancel
+exactly like the straight-apostrophe form, and a correction carrying a discourse
+marker ("Actually, create a goal") must still be recognized once the marker is
+stripped. Widening the shared predicate is the minimal correct way to do that;
+forking it per caller would let the two contracts drift apart on the same
+sentence.
+
+Because the predicates are shared, the pause path inherits the same reading. That
+inheritance is deliberate rather than incidental, and it is conservative in both
+directions:
+
+- the apostrophe fold is one character for one and is applied only where the
+  result can *add* a refusal, so it can never turn a refusal into an acceptance;
+- the discourse-marker widening only removes a lead-in, and what remains must
+  still match an imperative or passive pause shape *and* contain the quoted
+  words, so a mention ("what a pause"), a question, a hypothetical, a deferral,
+  and a keep-working instruction are all still refused.
+
+The pause path stays fail-closed as a whole: occurrence of the words alone never
+grants pause authority, corroboration still requires the newest human-authored
+message to carry an affirmative instruction containing the quote, and `/goal
+pause` remains available to the user regardless.
+
+Evidence: `test/goal12-pause-corroboration.test.mjs` — "a later
+typographic-apostrophe cancellation cannot corroborate a pause" and "a comma-less
+discourse-marker lead corroborates a pause". Both pause-path rows are in the
+matrix above, and neither was removed or weakened by the integration.
+
 ## Limitations
 
 - The quotation rules are deliberately conservative deterministic English rules.

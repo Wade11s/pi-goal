@@ -733,10 +733,16 @@ export class GoalStore {
 				if (!isUsageCheckpoint(checkpoint)) continue;
 				// A checkpoint only counts for the Goal it was written for.
 				if (supersededRecord && supersededLedger && checkpoint.goalId === supersededRecord.id) {
-					this.applyCheckpointTo(supersededLedger, checkpoint);
-					supersededRecord.usage = supersededLedger.usage;
-					supersededDirty = true;
-					if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
+					if (
+						this.chargeSupersededTail(supersededRecord, supersededLedger, (ledger) => {
+							this.applyCheckpointTo(ledger, checkpoint);
+							// Adopting a checkpoint rewrites the tail's baseline by construction, so
+							// its totals belong on the record even when its tokens are unchanged.
+							return true;
+						})
+					) {
+						supersededDirty = true;
+					}
 					continue;
 				}
 				if (checkpoint.goalId !== this.current?.id) continue;
@@ -756,10 +762,12 @@ export class GoalStore {
 				const message = entry.message;
 				if (message.role === "assistant") {
 					if (superseded && supersededLedger && supersededRecord) {
-						if (supersededLedger.account(entry.id, message.usage, "model")) {
-							supersededRecord.usage = supersededLedger.usage;
+						if (
+							this.chargeSupersededTail(supersededRecord, supersededLedger, (ledger) =>
+								ledger.account(entry.id, message.usage, "model") !== undefined,
+							)
+						) {
 							supersededDirty = true;
-							if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
 						}
 					} else {
 						this.ledger.account(entry.id, message.usage, "model");
@@ -769,10 +777,12 @@ export class GoalStore {
 					// so charging the result once is what keeps it from being counted
 					// twice.
 					if (superseded && supersededLedger && supersededRecord) {
-						if (supersededLedger.account(`toolResult:${message.toolCallId}`, message.usage, "nested")) {
-							supersededRecord.usage = supersededLedger.usage;
+						if (
+							this.chargeSupersededTail(supersededRecord, supersededLedger, (ledger) =>
+								ledger.account(`toolResult:${message.toolCallId}`, message.usage, "nested") !== undefined,
+							)
+						) {
 							supersededDirty = true;
-							if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
 						}
 					} else {
 						this.ledger.account(`toolResult:${message.toolCallId}`, message.usage, "nested");
@@ -783,10 +793,12 @@ export class GoalStore {
 			if (entry.type !== "compaction" && entry.type !== "branch_summary") continue;
 			if (!entry.usage) continue;
 			if (superseded && supersededLedger && supersededRecord) {
-				if (supersededLedger.account(entry.id, entry.usage, "nested")) {
-					supersededRecord.usage = supersededLedger.usage;
+				if (
+					this.chargeSupersededTail(supersededRecord, supersededLedger, (ledger) =>
+						ledger.account(entry.id, entry.usage, "nested") !== undefined,
+					)
+				) {
 					supersededDirty = true;
-					if (this.refreshSupersededRecord(supersededRecord, supersededLedger)) supersededDirty = true;
 				}
 			} else {
 				this.ledger.account(entry.id, entry.usage, "nested");
@@ -1268,6 +1280,37 @@ export class GoalStore {
 		return true;
 	}
 
+	/**
+	 * Charge one usage-bearing entry to the superseded identity's tail and bring the
+	 * record in step with the ledger that just took it.
+	 *
+	 * Every usage-bearing entry shape owes the same tail — an assistant report, a tool
+	 * result carrying its nested usage, a compaction or branch summary, and a durable
+	 * checkpoint — so the sequence lives here once instead of being copied per shape:
+	 * charge the ledger, copy its totals onto the record so a frozen snapshot carries
+	 * them, mark the tail dirty so the next boundary persists it, and record a budget
+	 * stop the charge crosses (see {@link refreshSupersededRecord}). A new entry shape
+	 * that charged the ledger and forgot the record would silently drop accounted work.
+	 *
+	 * `charge` reports whether it changed the ledger. The checkpoint path passes a
+	 * charge that always reports a change, because adopting a checkpoint rewrites the
+	 * tail's baseline by construction: its totals belong on the record even when its
+	 * tokens are unchanged.
+	 *
+	 * Returns whether the tail changed, which is what the caller folds into its own
+	 * dirty flag — the replay's answer to "does the branch still owe this tail?".
+	 */
+	private chargeSupersededTail(
+		record: GoalRecord,
+		ledger: UsageLedger,
+		charge: (ledger: UsageLedger) => boolean,
+	): boolean {
+		if (!charge(ledger)) return false;
+		record.usage = ledger.usage;
+		this.refreshSupersededRecord(record, ledger);
+		return true;
+	}
+
 	/** Mark the current run/segment as Goal-owned work for `goalId`. */
 	beginGoalWork(goalId: string): void {
 		this.goalOwned = true;
@@ -1348,7 +1391,7 @@ export class GoalStore {
 		if (!this.legacyPending || !current) {
 			this.legacyPending = false;
 			return { ok: true, cutover: false, notices: [] };
-	}
+		}
 		const notices: string[] = [];
 		let updated: GoalRecord = copyRecord(current);
 		const max = settings.maxTokenBudget;
@@ -1540,6 +1583,80 @@ export class GoalStore {
 	}
 
 	/**
+	 * Take a Goal out of `active` and make that transition durable, in the one order
+	 * that keeps the active-time watermark honest.
+	 *
+	 * The order is load-bearing, which is why it lives here once instead of being
+	 * copied into the four transitions that need it (completion, pause, the blocked
+	 * threshold, and an extension-owned stop):
+	 *
+	 * 1. the clock stops *before* the record is built, so the snapshot carries the
+	 *    interval that was actually worked rather than the trailing response of the
+	 *    turn that stopped the Goal;
+	 * 2. the snapshot is written before the folded interval is marked durable,
+	 *    because the write is what makes it durable;
+	 * 3. a failed write restarts the clock and leaves the interval unpersisted, so
+	 *    the Goal is still active and billable and the next checkpoint still owes the
+	 *    interval — instead of claiming time no session entry records.
+	 *
+	 * `stopped` says whether this transition takes the Goal out of `active`. A blocked
+	 * report below the threshold does not, so its clock keeps running and its record
+	 * keeps the usage it already had. `mutate` builds the record from the current one
+	 * and the usage to carry, which is undefined for a transition that does not stop
+	 * the clock; a transition written through {@link commitSnapshot} ignores it anyway,
+	 * because the commit folds the live view it reads *after* the stop and therefore
+	 * already carries the folded interval. `commit` writes the record and reports a
+	 * failed write instead of throwing (see {@link commitSnapshot} and
+	 * {@link commitStopSnapshot}).
+	 */
+	private stopAndPersist(
+		pi: ExtensionAPI,
+		current: GoalRecord,
+		stopped: boolean,
+		mutate: (current: GoalRecord, usage: GoalUsage | undefined) => GoalRecord,
+		commit: (record: GoalRecord) =>
+			| { ok: true; goal: GoalRecord }
+			| { ok: false; reason: "persistence"; error: unknown },
+	): { ok: true; goal: GoalRecord } | { ok: false; reason: "persistence"; error: unknown } {
+		const activeMs = stopped ? this.clock.stop() : undefined;
+		const updated = mutate(current, activeMs === undefined ? undefined : this.stoppedUsage(activeMs));
+		const result = commit(updated);
+		if (!result.ok) {
+			if (activeMs !== undefined) {
+				// Nothing was written, so the Goal is still active and the clock runs on.
+				// The folded interval stays unpersisted, so the next checkpoint still owes it.
+				this.clock.start();
+			}
+			return result;
+		}
+		if (activeMs !== undefined) this.clock.persisted(activeMs);
+		return result;
+	}
+
+	/**
+	 * Append a snapshot and adopt it as the live record, reporting a failed write
+	 * instead of throwing.
+	 *
+	 * The counterpart to {@link commitSnapshot} for the two extension-owned stops,
+	 * which are written at a boundary of their own rather than superseding whatever
+	 * transition is still waiting to be written: a budget stop armed in memory stays
+	 * pending for its own boundary, so a stop that cleared it would drop the one
+	 * bounded wrap-up the budget_limited Goal is owed.
+	 */
+	private commitStopSnapshot(
+		pi: ExtensionAPI,
+		goal: GoalRecord,
+	): { ok: true; goal: GoalRecord } | { ok: false; reason: "persistence"; error: unknown } {
+		try {
+			this.persistSnapshot(pi, goal);
+		} catch (error) {
+			return { ok: false, reason: "persistence", error };
+		}
+		this.current = this.adopt(goal);
+		return { ok: true, goal };
+	}
+
+	/**
 	 * Mark the current active Goal complete. Increments revision and updates
 	 * timestamp, folds the accounted usage into the snapshot, and stages it
 	 * durably through the supplied Pi API.
@@ -1572,23 +1689,21 @@ export class GoalStore {
 		}
 		// Completion is terminal for accounting: the clock stops at the transition and
 		// the snapshot carries the folded value.
-		const activeMs = this.clock.stop();
-		const result = this.commitSnapshot(pi, {
-			...current,
-			status: "complete",
-			// A complete Goal has no blocker, so a stale audit is dropped rather
-			// than reported as if it were still stopping the Goal.
-			blockedAudit: undefined,
-			updatedAt: Date.now(),
-			revision: current.revision + 1,
-		});
-		if (!result.ok) {
-			// The Goal is still active, so the clock keeps running.
-			this.clock.start();
-			return result;
-		}
-		this.clock.persisted(activeMs);
-		return result;
+		return this.stopAndPersist(
+			pi,
+			current,
+			true,
+			(current) => ({
+				...current,
+				status: "complete",
+				// A complete Goal has no blocker, so a stale audit is dropped rather
+				// than reported as if it were still stopping the Goal.
+				blockedAudit: undefined,
+				updatedAt: Date.now(),
+				revision: current.revision + 1,
+			}),
+			(record) => this.commitSnapshot(pi, record),
+		);
 	}
 
 	/**
@@ -1618,20 +1733,18 @@ export class GoalStore {
 				message: `only an active Goal can be paused (current status: ${current.status})`,
 			};
 		}
-		const activeMs = this.clock.stop();
-		const result = this.commitSnapshot(pi, {
-			...current,
-			status: "paused",
-			updatedAt: Date.now(),
-			revision: current.revision + 1,
-		});
-		if (!result.ok) {
-			// The Goal is still active, so the clock keeps running.
-			this.clock.start();
-			return result;
-		}
-		this.clock.persisted(activeMs);
-		return result;
+		return this.stopAndPersist(
+			pi,
+			current,
+			true,
+			(current) => ({
+				...current,
+				status: "paused",
+				updatedAt: Date.now(),
+				revision: current.revision + 1,
+			}),
+			(record) => this.commitSnapshot(pi, record),
+		);
 	}
 
 	/**
@@ -1681,15 +1794,7 @@ export class GoalStore {
 				};
 			}
 			const requested = options.tokenBudget!;
-			const resolution = resolveResumeTokenBudget(
-				requested,
-				{
-					defaultTokenBudget: undefined,
-					maxTokenBudget: options.maxTokenBudget,
-					problems: [],
-				},
-				this.ledger.usage.totalTokens,
-			);
+			const resolution = resolveResumeTokenBudget(requested, options.maxTokenBudget, this.ledger.usage.totalTokens);
 			if (!resolution.ok) {
 				return { ok: false, reason: "not-eligible", message: resolution.error };
 			}
@@ -2114,35 +2219,26 @@ export class GoalStore {
 		// trailing response of the turn that reported the blocker, to a Goal that is no
 		// longer working. A report below the threshold leaves the Goal active, so its
 		// clock keeps running.
-		//
-		// The folded interval is only marked durable *after* the snapshot that carries
-		// it is written, exactly like completion and pause: the write is what makes it
-		// durable. Advancing the watermark first would claim time the branch does not
-		// record, so an unclean exit between a failed write and the next boundary would
-		// lose it silently instead of letting a checkpoint recover it.
-		const activeMs = thresholdMet ? this.clock.stop() : undefined;
-		const updated: GoalRecord = {
-			...current,
-			...(activeMs !== undefined ? { status: "blocked" as const, usage: this.stoppedUsage(activeMs) } : {}),
-			blockedAudit: { blockerId: auditId, blocker, turns },
-			updatedAt: Date.now(),
-			revision: current.revision + 1,
-		};
-		try {
-			this.persistSnapshot(pi, updated);
-		} catch (error) {
-			if (activeMs !== undefined) {
-				// Nothing was written, so the Goal is still active and the clock runs on.
-				// The folded interval stays unpersisted, so the next checkpoint still owes it.
-				this.clock.start();
-			}
+		const result = this.stopAndPersist(
+			pi,
+			current,
+			thresholdMet,
+			(current, usage) => ({
+				...current,
+				...(thresholdMet ? { status: "blocked" as const, usage } : {}),
+				blockedAudit: { blockerId: auditId, blocker, turns },
+				updatedAt: Date.now(),
+				revision: current.revision + 1,
+			}),
+			(record) => this.commitStopSnapshot(pi, record),
+		);
+		if (!result.ok) {
+			// The report is not recorded, so the chain it would have extended is gone.
 			this.lastBlockerTurn = undefined;
 			this.lastBlockerRevision = undefined;
-			return { ok: false, reason: "persistence", error };
+			return { ok: false, reason: "persistence", error: result.error };
 		}
-		if (activeMs !== undefined) this.clock.persisted(activeMs);
-		this.current = this.adopt(updated);
-		return { ok: true, goal: updated, turns, thresholdMet, repeat: false };
+		return { ok: true, goal: result.goal, turns, thresholdMet, repeat: false };
 	}
 
 	/**
@@ -2156,9 +2252,7 @@ export class GoalStore {
 	 * Both are also transitions to a non-active status, so the active-time clock stops
 	 * here and the snapshot carries the folded value: a stopped Goal is not working,
 	 * and the interval after the stop — the trailing response of the run that hit the
-	 * limit, the user reading the notice, a restart — is not Goal work. A write
-	 * failure leaves the Goal active, so the clock is restarted and the folded
-	 * interval stays unpersisted, which lets the next checkpoint recover it.
+	 * limit, the user reading the notice, a restart — is not Goal work.
 	 */
 	stopGoal(
 		pi: ExtensionAPI,
@@ -2166,32 +2260,25 @@ export class GoalStore {
 	): StopGoalResult {
 		const current = this.current;
 		if (!current || current.status !== "active") return { ok: false, reason: "not-active" };
-		// The folded interval is marked durable only once the snapshot carrying it is
-		// written (see `markComplete` and `markPaused`). Marking it first would claim
-		// time that is not on the branch, so a crash between a failed write and the
-		// next boundary would lose it instead of leaving it to a checkpoint.
-		const activeMs = this.clock.stop();
-		const updated: GoalRecord = {
-			...current,
-			status: stop.status,
-			blockedAudit: { blocker: stop.blocker, turns: stop.turns ?? 0 },
-			usage: this.stoppedUsage(activeMs),
-			updatedAt: Date.now(),
-			revision: current.revision + 1,
-		};
-		try {
-			this.persistSnapshot(pi, updated);
-		} catch (error) {
-			// Nothing was written, so the Goal is still active and the clock runs on.
-			// The folded interval stays unpersisted, so the next checkpoint still owes it.
-			this.clock.start();
-			return { ok: false, reason: "persistence", error };
-		}
-		this.clock.persisted(activeMs);
-		this.current = this.adopt(updated);
+		const result = this.stopAndPersist(
+			pi,
+			current,
+			true,
+			(current, usage) => ({
+				...current,
+				status: stop.status,
+				blockedAudit: { blocker: stop.blocker, turns: stop.turns ?? 0 },
+				...(usage === undefined ? {} : { usage }),
+				updatedAt: Date.now(),
+				revision: current.revision + 1,
+			}),
+			(record) => this.commitStopSnapshot(pi, record),
+		);
+		if (!result.ok) return { ok: false, reason: "persistence", error: result.error };
+		// The stop ends the audit chain: whatever reports next starts a fresh one at one.
 		this.lastBlockerTurn = undefined;
 		this.lastBlockerRevision = undefined;
-		return { ok: true, goal: updated };
+		return { ok: true, goal: result.goal };
 	}
 
 	/**

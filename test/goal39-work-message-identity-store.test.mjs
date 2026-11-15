@@ -30,16 +30,6 @@ function fakeCtx(entries) {
 	return { sessionManager: { getBranch: () => entries, getSessionFile: () => "/tmp/session.jsonl" } };
 }
 
-function fakePi() {
-	const appended = [];
-	return {
-		appended,
-		appendEntry(type, data) {
-			appended.push({ type, data });
-		},
-	};
-}
-
 function usage(total, overrides = {}) {
 	return {
 		totalTokens: total,

@@ -12,20 +12,15 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
 import {
 	PiRpcSession,
-	assertOnlyFailures,
-	assistantOutcomes,
+	assertStepsConsumed,
 	lastGoalSnapshot,
 	readSessionEntries,
+	script,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /** Wait until the current run has provably started but has not yet answered. */
 function waitForRunStarted(session) {
@@ -43,16 +38,6 @@ async function startGoal(session, objective = OBJECTIVE) {
  * Assert the scripted provider was asked for exactly `steps` responses, and that
  * the only failures are the ones the test deliberately provoked.
  */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = assistantOutcomes(session);
-	assert.equal(
-		outcomes.length,
-		steps,
-		`expected exactly ${steps} provider responses, got ${outcomes.length}`,
-	);
-	assertOnlyFailures(session, expectedFailures);
-}
-
 test("provider failures are classified from what the evidence actually says", async () => {
 	// One terminal provider error per case, retries disabled so the failure reaches
 	// the boundary exactly as the reviewer's probes did. `usage_limited` is terminal

@@ -24,11 +24,15 @@ import {
 	PiRpcSession,
 	assertCleanRun,
 	assertOnlyFailures,
-	assistantOutcomes,
+	assertStepsConsumed,
 	continuationEntries,
+	currentGoalSnapshot,
 	lastGoalSnapshot,
+	liveUsage,
 	readSessionEntries,
 	runCount,
+	script,
+	waitForSnapshot,
 } from "./helpers/rpc-harness.mjs";
 import { structuredGoal } from "./helpers/blocked-audit.mjs";
 
@@ -36,27 +40,12 @@ const OBJECTIVE = "Make the full test suite pass in this repository";
 const REQUEST = "Please create a Goal for the release";
 const BLOCKER = "the upstream release API token has not been issued yet";
 
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
-
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
 }
 
 function goalStates(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
-/** The newest *current* snapshot: a `superseded` entry never selects the Goal. */
-function currentGoalSnapshot(entries) {
-	let snapshot;
-	for (const entry of entries) {
-		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
-			snapshot = entry;
-		}
-	}
-	return snapshot;
 }
 
 /** The newest snapshot marked `superseded`, or null. */
@@ -68,43 +57,6 @@ function supersededSnapshot(entries) {
 		}
 	}
 	return snapshot;
-}
-
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	assert.equal(
-		assistantOutcomes(session).length,
-		steps,
-		`expected exactly ${steps} provider responses, got ${assistantOutcomes(session).length}`,
-	);
-	assertOnlyFailures(session, expectedFailures);
-}
-
-/** Poll the newest snapshot until `predicate` holds. */
-async function waitForSnapshot(session, predicate, description, timeoutMs = 15_000) {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		const snapshot = lastGoalSnapshot(readSessionEntries(await session.sessionFile()));
-		if (snapshot && predicate(snapshot)) return snapshot;
-		if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
-		await new Promise((resolve) => setTimeout(resolve, 20));
-	}
-}
-
-/** The live accounted total reported by bare `/goal`. */
-async function liveUsage(session) {
-	const seen = session.records.filter(
-		(r) => r.type === "extension_ui_request" && r.method === "notify" && /Token usage: \d+ tokens/.test(r.message),
-	).length;
-	await session.prompt("/goal");
-	const notify = await session.waitFor("a fresh /goal report", (records) => {
-		const matches = records.filter(
-			(r) => r.type === "extension_ui_request" && r.method === "notify" && /Token usage: \d+ tokens/.test(r.message),
-		);
-		return matches.length > seen ? matches.at(-1) : undefined;
-	});
-	const match = /Token usage: (\d+) tokens/.exec(notify.message);
-	assert.ok(match, `no usage in: ${notify.message}`);
-	return Number(match[1]);
 }
 
 /**

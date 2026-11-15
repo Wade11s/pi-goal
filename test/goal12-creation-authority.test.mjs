@@ -26,11 +26,13 @@ import {
 	PiRpcSession,
 	assertCleanRun,
 	assertOnlyFailures,
-	assistantOutcomes,
+	assertStepsConsumed,
 	continuationEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Ship the release notes page";
@@ -38,20 +40,12 @@ const REQUEST = "Please create a Goal for the release";
 const PEER = new URL("./extensions/authority-peer.ts", import.meta.url).pathname;
 const TREE_NAV = new URL("./extensions/tree-nav.ts", import.meta.url).pathname;
 
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
-
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
 }
 
 function structuredGoal(result) {
 	return result.structuredContent?.goal ?? result.details?.goal;
-}
-
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
 function usageCheckpoints(entries) {
@@ -65,12 +59,6 @@ function dialogRequests(session) {
 }
 
 /** Fail unless exactly `steps` provider responses were consumed. */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = assistantOutcomes(session);
-	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
-	assertOnlyFailures(session, expectedFailures);
-}
-
 test("a raw interactive/RPC request authorizes create_goal with an exact quotation and an independent objective", async () => {
 	const session = await PiRpcSession.start();
 	// Turn 1 is ordinary work, turn 2 creates the Goal from the quoted request,

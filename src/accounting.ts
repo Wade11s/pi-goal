@@ -413,6 +413,46 @@ export type BudgetResolution =
 	| { ok: false; error: string };
 
 /**
+ * Validate one whole-token budget against the rules both budget paths share.
+ *
+ * The shape is identical for creating a Goal and for raising a `budget_limited`
+ * Goal's ceiling — a whole number of at least {@link MIN_TOKEN_BUDGET}, positive
+ * headroom where the caller requires it, and the configured maximum as a hard bound
+ * that is never clamped — and the two messages differ only in the scope they name
+ * and the remedy they offer. One validator keeps them in step: a wording or
+ * threshold fix lands here instead of in one path while the other quietly keeps the
+ * old text.
+ *
+ * Returns the error message, or undefined when the budget is acceptable.
+ */
+function validateWholeBudget(
+	value: number,
+	max: number | undefined,
+	wording: { scope: string; remedy: string; headroom?: { currentUsage: number } },
+): string | undefined {
+	if (!Number.isSafeInteger(value) || value < MIN_TOKEN_BUDGET) {
+		return (
+			`${wording.scope}a token budget must be a whole number of at least ${MIN_TOKEN_BUDGET} tokens ` +
+			`(got ${Number.isFinite(value) ? value : String(value)}).`
+		);
+	}
+	if (wording.headroom !== undefined && value <= wording.headroom.currentUsage) {
+		return (
+			`${wording.scope}the new budget of ${value} tokens must be strictly greater than the Goal's ` +
+			`current usage of ${wording.headroom.currentUsage} tokens, so the resumed Goal has positive headroom. ` +
+			"Request a higher cumulative total."
+		);
+	}
+	if (max !== undefined && value > max) {
+		return (
+			`${wording.scope}a token budget of ${value} tokens exceeds the configured maximum of ${max} ` +
+			`tokens. Raise goal.maxTokenBudget or ${wording.remedy}`
+		);
+	}
+	return undefined;
+}
+
+/**
  * Resolve the token budget for a new Goal.
  *
  * The configured maximum is a *hard* bound, so it constrains every path:
@@ -447,22 +487,11 @@ export function resolveGoalTokenBudget(requested: GoalBudgetRequest, settings: B
 		return { ok: true, tokenBudget: settings.defaultTokenBudget ?? max };
 	}
 
-	if (!Number.isSafeInteger(requested) || requested < MIN_TOKEN_BUDGET) {
-		return {
-			ok: false,
-			error:
-				`Goal not created: a token budget must be a whole number of at least ${MIN_TOKEN_BUDGET} tokens ` +
-				`(got ${Number.isFinite(requested) ? requested : String(requested)}).`,
-		};
-	}
-	if (max !== undefined && requested > max) {
-		return {
-			ok: false,
-			error:
-				`Goal not created: a token budget of ${requested} tokens exceeds the configured maximum of ${max} ` +
-				"tokens. Raise goal.maxTokenBudget or request a smaller budget.",
-		};
-	}
+	const invalid = validateWholeBudget(requested, max, {
+		scope: "Goal not created: ",
+		remedy: "request a smaller budget.",
+	});
+	if (invalid !== undefined) return { ok: false, error: invalid };
 	return { ok: true, tokenBudget: requested };
 }
 
@@ -484,39 +513,21 @@ export function remainingTokens(tokenBudget: number | undefined, usedTokens: num
  *
  * The configured maximum remains a hard cap and is never clamped.
  * `goal.defaultTokenBudget` is deliberately absent from this path: it applies to
- * new Goals only and is never implicit resume authority.
+ * new Goals only and is never implicit resume authority — which is why the only
+ * setting read here is the maximum, passed in on its own rather than as a whole
+ * {@link BudgetSettings} this path has no other use for.
  */
 export function resolveResumeTokenBudget(
 	requested: number,
-	settings: BudgetSettings,
+	maxTokenBudget: number | undefined,
 	currentUsage: number,
 ): BudgetResolution {
-	if (!Number.isSafeInteger(requested) || requested < MIN_TOKEN_BUDGET) {
-		return {
-			ok: false,
-			error:
-				`a token budget must be a whole number of at least ${MIN_TOKEN_BUDGET} tokens ` +
-				`(got ${Number.isFinite(requested) ? requested : String(requested)}).`,
-		};
-	}
-	if (requested <= currentUsage) {
-		return {
-			ok: false,
-			error:
-				`the new budget of ${requested} tokens must be strictly greater than the Goal's ` +
-				`current usage of ${currentUsage} tokens, so the resumed Goal has positive headroom. Request a ` +
-				`higher cumulative total.`,
-		};
-	}
-	const max = settings.maxTokenBudget;
-	if (max !== undefined && requested > max) {
-		return {
-			ok: false,
-			error:
-				`a token budget of ${requested} tokens exceeds the configured maximum of ${max} ` +
-				"tokens. Raise goal.maxTokenBudget or resume with a budget of at most that maximum.",
-		};
-	}
+	const invalid = validateWholeBudget(requested, maxTokenBudget, {
+		scope: "",
+		remedy: "resume with a budget of at most that maximum.",
+		headroom: { currentUsage },
+	});
+	if (invalid !== undefined) return { ok: false, error: invalid };
 	return { ok: true, tokenBudget: requested };
 }
 

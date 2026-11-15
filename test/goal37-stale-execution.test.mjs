@@ -28,13 +28,15 @@ import { join } from "node:path";
 import {
 	PiRpcSession,
 	assertCleanRun,
-	assertOnlyFailures,
-	assistantOutcomes,
+	assertStepsConsumed,
 	continuationEntries,
 	customMessageEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 
 const OLD_OBJECTIVE = "Verify the original objective in this repository";
@@ -42,20 +44,12 @@ const NEW_OBJECTIVE = "Ship the replacement objective in this repository";
 /** An explicit Goal-creation request, for the model-side `create_goal` boundary. */
 const REQUEST = "Please create a Goal for the replacement objective";
 
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
-
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
 }
 
 function structuredGoal(result) {
 	return result.structuredContent?.goal ?? result.details?.goal;
-}
-
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
 /** Wait until `count` provider turns have started. */
@@ -83,22 +77,6 @@ async function waitForStoredGoal(session, predicate, description = "stored Goal"
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`Timed out waiting for ${description}`);
-}
-
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
-}
-
-/** Fail unless exactly `steps` provider responses were consumed. */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = assistantOutcomes(session);
-	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
-	assertOnlyFailures(session, expectedFailures);
 }
 
 /**

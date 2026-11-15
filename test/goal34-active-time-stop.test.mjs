@@ -28,20 +28,20 @@ import { tmpdir } from "node:os";
 import {
 	PiRpcSession,
 	assertCleanRun,
-	assertOnlyFailures,
-	assistantOutcomes,
+	assertStepsConsumed,
 	continuationEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
 } from "./helpers/rpc-harness.mjs";
 import { scriptAuditChain, structuredGoal } from "./helpers/blocked-audit.mjs";
+import { USAGE_ENTRY_TYPE } from "../src/goal.ts";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
 /** The one genuine condition the model reports across consecutive Goal turns. */
 const BLOCKER = "the upstream release API token has not been issued yet";
-/** Keep in sync with the customTypes registered by the extension. */
-const USAGE_ENTRY_TYPE = "goal-usage";
 /** Held while the Goal is still active and idle, so its clock must accrue. */
 const ACTIVE_HOLD_MS = 1500;
 /** Idle time after the stop, long enough that a running clock would show it. */
@@ -51,21 +51,9 @@ function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Every persisted Goal snapshot, in the order the session recorded them. */
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
 /** Every durable accounting checkpoint, in append order. */
 function usageCheckpoints(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === USAGE_ENTRY_TYPE);
-}
-
-/** Fail unless exactly `steps` provider responses were consumed. */
-function assertStepsConsumed(session, steps) {
-	const outcomes = assistantOutcomes(session);
-	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
-	assertOnlyFailures(session, []);
 }
 
 /** Wait for the next settlement after the records accumulated so far. */
@@ -217,13 +205,25 @@ test("a blocked Goal stops its active-time clock, and a restart never resumes it
 		assert.equal(afterOrdinary.activeSeconds, before.activeSeconds, "an ordinary run adds no active time");
 		assert.equal(afterOrdinary.totalTokens, before.totalTokens, "and no Goal-owned tokens");
 
-		// Nothing after the stop may checkpoint a larger active time either.
+		// Nothing after the stop may checkpoint a larger active time either. The stopped
+		// clock owes nothing, so the honest form of that is a count: no checkpoint is
+		// appended past the newest snapshot at all. Asserting the count is what keeps
+		// this from passing vacuously if the filter ever matched nothing for the wrong
+		// reason. The checkpoints written *before* the stop are asserted too, so the
+		// accrual they recorded is real and none of them claims more than the stop
+		// folded.
 		const entries = readSessionEntries(await session.sessionFile());
-		for (const checkpoint of checkpointsAfterLastSnapshot(entries)) {
-			assert.equal(
-				checkpoint.data.usage.activeMs,
-				frozenMs,
-				"a checkpoint written after the stop keeps the frozen value",
+		assert.equal(
+			checkpointsAfterLastSnapshot(entries).length,
+			0,
+			"the stopped clock owes no checkpoint, so nothing after the stop restates active time",
+		);
+		const checkpoints = usageCheckpoints(entries);
+		assert.ok(checkpoints.length > 0, "the active interval before the stop was checkpointed");
+		for (const checkpoint of checkpoints) {
+			assert.ok(
+				checkpoint.data.usage.activeMs <= frozenMs,
+				"no checkpoint claims more active time than the stop folded",
 			);
 		}
 

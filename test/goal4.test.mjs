@@ -26,16 +26,15 @@ import {
 	assertCleanRun,
 	assertOnlyFailures,
 	continuationEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /** Tool results for one tool, in the order the calls finalized. */
 function toolResults(session, toolName) {
@@ -53,25 +52,6 @@ function waitForRunStarted(session) {
 		"run started",
 		(records) => (records.some((r) => r.type === "turn_start") ? true : undefined),
 	);
-}
-
-/**
- * Submit an extension command without awaiting its response, so the test can
- * answer a confirmation dialog (or observe ordering against a held provider
- * response) before the command handler completes.
- */
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
-}
-
-/** goal-state snapshots (records), in append order. */
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
 /** Stop an active Goal loop deliberately with an aborted run (Pi's hard exit). */

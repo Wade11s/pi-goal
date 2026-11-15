@@ -29,12 +29,15 @@ import {
 	PiRpcSession,
 	assertCleanRun,
 	assertOnlyFailures,
+	assertStepsConsumed,
 	assistantOutcomes,
 	continuationEntries,
 	failedAssistantOutcomes,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
 } from "./helpers/rpc-harness.mjs";
 import {
 	FOREIGN_ID,
@@ -64,35 +67,9 @@ const TERMINAL_ERROR = "invalid api key";
 /** A shell command that runs and is then killed by its own timeout. */
 const TIMING_OUT_COMMAND = { command: "sleep 1", timeout: 0.05 };
 
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
-
 /** Tool results for one tool, in the order the calls finalized. */
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
-}
-
-/** Every persisted Goal snapshot, in the order the session recorded them. */
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
-/**
- * Assert the scripted provider was asked for exactly `steps` responses.
- *
- * One provider request consumes one step and finalizes one assistant message,
- * so equality proves the test neither exhausted the script (which would stop the
- * Goal for the wrong reason) nor replayed a step.
- */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = assistantOutcomes(session);
-	assert.equal(
-		outcomes.length,
-		steps,
-		`expected exactly ${steps} provider responses, got ${outcomes.length}`,
-	);
-	assertOnlyFailures(session, expectedFailures);
 }
 
 /** Wait until the current run has provably started but has not yet answered. */

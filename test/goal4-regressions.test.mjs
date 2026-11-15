@@ -15,16 +15,16 @@ import {
 	assertCleanRun,
 	assertOnlyFailures,
 	continuationEntries,
+	currentGoalSnapshot,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
@@ -32,36 +32,6 @@ function toolResults(session, toolName) {
 
 function structuredGoal(result) {
 	return result.structuredContent?.goal ?? result.details?.goal;
-}
-
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
-/**
- * The newest *current* goal-state snapshot: the one that selects the session's Goal.
- *
- * A snapshot marked `superseded` is a finalized historical record of a replaced
- * identity. It is valid and replayable, but it never becomes the current Goal, so
- * the newest goal-state entry on the branch is not necessarily this one.
- */
-function currentGoalSnapshot(entries) {
-	let snapshot;
-	for (const entry of entries) {
-		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
-			snapshot = entry;
-		}
-	}
-	return snapshot;
-}
-
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
 }
 
 function waitForTurns(session, count) {

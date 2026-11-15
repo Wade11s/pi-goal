@@ -20,45 +20,22 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	PiRpcSession,
-	assertOnlyFailures,
+	assertStepsConsumed,
 	continuationEntries,
+	currentGoalSnapshot,
 	customMessageEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE_B = "Verify objective B in this repository";
 const OBJECTIVE_C = "Ship objective C in this repository";
 const WRAPUP_CUSTOM_TYPE = "goal-budget-wrapup";
 
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
-
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
 /** The newest *current* goal-state snapshot: the one that selects the session's Goal. */
-function currentGoalSnapshot(entries) {
-	let snapshot;
-	for (const entry of entries) {
-		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
-			snapshot = entry;
-		}
-	}
-	return snapshot;
-}
-
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
-}
-
 function waitForTurns(session, count) {
 	return session.waitFor(`${count} turn start(s)`, (records) =>
 		records.filter((r) => r.type === "turn_start").length >= count ? true : undefined,
@@ -82,15 +59,6 @@ async function waitForStoredGoal(session, predicate, description = "stored Goal"
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`Timed out waiting for ${description}`);
-}
-
-/** Fail unless exactly `steps` provider responses were consumed. */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = session.records.filter(
-		(r) => r.type === "message_end" && r.message.role === "assistant",
-	);
-	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
-	assertOnlyFailures(session, expectedFailures);
 }
 
 /** Text of a session-entry message content (string or block array). */

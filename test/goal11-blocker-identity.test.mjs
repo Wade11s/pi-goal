@@ -31,11 +31,14 @@ import {
 	PiRpcSession,
 	assertCleanRun,
 	assertOnlyFailures,
-	assistantOutcomes,
+	assertStepsConsumed,
 	continuationEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 import {
 	FOREIGN_ID,
@@ -57,18 +60,9 @@ const OTHER_BLOCKER = "the test database migration has not been written";
 const LEGACY_BLOCKER = "The test database is unavailable";
 const LEGACY_FIXTURES = join(import.meta.dirname, "fixtures", "legacy");
 
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
-
 /** Tool results for one tool, in the order the calls finalized. */
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
-}
-
-/** Every persisted Goal snapshot, in the order the session recorded them. */
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
 /** Every audit count the branch recorded, in order. */
@@ -81,13 +75,6 @@ function auditTurns(entries) {
 /** The audit of the newest persisted snapshot. */
 function lastAuditOf(entries) {
 	return lastGoalSnapshot(entries).data.goal.blockedAudit;
-}
-
-/** Fail unless exactly `steps` provider responses were consumed. */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = assistantOutcomes(session);
-	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
-	assertOnlyFailures(session, expectedFailures);
 }
 
 /** Create the Goal and confirm the kickoff run started. */
@@ -111,16 +98,6 @@ async function reportStatus(session) {
 		);
 		return matches.length ? matches.at(-1) : undefined;
 	});
-}
-
-/** Send a command without awaiting it, so a blocking dialog can be answered first. */
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
 }
 
 /** Copy one immutable legacy fixture into a fresh session dir and start Pi on it. */
