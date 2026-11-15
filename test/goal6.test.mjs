@@ -36,6 +36,7 @@ import {
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
@@ -49,10 +50,6 @@ const NESTED_OUTER_TOOL = "nested_usage_outer";
 const NESTED_GATED_TOOL = "nested_usage_gated";
 /** The leaf's accounted contribution: 40 input + 7 output + 3 cache write. */
 const NESTED_LEAF_ACCOUNTED = 50;
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));

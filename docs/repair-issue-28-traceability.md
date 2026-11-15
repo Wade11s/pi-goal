@@ -152,6 +152,35 @@ Both gates and the focused file were re-run with these fixes in place:
 | `npm run typecheck` | **exit 0** (`tsc --noEmit`, no output) |
 | `node --test test/goal13-integrated-acceptance.test.mjs` (3 repeats) | **4 pass, 0 fail** each |
 
+## Automated gates (integration review follow-up)
+
+The final two-axis review of this integration raised three medium and eight low
+findings, all in the standards axis (duplication in `src/store.ts`, the
+resume-notice conditional, hand-editing formatting artifacts, duplicated budget
+validation, dead test constants, and a re-declared `USAGE_ENTRY_TYPE`), plus the
+one low scope note resolved above. Every finding is fixed on this branch:
+
+| Finding | Fix |
+| --- | --- |
+| Superseded-ledger charge/dirty/refresh repeated four times | one `chargeSupersededTail` helper in `src/store.ts` |
+| stop-clock → stopped snapshot → persist → restart-on-failure → mark-durable repeated four times | one `stopAndPersist` helper, with `commitStopSnapshot` as the counterpart to `commitSnapshot` |
+| `waitForSnapshot`/`liveUsage` and the scenario scaffolding copied per file | moved into `test/helpers/rpc-harness.mjs`, with one `assertStepsConsumed` body |
+| Nested resume-notice ternary | a `resumeRestartNotice` switch |
+| Brace and string-continuation mis-indentation | corrected in `src/index.ts` and `src/store.ts` |
+| Duplicated whole-budget validation and a fabricated `BudgetSettings` | one `validateWholeBudget`, and `resolveResumeTokenBudget` now takes the maximum alone |
+| Dead test constants/helpers | removed, except the `goalStates` helper in `test/goal13-integrated-acceptance.test.mjs`, which is an accepted advisory and was left in place |
+| Re-declared `USAGE_ENTRY_TYPE` and a vacuous checkpoint loop | imported from `src/goal.ts`, and the checkpoint assertion now asserts a count plus the pre-stop checkpoints |
+
+The nested-usage report that `test/goal9-ownership.test.mjs` asserts is now read
+from the branch entry the finalized tool call produced, so the accounted
+contribution is pinned to the report rather than to a bare literal.
+
+| Gate | Result |
+| --- | --- |
+| `npm test` | **463 tests, 463 pass, 0 fail, 0 skipped** |
+| `npm run typecheck` | **exit 0** (`tsc --noEmit`, no output) |
+| Budget-message equivalence against the pre-fix `src/accounting.ts` | **352 cases, 0 differences** |
+
 ## Documentation audit
 
 Verified against the integrated commit:
@@ -315,6 +344,43 @@ after the new Goal committed), goal_67dfb762 kickoff, goal_67dfb762 wrap-up
 
 The deterministic RPC suite remains the automated gate; this smoke does not
 replace it.
+
+## Scope note resolved: the shared pause/creation predicates
+
+The Spec-axis review of this integration raised one low finding: the branch widens
+two predicates that the *pre-existing* pause-corroboration rules also use —
+`foldApostrophes` applied in `contradictsPause`, and `REQUEST_LEAD` gaining the
+`actually|in fact` discourse markers — while no repair ticket in the graph lists a
+pause-rule change. The finding is an advisory about scope, not about behavior: it
+records that a change landed beyond the asked repair surface without its own
+focused issue. It is resolved here rather than by reverting, because the change is
+not an independent edit to the pause rules.
+
+1. **One predicate, not two rule sets.** `foldApostrophes` and `REQUEST_LEAD` are
+   shared by the pause-corroboration rules and the Goal-creation authority rules
+   (see the batch-4 traceability, "Shared predicates: pause corroboration and
+   creation authority"). Batch 4's job was to make the *creation* path refuse a
+   curly-apostrophe cancellation and accept a discourse-marker correction; the
+   minimal correct way to do that is to widen the shared predicate.
+2. **The direction is conservative.** The fold can only add refusals. The
+   discourse-marker widening only strips a lead-in and still requires an
+   imperative or passive pause shape containing the quoted words, so mentions,
+   questions, hypotheticals, deferrals, and keep-working instructions are still
+   refused. Occurrence of the words alone never grants pause authority, and
+   `/goal pause` remains available to the user.
+3. **It is tested on the pause path, and those tests are kept.** Both pause-path
+   rows are asserted in `test/goal12-pause-corroboration.test.mjs` and are listed
+   in the batch-4 matrix. No pause test was removed, skipped, or weakened, and no
+   fail-open pause behavior was introduced: a pause still requires a corroborated
+   quotation from the newest human-authored user message, and a negation, a
+   keep-working instruction, a deferral, or a mere mention still refuses it.
+
+Accepted as part of the integrated V1 acceptance: the shared-predicate integration
+is intentional, its acceptance rationale is the three points above, and it needs
+no separate focused repair issue because it is a consequence of sharing one
+conservative English reading between two contracts rather than an independent
+change to either. This closes the scope note; the behavior is unchanged by this
+record.
 
 ## Defect status
 

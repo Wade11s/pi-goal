@@ -84,6 +84,7 @@ import {
 	type GoalCreationCorroboration,
 	type GoalPublicState,
 	type GoalRecord,
+	type GoalStatus,
 	previewObjective,
 	toPublicState,
 } from "./goal.ts";
@@ -172,8 +173,8 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 		if (!value) {
 			return {
 				error:
-				"Goal not resumed: /goal resume --budget needs a new total, for example " +
-				"/goal resume --budget 150.",
+					"Goal not resumed: /goal resume --budget needs a new total, for example " +
+					"/goal resume --budget 150.",
 			};
 		}
 		valueText = value[1]!;
@@ -191,7 +192,7 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 	if (!Number.isFinite(value)) {
 		return {
 			error:
-			`Goal not resumed: ${JSON.stringify(valueText)} is not a number. Use ` +
+				`Goal not resumed: ${JSON.stringify(valueText)} is not a number. Use ` +
 				"/goal resume --budget <new-total>.",
 		};
 	}
@@ -226,6 +227,30 @@ function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequ
 /** How long creation waits for the snapshot to become durable on disk. */
 const DURABILITY_TIMEOUT_MS = 5000;
 const DURABILITY_POLL_MS = 15;
+
+/**
+ * What a resume restarted work *from*, for the resume notice.
+ *
+ * A switch rather than a chained conditional: each of the four non-continuing
+ * statuses ends the Goal for a different reason, and the notice names that reason.
+ * `budget_limited` is the only one whose restart quotes the new ceiling, so it is
+ * the fallback rather than another branch.
+ */
+function resumeRestartNotice(status: GoalStatus, tokenBudget: number | undefined, accountedTokens: number): string {
+	switch (status) {
+		case "paused":
+			return "Work restarted from retained progress.";
+		case "blocked":
+			return "The blocked audit that ended it is cleared, so work restarts from retained progress with a fresh audit.";
+		case "usage_limited":
+			return "The usage-limit stop that ended it is cleared, so work restarts from retained progress.";
+		default:
+			return (
+				`The cumulative token ceiling is now ${tokenBudget} tokens with ${accountedTokens} tokens already ` +
+				"accounted; the old episode's wrap-up is cancelled."
+			);
+	}
+}
 
 /** Status-bar key used for the compact Goal indicator. */
 const STATUS_KEY = "goal";
@@ -637,9 +662,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (!store.needsLegacyCutover()) return;
 		const result = store.applyLegacyCutover(pi, budgetSettings);
 		if (!result.ok) {
-			notify(ctx, `pi-goal could not cut over the legacy Goal state: ${describeError(result.error)}. ` + "No repaired Goal work was admitted; fix the cause and reload the session.", "error");
+			notify(
+				ctx,
+				`pi-goal could not cut over the legacy Goal state: ${describeError(result.error)}. ` +
+					"No repaired Goal work was admitted; fix the cause and reload the session.",
+				"error",
+			);
 			return;
-	}
+		}
 		for (const notice of result.notices) notify(ctx, notice, "warning");
 		if (result.markerError !== undefined) {
 			// The repaired snapshot is durable, so the cutover stands and the Goal keeps
@@ -2161,14 +2191,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
 		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus), ctx);
-		const restarted =
-			previousStatus === "paused"
-				? "Work restarted from retained progress."
-				: previousStatus === "blocked"
-					? "The blocked audit that ended it is cleared, so work restarts from retained progress with a fresh audit."
-					: previousStatus === "usage_limited"
-						? "The usage-limit stop that ended it is cleared, so work restarts from retained progress."
-						: `The cumulative token ceiling is now ${updated.tokenBudget} tokens with ${store.getUsage().totalTokens} tokens already accounted; the old episode's wrap-up is cancelled.`;
+		const restarted = resumeRestartNotice(previousStatus, updated.tokenBudget, store.getUsage().totalTokens);
 		ctx.ui.notify(
 			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
 			"info",

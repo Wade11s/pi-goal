@@ -13,60 +13,28 @@ import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
+import { NESTED_LEAF_ACCOUNTED, NESTED_OUTER_TOOL } from "./extensions/nested-usage.ts";
 import {
 	PiRpcSession,
 	assertCleanRun,
-	assertOnlyFailures,
+	assertStepsConsumed,
 	continuationEntries,
+	currentGoalSnapshot,
 	customMessageEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
 /** Test-only extension whose outer tool reports nested model usage on its result. */
 const NESTED_EXTENSION = join(import.meta.dirname, "extensions", "nested-usage.ts");
-const NESTED_OUTER_TOOL = "nested_usage_outer";
-/** The leaf's accounted contribution: 40 input + 7 output + 3 cache write. */
-const NESTED_LEAF_ACCOUNTED = 50;
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
-}
-
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
-/**
- * The newest *current* goal-state snapshot: the one that selects the session's Goal.
- *
- * A snapshot marked `superseded` is a finalized historical record of a replaced
- * identity. It is valid and replayable, but it never becomes the current Goal, so
- * the newest goal-state entry on the branch is not necessarily this one.
- */
-function currentGoalSnapshot(entries) {
-	let snapshot;
-	for (const entry of entries) {
-		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
-			snapshot = entry;
-		}
-	}
-	return snapshot;
-}
-
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
 }
 
 function waitForTurns(session, count) {
@@ -166,19 +134,6 @@ async function reload(session, workDir) {
 	copyFileSync(file, copy);
 	const resumed = await PiRpcSession.start({ sessionFile: copy, cwd: workDir });
 	return { resumed, dir };
-}
-
-/**
- * Fail unless exactly `steps` provider responses were consumed. One provider
- * request consumes one scripted step, so equality proves the scenario neither
- * exhausted the script nor left a step unconsumed.
- */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = session.records.filter(
-		(r) => r.type === "message_end" && r.message.role === "assistant",
-	);
-	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
-	assertOnlyFailures(session, expectedFailures);
 }
 
 /** Every extension notification message this process has produced, in order. */
@@ -494,12 +449,28 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 
 		// The old identity's in-flight assistant response (110) and nested tool result
 		// (50) are frozen onto its superseded snapshot, at exact totals.
+		//
+		// The nested usage arrives merged into the tool result's own `usage` — the
+		// shape the store has to charge exactly once — so the report is read off the
+		// branch entry the finalized call produced. Asserting it pins where the
+		// accounted contribution comes from instead of leaving it a bare literal.
 		const liveFile = await session.sessionFile();
+		const outerResult = toolResults(session, NESTED_OUTER_TOOL).at(-1);
+		assert.equal(outerResult.isError, false, "the nested work ran and finalized cleanly");
+		const outerEntry = readSessionEntries(liveFile).find(
+			(entry) => entry.type === "message" && entry.message?.toolCallId === outerResult.toolCallId,
+		);
+		assert.equal(outerEntry.message.usage.totalTokens, 150, "Pi reports the nested usage on the tool result");
+		assert.equal(
+			outerEntry.message.usage.totalTokens - outerEntry.message.usage.cacheRead,
+			NESTED_LEAF_ACCOUNTED,
+			"only the uncached part of the nested report is accounted",
+		);
 		const liveStates = goalSnapshots(readSessionEntries(liveFile));
 		const oldSnapshots = liveStates.filter((e) => e.data.goal?.id === original.id);
 		const finalized = oldSnapshots.at(-1);
 		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
-		assert.equal(finalized.data.goal.usage.nestedTokens, 50);
+		assert.equal(finalized.data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
 		assert.equal(finalized.data.goal.status, "active");
 		// The freeze is a single append and the newest goal-state entry on the branch.
 		// There is no re-affirmation to lose: the superseded marker is what keeps this
@@ -616,7 +587,7 @@ test("Clear during the superseded identity's in-flight response keeps the tail a
 		const finalized = oldSnapshots.at(-1);
 		assert.equal(finalized.data.superseded, true, "the tail is frozen as history");
 		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
-		assert.equal(finalized.data.goal.usage.nestedTokens, 50);
+		assert.equal(finalized.data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
 
 		// A fresh process reconstructs no Goal and keeps the old identity's total.
 		const { resumed, dir } = await reload(session, workDir);
@@ -815,7 +786,7 @@ test("old-budget exhaustion is recorded on the superseded identity and admits no
 		const finalized = oldSnapshots.at(-1);
 		assert.equal(finalized.data.goal.status, "budget_limited", "the old identity's exhaustion is recorded");
 		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the in-flight tail is attributed to the old identity");
-		assert.equal(finalized.data.goal.usage.nestedTokens, 50);
+		assert.equal(finalized.data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
 
 		// No old continuation and no old wrap-up: the superseded identity never continues.
 		const entries = readSessionEntries(await session.sessionFile());
@@ -955,7 +926,7 @@ test("a hard crash between the old identity's tail and its freeze boundary recov
 		assert.equal(frozen.length, 1, "exactly one historical snapshot is recovered from the branch");
 		assert.equal(frozen[0].data.goal.id, original.id, "the tail stays with the identity that was replaced");
 		assert.equal(frozen[0].data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
-		assert.equal(frozen[0].data.goal.usage.nestedTokens, 50);
+		assert.equal(frozen[0].data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
 		assert.equal(
 			resumedEntries.filter((entry) => entry.type === "custom" && entry.customType === "goal-state").length,
 			crashGoalStates.length + 1,

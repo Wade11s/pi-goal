@@ -22,15 +22,12 @@ import {
 	assertOnlyFailures,
 	lastGoalSnapshot,
 	readSessionEntries,
+	script,
 } from "./helpers/rpc-harness.mjs";
 import { structuredGoal } from "./helpers/blocked-audit.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
 const EDITED_OBJECTIVE = "Ship the release notes page instead";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /** The last status-bar update pi-goal published, or undefined before one. */
 function lastStatus(session) {

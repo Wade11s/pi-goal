@@ -37,6 +37,7 @@ import {
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
@@ -44,10 +45,6 @@ const OBJECTIVE = "Make the full test suite pass in this repository";
 const PEER_CUSTOM_TYPE = "peer-boundary";
 const PEER_NOTE = "peer boundary note";
 const PEER_EXTENSION = join(import.meta.dirname, "extensions", "boundary-peer.ts");
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /** Tool results for one tool, in the order the calls finalized. */
 function toolResults(session, toolName) {

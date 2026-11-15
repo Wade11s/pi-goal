@@ -8,7 +8,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -16,13 +16,10 @@ import {
 	assertOnlyFailures,
 	lastGoalSnapshot,
 	readSessionEntries,
+	script,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /**
  * Stop an active Goal's continuation loop deliberately.

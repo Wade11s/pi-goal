@@ -433,11 +433,60 @@ export function readSessionEntries(sessionFile) {
 		.map((line) => JSON.parse(line));
 }
 
+/**
+ * Write the scripted provider's next responses.
+ *
+ * Every RPC scenario drives the same scripted test provider, and the provider
+ * re-reads this file on every request, so writing it is the one seam a scenario
+ * uses to say what the model does next.
+ */
+export function script(steps, session) {
+	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
+}
+
+/**
+ * Send a command without awaiting its response.
+ *
+ * A scenario needs this to run a lifecycle command while a provider response is
+ * still held open (or while a blocking dialog is unanswered) and observe the
+ * ordering, so the response is awaited only once the test is ready for it.
+ */
+export function submitCommand(session, id, message) {
+	const responsePromise = session.waitFor(
+		`response for ${id}`,
+		(records) => records.find((r) => r.type === "response" && r.id === id),
+	);
+	session.writeCommand({ id, type: "prompt", message });
+	return responsePromise;
+}
+
 /** Find the last goal-state snapshot entry in a session file. */
 export function lastGoalSnapshot(entries) {
 	let snapshot;
 	for (const entry of entries) {
 		if (entry.type === "custom" && entry.customType === "goal-state") snapshot = entry;
+	}
+	return snapshot;
+}
+
+/** Every goal-state snapshot entry, in append order. */
+export function goalSnapshots(entries) {
+	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
+}
+
+/**
+ * The newest *current* goal-state snapshot: the one that selects the session's Goal.
+ *
+ * A snapshot marked `superseded` is a finalized historical record of a replaced
+ * identity. It is valid and replayable, but it never becomes the current Goal, so
+ * the newest goal-state entry on the branch is not necessarily this one.
+ */
+export function currentGoalSnapshot(entries) {
+	let snapshot;
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded !== true) {
+			snapshot = entry;
+		}
 	}
 	return snapshot;
 }
@@ -509,4 +558,65 @@ export function assertOnlyFailures(session, expected) {
 			);
 		}
 	}
+}
+
+/**
+ * Fail unless exactly `steps` provider responses were consumed.
+ *
+ * One shared body is what keeps this meaning the same thing in every scenario: a
+ * script that is over- or under-sized fails here instead of silently changing what
+ * the run under test actually did.
+ */
+export function assertStepsConsumed(session, steps, expectedFailures = []) {
+	assert.equal(
+		assistantOutcomes(session).length,
+		steps,
+		`expected exactly ${steps} provider responses, got ${assistantOutcomes(session).length}`,
+	);
+	assertOnlyFailures(session, expectedFailures);
+}
+
+/** Resolve after `ms` milliseconds. */
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Poll the session file until the newest Goal snapshot satisfies `predicate`.
+ *
+ * The snapshot is durable state written by the extension, so polling for it is how
+ * a scenario waits for a transition to be committed rather than guessing at a
+ * delay.
+ */
+export async function waitForSnapshot(session, predicate, description, timeoutMs = 15_000) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const snapshot = lastGoalSnapshot(readSessionEntries(await session.sessionFile()));
+		if (snapshot && predicate(snapshot)) return snapshot;
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
+		await sleep(20);
+	}
+}
+
+/**
+ * The live accounted total reported by bare `/goal`.
+ *
+ * The status report is the user-facing contract for accounted usage, so reading the
+ * total out of it pins the observable view rather than a snapshot field that only a
+ * durable transition folds.
+ */
+export async function liveUsage(session) {
+	const seen = session.records.filter(
+		(r) => r.type === "extension_ui_request" && r.method === "notify" && /Token usage: \d+ tokens/.test(r.message),
+	).length;
+	await session.prompt("/goal");
+	const notify = await session.waitFor("a fresh /goal report", (records) => {
+		const matches = records.filter(
+			(r) => r.type === "extension_ui_request" && r.method === "notify" && /Token usage: \d+ tokens/.test(r.message),
+		);
+		return matches.length > seen ? matches.at(-1) : undefined;
+	});
+	const match = /Token usage: (\d+) tokens/.exec(notify.message);
+	assert.ok(match, `no usage in: ${notify.message}`);
+	return Number(match[1]);
 }

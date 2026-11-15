@@ -13,23 +13,20 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
 	PiRpcSession,
 	assertCleanRun,
-	assertOnlyFailures,
+	assertStepsConsumed,
+	goalSnapshots,
 	readSessionEntries,
 	runCount,
+	script,
 } from "./helpers/rpc-harness.mjs";
 
-const OBJECTIVE = "Make the full test suite pass in this repository";
 const FIXTURES = join(import.meta.dirname, "fixtures", "legacy");
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /** Copy one immutable fixture into a fresh session dir and start Pi on it. */
 async function startLegacy(fixture, options = {}) {
@@ -44,23 +41,11 @@ async function startLegacy(fixture, options = {}) {
 	return { session, dir, sessionFile };
 }
 
-function goalStates(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
 function cutovers(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-cutover");
 }
 
 /** Fail unless exactly `steps` provider responses were consumed. */
-function assertStepsConsumed(session, steps, expectedFailures = []) {
-	const outcomes = session.records.filter(
-		(r) => r.type === "message_end" && r.message.role === "assistant",
-	);
-	assert.equal(outcomes.length, steps, `expected exactly ${steps} provider responses, got ${outcomes.length}`);
-	assertOnlyFailures(session, expectedFailures);
-}
-
 test("a legacy active Goal is cut over once, keeps its reconstructed baseline, and continues under repaired attribution", async () => {
 	const { session, dir, sessionFile } = await startLegacy("legacy-active.jsonl");
 	// The provider is only read when a request is made, so the script also proves
@@ -79,7 +64,7 @@ test("a legacy active Goal is cut over once, keeps its reconstructed baseline, a
 
 		// The repaired snapshot and the branch-local cutover are durable.
 		const afterLoad = readSessionEntries(sessionFile);
-		const snapshots = goalStates(afterLoad);
+		const snapshots = goalSnapshots(afterLoad);
 		assert.equal(snapshots.length, 2, "the legacy snapshot plus the repaired one");
 		assert.equal(snapshots[0].data.repaired, undefined, "the original stays a 0.1.0 snapshot");
 		assert.equal(snapshots[1].data.repaired, true, "the cutover writes a repaired snapshot");
@@ -101,7 +86,7 @@ test("a legacy active Goal is cut over once, keeps its reconstructed baseline, a
 		try {
 			await second.waitForNotify((r) => r.message.includes("restored (active)"));
 			const again = readSessionEntries(sessionFile);
-			assert.equal(goalStates(again).length, 2, "no second cutover");
+			assert.equal(goalSnapshots(again).length, 2, "no second cutover");
 			assert.equal(cutovers(again).length, 1);
 			assertStepsConsumed(second, 0, []);
 			assert.equal(second.extensionErrors().length, 0);
@@ -161,7 +146,7 @@ test("non-active legacy statuses stay stopped, complete stays terminal, and a to
 			await session.waitForNotify((r) => r.message.includes("restored ("));
 			assert.equal(runCount(session), 0, `${fixture}: loading starts no run`);
 			const entries = readSessionEntries(sessionFile);
-			assert.equal(goalStates(entries).length, 2, `${fixture}: cut over once`);
+			assert.equal(goalSnapshots(entries).length, 2, `${fixture}: cut over once`);
 			const status = await reportStatus(session);
 			assert.equal(status.totalTokens, 165, `${fixture}: legacy total preserved`);
 			assert.notEqual(status.status, "active");
@@ -204,7 +189,7 @@ test("a malformed or unrecognized newest legacy snapshot fails closed with guida
 		const status = await reportStatus(session);
 		assert.equal(status, null);
 		const entries = readSessionEntries(sessionFile);
-		assert.equal(goalStates(entries).length, 2, "no repaired snapshot is written for a corrupt latest entry");
+		assert.equal(goalSnapshots(entries).length, 2, "no repaired snapshot is written for a corrupt latest entry");
 		assert.equal(cutovers(entries).length, 0);
 		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
@@ -225,7 +210,7 @@ test("0.1.0 optional-field defaults are preserved: origin command, zero usage, n
 		assert.equal(status.tokenBudget, "none (unbounded)", "absent budget stays unbounded");
 		assert.equal(session.records.some((r) => r.message?.includes("Blocker:")), false);
 		const entries = readSessionEntries(sessionFile);
-		const repaired = goalStates(entries).at(-1).data.goal;
+		const repaired = goalSnapshots(entries).at(-1).data.goal;
 		assert.equal(repaired.origin, undefined, "the 0.1.0 snapshot stays byte-fixed");
 		assert.equal(repaired.usage.totalTokens, 0);
 		assert.equal(repaired.wrapUpPending, undefined);
@@ -253,7 +238,7 @@ test("the configured maximum clamps an unbounded legacy Goal with an explicit no
 		assert.equal(status.tokenBudget, "500 tokens");
 		assert.equal(status.totalTokens, 165, "usage is preserved");
 		assert.equal(status.remaining, "335 tokens");
-		const repaired = goalStates(readSessionEntries(sessionFile)).at(-1).data.goal;
+		const repaired = goalSnapshots(readSessionEntries(sessionFile)).at(-1).data.goal;
 		assert.equal(repaired.tokenBudget, 500);
 		assertStepsConsumed(session, 0, []);
 		assert.equal(session.extensionErrors().length, 0);
@@ -321,7 +306,7 @@ test("a pending legacy wrap-up is delivered at most once", async () => {
 			1,
 			"the owed wrap-up is delivered",
 		);
-		assert.equal(goalStates(entries).at(-1).data.goal.wrapUpPending, false);
+		assert.equal(goalSnapshots(entries).at(-1).data.goal.wrapUpPending, false);
 
 		// A second ordinary run must not produce a duplicate historical wrap-up.
 		await session.prompt("anything else again?");
@@ -348,7 +333,7 @@ test("a legacy open audit is preserved for the Blocker-identity handoff without 
 		const status = await reportStatus(session);
 		assert.equal(status.blocker, "The test database is unavailable");
 		assert.equal(status.blockedTurns, 2);
-		const repaired = goalStates(readSessionEntries(sessionFile)).at(-1).data.goal;
+		const repaired = goalSnapshots(readSessionEntries(sessionFile)).at(-1).data.goal;
 		assert.equal(repaired.blockedAudit.blocker, "The test database is unavailable", "description preserved");
 		assert.equal(repaired.blockedAudit.turns, 2, "count preserved");
 		assert.match(

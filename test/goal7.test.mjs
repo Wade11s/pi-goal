@@ -29,14 +29,11 @@ import {
 	continuationEntries,
 	lastGoalSnapshot,
 	readSessionEntries,
+	script,
 } from "./helpers/rpc-harness.mjs";
 import { structuredGoal } from "./helpers/blocked-audit.mjs";
 
 const TREE_NAV = fileURLToPath(new URL("./extensions/tree-nav.ts", import.meta.url));
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /**
  * Stop an active Goal's continuation loop deliberately (Pi's documented hard exit).
