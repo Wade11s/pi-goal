@@ -15,16 +15,16 @@ import {
 	assertCleanRun,
 	assertOnlyFailures,
 	continuationEntries,
+	currentGoalSnapshot,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 function toolResults(session, toolName) {
 	return session.records.filter((r) => r.type === "tool_execution_end" && r.toolName === toolName);
@@ -32,19 +32,6 @@ function toolResults(session, toolName) {
 
 function structuredGoal(result) {
 	return result.structuredContent?.goal ?? result.details?.goal;
-}
-
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
-}
-
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
 }
 
 function waitForTurns(session, count) {
@@ -58,7 +45,18 @@ async function waitForStoredGoal(session, predicate, description = "stored Goal"
 	const file = await session.sessionFile();
 	const deadline = Date.now() + 5000;
 	while (Date.now() < deadline) {
-		const snapshot = lastGoalSnapshot(readSessionEntries(file));
+		let entries;
+		try {
+			entries = readSessionEntries(file);
+		} catch (error) {
+			// Pi defers creating the session file until the first user/assistant
+			// message, so the path can be reported before it exists. Treat that as
+			// "not written yet" and keep polling instead of failing the first read:
+			// under a full parallel `npm test` that window is reachable.
+			if (error.code !== "ENOENT") throw error;
+			entries = [];
+		}
+		const snapshot = lastGoalSnapshot(entries);
 		const goal = snapshot?.data?.goal;
 		if (goal && predicate(goal)) return goal;
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -170,12 +168,24 @@ test("a held completion cannot complete a Goal the user replaced while it was in
 		await replacePromise;
 
 		const entries = readSessionEntries(await session.sessionFile());
+		// The freeze of the old identity's in-flight tail is the last snapshot, and it is
+		// historical: the replacement is re-selected as the current Goal from its own
+		// snapshot rather than from a second, re-affirming append.
 		assert.deepEqual(
-			goalSnapshots(entries).map((s) => s.data.goal.id === replacement.id ? `new:${s.data.goal.status}:${s.data.goal.revision}` : `old:${s.data.goal.status}:${s.data.goal.revision}`),
-			["old:active:0", "new:active:0"],
-			"the replacement Goal was not completed by the stale call",
+			goalSnapshots(entries).map((s) => `${s.data.goal.id === replacement.id ? "new" : "old"}:${s.data.goal.status}:${s.data.goal.revision}:${s.data.superseded === true ? "superseded" : "current"}`),
+			["old:active:0:current", "old:active:0:current", "new:active:0:current", "old:active:0:superseded"],
+			"replacement preserves a durable superseded old-goal record and the stale completion cannot complete the replacement",
 		);
-		assert.equal(lastGoalSnapshot(entries).data.goal.id, replacement.id);
+		const oldSnapshots = goalSnapshots(entries).filter((s) => s.data.goal.id !== replacement.id);
+		assert.equal(oldSnapshots[0].data.goal.usage.totalTokens, 0, "the creation snapshot is not polluted");
+		assert.equal(oldSnapshots[1].data.goal.usage.totalTokens, 15, "the superseded snapshot carries the exact already-accounted kickoff total");
+		assert.equal(
+			oldSnapshots.at(-1).data.goal.usage.totalTokens,
+			30,
+			"the finalized superseded record carries the in-flight completion turn's response",
+		);
+		assert.equal(currentGoalSnapshot(entries).data.goal.id, replacement.id);
+		assert.equal(lastGoalSnapshot(entries).data.superseded, true, "the newest goal-state entry is the historical freeze");
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {

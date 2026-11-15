@@ -22,14 +22,12 @@ import {
 	assertOnlyFailures,
 	lastGoalSnapshot,
 	readSessionEntries,
+	script,
 } from "./helpers/rpc-harness.mjs";
+import { structuredGoal } from "./helpers/blocked-audit.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
 const EDITED_OBJECTIVE = "Ship the release notes page instead";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /** The last status-bar update pi-goal published, or undefined before one. */
 function lastStatus(session) {
@@ -134,23 +132,25 @@ test("the status line reports budget_limited when the token budget is exhausted"
 test("the status line reports blocked once the blocked audit threshold is met", async () => {
 	const session = await PiRpcSession.start();
 	const blocker = "The required API credential is missing from the environment";
-	script(
-		[
-			// The kickoff Goal turn reports the blocker, then two automatic
-			// continuations report the same blocker: the third report satisfies
-			// the three-consecutive-Goal-turn audit.
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker } }] },
-			{ text: "Still working." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker } }] },
-			{ text: "Still working." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker } }] },
-			{ text: "Still working." },
-		],
-		session,
-	);
+	// The kickoff Goal turn reports the blocker, then two automatic continuations
+	// report the same condition with the identity the first report was issued: the
+	// third report satisfies the three-consecutive-Goal-turn audit.
+	const gate = join(session.cwd, "pi-goal-audit-gate");
+	const chained = (id) => [
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker } }] },
+		{ text: "Still working.", waitForFile: gate },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker, blocker_id: id } }] },
+		{ text: "Still working." },
+		{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker, blocker_id: id } }] },
+		{ text: "Still working." },
+	];
+	writeFileSync(session.scriptPath, JSON.stringify(chained("@issued")), "utf8");
 	try {
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
+		writeFileSync(session.scriptPath, JSON.stringify(chained(issued)), "utf8");
+		writeFileSync(gate, "", "utf8");
 		const blocked = await session.waitForNotify((r) => r.message.includes("is now blocked"));
 		assert.equal(blocked.notifyType, "warning");
 		assert.match(await waitForStatus(session, /\bblocked\b/), /\bblocked\b/);

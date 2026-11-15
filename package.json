@@ -17,7 +17,7 @@
 		"extensions": ["./src/index.ts"]
 	},
 	"scripts": {
-		"test": "node --test test/",
+		"test": "node --test --test-concurrency=4 test/",
 		"typecheck": "tsc --noEmit"
 	},
 	"engines": {

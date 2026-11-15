@@ -26,16 +26,15 @@ import {
 	assertCleanRun,
 	assertOnlyFailures,
 	continuationEntries,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	runCount,
+	script,
+	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
-
-function script(steps, session) {
-	writeFileSync(session.scriptPath, JSON.stringify(steps), "utf8");
-}
 
 /** Tool results for one tool, in the order the calls finalized. */
 function toolResults(session, toolName) {
@@ -53,25 +52,6 @@ function waitForRunStarted(session) {
 		"run started",
 		(records) => (records.some((r) => r.type === "turn_start") ? true : undefined),
 	);
-}
-
-/**
- * Submit an extension command without awaiting its response, so the test can
- * answer a confirmation dialog (or observe ordering against a held provider
- * response) before the command handler completes.
- */
-function submitCommand(session, id, message) {
-	const responsePromise = session.waitFor(
-		`response for ${id}`,
-		(records) => records.find((r) => r.type === "response" && r.id === id),
-	);
-	session.writeCommand({ id, type: "prompt", message });
-	return responsePromise;
-}
-
-/** goal-state snapshots (records), in append order. */
-function goalSnapshots(entries) {
-	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
 /** Stop an active Goal loop deliberately with an aborted run (Pi's hard exit). */
@@ -501,13 +481,23 @@ test("replacing an unfinished objective requires confirmation", async () => {
 		await session.waitForSettled(2);
 		const entries = readSessionEntries(await session.sessionFile());
 		const snapshots = goalSnapshots(entries).map((s) => s.data.goal);
-		assert.equal(snapshots.length, 3, "old creation, new creation, new completion");
+		assert.equal(snapshots.length, 4, "old creation, superseded old snapshot, new creation, new completion");
 		assert.equal(snapshots[0].id, first.id);
-		assert.equal(snapshots[1].id, snapshots[2].id);
-		assert.notEqual(snapshots[1].id, first.id, "the replacement is a fresh Goal identity");
-		assert.equal(snapshots[1].objective, "A brand new objective");
-		assert.equal(snapshots[1].revision, 0, "the replacement starts a fresh revision history");
-		assert.equal(snapshots[2].status, "complete");
+		assert.equal(snapshots[0].revision, 0);
+		assert.equal(snapshots[1].id, first.id, "replacement preserves the superseded old identity's accounted usage");
+		assert.equal(snapshots[1].revision, 0, "preserving the superseded record does not advance its revision");
+		assert.equal(snapshots[1].status, snapshots[0].status);
+		assert.equal(
+			snapshots[1].usage.totalTokens,
+			45,
+			"the superseded snapshot carries the exact already-accounted total (kickoff, continuation, aborted continuation)",
+		);
+		assert.notEqual(snapshots[2].id, first.id, "the replacement is a fresh Goal identity");
+		assert.equal(snapshots[2].objective, "A brand new objective");
+		assert.equal(snapshots[2].revision, 0, "the replacement starts a fresh revision history");
+		assert.equal(snapshots[2].status, "active", "the replacement started working immediately");
+		assert.equal(snapshots[3].id, snapshots[2].id, "the final snapshot belongs to the replacement");
+		assert.equal(snapshots[3].status, "complete");
 
 		// Two continuations belong to the old Goal's loop, the last to the new one.
 		const continuations = continuationEntries(entries);
