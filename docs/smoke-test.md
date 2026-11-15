@@ -282,6 +282,57 @@ Then try the negative controls:
   refused;
 - use `/goal <objective>` directly: it still creates a Goal with no quotation.
 
+## 19. Optional: blocked and usage_limited active time
+
+Active elapsed time must stop at *every* non-active status. The deterministic
+regressions `test/goal34-active-time-stop.test.mjs` (a real `pi --mode rpc`
+blocked Goal, idle time, an ordinary run, and a restart) and
+`test/goal34-active-time-stop-store.test.mjs` (the `usage_limited` stop, the
+conservative stop, and a reconstruction) pin the exact frozen values.
+
+To check it by hand with a real provider, drive a Goal to `blocked` (section
+16), then run `/goal` twice a few seconds apart: the `Active time` value must
+not change while the Goal is `blocked`. Restart Pi and run `/goal` again: the
+value must still be the frozen one. `usage_limited` needs a real provider
+usage-limit error, so the deterministic store/RPC regressions are the practical
+verification for that status.
+
+## 20. Optional: hostile orderings across a Goal boundary
+
+Two orderings put work that belongs to one Goal in front of a different one. Both
+are pinned by the deterministic suite
+(`test/goal39-work-message-identity.test.mjs`,
+`test/goal39-work-message-identity-store.test.mjs`,
+`test/goal37-stale-execution.test.mjs`); the steps below reproduce them by hand
+with a real provider.
+
+**A stale queued work message never opens or charges the new Goal.**
+
+1. Create a Goal whose run stays busy for several turns, and let its first turn
+   land.
+2. `/goal pause`, then `/goal resume` immediately: the resume work message is
+   queued as a steer while the run is busy.
+3. `/goal clear`, then `/goal --budget 1 <objective>` for the new Goal.
+4. Let the queued message land.
+
+Expect the new Goal's own kickoff to be delivered exactly once and its ledger to
+carry only its own work — the stale message for the cleared identity opens
+nothing, so the old run's later turns are charged to nobody. The cleared identity
+earns no further Continuation or Budget wrap-up.
+
+**A stale execution cannot drive the new Goal's lifecycle.**
+
+1. Create a Goal whose single run keeps taking turns and ends with an
+   `update_goal { action: "complete" }` call; let its first turn land.
+2. `/goal <new objective>` while that run is in flight and answer **Yes** to the
+   replacement confirmation.
+
+Expect the replacement to commit, the old execution's later
+`update_goal` call to be refused (the execution is bound to the identity it was
+admitted against), and the new Goal to stay `active` at revision 0 with its own
+kickoff rather than being marked `complete` with no work. The replaced identity
+keeps its own durable superseded record.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -306,6 +357,14 @@ Then try the negative controls:
       starts a fresh chain.
 - [ ] A legacy open audit is preserved with its description and count and is issued
       a fresh Blocker identity at cutover, granting no extra unattended turns.
+- [ ] A `blocked` Goal's `Active time` is frozen across idle time and a restart,
+      and the `usage_limited` freeze is covered by the deterministic regressions.
+- [ ] A work message queued for a Goal that is then cleared or replaced is
+      delivered after the new Goal commits but opens nothing: the new Goal's own
+      kickoff runs exactly once and only its own work is charged.
+- [ ] A run admitted against a replaced identity cannot complete, report a
+      blocker against, or pause the Goal that replaced it; the replaced identity
+      keeps its own durable superseded record.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with
