@@ -1,13 +1,13 @@
 # Publishes @wade11s/pi-goal when a v* tag is pushed.
 #
-# Authentication is npm Trusted Publishing (OIDC): no NPM_TOKEN secret is stored
-# here. Configure it once on npmjs.com -> @wade11s/pi-goal -> Settings ->
-# Trusted publishing -> GitHub Actions:
-#   Organization or user: wade11s
-#   Repository:           pi-goal
-#   Workflow filename:    publish.yml
-# The configuration must complete its first successful publish within 2 days of
-# being created. See docs/release.md for the full procedure.
+# GitHub now issues immutable OIDC subject claims (repo:owner@id/repo@id) for
+# this repository, and npm's trusted publishing still matches the legacy shape,
+# so the exchange fails with "package not found" (npm/cli#9969). Until that is
+# fixed, authentication is a granular NPM_TOKEN secret scoped to this package.
+# Provenance is still generated from the OIDC token (id-token: write).
+#
+# When npm/cli#9969 is fixed: delete the token check and the NODE_AUTH_TOKEN
+# env, configure the trusted publisher on npmjs.com, and drop the secret.
 #
 # The job is re-runnable: a version already on npm is not republished, and an
 # existing GitHub release has its notes updated instead of failing.
@@ -72,7 +72,22 @@ jobs:
           # 90s per-step wait occasionally trips on the slowest blockers scenario.
           PI_GOAL_TEST_TIMEOUT_MS: "180000"
 
+      - name: Check the npm publish credential
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # npm's trusted publishing still compares the legacy OIDC subject
+          # (repo:owner/repo) and rejects this repository's immutable claims
+          # (repo:owner@id/repo@id) with "package not found" — npm/cli#9969.
+          # A granular token is the supported fallback until that is fixed.
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::NPM_TOKEN is not set. Trusted publishing is blocked by npm/cli#9969; add a granular @wade11s/pi-goal token as the NPM_TOKEN secret (docs/release.md)."
+            exit 1
+          fi
+
       - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           node -e 'console.log({ oidcUrl: Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_URL), oidcToken: Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) })'
@@ -81,7 +96,7 @@ jobs:
           if npm view "$name@$version" version >/dev/null 2>&1; then
             echo "::notice::$name@$version is already published; skipping npm publish"
           else
-            npm publish --loglevel verbose
+            npm publish --provenance --loglevel verbose
           fi
 
       - name: Create or update the GitHub release

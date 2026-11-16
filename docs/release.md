@@ -1,42 +1,47 @@
 # Releasing to npm
 
 `@wade11s/pi-goal` publishes from GitHub Actions when a `v*` tag is pushed
-(`.github/workflows/publish.yml`). Authentication is npm **Trusted Publishing**
-(OIDC), so no long-lived npm token is stored in the repository. Provenance
-attestations are generated automatically.
+(`.github/workflows/publish.yml`). The pipeline verifies the tag against
+`package.json`, runs typecheck and the full RPC suite, publishes to npm, and
+creates a GitHub release whose body is that version's `CHANGELOG.md` section.
 
-## One-time setup
+## Authentication
 
-The first publish must be manual, because a trusted publisher is configured on an
-existing npm package page.
+**Trusted publishing is currently blocked for this repository.** GitHub issues
+immutable OIDC subject claims for new repositories:
 
-1. Publish the first version from a clean `main`:
+```
+sub: repo:Wade11s@143927706/pi-goal@1452240836:ref:refs/tags/v0.1.1
+```
+
+npm's exchange still compares the legacy `repo:owner/repo` shape, so it answers
+`OIDC token exchange error - package not found` (npm/cli#9969). This is not a
+configuration mistake and waiting does not fix it.
+
+Until npm fixes that, the workflow authenticates with a granular **`NPM_TOKEN`**
+secret. Provenance is still generated from the OIDC token (`id-token: write`).
+
+### One-time setup
+
+1. The first version (0.1.0) was published manually. A trusted publisher is
+   configured on npmjs.com, but it cannot be exercised until npm/cli#9969 lands.
+2. Create a granular npm token:
+   **npmjs.com → Access Tokens → Generate New Token → Granular Access Token**
+   - Packages: `@wade11s/pi-goal`
+   - Permissions: read and write
+   - Expiry: the shortest practical window
+3. Store it as a repository secret:
 
    ```sh
-   npm whoami            # must be wade11s (the @wade11s scope owner)
-   npm run typecheck
-   npm test              # full RPC suite; needs `pi` 1.5.1+ on PATH
-   npm publish           # publishes 0.1.0 (publishConfig.access is public)
+   gh secret set NPM_TOKEN   # paste the token when prompted
    ```
 
-2. Configure the trusted publisher on npmjs.com:
-   **@wade11s/pi-goal → Settings → Trusted publishing → GitHub Actions**
+4. When npm/cli#9969 is fixed: configure the trusted publisher
+   (`wade11s` / `pi-goal` / `publish.yml`, allow `npm publish`), delete the token
+   check and `NODE_AUTH_TOKEN` from the workflow, and revoke the token. The
+   workflow header carries the same note.
 
-   | Field | Value |
-   | --- | --- |
-   | Organization or user | `wade11s` |
-   | Repository | `pi-goal` |
-   | Workflow filename | `publish.yml` |
-   | Environment name | *(leave empty unless the job uses one)* |
-
-   The configuration must complete its first successful publish within 2 days of
-   being created, otherwise it expires and has to be recreated.
-
-3. Recommended hardening: **Settings → Publishing access → Require two-factor
-   authentication and disallow tokens**. Trusted publishers keep working; stray
-   automation tokens stop working.
-
-## Every release after that
+## Every release
 
 ```sh
 git switch main && git pull --ff-only
@@ -52,10 +57,10 @@ The tag pipeline then:
    if it is missing or empty;
 3. runs `npm ci`, `npm run typecheck`, and the full `npm test` suite against the
    Pi CLI installed with the dev dependencies (`PI_BINARY`);
-4. runs `npm publish` (which also re-runs `prepublishOnly`), skipping it when the
-   version is already on npm;
-5. creates the GitHub release for the tag, using the changelog section as its
-   body — or updates that release's notes when it already exists.
+4. runs `npm publish --provenance` (which also runs `prepublishOnly`),
+   skipping it when the version is already on npm;
+5. creates the GitHub release for the tag from the changelog section — or
+   updates that release's notes when it already exists.
 
 Watch the run under **Actions → Publish to npm**, then verify:
 
@@ -85,7 +90,6 @@ npm run release:notes -- X.Y.Z
 - **Bad release:** `npm deprecate @wade11s/pi-goal@X.Y.Z "reason"` and publish a
   fixed patch. Unpublishing is only possible within 72 hours, removes the version
   from the registry, and is rarely the right call.
-- **Token fallback** (if OIDC is unavailable): add a granular read-and-write
-  `NPM_TOKEN` repository secret and set
-  `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` on the publish step. Prefer trusted
-  publishing; it has no secret to leak or rotate.
+- **Tag protection:** the repository ruleset `Protect release tags` blocks
+  deleting or force-pushing `refs/tags/v*`. To correct a tag before it publishes,
+  disable the ruleset, move the tag, and re-enable it.
