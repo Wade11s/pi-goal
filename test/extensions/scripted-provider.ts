@@ -53,10 +53,27 @@ export interface ScriptedStep {
 	waitForFile?: string;
 }
 
-function readSteps(): ScriptedStep[] {
+/**
+ * Read the scripted steps, retrying a torn read.
+ *
+ * Tests rewrite this file between turns while Pi may already be requesting the
+ * next response. A plain read can land mid-write and see invalid JSON, which
+ * ends the run as a provider error instead of exercising the scenario under
+ * test. The writer replaces the whole file, so a retry sees either the old
+ * complete script or the new complete one; both are valid for the turn already
+ * in flight, and the gate step each scenario writes is identical in both.
+ */
+async function readSteps(): Promise<ScriptedStep[]> {
 	const path = process.env.PI_GOAL_TEST_SCRIPT;
 	if (!path) throw new Error("PI_GOAL_TEST_SCRIPT is not set");
-	return JSON.parse(readFileSync(path, "utf8")) as ScriptedStep[];
+	for (let attempt = 0; ; attempt += 1) {
+		try {
+			return JSON.parse(readFileSync(path, "utf8")) as ScriptedStep[];
+		} catch (error) {
+			if (!(error instanceof SyntaxError) || attempt >= 100) throw error;
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+	}
 }
 
 export default function scriptedProviderExtension(pi: ExtensionAPI): void {
@@ -93,8 +110,11 @@ function streamScriptedStep(
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {
+		// Read before advancing the index: a free read can throw, and Pi retries a
+		// failed provider request. Consuming an index on a throw would shift every
+		// later step, so a retried request must be served the same step.
+		const steps = await readSteps();
 		const index = nextIndex();
-		const steps = readSteps();
 		const step = steps[index];
 		if (!step) throw new Error(`scripted provider: no step at index ${index} in PI_GOAL_TEST_SCRIPT`);
 

@@ -202,6 +202,7 @@ test("an unknown identity is refused without Goal mutation and does not own the 
 		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
 		writeFileSync(session.scriptPath, JSON.stringify(steps(issued)), "utf8");
 		writeFileSync(gate, "", "utf8");
+		await session.waitForToolResult("update_goal", 4);
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
@@ -258,6 +259,7 @@ test("a stale identity from an ended chain is refused, and a corrected call star
 		const chained = structuredGoal((await session.waitForToolResult("update_goal", 3)).result).blockerId;
 		writeFileSync(session.scriptPath, JSON.stringify(steps(chained)), "utf8");
 		writeFileSync(secondGate, "", "utf8");
+		await session.waitForToolResult("update_goal", 5);
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
@@ -311,6 +313,7 @@ test("only the third consecutive Goal turn transitions, and no turn can double-c
 		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
 		writeFileSync(session.scriptPath, JSON.stringify(steps(issued)), "utf8");
 		writeFileSync(gate, "", "utf8");
+		await session.waitForToolResult("update_goal", 5);
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
@@ -369,6 +372,7 @@ test("a Replacement Goal starts a fresh audit and inherits no chain", async () =
 		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
 		await replace;
 		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		await session.waitForToolResult("update_goal", 5);
 		await session.waitForSettled(2);
 
 		const results = toolResults(session, "update_goal");
@@ -413,6 +417,7 @@ test("a compacted Goal turn keeps the audit chain, and the identity survives the
 		const issued = structuredGoal((await session.waitForToolResult("update_goal", 1)).result).blockerId;
 		writeFileSync(session.scriptPath, JSON.stringify(steps(issued)), "utf8");
 		writeFileSync(gate, "", "utf8");
+		await session.waitForToolResult("update_goal", 3);
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");
@@ -578,6 +583,7 @@ test("the legacy handoff grants no extra unattended turns and alters no reset ru
 			session,
 		);
 		await session.prompt("keep going");
+		await session.waitForToolResult("update_goal", 3);
 		await session.waitForSettled(1);
 
 		const results = toolResults(session, "update_goal");

@@ -113,6 +113,11 @@ export async function runAuditChain(session, reports, extra = [], start) {
 	for (let index = 0; index < chain.gates.length; index++) {
 		currentId = await advanceAuditGate(session, chain, index);
 	}
+	// The run can settle before the chain's last report reaches the RPC stream,
+	// which would make an assertion snapshot one report short. Wait for the
+	// reports the chain asked for before waiting for the settle; a report that
+	// never executes still fails, as a timeout instead of a short count.
+	await session.waitForToolResult("update_goal", reports.length);
 	await session.waitForSettled(1);
 	return currentId;
 }
