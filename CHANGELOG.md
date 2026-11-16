@@ -1,23 +1,24 @@
 # Changelog
 
-Release notes for `@wade11s/pi-goal`. Pi shows entries newer than the last seen
-version after a package update, matching these headings against the `version`
-field in `package.json`.
+Notable changes to pi-goal. Version headings match the `version` field in
+`package.json`; install a release with `pi install
+git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [0.1.1] - 2026-11-16
 
-- Publish from CI: pushing a `v*` tag runs typecheck and the full test suite,
-  publishes with npm Trusted Publishing (OIDC), and creates a GitHub release from
-  this changelog — no npm token is stored in the repository.
-- Add `scripts/release-notes.mjs` and tests that pin its changelog extraction
-  rules, plus `docs/release.md` for the release procedure.
-- Document the npm-first install flow and the reorganized docs map.
+- Add the docs map: the behavioral contract lives in `docs/behavior/`, the model
+tools in `docs/tools.md`, testing in `docs/testing.md`, and historical evidence
+in `docs/traceability/`.
 - Require Node 22.19+ (Pi's own minimum) and run the suite from an explicit file
-  glob so it also runs on Node 24.
+glob so it also runs on Node 24.
+- Make the legacy fixtures portable: the copied session header is retargeted at
+the current temp directory instead of the macOS path recorded at capture.
+- Stabilize the scripted provider and the blocked-audit chains against mid-write
+script reads and settle ordering.
 
 ## [0.1.0] - 2026-11-16
 
-First npm release.
+First release.
 
 - `/goal` command: create, replace, edit, inspect, pause, resume, and clear a
   Goal, with durable-before-announced lifecycle transitions.

@@ -42,7 +42,6 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | --- | --- |
 | [testing.md](testing.md) | The automated gate, the rules that keep the RPC suite from passing for the wrong reason, development setup, and the verification commands |
 | [smoke-test.md](smoke-test.md) | The manual real-Pi procedure and its checklist |
-| [release.md](release.md) | First publish, trusted publishing setup, the tag-driven release flow, changelog-driven GitHub release notes, and recovery |
 
 ## Decisions and conventions
 

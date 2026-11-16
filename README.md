@@ -36,47 +36,39 @@ its `jiti` loader, so no build step is required.
 
 ## Install
 
-pi-goal is published on npm. Install it with `pi install`:
+pi-goal installs as a Pi package from its GitHub repository:
 
 ```sh
-pi install npm:@wade11s/pi-goal
+pi install git:github.com/Wade11s/pi-goal
 ```
 
-Pi installs the package and records it in personal settings
-(`~/.pi/agent/settings.json`); the extension loads on the next start. Confirm the
-installation:
+Pi records the package in personal settings (`~/.pi/agent/settings.json`); the
+extension loads on the next start. Confirm the installation:
 
 ```sh
-pi list                  # @wade11s/pi-goal appears under User packages
+pi list                  # pi-goal appears under User packages
 ```
 
-Pin an exact version by appending it to the source:
+Pin a tag, branch, or commit by appending it to the source:
 
 ```sh
-pi install npm:@wade11s/pi-goal@0.1.0
+pi install git:github.com/Wade11s/pi-goal@v0.1.1   # or a branch / commit
 ```
 
-An npm version is pinned: `pi update --extensions` reinstalls only a newer version
-that matches the configured specification.
+A git ref is pinned: `pi update --extensions` reconciles the checkout but never
+moves a configured ref. Without one, Pi follows the repository's default branch.
 
 Add the declaration to the project rather than your personal settings with
 `--local` (`.pi/settings.json`, read only after project trust):
 
 ```sh
-pi install --local npm:@wade11s/pi-goal
+pi install --local git:github.com/Wade11s/pi-goal
 ```
 
 Try it once without adding it to settings:
 
 ```sh
-pi -e npm:@wade11s/pi-goal
-```
-
-Install straight from the repository instead — a branch, tag, or commit is
-pinned the same way:
-
-```sh
-pi install git:github.com/Wade11s/pi-goal
+pi -e git:github.com/Wade11s/pi-goal
 ```
 
 For development against a checkout, install the directory directly — a local
@@ -90,8 +82,8 @@ pi install --local ./    # or project-local (.pi/settings.json)
 Update and remove the installed package by source:
 
 ```sh
-pi update npm:@wade11s/pi-goal   # or: pi update --extensions
-pi remove npm:@wade11s/pi-goal
+pi update git:github.com/Wade11s/pi-goal   # or: pi update --extensions
+pi remove git:github.com/Wade11s/pi-goal
 ```
 
 The package declares its entry point in `package.json` (`pi.extensions`), is
@@ -271,10 +263,6 @@ results, model context, persisted session entries, and survival across hard kill
 and restarts. Set `PI_BINARY` to run against a specific Pi binary.
 
 → [Testing and verification](docs/testing.md)
-
-Releases publish from CI when a `v*` tag is pushed (npm Trusted Publishing, no
-stored token), and the GitHub release is generated from that version's
-`CHANGELOG.md` section. → [Releasing to npm](docs/release.md)
 
 ## Verification
 
