@@ -12,6 +12,8 @@ field in `package.json`.
 - Add `scripts/release-notes.mjs` and tests that pin its changelog extraction
   rules, plus `docs/release.md` for the release procedure.
 - Document the npm-first install flow and the reorganized docs map.
+- Require Node 22.19+ (Pi's own minimum) and run the suite from an explicit file
+  glob so it also runs on Node 24.
 
 ## [0.1.0] - 2026-11-16
 

@@ -34,7 +34,7 @@
 		]
 	},
 	"scripts": {
-		"test": "node --test --test-concurrency=4 test/",
+		"test": "node --test --test-concurrency=4 \"test/*.test.mjs\"",
 		"typecheck": "tsc --noEmit",
 		"release:notes": "node scripts/release-notes.mjs",
 		"prepublishOnly": "npm run typecheck"
@@ -43,7 +43,7 @@
 		"access": "public"
 	},
 	"engines": {
-		"node": ">=20"
+		"node": ">=22.19.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
