@@ -24,6 +24,9 @@ pi install ./            # personal settings (~/.pi/agent/settings.json)
 pi install --local ./    # .pi/settings.json, after project trust
 ```
 
+To verify the published package instead, install `npm:@wade11s/pi-goal` (see the
+repository README for version pinning).
+
 Confirm Pi recorded it:
 
 ```sh

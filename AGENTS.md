@@ -10,7 +10,7 @@ Use the five canonical triage labels with their default names. See `docs/agents/
 
 ### Domain docs
 
-Use the single-context layout: root `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`.
+Use the single-context layout: root `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`. The documentation map is `docs/README.md`: the behavioral contract lives in `docs/behavior/`, model tools in `docs/tools.md`, testing in `docs/testing.md`, and historical evidence in `docs/traceability/`.
 
 ### Orchestration
 

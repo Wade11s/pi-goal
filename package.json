@@ -1,14 +1,24 @@
 {
-	"name": "pi-goal",
+	"name": "@wade11s/pi-goal",
 	"version": "0.1.0",
 	"description": "Codex-style persistent Goals for Pi: /goal command plus get_goal, create_goal, and update_goal model tools, with automatic continuation at Pi's safe settlement boundary",
 	"type": "module",
 	"license": "MIT",
-	"keywords": ["pi-package"],
+	"author": "Wade11s",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Wade11s/pi-goal.git"
+	},
+	"homepage": "https://github.com/Wade11s/pi-goal#readme",
+	"bugs": {
+		"url": "https://github.com/Wade11s/pi-goal/issues"
+	},
+	"keywords": ["pi-package", "pi", "goal", "automation"],
 	"files": [
 		"src",
 		"docs",
 		"README.md",
+		"CHANGELOG.md",
 		"LICENSE",
 		"NOTICE.md",
 		"LICENSE-APACHE-2.0.txt"
@@ -18,7 +28,12 @@
 	},
 	"scripts": {
 		"test": "node --test --test-concurrency=4 test/",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"release:notes": "node scripts/release-notes.mjs",
+		"prepublishOnly": "npm run typecheck"
+	},
+	"publishConfig": {
+		"access": "public"
 	},
 	"engines": {
 		"node": ">=20"
