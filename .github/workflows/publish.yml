@@ -68,6 +68,9 @@ jobs:
         run: npm test
         env:
           PI_BINARY: ${{ github.workspace }}/node_modules/.bin/pi
+          # Shared runners are slower and run four test files at once; the default
+          # 90s per-step wait occasionally trips on the slowest blockers scenario.
+          PI_GOAL_TEST_TIMEOUT_MS: "180000"
 
       - name: Publish to npm
         run: |
