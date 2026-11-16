@@ -75,12 +75,13 @@ jobs:
       - name: Publish to npm
         run: |
           set -euo pipefail
+          node -e 'console.log({ oidcUrl: Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_URL), oidcToken: Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) })'
           name="$(node -p 'require("./package.json").name')"
           version="$(node -p 'require("./package.json").version')"
           if npm view "$name@$version" version >/dev/null 2>&1; then
             echo "::notice::$name@$version is already published; skipping npm publish"
           else
-            npm publish
+            npm publish --loglevel verbose
           fi
 
       - name: Create or update the GitHub release
