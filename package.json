@@ -1,6 +1,6 @@
 {
 	"name": "@wade11s/pi-goal",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Codex-style persistent Goals for Pi: /goal command plus get_goal, create_goal, and update_goal model tools, with automatic continuation at Pi's safe settlement boundary",
 	"type": "module",
 	"license": "MIT",
@@ -13,7 +13,12 @@
 	"bugs": {
 		"url": "https://github.com/Wade11s/pi-goal/issues"
 	},
-	"keywords": ["pi-package", "pi", "goal", "automation"],
+	"keywords": [
+		"pi-package",
+		"pi",
+		"goal",
+		"automation"
+	],
 	"files": [
 		"src",
 		"docs",
@@ -24,7 +29,9 @@
 		"LICENSE-APACHE-2.0.txt"
 	],
 	"pi": {
-		"extensions": ["./src/index.ts"]
+		"extensions": [
+			"./src/index.ts"
+		]
 	},
 	"scripts": {
 		"test": "node --test --test-concurrency=4 test/",
