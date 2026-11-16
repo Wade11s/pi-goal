@@ -13,9 +13,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { prepareLegacySession } from "./helpers/legacy-fixture.mjs";
 import {
 	PiRpcSession,
 	assertCleanRun,
@@ -32,12 +33,9 @@ const FIXTURES = join(import.meta.dirname, "fixtures", "legacy");
 async function startLegacy(fixture, options = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-legacy-"));
 	const sessionFile = join(dir, "legacy.jsonl");
-	copyFileSync(join(FIXTURES, fixture), sessionFile);
-	// Pi refuses to resume a session whose stored working directory is missing. The
-	// fixtures were captured in a throwaway temp dir, so recreate that exact path.
-	const stored = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]);
-	if (stored.cwd) mkdirSync(stored.cwd, { recursive: true });
-	const session = await PiRpcSession.start({ ...options, sessionFile, cwd: options.cwd ?? dir });
+	const cwd = options.cwd ?? dir;
+	prepareLegacySession(join(FIXTURES, fixture), sessionFile, cwd);
+	const session = await PiRpcSession.start({ ...options, sessionFile, cwd });
 	return { session, dir, sessionFile };
 }
 

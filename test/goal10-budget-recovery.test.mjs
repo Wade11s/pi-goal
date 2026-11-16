@@ -14,9 +14,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { prepareLegacySession } from "./helpers/legacy-fixture.mjs";
 import {
 	PiRpcSession,
 	assertCleanRun,
@@ -80,10 +81,9 @@ function resumeMessages(entries) {
 async function startLegacy(fixture, options = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-legacy-"));
 	const sessionFile = join(dir, "legacy.jsonl");
-	copyFileSync(join(FIXTURES, fixture), sessionFile);
-	const stored = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]);
-	if (stored.cwd) mkdirSync(stored.cwd, { recursive: true });
-	const session = await PiRpcSession.start({ ...options, sessionFile, cwd: options.cwd ?? dir });
+	const cwd = options.cwd ?? dir;
+	prepareLegacySession(join(FIXTURES, fixture), sessionFile, cwd);
+	const session = await PiRpcSession.start({ ...options, sessionFile, cwd });
 	return { session, dir, sessionFile };
 }
 
@@ -873,9 +873,7 @@ test("a migrated exhausted legacy Goal recovers with positive headroom, and no r
 	{
 		const dir = mkdtempSync(join(tmpdir(), "pi-goal-legacy-"));
 		const sessionFile = join(dir, "legacy.jsonl");
-		copyFileSync(join(FIXTURES, "legacy-exhausted-active.jsonl"), sessionFile);
-		const stored = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]);
-		if (stored.cwd) mkdirSync(stored.cwd, { recursive: true });
+		prepareLegacySession(join(FIXTURES, "legacy-exhausted-active.jsonl"), sessionFile, dir);
 
 		const first = await PiRpcSession.start({
 			sessionFile,
