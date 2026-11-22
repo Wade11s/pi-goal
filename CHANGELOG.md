@@ -6,6 +6,17 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Document the read-only review-child launch profile for `rex-subagent`
+  dispatches in `docs/agents/subagents.md` and `docs/agents/orchestration.md`:
+  `tools` = `read,bash,grep,find`, `excludeTools` =
+  `edit,write,get_goal,create_goal,update_goal`. It is a per-child Rex launch
+  argument set, not a Pi review-thread classification; pi-goal core gains no
+  Rex or review logic, and the parent session keeps its Goal tools and Goal
+  state. A deterministic test starts a real Pi session with the documented
+  arguments, proves the active tool set is read-only, and drives accidental
+  Goal-tool calls to Pi's `Tool <name> not found` refusal without a Goal write;
+  a live scenario inspects the released provider's child launch arguments. An
+  upstream Rex review preset remains a separate enhancement request.
 - Add explicit local Objective attachments through repeatable leading `/goal
   --file <path>` and `--image <path>` options at creation and Replacement Goal
   time. Materialize UTF-8 text and PNG/JPEG/GIF/WebP images into an immutable,

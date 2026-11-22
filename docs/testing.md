@@ -187,6 +187,21 @@ The live scenarios need a `rex` CLI; without one they skip with a message,
 because what they certify is the real released provider, not a green tick.
 pi-goal core stays Rex-free, which the suite's static isolation test pins.
 
+### Review-child launch profile
+
+`test/goal57-review-profile.test.mjs` keeps the orchestration docs honest about
+the read-only review-child profile in `docs/agents/subagents.md`. It parses the
+documented `rex_spawn` arguments and the equivalent CLI form, then starts a real
+`pi --mode rpc` session with exactly those `--tools` / `--exclude-tools` values
+and reads Pi's model-visible active tool set through
+`test/extensions/active-tools-peer.ts`. The same suite proves the parent session
+still declares the Goal tools and keeps its durable Goal bytes unchanged, and
+drives `get_goal`, `create_goal`, and `update_goal` in the review child to the
+`Tool <name> not found` refusal without any Goal snapshot. When `rex` is
+available, a live scenario dispatches through the released provider's
+`rex_spawn` and inspects the run record's `launchArgs`, so the documented
+profile is proven to reach the child Pi as real launch arguments.
+
 ## Interactive smoke test
 
 Deterministic RPC tests are the automated gate. The manual real-Pi procedure —
