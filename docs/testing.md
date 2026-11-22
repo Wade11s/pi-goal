@@ -74,6 +74,27 @@ issues can be read out of a structured tool result and passed back by the later
 turns — exactly what a real model does after calling `get_goal`, and race-free
 because no request after the gate is made until the gate file exists.
 
+### Rex provider acceptance
+
+`test/goal43-rex-acceptance.test.mjs` accepts the *released* pi-rex-subagent
+provider against the same RPC surface. The vendored release tree
+(`test/fixtures/rex-subagent-v0.2.0`, with its provenance record: tag, release
+commit, and tarball checksum) is loaded as a real extension next to pi-goal, so
+child work crosses exactly the seam the provider contract fixes: the persisted
+parent tool-result `usage` plus the accounting `details` cursors, produced by a
+real child Pi whose session events publish the usage snapshots.
+
+`test/helpers/rex-acceptance.mjs` builds the isolated environment per test: a
+foreground Rex server on a private Unix socket (`REX_SERVER`, so the user's own
+Rex app is never touched), a deterministic OpenAI-compatible child provider
+resolved through `models.json` in the shared agent directory (no credentials, no
+network), and that agent directory, which also isolates the provider's run
+records. A hold gate can keep a child provably mid-turn so a test can observe
+the zero-usage snapshot a running child has already published. The live
+scenarios need a `rex` CLI; without one they skip with a message, because what
+they certify is the real released provider, not a green tick. pi-goal core
+stays Rex-free, which the suite's static isolation test pins.
+
 ## Interactive smoke test
 
 Deterministic RPC tests are the automated gate. The manual real-Pi procedure —
