@@ -52,6 +52,11 @@ export class PiRpcSession {
 		// User-level settings written to <agent-dir>/settings.json before the spawn,
 		// for tests that need deterministic retry or compaction behavior.
 		this.settings = options.settings ?? undefined;
+		// Pi's `--tools` allowlist and `--exclude-tools` denylist, verbatim. The
+		// review-child profile test passes the documented launch arguments here so a
+		// real Pi session proves which tools are actually active.
+		this.tools = options.tools ?? undefined;
+		this.excludeTools = options.excludeTools ?? undefined;
 		// Extra environment for the spawned Pi, applied over the harness defaults.
 		// The Rex acceptance suite uses it to point the released provider at an
 		// isolated Rex server and to strip this terminal's own Rex identity, so a
@@ -98,9 +103,16 @@ export class PiRpcSession {
 			"stepfun-5-preview",
 		);
 		for (const extension of this.extraExtensions) args.push("-e", extension);
+		if (this.tools) args.push("--tools", this.tools);
+		if (this.excludeTools) args.push("--exclude-tools", this.excludeTools);
 		if (this.noSession) args.push("--no-session");
 		else if (this.resumeSessionFile) args.push("--session", this.resumeSessionFile);
 		else args.push("--session-dir", this.sessionDir);
+
+		// The exact child argv this session was started with. The review-profile
+		// test inspects it, then relies on this same real session to prove the
+		// documented arguments actually take effect.
+		this.args = args;
 
 		this.proc = spawn(PI_BINARY, args, {
 			cwd: this.cwd,

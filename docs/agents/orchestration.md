@@ -16,6 +16,13 @@ Balance assignments across the pool by active workload, issue size, and relevant
 
 Pull requests are reviewed through `rex-subagent`. Select reviewers from the independent-review pool in `docs/agents/subagents.md`, alternating primaries and preferring a different model family than the implementer; security, data-loss-risk, and final high-risk reviews use the high-risk review pool. Every review subagent follows the `open-code-review-delegate` workflow defined in the root `AGENTS.md`.
 
+Every review child is launched with the read-only review-child profile in
+`docs/agents/subagents.md`: `tools` = `read,bash,grep,find,ls` and `excludeTools` =
+`edit,write,get_goal,create_goal,update_goal`. The profile is a Rex launch
+argument set, not a Pi review-thread classification; the parent session keeps its
+Goal tools and Goal state. If a review child reports that a Goal tool is
+unavailable, that is the intended refusal, not a provider problem.
+
 The orchestrator dispatches reviews, routes requested changes back to the implementation worker, and verifies the resulting updates.
 
 ## Issue and pull request flow
@@ -30,4 +37,4 @@ The orchestrator dispatches reviews, routes requested changes back to the implem
 
 ## Subagent operation
 
-Use `rex-subagent` for every worker and reviewer dispatch. Read `docs/agents/subagents.md` before each dispatch and pass `--model` and `--thinking` explicitly. Wait for delegated runs, read their logs, and independently verify reported results before treating them as complete. Stop subagents when their results are no longer needed.
+Use `rex-subagent` for every worker and reviewer dispatch. Read `docs/agents/subagents.md` before each dispatch and pass `--model` and `--thinking` explicitly. Review dispatches also pass the documented review-child tool profile; implementation dispatches keep their ordinary tools. Wait for delegated runs, read their logs, and independently verify reported results before treating them as complete. Stop subagents when their results are no longer needed.
