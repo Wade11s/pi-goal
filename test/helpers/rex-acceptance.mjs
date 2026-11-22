@@ -11,9 +11,12 @@
  * Isolation comes from three per-test resources, all under one temp directory:
  *
  * - a foreground Rex server on a private Unix socket (`rex server run
- *   --listen ... --state-dir ... --restore=false`), selected through the
- *   `REX_SERVER` environment variable the released extension's `discoverRex`
- *   honors, so no window or session ever touches the user's own Rex app;
+ *   --listen ... --state-dir ... --restore=false --config <minimal temp file>`),
+ *   selected through the `REX_SERVER` environment variable the released
+ *   extension's `discoverRex` honors, so no window or session ever touches the
+ *   user's own Rex app. The explicit minimal `--config` overrides `REX_CONFIG`
+ *   and the default `rex/init.lua`, so the server can never load the developer's
+ *   own Rex config and open extra listeners or tailnet endpoints from it;
  * - a deterministic OpenAI-compatible chat-completions server the spawned child
  *   Pi resolves through `models.json` in the shared `PI_CODING_AGENT_DIR`
  *   (`buildChildScript` exports that variable to the child), so the child needs
@@ -28,7 +31,8 @@
  * can observe the zero-usage snapshot a running child has already published.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -52,10 +56,16 @@ export const CHILD_USAGE = { input: 60, output: 30, cacheRead: 50, cacheWrite: 1
 /** The child usage pi-goal must account: input + output + cacheWrite. */
 export const CHILD_ACCOUNTED = CHILD_USAGE.input + CHILD_USAGE.output + CHILD_USAGE.cacheWrite;
 
-/** Whether a `rex` CLI is available to run the isolated server at all. */
+/**
+ * Whether a `rex` CLI is available to run the isolated server at all.
+ *
+ * A real version probe with a required clean exit: a `rex` that exists but fails
+ * to run (non-zero exit) is not available, and counting it as available would
+ * only turn the live acceptance scenarios into confusing failures.
+ */
 export function rexAvailable() {
-	const probe = spawnSync("rex", ["--help"], { timeout: 10_000, stdio: "ignore" });
-	return probe.error === undefined;
+	const probe = spawnSync("rex", ["version"], { timeout: 10_000, stdio: "ignore" });
+	return probe.error === undefined && probe.status === 0;
 }
 
 function sse(object) {
@@ -70,7 +80,7 @@ function sse(object) {
  * response is deferred until `releaseChild()`, which is how a test keeps the
  * child provably mid-turn (its pre-turn snapshot published, its usage not).
  */
-class ChildProviderServer {
+export class ChildProviderServer {
 	#release = () => undefined;
 
 	constructor() {
@@ -161,7 +171,13 @@ class ChildProviderServer {
 	}
 
 	close() {
-		return new Promise((resolve) => this.server.close(() => resolve()));
+		return new Promise((resolve) => {
+			this.server.close(() => resolve());
+			// Drop every open socket so close() cannot block on a child that never
+			// finishes its POST (held, blocked, or slow): destroying the sockets lets
+			// the close callback fire even while a response is still held.
+			this.server.closeAllConnections();
+		});
 	}
 }
 
@@ -177,8 +193,69 @@ function waitForSocket(path, timeoutMs) {
 	});
 }
 
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Stop a detached server process group within `graceMs`, escalating from a
+ * group SIGTERM to a group SIGKILL, and always clearing the escalation timer.
+ *
+ * The server is spawned `detached`, so it leads its own process group and
+ * `-child.pid` reaches the server together with every window it spawned (the
+ * child Pi). Clearing the timer is what keeps a passing teardown from leaving a
+ * pending handle that would otherwise hold `node --test` open for the whole
+ * grace period.
+ */
+export function stopServer(child, exited, graceMs = 5000) {
+	return new Promise((resolve) => {
+		const signalGroup = (signal) => {
+			try {
+				process.kill(-child.pid, signal);
+			} catch {
+				// The group is already gone, or the platform refuses group signals.
+			}
+		};
+		let settled = false;
+		let escalation;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(escalation);
+			resolve();
+		};
+		escalation = setTimeout(() => {
+			signalGroup("SIGKILL");
+			// SIGKILL cannot be blocked; never wait past the grace period.
+			settle();
+		}, graceMs);
+		exited.then(settle);
+		signalGroup("SIGTERM");
+	});
+}
+
+/**
+ * SHA-256 over a vendored tree: the sorted relative paths followed by each
+ * file's bytes, every path and body separated by a NUL so no two distinct trees
+ * can collide. Recorded in the fixture's provenance so a later edit to the tree
+ * is caught by the acceptance test instead of silently passing.
+ */
+export function hashTree(dir) {
+	const files = [];
+	const walk = (current, prefix) => {
+		for (const name of readdirSync(current)) {
+			const full = join(current, name);
+			const rel = prefix ? `${prefix}/${name}` : name;
+			if (statSync(full).isDirectory()) walk(full, rel);
+			else files.push({ rel, full });
+		}
+	};
+	walk(dir, "");
+	files.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+	const hash = createHash("sha256");
+	for (const { rel, full } of files) {
+		hash.update(rel, "utf8");
+		hash.update("\0");
+		hash.update(readFileSync(full));
+		hash.update("\0");
+	}
+	return hash.digest("hex");
 }
 
 /**
@@ -215,6 +292,21 @@ export async function startRexAcceptanceEnv() {
 		"utf8",
 	);
 
+	// Isolate the server from the developer's own Rex config: an explicit minimal
+	// `--config` overrides REX_CONFIG and the default rex/init.lua, so the server
+	// can never pick up extra listeners or tailnet endpoints from them (see the
+	// module header for the full isolation boundary).
+	const rexConfigPath = join(root, "rex-init.lua");
+	writeFileSync(
+		rexConfigPath,
+		"# Intentionally minimal Rex config for the isolated acceptance server.\n" +
+			"# No bindings, no extra listeners, no tailnet: the only endpoint is the\n" +
+			"# private --listen socket, so the server never reaches the user's Rex.\n",
+		"utf8",
+	);
+
+	// `detached` makes the server its own process-group leader, so stopServer can
+	// signal the whole group (-pid) and reap the child Pi window it spawns.
 	const rex = spawn(
 		"rex",
 		[
@@ -225,8 +317,10 @@ export async function startRexAcceptanceEnv() {
 			"--state-dir",
 			stateDir,
 			"--restore=false",
+			"--config",
+			rexConfigPath,
 		],
-		{ stdio: ["ignore", "ignore", "pipe"] },
+		{ stdio: ["ignore", "ignore", "pipe"], detached: true },
 	);
 	let stderr = "";
 	rex.stderr.on("data", (chunk) => (stderr += chunk.toString("utf8")));
@@ -264,10 +358,17 @@ export async function startRexAcceptanceEnv() {
 			if (stopped) return;
 			stopped = true;
 			try {
-				rex.kill("SIGTERM");
-				await Promise.race([exited, sleep(10_000).then(() => rex.kill("SIGKILL"))]);
-			} finally {
+				// Release any held child so its in-flight response can drain, then
+				// close the deterministic provider. close() also drops every open
+				// socket, so it cannot block on a child that never finishes its
+				// POST — the state a test that throws or times out before
+				// releaseChild() would otherwise leave behind.
+				provider.releaseChild();
 				await provider.close();
+			} finally {
+				// Kill the whole server process group (the child Pi is a descendant)
+				// with a bounded wait, then always remove the temp tree.
+				await stopServer(rex, exited);
 				rmSync(root, { recursive: true, force: true });
 			}
 		},

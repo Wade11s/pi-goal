@@ -14,17 +14,22 @@
  * one they skip loudly, because the acceptance they certify is about the real
  * released provider, not about green ticks.
  */
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import {
 	CHILD_ACCOUNTED,
 	CHILD_USAGE,
+	ChildProviderServer,
 	REX_ARTIFACT_DIR,
 	REX_PROVENANCE,
+	hashTree,
 	rexAvailable,
 	startRexAcceptanceEnv,
+	stopServer,
 } from "./helpers/rex-acceptance.mjs";
 import {
 	PiRpcSession,
@@ -42,7 +47,7 @@ import {
 
 const OBJECTIVE = "Land the delegated work through the Rex subagent";
 const live = rexAvailable();
-const skipLive = { skip: !live };
+const skipLive = { skip: live ? false : "needs a local `rex` CLI to run the isolated Rex server" };
 
 /** The parent-model steps before the handle is known; step 1 is held at its gate. */
 function spawnScriptSteps(gate) {
@@ -96,6 +101,11 @@ test("the vendored provider artifact is the released v0.2.0 tree with recorded p
 	assert.equal(REX_PROVENANCE.repository, "Wade11s/pi-rex-subagent");
 	assert.equal(REX_ARTIFACT_DIR, join(import.meta.dirname, "fixtures", "rex-subagent-v0.2.0"),
 		"the live suite loads exactly the vendored release tree");
+	// The recorded tree hash pins the actual vendored bytes, so a later edit to the
+	// fixture fails here instead of silently passing on the version strings alone.
+	assert.match(REX_PROVENANCE.treeSha256, /^[0-9a-f]{64}$/, "a vendored tree hash is recorded");
+	assert.equal(hashTree(REX_ARTIFACT_DIR), REX_PROVENANCE.treeSha256,
+		"the vendored tree still matches the recorded release tree hash");
 });
 
 test("pi-goal core contains no Rex import, run-directory parser, or provider-specific accounting branch", () => {
@@ -110,6 +120,69 @@ test("pi-goal core contains no Rex import, run-directory parser, or provider-spe
 	assert.equal(manifest.dependencies, undefined, "pi-goal stays dependency-free");
 	assert.equal(manifest.peerDependencies["pi-rex-subagent"], undefined);
 	assert.equal(manifest.devDependencies["pi-rex-subagent"], undefined);
+});
+
+/** Poll until `pid` is reaped; a group SIGKILL leaves only a brief zombie. */
+async function waitForProcessGone(pid, timeoutMs = 2000) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return;
+		}
+		if (Date.now() > deadline) throw new Error(`process ${pid} was not reaped within ${timeoutMs}ms`);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
+test("the deterministic child provider tears down even while a response is held open", async (t) => {
+	// A real client connection the server holds mid-response and never releases,
+	// exactly the state a test that throws or times out before releaseChild()
+	// leaves behind: teardown must not block on it.
+	const provider = new ChildProviderServer();
+	const port = await provider.listen();
+	t.after(() => provider.close());
+	provider.armHold();
+	const pending = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", body: "{}" }).catch(() => undefined);
+	await provider.waitForChildRequest();
+	const started = Date.now();
+	await provider.close();
+	const elapsed = Date.now() - started;
+	assert.ok(elapsed < 5000, `close() must not wait on a held response (took ${elapsed}ms)`);
+	await pending;
+});
+
+test("the isolated server teardown is bounded when the server ignores SIGTERM", async (t) => {
+	// A detached leader that ignores SIGTERM, mirroring a server that will not
+	// stop gracefully: teardown must escalate to a group SIGKILL and still finish.
+	const leader = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => {}, 300000)"], { stdio: "ignore", detached: true });
+	const exited = new Promise((resolve) => leader.once("exit", (code, signal) => resolve({ code, signal })));
+	t.after(() => { try { process.kill(-leader.pid, "SIGKILL"); } catch { /* already gone */ } });
+	const started = Date.now();
+	await stopServer(leader, exited, 1000);
+	const elapsed = Date.now() - started;
+	assert.ok(elapsed < 1000 + 1000, `teardown must finish within the bounded wait (took ${elapsed}ms)`);
+	await waitForProcessGone(leader.pid);
+});
+
+test("the isolated server teardown reaps the whole process group, not just the leader", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-rex-teardown-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const childPidFile = join(root, "child.pid");
+	// A detached leader (its own process group) that keeps one long-lived child in
+	// the same group, the way the Rex server parents the child Pi window.
+	const leader = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process"); const { writeFileSync } = require("node:fs"); const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300000)"], { stdio: "ignore" }); writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid)); setTimeout(() => {}, 300000);`], { stdio: "ignore", detached: true });
+	const exited = new Promise((resolve) => leader.once("exit", (code, signal) => resolve({ code, signal })));
+	t.after(() => { try { process.kill(-leader.pid, "SIGKILL"); } catch { /* already gone */ } });
+	const recordDeadline = Date.now() + 2000;
+	while (!existsSync(childPidFile) && Date.now() < recordDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+	const childPid = Number(readFileSync(childPidFile, "utf8"));
+	assert.ok(childPid > 0, "the leader recorded its child pid");
+	await stopServer(leader, exited, 1000);
+	// The child, in the leader's process group, must be reaped with the leader:
+	// proving the teardown signals the group, not just the server pid.
+	await waitForProcessGone(childPid);
 });
 
 test("released Rex v0.2.0 child usage is charged once inside the Goal admission segment", skipLive, async (t) => {

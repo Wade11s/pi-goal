@@ -4,7 +4,8 @@
 	"tag": "v0.2.0",
 	"releaseCommit": "b2dd0d04c4697ea69e69ede89c69f54fc9d5334c",
 	"tarballSha256": "f28d0bad0edad233b6a879061d16318f99f07df4486524e0669db927eac226e7",
+	"treeSha256": "532d3b529ec10ba84dc1e960df44bd10074ef5f7c2e958120ebbc1c1b86d37bd",
 	"tarballUrl": "https://github.com/Wade11s/pi-rex-subagent/archive/refs/tags/v0.2.0.tar.gz",
 	"fetchedAt": "2026-11-22",
-	"notes": "Verbatim tree of the v0.2.0 release tag (commit b2dd0d0, 'chore: release 0.2.0'), fetched as the GitHub source tarball and unpacked unmodified. It is loaded as the released provider in the issue-43 acceptance suite; pi-goal never imports it. Refresh it only by replacing the whole tree from a newer release tag and updating this provenance record."
+	"notes": "Verbatim tree of the v0.2.0 release tag (commit b2dd0d0, 'chore: release 0.2.0'), fetched as the GitHub source tarball and unpacked unmodified. It is loaded as the released provider in the issue-43 acceptance suite; pi-goal never imports it. treeSha256 is the deterministic hash of the vendored tree (sorted relative paths + file bytes) that the acceptance test recomputes, so any later edit to the tree fails the suite instead of silently passing on the version strings. Refresh it only by replacing the whole tree from a newer release tag and updating this provenance record."
 }
