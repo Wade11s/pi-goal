@@ -36,6 +36,8 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | --- | --- |
 | [tools.md](tools.md) | `get_goal`, `create_goal` and its creation authority, the objective's trust boundary, `update_goal` and its execution binding, structured tool responses |
 | [limitations.md](limitations.md) | What the extension does not understand, cannot preempt, or intentionally leaves to the user |
+| [subagent-usage.md](subagent-usage.md) | Provider-neutral cumulative snapshots, Pi tool-result deltas, cursor reconstruction, ownership, final collection, and observation-time V1 |
+| [codex-migration.md](codex-migration.md) | Per-capability Codex comparison, released-provider status, and verification evidence |
 
 ## Testing and verification
 

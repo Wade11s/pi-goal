@@ -37,6 +37,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RpcConformanceSession } from "./subagent-usage-conformance.mjs";
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 function readJsonFile(path) {
@@ -589,4 +590,91 @@ export async function startRexAcceptanceEnv(options = {}) {
 		throw new Error(`${error instanceof Error ? error.message : String(error)}${stderr ? `; rex stderr: ${stderr}` : ""}`);
 	}
 	return environment;
+}
+
+/**
+ * Issue #45 neutral-conformance adapter. Snapshot writes below are fixture
+ * administration only; every observation under test still crosses the released
+ * provider's real public tool-result seam in a real parent Pi.
+ */
+export async function startRexConformanceProvider() {
+	const env = await startRexAcceptanceEnv();
+	const rpc = new RpcConformanceSession({
+		...env.sessionOptions(),
+		toolNames: { spawn: "rex_spawn", adopt: "rex_adopt", observe: "rex_observe", stop: "rex_stop" },
+	});
+	rpc.spawnArgs = (name) => ({
+		prompt: `Run ${name} for neutral usage conformance`,
+		name,
+		provider: "rexdeterministic",
+		model: "child-model",
+	});
+	await rpc.start();
+	const provider = {
+		source: "pi-rex-subagent",
+		env,
+		rpc,
+		async spawn(name) {
+			const spawned = await rpc.spawn(name);
+			if (spawned.runId) await env.waitForRun(spawned.runId);
+			return spawned;
+		},
+		observe: (handles) => rpc.observe(handles),
+		observeConcurrent: (groups) => rpc.observeConcurrent(groups),
+		adopt: (handle) => rpc.adopt(handle),
+		stop: (handle) => rpc.stop(handle),
+		restart: () => rpc.restart(),
+		assertRestartWasFree: () => rpc.assertRestartWasFree(),
+		baselineEntryId: (handle) => rpc.baselineEntryId(handle),
+		navigate: (entryId) => rpc.navigate(entryId),
+		async snapshot(runId) {
+			const raw = JSON.parse(readFileSync(join(env.runDir(runId), "usage.json"), "utf8"));
+			return {
+				version: raw.version,
+				source: raw.source,
+				runId: raw.runHandle,
+				parentSessionId: raw.parentSessionId,
+				childSessionId: raw.childSessionId,
+				childSessionGeneration: raw.childSessionGeneration,
+				sequence: raw.sequence,
+				usage: raw.usage,
+				final: raw.final,
+			};
+		},
+		async publish(runId, snapshot) {
+			writeFileSync(join(env.runDir(runId), "usage.json"), `${JSON.stringify({
+				version: snapshot.version,
+				source: snapshot.source,
+				runHandle: runId,
+				parentSessionId: snapshot.parentSessionId,
+				childSessionId: snapshot.childSessionId,
+				childSessionGeneration: snapshot.childSessionGeneration,
+				sequence: snapshot.sequence,
+				usage: snapshot.usage,
+				final: snapshot.final,
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			}, null, 2)}\n`, "utf8");
+		},
+		async createUnowned(runId, usage) {
+			const spawned = await env.cli([
+				"spawn", "--name", runId, "--provider", "rexdeterministic", "--model", "child-model",
+				"--prompt", "pre-adoption neutral conformance work", "--json",
+			]);
+			const handle = JSON.parse(spawned.stdout).handle;
+			await env.waitForRun(handle);
+			await provider.publish(handle, { ...await provider.snapshot(handle), sequence: 1, usage });
+			return handle;
+		},
+		async prepareFinal() {
+			// The real idle child publishes its own final snapshot during rex_stop.
+		},
+		async hasRun(runId) {
+			return existsSync(env.runDir(runId));
+		},
+		async close() {
+			await rpc.close();
+			await env.stop();
+		},
+	};
+	return provider;
 }
