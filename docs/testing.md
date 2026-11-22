@@ -204,6 +204,30 @@ The live scenarios need a `rex` CLI; without one they skip with a message,
 because what they certify is the real released provider, not a green tick.
 pi-goal core stays Rex-free, which the suite's static isolation test pins.
 
+### Neutral subagent-usage conformance
+
+`test/helpers/subagent-usage-conformance.mjs` defines the issue #45 V1 cases once
+and executes them through a provider's real public custom-tool results. The
+adapter supplies fixture administration only; assertions see Pi's persisted
+`usage` delta and `details` cursors, never private provider accounting methods.
+`test/goal45-subagent-usage-conformance.test.mjs` runs seven cases each against:
+
+- `test/extensions/usage-conformance-fake.ts`, a deterministic file-backed fake
+  with no model or network dependency;
+- released Rex v0.2.0, through the same isolated environment used by #43/#44.
+
+The cases cover explicit baselines, complete Usage, first/repeated/zero-delta and
+concurrent observations, malformed/regressed/negative-component/negative-delta/
+changed-child-session/changed-generation/ownership/wrong-identity rejection,
+rejected-call cursor atomicity (a failed multi-run observation commits none of
+its cursors, so the exact outstanding delta is still collectable), adoption,
+restart and selected-branch reconstruction without a charge, and final collection
+before removal. Private fake run metadata deliberately includes child active time
+to prove it never crosses the public result: every observation assertion rejects
+active/elapsed field names and the planted values anywhere in the serialized
+result, `content` included. The Rex scenarios also skip loudly when no `rex` CLI
+is available; the fake cases always run.
+
 ## Interactive smoke test
 
 Deterministic RPC tests are the automated gate. The manual real-Pi procedure —

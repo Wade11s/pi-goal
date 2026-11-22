@@ -12,10 +12,10 @@ substitute for the per-capability table.
 | Side | Baseline |
 | --- | --- |
 | Codex | [`openai/codex@ab541fb`](https://github.com/openai/codex/tree/ab541fb9908198d95e9420668bb03f94dfe6324e/codex-rs/ext/goal), the source revision named in [NOTICE.md](../NOTICE.md), plus the Goal TUI files under `codex-rs/tui/` at the same revision |
-| pi-goal | `integration/complete-codex-migration-42` at `63dac78` (P0–P3 delivery; `main` stays at `13a341f` until the spec lands) |
-| pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43 and #44 |
+| pi-goal | `integration/complete-codex-migration-42` base `63dac78`, plus #45 on `issue-45` (P0–P3 delivery; `main` stays at `13a341f` until the spec lands) |
+| pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43, #44, and the neutral #45 suite |
 | Pi API evidence | pi-goal's declared minimum, Pi 1.5.1; selected behavior also checked against the installed Pi 1.6.0 documentation and type definitions |
-| Verification on 2026-11-22 | `npm run typecheck` passed; `npm test` passed 564/564 tests |
+| Verification on 2026-11-22 | Before #45: `npm test` passed 564/564. The #45 branch merged the integration tip (`107d2a9`): `npm run typecheck` passed and `npm test` passed 620/620, including all 14 neutral conformance cases (seven cases against each provider) with zero skips |
 
 The comparison covers the behavior in Codex `ext/goal`, its user-facing TUI
 integration, and the corresponding pi-goal behavior. Codex's Rust implementation
@@ -36,15 +36,17 @@ public extension API.
 
 The Goal state machine, automatic continuation, deterministic stopping rules,
 budgets, durable accounting, and restart/branch reconstruction are migrated. Some
-of them are stricter than Codex. The remaining differences are concentrated in
-host integration: external subagent-process usage, telemetry, rich objective
-attachments, and a few convenience surfaces.
+of them are stricter than Codex. Released Rex child usage now crosses Pi's
+standard tool-result seam and has a provider-neutral conformance contract. The
+remaining differences are concentrated in telemetry, rich objective attachments,
+and a few convenience or host-integration surfaces.
 
 Two corrections prevent an over-broad “complete” claim:
 
 1. pi-goal **already accounts Pi `toolResult.usage`**, including nested tool work
-   and summarization usage. The missing piece is specifically a bridge for a Rex
-   child, which is a separate Pi process with a separate session file.
+   and summarization usage. Released Rex v0.2.0 supplies the separate-process
+   bridge; #45 proves the neutral contract against Rex and a deterministic fake
+   without a pi-goal accounting change.
 2. Codex's continuation template contains an `update_plan` progress-visibility
    section that pi-goal does not reproduce. Pi has no built-in `update_plan` tool;
    this is a prompt/tool integration choice, not a lifecycle defect.
@@ -76,12 +78,12 @@ Two corrections prevent an over-broad “complete” claim:
 | Budget recovery | External Goal updates can change the budget | `/goal resume --budget <new-total>` raises the cumulative ceiling with explicit headroom/maximum validation | Ported with a clearer user surface |
 | Token formula | `input - cached_input + output` | `input + output + cacheWrite`; cached reads excluded, reasoning not added twice | Intentional adapter-specific difference; see below |
 | In-process nested model usage | Descendant usage can be folded into root accounting | `toolResult.usage` is charged once by tool-call identity and replayed from the parent branch | Ported |
-| External descendant-process usage | Codex thread hierarchy reports descendant token usage to the root accounting state | Released Rex v0.2.0 reports each child's delta through Pi's standard parent `toolResult.usage`; #43/#44 accept parallel, restart, branch, replacement, adoption, nested, and final-collection behavior without a core change | Ported through Pi's tool-result seam; provider-neutral conformance contract in #45, encoded in the [plugin-neutral provider contract](subagent-usage.md) |
+| External descendant-process usage | Codex thread hierarchy reports descendant token usage to the root accounting state | Released Rex v0.2.0 reports each child's delta through Pi's standard parent `toolResult.usage`; #43/#44 accept Goal ownership and recovery, and #45 runs seven neutral cases against both Rex and a deterministic fake | Ported through Pi's tool-result seam; [neutral V1 contract](subagent-usage.md), no registry or second ledger |
 | Active elapsed time | Wall-clock deltas are persisted with Goal usage | Monotonic active clock, stopped in every non-active state and during downtime | Strengthened |
 | Persistence | `thread_goals` state DB records; fork flushes in-flight progress | `goal-state` / `goal-usage` entries on the selected session branch, tombstones, superseded records, and legacy cutover | Strengthened for Pi's tree model |
 | Ephemeral sessions | Ephemeral threads reject Goals | `--no-session` refuses Goal creation | Ported |
 | Stale model transitions | `expected_goal_id` guards persistent updates | Execution binding plus identity/revision checks reject transitions from pre-replacement or otherwise stale runs | Strengthened |
-| Automated evidence | Rust unit/integration tests | 564 real-Pi RPC and unit tests at the recorded baseline | Ported with host-level coverage |
+| Automated evidence | Rust unit/integration tests | 620 real-Pi RPC and unit tests across the integration tip and #45, including 14 provider-neutral conformance cases | Ported with host-level coverage |
 
 ## Per-capability comparison: host and UX integration
 
@@ -142,14 +144,17 @@ Two corrections prevent an over-broad “complete” claim:
 ## Rex subagent usage: one reference provider
 
 The normative design is the [plugin-neutral subagent usage contract](subagent-usage.md).
-The remainder of this section maps that contract onto Rex as **one interchangeable
-provider**. It is not a Rex-specific accounting path in pi-goal. The same contract
-can be implemented inside another subagent plugin or by a separate adapter package.
+Released Rex v0.2.0 implements it as **one interchangeable provider**. The
+`rex_spawn` baseline, `rex_wait` / `rex_observe` deltas, `rex_adopt` ownership,
+and accounting-aware `rex_stop` all use public parent tool results. #43/#44
+accepted the released artifact; #45 runs the reusable contract against that
+artifact and a deterministic fake. pi-goal has no Rex import or provider branch.
 
-**The remainder of this section is a provider proposal, not current behavior.** No
-`usage.json` file or Rex observation tool exists at the recorded baseline.
+The remainder of this section preserves the original design rationale. Where it
+uses proposal language, the accepted V1 contract and released-provider behavior
+above are authoritative.
 
-### Why current Rex usage is invisible to the parent Goal
+### Why a separate-process usage bridge was necessary
 
 `rex-subagent spawn` starts an ordinary interactive Pi in a separate process. It
 uses a run-specific `--session-dir` and writes the child session under
@@ -309,7 +314,7 @@ For either choice, a final observation must happen before `rex-subagent stop
 --remove` deletes the run directory. A combined Rex stop tool should collect the
 last snapshot before removal; otherwise late, uncollected child usage is lost.
 
-### 5. Minimal file-level change plan
+### 5. Original file-level change plan (now delivered upstream)
 
 | Repository / file | Proposed change |
 | --- | --- |
@@ -352,16 +357,17 @@ When updating this comparison, record the new source revision, change the affect
 row rather than only the summary, and link the behavioral/test document that
 provides current evidence.
 
-Recommended order for actual implementation:
+Delivery order and current status:
 
-1. Implement the neutral snapshot/provider contract and its reusable conformance
-   suite. Use `ToolResultMessage.usage` for custom-tool providers and one generic
-   async collector for external-process providers. This is the only missing piece
-   that changes budget correctness for the user's current subagent setup.
-2. Supply Rex support as one provider—inside pi-rex-subagent or in a separate
-   adapter—without adding Rex-specific logic to pi-goal.
-3. `goal.enabled` and the completion usage reminder as small UX additions.
-4. Local `pi.events` Goal-updated notifications; add an exporter only when a real
-   consumer exists.
-5. Rich objective attachments only after attachment lifetime, trust boundaries,
-   and continuation behavior are specified.
+1. **P0-1 complete in #45:** the neutral snapshot contract and reusable suite use
+   `ToolResultMessage.usage`; seven cases run against each provider. No generic
+   asynchronous collector or durable external-usage ledger was added.
+2. **P0-2 complete in #43/#44:** released Rex v0.2.0 is the reference provider,
+   with Goal accounting, budget, recovery, ownership, nesting, and final
+   collection accepted through real Pi RPC sessions.
+3. **P1 and later bands:** follow their individual issues and review status in
+   the comparison above. Observation-time V1 and unrecoverable unpublished child
+   work remain documented limitations, not hidden parity claims.
+4. A future asynchronous collector is justified only by a real provider that
+   cannot use the tool-result seam; it must remain generic, branch-local, and
+   conform to the same contract.
