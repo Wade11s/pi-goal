@@ -21,6 +21,11 @@ import assert from "node:assert/strict";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 
+/** Drop undefined values: `spawn` refuses them, and a test may unset a variable. */
+function cleanEnv(env) {
+	return Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined));
+}
+
 export const PI_BINARY = process.env.PI_BINARY ?? "pi";
 export const PI_TIMEOUT_MS = Number(process.env.PI_GOAL_TEST_TIMEOUT_MS ?? 90_000);
 
@@ -28,7 +33,10 @@ let nextRequestId = 0;
 
 export class PiRpcSession {
 	constructor(options = {}) {
-		this.agentDir = mkdtempSync(join(tmpdir(), "pi-goal-agent-"));
+		// A caller-supplied agent dir (the Rex acceptance suite pre-writes models.json
+		// there so spawned Rex children resolve the deterministic provider) is the
+		// caller's to clean up; only a directory created here is removed on stop.
+		this.agentDir = options.agentDir ?? mkdtempSync(join(tmpdir(), "pi-goal-agent-"));
 		this.sessionDir = options.sessionDir ?? mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
 		this.cwd = options.cwd ?? mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 		this.scriptPath = options.scriptPath ?? join(this.cwd, "provider-script.json");
@@ -44,11 +52,17 @@ export class PiRpcSession {
 		// User-level settings written to <agent-dir>/settings.json before the spawn,
 		// for tests that need deterministic retry or compaction behavior.
 		this.settings = options.settings ?? undefined;
+		// Extra environment for the spawned Pi, applied over the harness defaults.
+		// The Rex acceptance suite uses it to point the released provider at an
+		// isolated Rex server and to strip this terminal's own Rex identity, so a
+		// test run from inside a Rex window cannot inherit it.
+		this.env = options.env ?? undefined;
 
 		// Only remove directories this session created; dirs passed in via options
-		// (shared cwd, shared session dir) outlive this instance and are the
-		// caller's responsibility.
-		this.ownedTempDirs = [this.agentDir];
+		// (shared cwd, shared session dir, caller agent dir) outlive this instance
+		// and are the caller's responsibility.
+		this.ownedTempDirs = [];
+		if (!options.agentDir) this.ownedTempDirs.push(this.agentDir);
 		if (!options.cwd) this.ownedTempDirs.push(this.cwd);
 		if (!options.sessionDir) this.ownedTempDirs.push(this.sessionDir);
 
@@ -90,11 +104,12 @@ export class PiRpcSession {
 
 		this.proc = spawn(PI_BINARY, args, {
 			cwd: this.cwd,
-			env: {
+			env: cleanEnv({
 				...process.env,
 				PI_CODING_AGENT_DIR: this.agentDir,
 				PI_GOAL_TEST_SCRIPT: this.scriptPath,
-			},
+				...(this.env ?? {}),
+			}),
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 

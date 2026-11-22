@@ -100,6 +100,13 @@ wrap-up, and every later run of a `budget_limited` Goal. The branch replay after
 restart draws exactly the same line, so an unclean exit cannot reclassify
 post-completion work as Goal usage.
 
+The formula is the extension's accounting rule applied to what Pi reports, never
+an invoice: provider billing is not reconciled, cached reads are excluded, and a
+migrated 0.1.0 Goal carries legacy reconstructed totals rather than exact
+Goal-owned attribution. A budgeted Goal's completion says so explicitly next to
+the numbers it reports (see
+[completion usage report](budgets.md#completion-usage-report)).
+
 **Active time.** A monotonic clock (`performance.now()`, sampled exactly once per
 operation and clamped to the highest value seen) runs while a Goal is active in a
 live session. Every non-active status stops it — `paused`, `blocked`,

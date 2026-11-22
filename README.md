@@ -198,6 +198,11 @@ continues automatically: only the user's `/goal resume` restarts it.
 - `/goal resume --budget <new-total>` raises the **cumulative** ceiling (not an
   increment). It must exceed the accounted total and stay within the configured
   maximum, and it earns one fresh wrap-up per exhaustion episode.
+- Completing a **budgeted** Goal returns a final-response usage report in the
+  `update_goal` result: accounted tokens, Active elapsed time, the Token budget,
+  remaining capacity, and the accounting approximations behind them. It is built
+  from the completion snapshot, so it costs no extra provider request. An
+  unbudgeted Goal's completion reports no budget and no remaining capacity.
 
 → [Token budgets and budget exhaustion](docs/behavior/budgets.md)
 

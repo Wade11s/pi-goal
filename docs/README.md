@@ -28,6 +28,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | [behavior/stopping.md](behavior/stopping.md) | The Blocker identity contract, blocked-audit thresholds, anti-loop bounds, and the usage-limit classification tiers |
 | [behavior/accounting.md](behavior/accounting.md) | The `input + output + cacheWrite` formula, deduplication, admission segments, active time, and durable-write ordering |
 | [behavior/persistence.md](behavior/persistence.md) | `goal-state` and `goal-usage` entries, reconstruction, forks, tombstones, superseded records, and the 0.1.0 cutover |
+| [behavior/events.md](behavior/events.md) | The local `pi-goal:updated` event stream: payload, transition kinds, durable-before-announced ordering, no-flood rules, and listener-failure isolation |
 
 ## Reference
 

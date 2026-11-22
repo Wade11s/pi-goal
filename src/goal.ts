@@ -392,6 +392,45 @@ export const getGoalOutputSchema = Type.Object({
 });
 
 /**
+ * The final-response usage instruction a *budgeted* Goal's completion publishes.
+ *
+ * Completion is terminal and the extension cannot ask for another provider turn
+ * just to produce a cost report, so the report travels inside the completing
+ * `update_goal` result: the model reads `instruction` and states the numbers in
+ * the final response it is already writing. The numeric fields are present so a
+ * programmatic caller never has to parse the instruction.
+ */
+export const goalCompletionReportSchema = Type.Object({
+	/** The instruction the final response must follow, verbatim. */
+	instruction: Type.String(),
+	/** Accounted Goal tokens at completion (input + output + cache writes). */
+	accountedTokens: Type.Integer(),
+	/** Active elapsed seconds at completion, in whole seconds. */
+	activeSeconds: Type.Integer(),
+	/** The Goal's Token budget. */
+	tokenBudget: Type.Integer(),
+	/** Tokens of remaining capacity, floored at zero. */
+	remainingTokens: Type.Integer(),
+	/**
+	 * The applicable accounting approximations, single-sourced into the
+	 * instruction so the model and a programmatic caller read the same caveats.
+	 */
+	accountingNotes: Type.Array(Type.String()),
+});
+export type GoalCompletionReport = Static<typeof goalCompletionReportSchema>;
+
+/**
+ * `update_goal`'s structured result: the same `{ goal }` payload every Goal tool
+ * returns, plus the completion usage report when a budgeted Goal completes.
+ * An unbudgeted completion carries no report, so it can never claim a budget or
+ * remaining capacity it does not have.
+ */
+export const updateGoalOutputSchema = Type.Object({
+	goal: Type.Union([Type.Null(), goalPublicStateSchema]),
+	completionReport: Type.Optional(goalCompletionReportSchema),
+});
+
+/**
  * Project the public, structured state from a record. One source of truth so the
  * /goal command output, get_goal, create_goal, and update_goal always agree.
  */
@@ -560,6 +599,43 @@ export function formatGoalStatusLine(state: GoalPublicState, admission: Admissio
 	// away.
 	if (admission.admissionEnabled === false) parts.push("admission off");
 	return parts.join(" · ");
+}
+
+/**
+ * Build the completion usage report for a finished Goal, or null when the Goal
+ * has no Token budget.
+ *
+ * Budgeted only, because the report's whole point is the cost of the work
+ * against its ceiling: an unbudgeted Goal has no budget and no remaining
+ * capacity to report, and inventing either would misstate what the user asked
+ * for. Everything comes from the completion snapshot the extension already
+ * built, so no extra provider request and no re-accounting is involved.
+ */
+export function buildCompletionReport(state: GoalPublicState): GoalCompletionReport | null {
+	if (state.tokenBudget === null) return null;
+	const accountedTokens = state.usage.totalTokens;
+	const remaining = state.remainingTokens ?? 0;
+	const activeSeconds = state.usage.activeSeconds;
+	const accountingNotes = [
+		"Accounted tokens are pi-goal's accounting approximation, not a provider invoice total: " +
+			"input + output + cache writes as Pi reports them, with cached reads excluded as prompt " +
+			"reuse, reasoning already inside output, and nested tool usage counted once.",
+		"Active elapsed time counts live-session time while the Goal was active, in whole seconds, " +
+			"and excludes non-active statuses and process downtime.",
+	];
+	const instruction =
+		"This budgeted Goal is complete. Your final response must report the cost and duration of the work: " +
+		`${accountedTokens} accounted tokens of the ${state.tokenBudget}-token Token budget, ` +
+		`${remaining} tokens of remaining capacity, and ${formatSeconds(activeSeconds)} of Active elapsed time. ` +
+		accountingNotes.join(" ");
+	return {
+		instruction,
+		accountedTokens,
+		activeSeconds,
+		tokenBudget: state.tokenBudget,
+		remainingTokens: remaining,
+		accountingNotes,
+	};
 }
 
 export function formatNoGoal(admissionEnabled = true): string {
