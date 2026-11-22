@@ -4,7 +4,7 @@ Known boundaries of the current model: what the extension does not understand,
 what it cannot preempt, and what is intentionally left to the user.
 
 [← README](../README.md) · See also [tools](tools.md) ·
-[attachments](behavior/attachments.md)
+[attachments](behavior/attachments.md) · [history](behavior/history.md)
 
 - `create_goal` (the model tool) refuses while **any** Goal exists, including a
   complete, blocked, or usage-limited one, because replacing and clearing are
@@ -53,6 +53,13 @@ what it cannot preempt, and what is intentionally left to the user.
   but their attachments unverifiable; automatic Continuation then stops with an
   explicit error and no artifact-driven Lifecycle change until the original
   bytes are restored or the Goal is replaced.
+- `/goal history` reports the branch's `goal-history` records as they are. A
+  process that dies between a lifecycle commit and the history append leaves one
+  transition with no record: the timeline never invents a placeholder for it, and
+  the authoritative Goal — reconstructed from `goal-state` alone — is unaffected.
+  A record that is present but unreadable is skipped and counted rather than
+  trusted, so a hand-edited or truncated file produces a shorter timeline with a
+  notice, never a different Goal.
 - An edit preserves the Goal identity, creation time, origin, budget, attachment
   manifest, and usage history: only the objective changes and the revision
   advances. Changing attachments requires a Replacement Goal. Replacement of

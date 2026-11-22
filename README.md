@@ -15,6 +15,7 @@ extension APIs and does not patch Pi core.
 | --- | --- |
 | `/goal <objective>` | Create a Goal and start work immediately |
 | `/goal` | Report objective, status, identity, usage, and remaining capacity |
+| `/goal history` | Read-only timeline of the branch's committed Goal transitions |
 | `/goal edit [objective]` | Change the objective in place, keeping identity and history |
 | `/goal pause` · `/goal resume` · `/goal clear` | Stop admission, restart work, or remove the Goal |
 | `/goal --budget <n>` · `/goal --no-budget` | Bound unattended usage at creation |
@@ -402,6 +403,29 @@ credentials.
 → [Goal-updated events](docs/behavior/events.md) ·
 [Operational metrics and the exporter seam](docs/behavior/metrics.md)
 
+### Goal audit history
+
+Every committed transition is also appended to the session branch as a
+`goal-history` entry, and `/goal history` renders them as a readable timeline:
+identity, revision, previous and current Lifecycle status, timestamp, usage
+summary, Active elapsed time, and attachment manifest hashes when the Goal has
+attachments.
+
+- **Non-authoritative.** The durable `goal-state` snapshots and tombstones remain
+  the only lifecycle authority. Nothing reconstructs from history, so missing or
+  malformed history cannot resurrect, clear, replace, or otherwise change the
+  current Goal, and a malformed entry is skipped and surfaced as a rendering
+  notice only.
+- **Read-only.** No command, tool, or option mutates a Goal from a history
+  record; `/goal history` only reads and prints.
+- **One record per committed transition** — never per token delta, accounting
+  checkpoint, or clock tick, and never for a rolled-back transition.
+- **A crash between the commit and the append** leaves a documented diagnostic
+  gap: the timeline has no record for that transition, and reconstruction and
+  later transitions are unaffected.
+
+→ [Goal audit history](docs/behavior/history.md)
+
 ## Limitations
 
 - `create_goal` refuses while **any** Goal exists; replacing, clearing, and
@@ -434,6 +458,10 @@ credentials.
   mid-session. While the extension is disabled, an active Goal accrues no new
   Goal-owned usage either, because every run starts from a user prompt that
   closes the admission segment.
+- `/goal history` reports the branch's records as they are. A crash between a
+  lifecycle commit and its history append leaves one transition without a record;
+  the timeline never invents a placeholder for it, and the authoritative Goal is
+  unaffected either way.
 - `goal.resumePrompt` is a convenience over the explicit `/goal resume`, never a
   replacement for it: it is off by default, asks only once per session start and
   only for a restored `paused` Goal, and every answer other than an explicit

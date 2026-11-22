@@ -6,6 +6,22 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the non-authoritative durable Goal audit history: every committed transition
+  covered by `pi-goal:updated` is appended to the session branch as a `goal-history`
+  entry and rendered read-only by `/goal history`. Each record carries the
+  committed identity, revision, transition, previous and current Lifecycle
+  statuses, timestamp, usage summary, Active elapsed time, and attachment manifest
+  hashes when present — never attachment contents and never objective text. The
+  timeline is written from the same committed-transition seam as the event stream
+  and projected from that stream's payload, so the two cannot disagree; it records
+  no accounting checkpoint or clock tick and nothing for a rolled-back transition.
+  Goal snapshots and tombstones stay the only lifecycle authority: nothing
+  reconstructs from history, so missing or malformed history cannot resurrect,
+  clear, replace, or otherwise change the current Goal, and a malformed entry is
+  skipped and surfaced as a rendering notice only. A crash between the lifecycle
+  commit and the history append leaves only a documented diagnostic gap. No
+  command, tool, or option mutates a Goal from a history record. The contract is
+  documented in `docs/behavior/history.md`.
 - Document the read-only review-child launch profile for `rex-subagent`
   dispatches in `docs/agents/subagents.md` and `docs/agents/orchestration.md`:
   `tools` = `read,bash,grep,find,ls`, `excludeTools` =
