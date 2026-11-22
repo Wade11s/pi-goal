@@ -32,7 +32,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -76,7 +76,9 @@ function sse(object) {
  * Deterministic OpenAI-compatible server for the child Pi.
  *
  * Every `/chat/completions` request streams one assistant answer whose final
- * chunk carries the fixed {@link CHILD_USAGE}. While `hold` is armed each
+ * chunk carries the fixed {@link CHILD_USAGE}. The default answer is text; a
+ * test-installed responder can instead emit tool calls for nested delegation.
+ * While `hold` is armed each
  * response is deferred until `releaseChild()`, which is how a test keeps the
  * child provably mid-turn (its pre-turn snapshot published, its usage not).
  */
@@ -86,17 +88,32 @@ export class ChildProviderServer {
 	constructor() {
 		this.requests = [];
 		this.hold = false;
+		/** Optional per-request response script used by nested-delegation acceptance. */
+		this.responder = undefined;
 		this.#startHoldGate();
 		this.server = createServer((request, response) => {
 			let body = "";
 			request.on("data", (chunk) => (body += chunk));
 			request.on("end", () => {
 				this.requests.push({ url: request.url, body });
+				const requestIndex = this.requests.length - 1;
 				if (request.method !== "POST" || !request.url.endsWith("/chat/completions")) {
 					response.writeHead(404).end();
 					return;
 				}
 				const finish = () => {
+					const index = requestIndex;
+					const answer = this.responder?.({ index, body: body ? JSON.parse(body) : {} }) ?? { text: "CHILD_DONE" };
+					const delta = { role: "assistant" };
+					if (answer.text !== undefined) delta.content = answer.text;
+					if (answer.toolCalls) {
+						delta.tool_calls = answer.toolCalls.map((call, callIndex) => ({
+							index: callIndex,
+							id: `child-call-${index}-${callIndex}`,
+							type: "function",
+							function: { name: call.name, arguments: JSON.stringify(call.args) },
+						}));
+					}
 					response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
 					response.write(
 						sse({
@@ -104,7 +121,7 @@ export class ChildProviderServer {
 							object: "chat.completion.chunk",
 							created: 1,
 							model: "child-model",
-							choices: [{ index: 0, delta: { role: "assistant", content: "CHILD_DONE" }, finish_reason: null }],
+							choices: [{ index: 0, delta, finish_reason: null }],
 						}),
 					);
 					response.write(
@@ -113,7 +130,7 @@ export class ChildProviderServer {
 							object: "chat.completion.chunk",
 							created: 1,
 							model: "child-model",
-							choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+							choices: [{ index: 0, delta: {}, finish_reason: answer.toolCalls?.length ? "tool_calls" : "stop" }],
 							usage: {
 								prompt_tokens: CHILD_USAGE.input + CHILD_USAGE.cacheRead + CHILD_USAGE.cacheWrite,
 								completion_tokens: CHILD_USAGE.output,
@@ -142,6 +159,14 @@ export class ChildProviderServer {
 			this.#release = resolve;
 		});
 	}
+	/**
+	 * Script a response from the OpenAI request body and zero-based request index.
+	 * The default remains one fixed text response; nested acceptance uses tool calls.
+	 */
+	setResponder(responder) {
+		this.responder = responder;
+	}
+
 	/** Keep every further child response until {@link releaseChild}. */
 	armHold() {
 		this.hold = true;
@@ -155,9 +180,9 @@ export class ChildProviderServer {
 	}
 
 	/** Resolve once the child has requested its first turn (so its pre-turn snapshot exists). */
-	async waitForChildRequest() {
+	async waitForChildRequest(count = 1) {
 		const deadline = Date.now() + 60_000;
-		while (this.requests.length === 0) {
+		while (this.requests.length < count) {
 			if (Date.now() > deadline) throw new Error("the Rex child never requested its deterministic provider");
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
@@ -263,12 +288,20 @@ export function hashTree(dir) {
  * isolated Rex server, deterministic child provider, and the agent dir both the
  * parent and the spawned child share.
  */
-export async function startRexAcceptanceEnv() {
+export async function startRexAcceptanceEnv(options = {}) {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-rex-"));
 	const agentDir = join(root, "agent");
 	const socketPath = join(root, "server.sock");
 	const stateDir = join(root, "rex-state");
 	mkdirSync(agentDir, { recursive: true });
+	// Nested children discover user-level extensions from the shared agent dir.
+	// The parent then uses that same single global loading path instead of loading
+	// the release twice (once explicitly and once through the symlink).
+	if (options.loadProviderGlobally) {
+		const extensionsDir = join(agentDir, "extensions");
+		mkdirSync(extensionsDir, { recursive: true });
+		symlinkSync(REX_ARTIFACT_DIR, join(extensionsDir, "rex-subagent"), "dir");
+	}
 
 	const provider = new ChildProviderServer();
 	const port = await provider.listen();
@@ -320,7 +353,13 @@ export async function startRexAcceptanceEnv() {
 			"--config",
 			rexConfigPath,
 		],
-		{ stdio: ["ignore", "ignore", "pipe"], detached: true },
+		{
+			stdio: ["ignore", "ignore", "pipe"],
+			detached: true,
+			// Rex windows inherit the server's environment. Pinning the endpoint here
+			// as well as in the parent keeps a nested child on this private server.
+			env: { ...process.env, REX_SERVER: `unix://${socketPath}` },
+		},
 	);
 	let stderr = "";
 	rex.stderr.on("data", (chunk) => (stderr += chunk.toString("utf8")));
@@ -341,16 +380,88 @@ export async function startRexAcceptanceEnv() {
 		PATH: [...pathPrefix, process.env.PATH].filter(Boolean).join(":"),
 	};
 
+	const runProcess = async (executable, args, env = sessionEnv) => {
+		const child = spawn(executable, args, {
+			cwd: root,
+			env: Object.fromEntries(Object.entries({ ...process.env, ...env }).filter(([, value]) => value !== undefined)),
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (chunk) => (stdout += chunk.toString("utf8")));
+		child.stderr.on("data", (chunk) => (stderr += chunk.toString("utf8")));
+		const code = await new Promise((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", resolve);
+		});
+		return { code, stdout, stderr };
+	};
+
 	let stopped = false;
 	const environment = {
+		root,
 		agentDir,
 		sessionEnv,
 		provider,
+		runDir(handle) {
+			return join(agentDir, "rex-subagents", handle);
+		},
+		record(handle) {
+			return readJsonFile(join(this.runDir(handle), "metadata.json"));
+		},
+		records() {
+			const runsRoot = join(agentDir, "rex-subagents");
+			return existsSync(runsRoot) ? readdirSync(runsRoot).map((handle) => this.record(handle)) : [];
+		},
+		/** Run the released CLI in the same isolated environment, never the user's Rex. */
+		async cli(args, { allowFailure = false } = {}) {
+			const result = await runProcess(process.execPath, [join(REX_ARTIFACT_DIR, "src", "cli.ts"), ...args], {
+				...sessionEnv,
+				PI_CODING_AGENT_DIR: agentDir,
+				PI_SESSION_ID: undefined,
+			});
+			if (!allowFailure && result.code !== 0) {
+				throw new Error(`rex-subagent ${args.join(" ")} failed (${result.code}): ${result.stderr || result.stdout}`);
+			}
+			return result;
+		},
+		async waitForRun(handle) {
+			const result = await this.cli(["wait", handle, "--for", "60s", "--json"], { allowFailure: true });
+			const [outcome] = JSON.parse(result.stdout);
+			if (!outcome || outcome.outcome === "timeout") {
+				throw new Error(`child ${handle} did not settle: ${result.stdout || result.stderr}`);
+			}
+			return outcome;
+		},
+		async send(handle, message) {
+			await this.cli(["send", handle, message]);
+		},
+		/** Crash only this child, leaving its last durable snapshot untouched. */
+		async killChild(handle) {
+			const record = this.record(handle);
+			const args = [
+				"-S", record.rex.endpoint,
+				"--autostart=false",
+				"block", "call", "-s", record.rex.sessionId, "-b", record.rex.blockId, "process",
+			];
+			const before = await runProcess("rex", args);
+			if (before.code !== 0) throw new Error(`could not inspect child ${handle}: ${before.stderr || before.stdout}`);
+			const pid = JSON.parse(before.stdout).child?.pid;
+			if (!Number.isInteger(pid)) throw new Error(`child ${handle} has no live process to kill: ${before.stdout}`);
+			process.kill(pid, "SIGKILL");
+			const deadline = Date.now() + 10_000;
+			for (;;) {
+				const after = await runProcess("rex", args);
+				if (after.code === 0 && JSON.parse(after.stdout).last_exit) return;
+				if (Date.now() > deadline) throw new Error(`Rex did not reap killed child ${handle}`);
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+		},
 		/** Options for `PiRpcSession.start`: the released provider rides along. */
 		sessionOptions() {
 			return {
 				agentDir,
-				extraExtensions: [REX_ARTIFACT_DIR],
+				extraExtensions: options.loadProviderGlobally ? [] : [REX_ARTIFACT_DIR],
 				env: sessionEnv,
 			};
 		},

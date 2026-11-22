@@ -101,10 +101,25 @@ Rex app is never touched), a deterministic OpenAI-compatible child provider
 resolved through `models.json` in the shared agent directory (no credentials, no
 network), and that agent directory, which also isolates the provider's run
 records. A hold gate can keep a child provably mid-turn so a test can observe
-the zero-usage snapshot a running child has already published. The live
-scenarios need a `rex` CLI; without one they skip with a message, because what
-they certify is the real released provider, not a green tick. pi-goal core
-stays Rex-free, which the suite's static isolation test pins.
+the zero-usage snapshot a running child has already published. The helper also
+drives the released CLI for adoption and second-turn fixtures, supports nested
+children on the same private server, and can crash one child to exercise
+durable-recovery diagnostics.
+
+`test/goal44-rex-recovery.test.mjs` extends that acceptance through restart and
+selected-parent-branch reconstruction, parallel and overlapping observations,
+Replacement Goal ownership, adoption and nested delegation, and final
+stop/removal. The final-collection scenario checks all three persisted cursor
+outcomes: `final: true`, a durable non-final remainder marked
+`finalization: "unconfirmed"`, and terminal `snapshot: "missing"` recovery with
+zero observed usage. The restart scenario also pins observation-time V1: work
+performed while paused is charged only by the post-resume observation. These
+tests assert public tool results and Goal records; direct run-directory access
+is limited to fixture administration and crash setup.
+
+The live scenarios need a `rex` CLI; without one they skip with a message,
+because what they certify is the real released provider, not a green tick.
+pi-goal core stays Rex-free, which the suite's static isolation test pins.
 
 ## Interactive smoke test
 
