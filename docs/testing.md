@@ -197,7 +197,11 @@ and reads Pi's model-visible active tool set through
 `test/extensions/active-tools-peer.ts`. The same suite proves the parent session
 still declares the Goal tools and keeps its durable Goal bytes unchanged, and
 drives `get_goal`, `create_goal`, and `update_goal` in the review child to the
-`Tool <name> not found` refusal without any Goal snapshot. When `rex` is
+`Tool <name> not found` refusal without any Goal snapshot. The byte comparison
+comes after the child's re-run has settled and consumed its second scripted
+step, because a prompt response only acknowledges acceptance; the test also pins
+the interim `agent_settled` count and the run count, so a skipped re-run fails
+instead of silently passing the comparison. When `rex` is
 available, a live scenario dispatches through the released provider's
 `rex_spawn` and inspects the run record's `launchArgs`, so the documented
 profile is proven to reach the child Pi as real launch arguments.

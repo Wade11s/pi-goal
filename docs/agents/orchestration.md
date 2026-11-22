@@ -17,7 +17,7 @@ Balance assignments across the pool by active workload, issue size, and relevant
 Pull requests are reviewed through `rex-subagent`. Select reviewers from the independent-review pool in `docs/agents/subagents.md`, alternating primaries and preferring a different model family than the implementer; security, data-loss-risk, and final high-risk reviews use the high-risk review pool. Every review subagent follows the `open-code-review-delegate` workflow defined in the root `AGENTS.md`.
 
 Every review child is launched with the read-only review-child profile in
-`docs/agents/subagents.md`: `tools` = `read,bash,grep,find` and `excludeTools` =
+`docs/agents/subagents.md`: `tools` = `read,bash,grep,find,ls` and `excludeTools` =
 `edit,write,get_goal,create_goal,update_goal`. The profile is a Rex launch
 argument set, not a Pi review-thread classification; the parent session keeps its
 Goal tools and Goal state. If a review child reports that a Goal tool is

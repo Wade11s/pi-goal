@@ -55,7 +55,7 @@ Canonical `rex_spawn` arguments (the profile contract this document owns):
 
 ```json review-child-profile
 {
-  "tools": "read,bash,grep,find",
+  "tools": "read,bash,grep,find,ls",
   "excludeTools": "edit,write,get_goal,create_goal,update_goal"
 }
 ```
@@ -63,13 +63,13 @@ Canonical `rex_spawn` arguments (the profile contract this document owns):
 Equivalent CLI dispatch for diagnostics and manual runs:
 
 ```sh review-child-cli
-rex-subagent spawn --name review --tools read,bash,grep,find --exclude-tools edit,write,get_goal,create_goal,update_goal --prompt "Review <base>..<head>"
+rex-subagent spawn --name review --tools read,bash,grep,find,ls --exclude-tools edit,write,get_goal,create_goal,update_goal --prompt "Review <base>..<head>"
 ```
 
 Rules:
 
-- `tools` is Pi's `--tools` allowlist. `read`, `grep`, and `find` are the reading
-  tools; `bash` is required for OCR and Git. `grep`, `find`, and `ls` are
+- `tools` is Pi's `--tools` allowlist. `read`, `grep`, `find`, and `ls` are the
+  reading tools; `bash` is required for OCR and Git. `grep`, `find`, and `ls` are
   off-by-default built-ins, so name the ones a Reviewer needs explicitly.
 - `excludeTools` is Pi's `--exclude-tools` denylist. `edit` and `write` are
   excluded because a Reviewer never modifies code; `get_goal`, `create_goal`, and
@@ -88,9 +88,11 @@ Rules:
 
 Accidental Goal-tool invocation in a review child fails closed: Pi refuses the
 call with `Tool <name> not found`, the child records no Goal transition, and the
-parent's durable Goal entries are not touched. The Reviewers' prompt says the
-lifecycle controls are unavailable and out of scope so a model does not spend a
-retry discovering the refusal.
+parent's durable Goal entries are not touched. The root `AGENTS.md` review
+instruction states that review children have no Goal lifecycle controls: the
+tools are absent and out of scope, and a Reviewer must not
+attempt lifecycle operations. The prompt says so up front so a model does not
+spend a retry discovering the refusal.
 
 ### Upstream request (pi-rex-subagent, not pi-goal)
 
@@ -108,6 +110,6 @@ A subagent assigned any review of workspace changes, a PR, a commit, or a branch
 
 - Use delegation mode only: `ocr delegate preview`, `ocr delegate rule`, mode-appropriate diffs, per-file review, and the required finding format. Pass the requested scope and matching refs to both OCR subcommands.
 - Account for every `reviewable_files` entry as `reviewed` or `skipped` with a concrete reason. Report `total_files`, `reviewed_files`, `skipped_files`, and `coverage_rate`.
-- Keep skills enabled and give the Reviewer at least `read,bash,grep,find`. Bash is required for OCR and Git; do not spawn a Reviewer with a tool set that omits Bash or with `--no-skills`.
+- Keep skills enabled and give the Reviewer at least `read,bash,grep,find,ls`. Bash is required for OCR and Git; do not spawn a Reviewer with a tool set that omits Bash or with `--no-skills`.
 - Reviewers only review; they must not modify code. The profile above removes `edit` and `write`, and the Reviewer must not write through `bash` either; the orchestrator arranges fixes separately based on review results.
 - If the OCR CLI is unavailable or the workflow is blocked, follow the skill's troubleshooting instructions and report the blocker; do not substitute native `open-code-review` or an ad hoc diff review.

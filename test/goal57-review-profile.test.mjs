@@ -8,14 +8,19 @@
  * 1. the documented profile is read-only and excludes every Goal tool, in both
  *    its `rex_spawn` JSON form and its equivalent CLI form;
  * 2. a real Pi session started with exactly those documented launch arguments
- *    declares only `read,bash,grep,find` to the model, while an ordinary parent
- *    session still declares the Goal tools and keeps its own Goal state;
+ *    declares only `read,bash,grep,find,ls` to the model, while an ordinary
+ *    parent session still declares the Goal tools and keeps its own Goal state;
  * 3. an accidental `get_goal`/`create_goal`/`update_goal` call in the review
  *    child is refused by Pi and writes no Goal transition.
  *
  * The live scenario, when a local `rex` CLI exists, inspects the released
  * provider's run record and proves the profile reaches the child Pi as the real
  * `--tools` / `--exclude-tools` launch arguments.
+ *
+ * The isolation scenario re-runs the child *after* the parent Goal exists, so its
+ * byte comparison must wait for that second run to settle: a prompt response only
+ * acknowledges acceptance, and a busy child would silently discard the second
+ * scripted step while the comparison still passed.
  */
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,7 +29,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	PiRpcSession,
+	assertStepsConsumed,
 	readSessionEntries,
+	runCount,
 	script,
 	waitForSnapshot,
 } from "./helpers/rpc-harness.mjs";
@@ -34,7 +41,7 @@ const SUBAGENTS_DOC = join(import.meta.dirname, "..", "docs", "agents", "subagen
 const ACTIVE_TOOLS_PEER = join(import.meta.dirname, "extensions", "active-tools-peer.ts");
 
 /** The profile's read-only allowlist, in its canonical order. */
-const READ_ONLY_TOOLS = ["read", "bash", "grep", "find"];
+const READ_ONLY_TOOLS = ["read", "bash", "grep", "find", "ls"];
 /** Tools a review child must never have: code mutation and Goal lifecycle. */
 const DENIED_TOOLS = ["edit", "write", "get_goal", "create_goal", "update_goal"];
 const GOAL_TOOLS = ["get_goal", "create_goal", "update_goal"];
@@ -134,6 +141,7 @@ test("the documented launch arguments produce a read-only real Pi session, leavi
 	t.after(() => child.stop());
 	script([{ text: "Review complete." }, { text: "Still review only." }], child);
 	await child.prompt("Review the branch please.");
+	await child.waitForSettled(1);
 
 	// Launch-argument inspection: the real child Pi process was started with the
 	// documented profile, as adjacent flag/value pairs.
@@ -174,7 +182,26 @@ test("the documented launch arguments produce a read-only real Pi session, leavi
 
 	// Re-run the child after the parent Goal exists, then prove the parent's
 	// durable session bytes are unchanged: the child cannot reach across sessions.
+	// The response only acknowledges prompt acceptance, so wait for the second run
+	// to actually settle before comparing bytes. Without that wait a busy child
+	// would drop the second scripted step and the comparison would still pass,
+	// which is why the step count and the second reply are asserted as well.
 	await child.prompt("Summarize the review.");
+	await child.waitForSettled(2);
+	assertStepsConsumed(child, 2);
+	assert.equal(runCount(child), 2, "the child ran the re-review as a second agent run");
+	assert.deepEqual(
+		child.records
+			.filter((record) => record.type === "message_end" && record.message.role === "assistant")
+			.map((record) =>
+				record.message.content
+					.filter((block) => block.type === "text")
+					.map((block) => block.text)
+					.join(""),
+			),
+		["Review complete.", "Still review only."],
+		"the second scripted step is the re-run's reply, not a discarded step",
+	);
 	assert.deepEqual(readFileSync(parentFile), before, "the parent's durable Goal state is byte-for-byte unchanged");
 });
 

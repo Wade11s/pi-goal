@@ -8,7 +8,7 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 - Document the read-only review-child launch profile for `rex-subagent`
   dispatches in `docs/agents/subagents.md` and `docs/agents/orchestration.md`:
-  `tools` = `read,bash,grep,find`, `excludeTools` =
+  `tools` = `read,bash,grep,find,ls`, `excludeTools` =
   `edit,write,get_goal,create_goal,update_goal`. It is a per-child Rex launch
   argument set, not a Pi review-thread classification; pi-goal core gains no
   Rex or review logic, and the parent session keeps its Goal tools and Goal
