@@ -188,6 +188,47 @@ and is reported as a persistence error).
   snapshot, so restarts and reloads cannot resurrect it, and the session returns
   to ordinary prompt-by-prompt behavior.
 
+## Opt-in resume prompt
+
+```json
+{ "goal": { "resumePrompt": true } }
+```
+
+`goal.resumePrompt` (Pi settings, default `false`) is convenience over the
+user-owned resume, never a replacement for it. When a session start restores a
+Goal whose Lifecycle status is `paused` and a dialog-capable UI exists, pi-goal
+asks **once** whether to resume it.
+
+- **Accept** runs the same durable transition as `/goal resume`: the same
+  identity, creation time, objective, and accounted history, one revision
+  advance, and a **fresh Blocked audit** (the audit that described the stop the
+  user just overruled is dropped). The resume kickoff then restarts work exactly as
+  the command would.
+- **Decline, dismissal, timeout, and no UI change nothing.** The answer is
+  revalidated against the exact record the dialog described, so a Goal that was
+  edited, resumed, replaced, or cleared while the dialog was open is not resumed
+  by a stale answer. The dialog is bounded, and its default answer is "no".
+- **Only `paused` is prompted for.** `active`, `complete`, `blocked`,
+  `usage_limited`, and `budget_limited` never prompt in V1: blocked and
+  usage-limited recovery is an explicit user decision with its own reasoning,
+  and budget-limited recovery still requires valid new headroom
+  (`/goal resume --budget <new-total>`).
+- **Nothing waits on the prompt.** Print and JSON modes have no dialog-capable
+  UI, so nothing is asked and the notice says the Goal stays paused. In TUI and
+  RPC mode the dialog is created without being awaited by the `session_start`
+  handler, so the session is usable while the request is still pending and a
+  headless RPC caller can ignore it entirely; the safety bound then resolves it
+  to "no".
+- **A disabled extension does not ask.** While `goal.enabled` is false the prompt
+  cannot admit the resume it would perform, so it is not offered at all: the
+  restore notice names the disabled condition and the two explicit ways forward
+  (re-enable and `/goal resume`, or leave the Goal paused).
+
+The prompt is read from Pi's effective settings at session start like the other
+settings, so changing it takes effect on the next session start or reload. An
+invalid value is reported once and leaves the prompt off — a configuration
+mistake can never opt a user into a question they did not enable.
+
 ## Disabling the extension (`goal.enabled`)
 
 `goal.enabled` (Pi settings, default `true`) is an **admission control**, not a
@@ -201,6 +242,7 @@ new Goal work:
 | `/goal edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. |
 | `/goal resume` | The resume message restarts the loop. |
 | The automatic Continuation, and an owed Budget wrap-up | Both are unattended Goal work. A pending wrap-up is **deferred, not lost**: it is delivered at the first settlement after re-enabling. |
+| The opt-in resume prompt (`goal.resumePrompt`) | The dialog would only offer a resume that admission refuses, so it is not opened; the restore notice says why. |
 
 What stays available: bare `/goal` and `get_goal` (which surface the disabled
 condition), `/goal pause`, `/goal clear`, and every terminal update from work
@@ -219,6 +261,48 @@ An edit of a Goal that is *already stopped* is not work-admitting — it changes
 only durable state — so it stays available while disabled, and its notice says
 that no work was started. Re-enabling restores admission, and an active Goal
 continues only at Pi's normal settlement seam.
+
+## Naming the session from the Objective
+
+```json
+{ "goal": { "sessionNameFromObjective": true } }
+```
+
+`goal.sessionNameFromObjective` (Pi settings, default `false`) is an opt-in
+convenience: after a successful creation, pi-goal may name an otherwise unnamed
+session from the Objective, so a Goal is easier to find later in a session list.
+
+- The name is the Objective's **first line**, whitespace-collapsed and capped at
+  **80 characters**. Truncation is silent — no ellipsis — because a session name is
+  a label in a selector, and the Objective stays the authoritative text. Only the
+  Objective text contributes: attachment contents are supporting material with
+  their own trust boundary and never reach a name.
+- The name is written through Pi's own seam, so it is a `session_info` entry in the
+  session file. It is **host metadata, not Goal state**: it is never persisted in a
+  snapshot, never reconstructed from a branch, never part of a `pi-goal:updated`
+  event, and never counted in accounting. It survives a restart because Pi
+  persists it.
+- The write happens **after** the durable commit it describes and only while the
+  session has no name, so it is gated by exactly the checks that decide whether a
+  creation stands.
+
+What it never does:
+
+| Case | Behavior |
+| --- | --- |
+| The setting is absent or `false` (the default) | Nothing is read and nothing is written. A non-boolean value is reported once and ignored, which keeps sessions unnamed exactly as an unset value does. |
+| The session already has a name — whether the user typed it or an earlier Goal wrote it | Left alone. A name that exists is never overwritten. |
+| An Objective edit | Never renames. The edit changes the Goal in place, not the session. |
+| A Replacement Goal | Never renames. A replacement is a new Goal in a session that already has Goal history, so naming it would relabel a session the user may already recognize. |
+| A refused, failed, or rolled-back creation | Never names. The write sits after the durable commit, so a creation that did not stand leaves no name behind. |
+| A creation cleared while it waited for the current run | Never names. The command reports that the Goal was cleared instead of claiming success, and the naming goes with the success it never had. |
+
+A failure to write the name (a full disk, an unwritable session file) is reported
+as a warning and never as a creation failure: the Goal is already durable, and the
+name is metadata about the session. Both creation paths name the session —
+`/goal <objective>` for a fresh creation and `create_goal`, which refuses while
+any Goal exists and is therefore always a fresh one — and nothing else in the
+extension ever writes a session name.
 
 These commands are **usable while work is running** and never wait for the
 agent to become idle — an active Goal's own continuation loop keeps Pi busy

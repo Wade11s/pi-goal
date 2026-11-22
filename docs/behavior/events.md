@@ -107,7 +107,11 @@ The stream describes lifecycle state, not accounting churn:
 - blocked-audit resets, the wrap-up's delivery and its disarming, superseded
   freezes of a replaced identity's tail, the one-time legacy cutover, and the
   creation/replacement retractions (`rollback`/`restore`) are bookkeeping or
-  history, not lifecycle transitions.
+  history, not lifecycle transitions;
+- the opt-in session name (`goal.sessionNameFromObjective`) never emits. It is
+  Pi's own session metadata rather than Goal state — see
+  [lifecycle](lifecycle.md#naming-the-session-from-the-objective) — so a listener
+  that wants to react to a name reads it from Pi, not from a Goal event.
 
 ## Listener failures
 

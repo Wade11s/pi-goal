@@ -365,7 +365,8 @@ export interface AdmissionSettings {
 	problems: string[];
 }
 
-function readEnabledValue(value: unknown): boolean | undefined | "invalid" {
+/** Read an optional boolean setting; anything other than a boolean is invalid. */
+function readOptionalBoolean(value: unknown): boolean | undefined | "invalid" {
 	if (value === undefined) return undefined;
 	if (typeof value !== "boolean") return "invalid";
 	return value;
@@ -386,7 +387,7 @@ export function parseAdmissionSettings(settings: unknown): AdmissionSettings {
 	const goal = (settings && typeof settings === "object" ? (settings as Record<string, unknown>).goal : undefined) as
 		| Record<string, unknown>
 		| undefined;
-	const raw = readEnabledValue(goal?.enabled);
+	const raw = readOptionalBoolean(goal?.enabled);
 	if (raw === "invalid") {
 		return {
 			enabled: true,
@@ -396,6 +397,49 @@ export function parseAdmissionSettings(settings: unknown): AdmissionSettings {
 		};
 	}
 	return { enabled: raw ?? true, problems: [] };
+}
+
+/**
+ * Extension-level convenience configuration (`goal.resumePrompt`).
+ *
+ * The prompt is a convenience over the durable `/goal resume` transition, never
+ * a substitute for it: it asks once at session start whether to run that same
+ * user-owned resume, and declining, dismissing, timing out, or having no UI
+ * leaves the paused Goal exactly as it was. Off by default, because resuming is
+ * the user's decision and an automatic prompt would quietly make it opt-out
+ * instead of opt-in.
+ */
+export interface ResumePromptSettings {
+	/** Whether a restored paused Goal may be offered a resume prompt. Defaults to false. */
+	enabled: boolean;
+	/** Human-readable configuration problems, reported once per session. */
+	problems: string[];
+}
+
+/**
+ * Read `goal.resumePrompt` from Pi's effective settings.
+ *
+ * The default is `false` and an invalid value also resolves to `false`: the
+ * prompt is the one setting here that *offers* a lifecycle decision, so a
+ * configuration mistake must fall back to the explicit `/goal resume` path
+ * rather than ask a question the user never opted into. The mistake is reported
+ * once, like the budget and admission settings.
+ */
+export function parseResumePromptSettings(settings: unknown): ResumePromptSettings {
+	const goal = (settings && typeof settings === "object" ? (settings as Record<string, unknown>).goal : undefined) as
+		| Record<string, unknown>
+		| undefined;
+	const raw = readOptionalBoolean(goal?.resumePrompt);
+	if (raw === "invalid") {
+		return {
+			enabled: false,
+			problems: [
+				"pi-goal: goal.resumePrompt must be a boolean (true or false); ignoring it and leaving the paused-Goal " +
+					"resume prompt off.",
+			],
+		};
+	}
+	return { enabled: raw ?? false, problems: [] };
 }
 
 function readBudgetValue(value: unknown): number | undefined | "invalid" {

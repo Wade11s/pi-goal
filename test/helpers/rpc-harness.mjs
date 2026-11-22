@@ -319,6 +319,30 @@ export class PiRpcSession {
 	}
 
 	/**
+	 * Wait for a blocking extension confirm dialog and dismiss it.
+	 *
+	 * Dismissal is a different wire answer from an explicit "No": a host that
+	 * closes the dialog sends `cancelled: true`, which Pi maps to the dialog's
+	 * default answer without the user having decided anything. The extension
+	 * cannot observe the difference, so this is how a test pins dismissal as its
+	 * own path rather than reusing the decline answer.
+	 */
+	async dismissConfirm(matcher) {
+		const request = await this.waitFor("unanswered matching extension confirm dialog", (records) =>
+			records.find(
+				(r) =>
+					r.type === "extension_ui_request" &&
+					r.method === "confirm" &&
+					!this.answeredUiRequests.has(r.id) &&
+					matcher(r),
+			),
+		);
+		this.answeredUiRequests.add(request.id);
+		this.writeCommand({ type: "extension_ui_response", id: request.id, cancelled: true });
+		return request;
+	}
+
+	/**
 	 * Wait for a blocking extension editor dialog and answer it with `value`.
 	 *
 	 * Mirrors `respondToConfirm` for the `editor` method, which carries the
@@ -362,6 +386,25 @@ export class PiRpcSession {
 
 	async getState() {
 		return this.sendSimple("get_state");
+	}
+
+	/**
+	 * Rename the session the way an interactive user or a host does (RPC
+	 * `set_session_name`).
+	 *
+	 * This is the *user-provided* name seam: pi-goal must never overwrite it, so a
+	 * naming test needs a way to produce a name that did not come from the extension.
+	 */
+	async setSessionName(name) {
+		const id = `req-${++nextRequestId}`;
+		const responsePromise = this.waitFor(
+			`response for set_session_name ${id}`,
+			(records) => records.find((r) => r.type === "response" && r.id === id),
+		);
+		this.writeCommand({ id, type: "set_session_name", name });
+		const response = await responsePromise;
+		if (!response.success) throw new Error(`set_session_name failed: ${response.error}`);
+		return response.data;
 	}
 
 	async getCommands() {
