@@ -1386,6 +1386,18 @@ function formatAttachmentManifestListing(goal: GoalRecord): string {
 }
 
 /**
+ * Options for one Continuation message.
+ */
+export interface ContinuationMessageOptions {
+	/**
+	 * Whether the opt-in progress-plan tool is registered *and* enabled in this
+	 * session, so the message may name it. False by default, so a caller that does
+	 * not know never mentions it.
+	 */
+	planTool?: boolean;
+}
+
+/**
  * Continuation message drafted at `agent_before_settle` while a Goal is active.
  *
  * It restates the objective verbatim on every continuation so the finish line
@@ -1406,8 +1418,19 @@ function formatAttachmentManifestListing(goal: GoalRecord): string {
  * open the message restates that identity, the latest description, and the count,
  * because compaction and a restart are exactly when they would otherwise be
  * missing from the model's context.
+ *
+ * `options.planTool` decides whether the message mentions the opt-in progress-plan
+ * tool. It is passed in rather than read from module state so the wording is a
+ * pure function of its arguments, and it is only ever true when the caller knows
+ * the tool is actually registered *and* the setting is enabled — instructing a
+ * model to call a tool that is not in its loadout wastes a Goal turn and teaches
+ * it to ignore the extension's instructions.
  */
-export function formatContinuationMessage(goal: GoalRecord, attachments: readonly AttachmentContent[] = []): GoalMessageContent {
+export function formatContinuationMessage(
+	goal: GoalRecord,
+	options: ContinuationMessageOptions = {},
+	attachments: readonly AttachmentContent[] = [],
+): GoalMessageContent {
 	const text = [
 		`${GOAL_MESSAGE_PREFIX} Continue Goal ${goal.id} (active, revision ${goal.revision}).`,
 		"",
@@ -1437,6 +1460,19 @@ export function formatContinuationMessage(goal: GoalRecord, attachments: readonl
 		"- Partial progress, unverified claims, and weak evidence keep the Goal active: keep working.",
 		'- If the same genuine blocker persists, report it with update_goal action "blocked" once the blocked audit below is satisfied.',
 		"",
+		// The plan tool is mentioned only when it is really there. The wording names the
+		// tool, states the one rule a schema cannot express (at most one in-progress
+		// step), and then separates a plan from the completion contract — a model that
+		// has just marked every step completed is the one most likely to mistake its
+		// own narration for a finished Goal.
+		...(options.planTool
+			? [
+				"Progress plan (optional, update_plan):",
+				"- If the work has several ordered steps, keep them current with the update_plan tool: pass the whole ordered plan, each step pending, in_progress, or completed, with at most one in_progress.",
+				"- The plan is progress narration, not Goal state: updating it never changes this Goal's Lifecycle status, and marking every step completed never completes the Goal. Only update_goal with action complete does that, after the evidence audit above.",
+				"",
+			]
+			: []),
 		`Blocked audit (${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns with the same genuine blocker):`,
 		`- Report the blocker on every Goal turn it persists, with update_goal action "blocked" and a plain-language description of what is blocking the work and what would unblock it. pi-goal counts the consecutive Goal turns that reported it and only marks the Goal blocked on the ${BLOCKED_AUDIT_THRESHOLD}rd, so an early report is recorded rather than acted on.`,
 		"- The chain is consecutive: a Goal turn that makes progress, verifies a wait, or reports no blocker breaks it and the count starts again.",

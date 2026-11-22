@@ -148,6 +148,29 @@ the timeout case (see [Dialog timeouts](#dialog-timeouts)); the UI-less behavior
 of print and JSON modes is covered against the handler directly, with a fake Pi
 API, because those modes have no dialog to observe through the RPC harness.
 
+The opt-in progress-plan tool (issue #53) is tested through the same RPC surface
+in `test/goal53-progress-plan.test.mjs`, and it drives real model tool calls
+rather than calling the extension's own helpers. The registration cases read the
+tool declarations Pi puts in the model's context — the `tools` section and the
+guideline bullets of the system prompt — so "not registered while disabled" is
+observed as the absence of a declaration plus Pi's own refusal of the call, not as
+an internal flag. Step validation is driven with arguments that fail the
+argument schema (a drifted `status`) and arguments that pass it but break a
+semantic rule (two `in_progress` steps), which is what separates Pi's refusal from
+the extension's. Durability and restart visibility are asserted from the
+persisted tool-result `details` on the session branch and from the model context
+after reopening a copied session file; accounting is asserted against the durable
+and live usage totals, including the excluded cached reads; and the Completion
+audit is asserted by proving that a plan marking every step `completed` writes no
+snapshot, advances no revision, and leaves the loop running until the model's own
+`update_goal` call. Two scenarios are gated rather than raced: the ones that
+assert mid-run state end their script with a `hang` step and stop the loop with an
+explicit abort, because the scripted provider is fast enough to finish a scenario
+while the test is still reading the session file. The name-collision case loads
+`test/extensions/plan-name-peer.ts`, which owns the `update_plan` name first, and
+asserts that pi-goal registers nothing, that the peer's tool is the one that runs,
+and that no Continuation names it.
+
 ### Dialog timeouts
 
 Every interactive dialog pi-goal opens (a replacement confirmation, the

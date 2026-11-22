@@ -1,7 +1,8 @@
 # Model tools
 
-`get_goal`, `create_goal`, and `update_goal`: the structured state they return,
-the authority each transition requires, and the objective's trust boundary.
+`get_goal`, `create_goal`, `update_goal`, and the opt-in `update_plan`: the
+structured state they return, the authority each transition requires, and the
+objective's trust boundary.
 
 [← README](../README.md) · See also [lifecycle](behavior/lifecycle.md) ·
 [attachments](behavior/attachments.md) · [stopping](behavior/stopping.md)
@@ -91,6 +92,63 @@ starts no Goal, Continuation, or admitted Goal work. Evidence is checked only
 at execution time: snapshots retain `origin: "tool"` and gain no persisted
 quotation, source-message id, or reusable authorization marker. The direct
 `/goal <objective>` path is unchanged and needs no quotation.
+
+## Model tool: `update_plan`
+
+`update_plan` is the opt-in structured progress plan (`goal.planTool`, default
+`false`). It takes one argument — `plan`, an ordered array of `{ step, status }`
+where `status` is `pending`, `in_progress`, or `completed` — and replaces any
+previous plan wholesale. At most one step may be `in_progress`; a list of 1–20
+steps with step text of 1–200 characters is accepted, and anything else is
+refused with the rule that was broken.
+
+```json
+{
+  "plan": {
+    "steps": [
+      { "step": "Write the failing test", "status": "completed" },
+      { "step": "Implement the plan tool", "status": "in_progress" },
+      { "step": "Document the tool", "status": "pending" }
+    ],
+    "counts": { "total": 3, "completed": 1, "inProgress": 1, "pending": 1 }
+  }
+}
+```
+
+That object is the whole result: the tool returns it as both `structuredContent`
+and `details`, and Pi persists the tool result — including its `details` — on the
+session branch. So the plan's durability is the ordinary tool result, which
+survives a restart and is visible to the model in its own context, and there is
+no second Goal record: no `goal-state` entry, no revision, and no
+`pi-goal:updated` event. A later plan becomes the newest record on the branch and
+leaves the earlier one in place as history.
+
+What the tool deliberately does **not** do:
+
+- **It never mutates the Lifecycle.** Nothing in its execution path reaches the
+  Goal store, so a plan call cannot complete, pause, block, or budget-limit a
+  Goal. A plan that marks every step `completed` leaves the Goal active, and the
+  result text says so — a model that has just finished its own list is exactly
+  the one that might otherwise read it as a finished Goal.
+- **It cannot satisfy or bypass the Completion audit.** Completion remains
+  `update_goal` with `complete`, after every requirement of the objective is
+  verified by current-state evidence. A plan is narration about what the model
+  intends, never evidence that it happened.
+- **It performs no model work**, so it reports no usage of its own. Its turn is
+  charged by the ordinary accounting path like any other Goal turn, and it counts
+  as activity for the anti-loop counters like any other tool call.
+- **It never replaces another extension's tool.** If `update_plan` is already
+  registered by someone else, pi-goal registers nothing, reports why, and no
+  Continuation names the tool.
+
+Refusals — no Goal set, a second `in_progress` step, an empty or over-long step,
+an unknown status, a malformed argument — return an error result with **no**
+`details` payload, so the durable plan on a branch is only ever a successful tool
+result. A call in a session with no Goal is refused because there is no progress
+for a plan to describe and no Continuation that would ever show it.
+
+While the setting is off the tool does not exist: it is not declared to the model,
+and Pi refuses a call to it before any extension runs.
 
 ## The objective's trust boundary
 
@@ -258,7 +316,9 @@ opaque identity says nothing useful there and is not displayed.
 
 `get_goal`, `create_goal`, and `update_goal` all return the same structured
 `{ goal }` payload, so status, budgets, usage, and remaining capacity are
-unambiguous for programmatic callers:
+unambiguous for programmatic callers. The opt-in `update_plan` returns a
+`{ plan }` payload of its own (see above), which is deliberately *not* a Goal
+payload: nothing in it is Goal state.
 
 ```json
 {
