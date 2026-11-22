@@ -7,7 +7,8 @@ procedure, and the historical evidence behind the V1 repair programme.
 ## Reading paths
 
 - **Using pi-goal** — [README](../README.md) → [lifecycle](behavior/lifecycle.md)
-  → [attachments](behavior/attachments.md) → [budgets](behavior/budgets.md). Read [limitations](limitations.md) for the
+  → [attachments](behavior/attachments.md) → [budgets](behavior/budgets.md) →
+  [history](behavior/history.md). Read [limitations](limitations.md) for the
   honest edges.
 - **Changing behavior** — [ADR-0001](adr/0001-conservative-stopping.md) →
   [continuation](behavior/continuation.md) → [stopping](behavior/stopping.md) →
@@ -31,6 +32,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | [behavior/persistence.md](behavior/persistence.md) | `goal-state` and `goal-usage` entries, reconstruction, forks, tombstones, superseded records, and the 0.1.0 cutover |
 | [behavior/events.md](behavior/events.md) | The local `pi-goal:updated` event stream: payload, transition kinds, durable-before-announced ordering, no-flood rules, and listener-failure isolation |
 | [behavior/metrics.md](behavior/metrics.md) | The privacy-safe `pi-goal:metrics` projection, its allowlist, the local consumer seam, and the on-demand hosted companion's consent, redaction, retry, and credential rules |
+| [behavior/history.md](behavior/history.md) | The non-authoritative durable audit history: `/goal history`, what is recorded, the documented crash gap, and malformed-entry handling |
 
 ## Reference
 

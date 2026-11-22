@@ -99,6 +99,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Enable/disable setting | `GoalExtensionConfig.enabled` can be changed by the host | `goal.enabled` (default true) gates admission only: no status rewrite, no clock stop | Ported |
 | Completion usage report | Completing a budgeted Goal returns instructions to report final token/time usage | A budgeted completion returns `completionReport` with the instruction, tokens, budget, remaining capacity, and Active elapsed time | Ported |
 | Goal update events | `ThreadGoalUpdated` protocol event | Versioned `pi-goal:updated` on Pi's shared event bus after every durable transition | Ported locally; hosted protocol events remain out of scope |
+| Durable audit/event history | `thread_goals` state DB plus goal history events | Branch-local `goal-history` entries after every committed transition, projected from the event payload and rendered read-only by `/goal history` | Ported; non-authoritative by construction, no second lifecycle source of truth |
 | Analytics and metrics | Analytics events plus otel counters/histograms | Privacy-safe local projection in review (#55); no hosted exporter in core | Partial; hosted export is a companion-only path |
 | External app-server methods | `thread/goal/get`, `set`, and `clear` | Pi RPC can invoke the command surface; a companion adapter is planned in #56 | Host-specific; optional companion, never a core dependency |
 | Review-subagent tool visibility | Goal tools are hidden from Codex review subagents | No built-in Pi review-thread classification; a documented launch profile is planned in #57 | Host-specific; Rex `--tools` / `--exclude-tools` is the seam |
@@ -133,7 +134,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Resume prompt | `session_start`, `ctx.hasUI`, `ctx.ui.select()` / `confirm()` | Small; TUI and RPC need tests, print/JSON must not block |
 | Completion usage reminder | Structured `update_goal` result or completion-contract wording | Small |
 | Local Goal events | `pi.events.emit()` after durable transitions | Small; publish only after the durable write succeeds |
-| Durable audit/event history | `pi.appendEntry()` and optionally `pi.registerEntryRenderer()` | Medium; avoid putting a second conflicting lifecycle source of truth on the branch |
+| Durable audit/event history | `pi.appendEntry()` after the durable transition, plus `ctx.ui.notify()` for rendering | Delivered in #54: `goal-history` entries derived from the committed event payload, read-only `/goal history`, no second lifecycle source of truth on the branch |
 | Session title from objective | `ctx.sessionManager.getSessionName()` + `pi.setSessionName()` | Small and optional |
 | Long objectives and explicit file references | Node filesystem APIs, `ctx.ui.editor()`, and the existing encoded-objective boundary | Medium; raising the length limit is easy, lifecycle/cleanup of referenced files needs a contract |
 | Images in Goal kickoff | `pi.sendUserMessage()` accepts text/image content arrays | Medium; durable attachment ownership and every later continuation must reference the same artifacts |

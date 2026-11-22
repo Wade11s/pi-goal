@@ -4,7 +4,8 @@ The local event contract for other Pi extensions: what pi-goal announces on the
 shared extension event bus, when, and what deliberately stays off the stream.
 
 [← README](../README.md) · Map: [docs/README.md](../README.md) · See also
-[metrics](metrics.md) · Attachments: [behavior/attachments.md](attachments.md)
+[metrics](metrics.md) · [history](history.md) ·
+Attachments: [behavior/attachments.md](attachments.md)
 
 ## Why a local event stream
 
@@ -116,6 +117,17 @@ The stream describes lifecycle state, not accounting churn:
   Pi's own session metadata rather than Goal state — see
   [lifecycle](lifecycle.md#naming-the-session-from-the-objective) — so a listener
   that wants to react to a name reads it from Pi, not from a Goal event.
+
+## The durable history beside the stream
+
+The same committed transitions are also appended to the session branch as
+`goal-history` entries and rendered by the read-only `/goal history` command (see
+[history](history.md)). That timeline is *derived from this payload* — each record
+is projected from the event of its own transition — so a consumer of the stream and
+a reader of the timeline can never be told two different stories about one
+transition. The history adds the previous Lifecycle status, which the event does
+not carry, and it stays as non-authoritative as the stream is: nothing
+reconstructs from it, and no command mutates from it.
 
 ## Listener failures
 

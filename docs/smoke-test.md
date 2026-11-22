@@ -481,6 +481,36 @@ the user-visible surface by hand.
    in the tool list, no mention of it in any Continuation, and a refusal if the
    model calls it anyway.
 
+## 26. Optional: the Goal audit history
+
+After any of the transitions above, read the timeline:
+
+```
+/goal history
+```
+
+Expect one line per committed transition — identity, revision, previous and
+current Lifecycle status, timestamp, usage summary, Active elapsed time, and an
+`attachments:` line with manifest hashes when the Goal has attachments. The
+header names the timeline as non-authoritative.
+
+1. Restart the session and run `/goal history` again: the same records, because
+   they are durable session entries rather than runtime state.
+2. Run `/goal` before and after `/goal history`: nothing changes. The rendering
+   writes no `goal-state`, `goal-history`, or `goal-usage` entry and starts no
+   run, and no command mutates a Goal from a record.
+3. Pause, resume, edit, and clear, checking the timeline after each: every
+   committed transition gets exactly one record, and refusals (a second pause, a
+   second clear, a declined replacement) get none.
+4. For the malformed-entry check, stop Pi and truncate one `goal-history` line's
+   JSON payload in the session file (leave the entry's id, parent, and timestamp
+   intact). Restart: `/goal` reports the unchanged Goal, and `/goal history`
+   renders the readable records plus a notice that one entry could not be read.
+5. For the crash-gap check, stop Pi and delete one `goal-history` line, re-pointing
+   the following entry's `parentId` at the removed entry's parent. Restart: the
+   Goal is unchanged, the timeline simply has no record for that transition, and
+   the next transition appends normally.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -544,6 +574,12 @@ the user-visible surface by hand.
       revision — only `update_goal` completes it.
 - [ ] With the setting absent or `false`, no `update_plan` tool is registered and
       no Continuation mentions it.
+- [ ] `/goal history` renders one record per committed transition (identity,
+      revision, previous/current status, timestamp, usage, active time, manifest
+      hashes), survives a restart, writes nothing, and mutates nothing.
+- [ ] A truncated `goal-history` entry is skipped and surfaced as a notice while
+      the Goal reconstructs unchanged, and a missing one leaves only the
+      documented diagnostic gap.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with

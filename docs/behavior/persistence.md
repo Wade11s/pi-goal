@@ -4,7 +4,8 @@ Where Goal state lives in the session, how reconstruction works across restart,
 reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
 
 [← README](../README.md) · See also [accounting](accounting.md) ·
-[lifecycle](lifecycle.md) · [attachments](attachments.md)
+[lifecycle](lifecycle.md) · [attachments](attachments.md) ·
+[history](history.md) · [events](events.md)
 
 ## Persistence model
 
@@ -71,6 +72,15 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   changing Lifecycle status. Clear and replacement retain committed artifacts
   for historical branches; V1 performs no destructive automatic garbage
   collection. See [Objective attachments](attachments.md).
+- Every committed transition also appends a **`goal-history`** custom entry beside
+  its snapshot: the committed identity, revision, transition, previous and current
+  Lifecycle statuses, timestamp, usage summary, Active elapsed time, and the
+  attachment manifest's metadata (hashes included, contents never). The timeline is
+  derived diagnostic data — it is written from the same committed-transition seam as
+  the local event stream and is projected from that stream's payload, so the two
+  cannot disagree — and it is never read by reconstruction: a missing, truncated, or
+  malformed entry cannot resurrect, clear, replace, or otherwise change the current
+  Goal. `/goal history` renders it, read-only. See [Goal audit history](history.md).
 - Usage accounting is durable too. Token totals are always recoverable from the
   session branch, and the accounted active time is checkpointed into separate
   `goal-usage` custom entries — kept apart from `goal-state` so the lifecycle log
