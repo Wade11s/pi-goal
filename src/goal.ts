@@ -434,8 +434,38 @@ function formatSeconds(seconds: number): string {
 	return rest === 0 ? `${minutes}m` : `${minutes}m ${rest}s`;
 }
 
+/**
+ * Whether new Goal work may be admitted (`goal.enabled`).
+ *
+ * Passed to the renderers rather than stored on the Goal: admission is a host
+ * preference, not Goal state, so it must never appear in a snapshot or in the
+ * structured Goal record. Defaults to enabled so a caller that does not track
+ * the setting renders exactly what it did before.
+ */
+export interface AdmissionView {
+	admissionEnabled?: boolean;
+}
+
+/**
+ * The lines that tell the user the extension is disabled while a Goal exists.
+ *
+ * The point is that an **active-but-disabled** Goal is not a continuing one:
+ * nothing new will be admitted, but nothing about the Goal itself moved — its
+ * Lifecycle status is untouched and its Active elapsed time keeps accruing, so
+ * pausing the Goal (not disabling the extension) is what stops that clock.
+ */
+function admissionDisabledLines(): string[] {
+	return [
+		"Admission disabled: goal.enabled is false, so pi-goal admits no new Goal work — no /goal <objective> or " +
+			"create_goal, no work-admitting /goal edit, no /goal resume, and no automatic continuation. " +
+			"Disabling the extension is an admission control, not a Lifecycle status and not a pause: this Goal keeps its " +
+			"status and keeps accruing active time. Inspection (/goal, get_goal), /goal pause, /goal clear, and terminal " +
+			"updates from work already in flight still work; /goal pause, not disabling the extension, stops the clock.",
+	];
+}
+
 /** Compact single-line rendering used in notifications and tool result text. */
-export function formatGoalSummary(state: GoalPublicState): string {
+export function formatGoalSummary(state: GoalPublicState, admission: AdmissionView = {}): string {
 	const budget = state.tokenBudget === null ? "none (unbounded)" : `${state.tokenBudget} tokens`;
 	const usage = state.usage;
 	const lines = [
@@ -470,6 +500,9 @@ export function formatGoalSummary(state: GoalPublicState): string {
 			? "Remaining capacity: unlimited"
 			: `Remaining capacity: ${state.remainingTokens} tokens` +
 				(state.budgetExhausted ? " (budget exhausted)" : ""),
+		// Surfaced separately from the status line above, so an active-but-disabled
+		// Goal is never mistaken for one that keeps continuing on its own.
+		...(admission.admissionEnabled === false ? admissionDisabledLines() : []),
 	];
 	if (state.blocker !== null) {
 		lines.push(`Blocker: ${state.blocker}`);
@@ -490,17 +523,26 @@ export function formatGoalSummary(state: GoalPublicState): string {
  * Deliberately short: the footer is a glance surface, and the full breakdown is
  * one `/goal` away.
  */
-export function formatGoalStatusLine(state: GoalPublicState): string {
+export function formatGoalStatusLine(state: GoalPublicState, admission: AdmissionView = {}): string {
 	const parts = [`${state.id}`, state.status, `${state.usage.totalTokens} tok`];
 	if (state.tokenBudget !== null) {
 		parts.push(state.budgetExhausted ? "budget exhausted" : `${state.remainingTokens} left`);
 	}
 	parts.push(formatSeconds(state.usage.activeSeconds));
+	// The one word that says this active Goal is not admitting anything new. Kept
+	// short: the footer is a glance surface and the full explanation is one /goal
+	// away.
+	if (admission.admissionEnabled === false) parts.push("admission off");
 	return parts.join(" · ");
 }
 
-export function formatNoGoal(): string {
-	return "No Goal is set in this session. Use /goal <objective> to create one.";
+export function formatNoGoal(admissionEnabled = true): string {
+	const base = "No Goal is set in this session. Use /goal <objective> to create one.";
+	if (admissionEnabled) return base;
+	return (
+		`${base} pi-goal is disabled (goal.enabled is false), so /goal <objective> and create_goal are refused ` +
+		"until it is re-enabled; get_goal, /goal pause, and /goal clear are unaffected."
+	);
 }
 
 /** Compact single line for quoting an objective inside dialogs and errors. */

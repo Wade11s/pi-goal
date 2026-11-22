@@ -89,6 +89,13 @@ guidance to use the typed form instead of blocking on a terminal-only dialog.
 Pi's editor dialog has no timeout option, so pi-goal auto-cancels the command
 after 120 seconds if the host never answers; the objective is unchanged.
 
+While `goal.enabled` is false, editing the objective of an **active** Goal is
+refused: the edit would steer a new objective into the running work, which is new
+Goal work. The refusal happens before the editor dialog opens. Editing a Goal
+that is already stopped (`paused`, `blocked`, `usage_limited`, `budget_limited`)
+changes only durable state, so it stays available, and its notice says that no
+work was started because admission is off.
+
 ## Inspect the current Goal
 
 ```
@@ -114,7 +121,14 @@ Remaining capacity: 201790 tokens
 ```
 
 When a session with a Goal starts, restores, or reloads, a `Goal ... restored
-(active)` notification confirms reconstruction.
+(active)` notification confirms reconstruction. A restored **active** Goal while
+the extension is disabled adds that the Goal keeps its status and keeps accruing
+active time but admits no new Goal work, so an active-but-disabled Goal is never
+mistaken for a continuing one.
+
+Bare `/goal` also reports the disabled condition when `goal.enabled` is false —
+an `Admission disabled:` block naming what is refused, what still works, and the
+fact that pausing rather than disabling stops the clock.
 
 ## Status indicator
 
@@ -129,8 +143,9 @@ The indicator exposes every lifecycle state — `active`, `paused`, `blocked`,
 `usage_limited`, `budget_limited`, and `complete` — and is refreshed on session
 start/restore, after every lifecycle transition (create, edit, pause, resume,
 clear, complete, blocked, usage-limit, budget-limit), and after accounted usage.
-Clearing a Goal removes the indicator. The full breakdown is always one `/goal`
-away.
+Clearing a Goal removes the indicator. While `goal.enabled` is false the line
+ends with `admission off`, so an active-but-disabled Goal is visible as one that
+is not admitting anything. The full breakdown is always one `/goal` away.
 
 ## The lifecycle: pause, resume, clear
 
@@ -168,6 +183,37 @@ and is reported as a persistence error).
 - `/goal clear` removes the Goal from any status by writing a durable tombstone
   snapshot, so restarts and reloads cannot resurrect it, and the session returns
   to ordinary prompt-by-prompt behavior.
+
+## Disabling the extension (`goal.enabled`)
+
+`goal.enabled` (Pi settings, default `true`) is an **admission control**, not a
+Lifecycle status and not an implicit pause. While it is false, pi-goal admits no
+new Goal work:
+
+| Refused while disabled | Why |
+| --- | --- |
+| `/goal <objective>` — creation **and** replacement | Both open a new Goal identity and start work. The refusal comes before the replacement confirmation, so no dialog promises a replacement that will not happen. |
+| `create_goal` | Same admission, from the model side. The refusal reports `goal: null` (or the unchanged current Goal) and leaves the one-shot creation authority intact, so a corrected call can retry after re-enabling. |
+| `/goal edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. |
+| `/goal resume` | The resume message restarts the loop. |
+| The automatic Continuation, and an owed Budget wrap-up | Both are unattended Goal work. A pending wrap-up is **deferred, not lost**: it is delivered at the first settlement after re-enabling. |
+
+What stays available: bare `/goal` and `get_goal` (which surface the disabled
+condition), `/goal pause`, `/goal clear`, and every terminal update from work
+already in flight — a `budget_limited` transition, an `update_goal` completion, a
+blocker report. An in-flight provider request is never aborted, and work already
+queued is delivered as ordinary work rather than dropped.
+
+Nothing is rewritten: the Goal keeps its Lifecycle status, including `active`, and
+keeps accruing active time, because stopping that clock is a pause rather than a
+host preference. The status report and the compact indicator therefore carry the
+disabled condition separately (`Admission disabled: …` / `admission off`) so an
+active-but-disabled Goal is never mistaken for one that keeps continuing.
+
+An edit of a Goal that is *already stopped* is not work-admitting — it changes
+only durable state — so it stays available while disabled, and its notice says
+that no work was started. Re-enabling restores admission, and an active Goal
+continues only at Pi's normal settlement seam.
 
 These commands are **usable while work is running** and never wait for the
 agent to become idle — an active Goal's own continuation loop keeps Pi busy

@@ -44,6 +44,15 @@
  * itself by completing the Goal, or by reporting the same genuine blocker for
  * three consecutive Goal turns. User actions reset every anti-loop counter.
  *
+ * `goal.enabled` (Pi settings, default true) is an admission control rather than
+ * a lifecycle state: while it is false the extension admits no *new* Goal work —
+ * no creation or replacement, no `create_goal`, no work-admitting objective edit,
+ * no resume, and no automatic continuation or budget wrap-up at the settlement
+ * seam — while inspection, pause, clear, and terminal updates from work already
+ * in flight keep working. It never rewrites a Lifecycle status and never stops
+ * Active elapsed time, so an active-but-disabled Goal is surfaced as exactly
+ * that instead of being mistaken for a continuing one.
+ *
  * Usage is accounted durably from finalized Pi messages and reported nested
  * usage, with stable deduplication (see `accounting.ts`). A Goal with a token
  * budget transitions to `budget_limited` when its accounted usage reaches the
@@ -92,7 +101,9 @@ import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure
 import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
+	type AdmissionSettings,
 	type BudgetSettings,
+	parseAdmissionSettings,
 	parseBudgetSettings,
 	resolveGoalTokenBudget,
 } from "./accounting.ts";
@@ -520,6 +531,70 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
+	 * Extension-level admission configuration (`goal.enabled`), read from Pi's
+	 * effective settings at every session start, exactly like the budget settings,
+	 * so a reload picks up a changed configuration.
+	 *
+	 * Admission is a host preference rather than Goal state: nothing about it is
+	 * persisted, and a disabled extension never rewrites a Lifecycle status, never
+	 * pauses a Goal, and never stops the Active elapsed time clock. It only refuses
+	 * to admit *new* Goal work — creation, replacement, a work-admitting objective
+	 * edit, resume, and the automatic continuation (or budget wrap-up) the
+	 * settlement seam would otherwise request.
+	 */
+	let admission: AdmissionSettings = { enabled: true, problems: [] };
+
+	/**
+	 * The refusal for an admission request that `goal.enabled` currently forbids.
+	 *
+	 * One shared tail, because every refusal has to answer the same three
+	 * questions: nothing about the existing Goal moved, which controls still work,
+	 * and what admits work again. Naming the permitted controls is the point — a
+	 * user who disabled the extension must still be able to inspect and stop a Goal
+	 * safely, and must not read the refusal as a lifecycle decision.
+	 */
+	function admissionDisabledRefusal(prefix: string): string {
+		return (
+			`${prefix} pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted. ` +
+			"Disabling the extension is an admission control, not a Lifecycle status and not a pause: no Goal was " +
+			"created, replaced, edited, resumed, or paused, and no work was started or aborted. Status inspection " +
+			"(/goal, get_goal), /goal pause, /goal clear, and terminal updates from work already in flight still work. " +
+			"Re-enable goal.enabled to admit Goal work again."
+		);
+	}
+
+	/**
+	 * The uniform `{ goal }` tool error for a refused admission request.
+	 *
+	 * The shape matches every other create refusal: the unchanged current Goal, or
+	 * null when the session has none, so a caller never has to guess whether the
+	 * state moved.
+	 */
+	function admissionDisabledToolError(prefix: string) {
+		const current = store.get();
+		return goalToolError(admissionDisabledRefusal(prefix), current ? toPublicState(current) : null);
+	}
+
+	/**
+	 * Refuse an objective edit that would admit work, naming why that edit is the
+	 * one edit a disabled extension declines.
+	 *
+	 * An edit of an *active* Goal steers a new objective into the running work, so
+	 * it is new Goal work. The edit of a Goal that is already stopped changes only
+	 * durable state and stays available, which is why this refusal is scoped to the
+	 * active case rather than to every edit.
+	 */
+	function refuseWorkAdmittingEdit(ctx: ExtensionCommandContext, goal: GoalRecord): void {
+		ctx.ui.notify(
+			admissionDisabledRefusal(
+				"Goal not edited: the objective of an active Goal is work-admitting, because an edit steers a new " +
+					"objective into the running work.",
+			),
+			"warning",
+		);
+	}
+
+	/**
 	 * Extension-level budget configuration, read from Pi's effective settings at
 	 * every session start (so a reload picks up a changed configuration).
 	 */
@@ -570,7 +645,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	function updateStatus(ctx: ExtensionContext): void {
 		const goal = store.get();
 		try {
-			ctx.ui.setStatus(STATUS_KEY, goal ? formatGoalStatusLine(toPublicState(goal)) : undefined);
+			ctx.ui.setStatus(
+				STATUS_KEY,
+				goal ? formatGoalStatusLine(toPublicState(goal), { admissionEnabled: admission.enabled }) : undefined,
+			);
 		} catch {
 			// Status is a convenience surface; never break a lifecycle event for it.
 		}
@@ -608,11 +686,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const limited = store.markBudgetLimited();
 			if (limited.ok) {
 				budgetGateActive = true;
+				// The one bounded wrap-up is automatic work like a continuation, so a
+				// disabled extension defers it instead of delivering it. The flag is
+				// durable, so re-enabling the setting still delivers it exactly once.
+				const wrapUp = admission.enabled
+					? "No further Goal work runs; one wrap-up summary follows. "
+					: "No further Goal work runs; because pi-goal is disabled (goal.enabled is false) the one bounded " +
+							"wrap-up is deferred until the setting is re-enabled. ";
 				notify(
 					ctx,
 					`Goal ${limited.goal.id} reached its token budget of ${limited.goal.tokenBudget} tokens ` +
 						`(${store.getUsage().totalTokens} accounted) and is now budget_limited. ` +
-						"No further Goal work runs; one wrap-up summary follows. " +
+						wrapUp +
 						"Budget exhaustion is not completion.",
 					"warning",
 				);
@@ -625,6 +710,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		clearCreationAuthority();
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
+		// Admission is read from the same effective settings, at the same seam: a
+		// changed `goal.enabled` takes effect on the next session start or reload,
+		// never retroactively for work already in flight.
+		admission = parseAdmissionSettings(pi.getSettings());
+		for (const problem of admission.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
 		// A hard crash can leave the superseded identity's in-flight tail on the branch
 		// with no freeze boundary after it. Reconstruction recovers that tail into
@@ -638,7 +728,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		safety.reset();
 		const goal = store.get();
 		if (goal) {
-			notify(ctx, `Goal ${goal.id} restored (${goal.status}).`, "info");
+			// An active-but-disabled Goal is the case a user could mistake for a
+			// continuing one, so the restore notice names the disabled condition
+			// instead of leaving it to the status report.
+			const disabled =
+				!admission.enabled && goal.status === "active"
+					? " pi-goal is disabled (goal.enabled is false): this Goal keeps its active status and keeps accruing " +
+							"active time, but admits no new Goal work until the setting is re-enabled."
+					: "";
+			notify(ctx, `Goal ${goal.id} restored (${goal.status}).${disabled}`, "info");
 		}
 		updateStatus(ctx);
 	});
@@ -1193,6 +1291,41 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// written before the wrap-up snapshot that follows it.
 		store.flushAccounting(pi);
 
+		/*
+		 * Admission control: while `goal.enabled` is false, this settlement admits
+		 * nothing new. Neither the one bounded budget wrap-up nor a continuation is
+		 * requested, because both are unattended Goal work.
+		 *
+		 * Nothing is dropped: the wrap-up flag is durable, so re-enabling the setting
+		 * delivers it at the next settlement, and the Goal itself is untouched. It keeps
+		 * its Lifecycle status — including `active` — and keeps accruing Active elapsed
+		 * time, because stopping that clock is a pause, not a host preference. A run
+		 * that is already in flight is never aborted here either; it finishes and
+		 * reports its own terminal update.
+		 */
+		if (!admission.enabled) {
+			const current = store.get();
+			if (current?.status === "active") {
+				notify(
+					ctx,
+					`Goal ${current.id} is active, but pi-goal is disabled (goal.enabled is false), so no continuation was ` +
+						"requested at this settlement. The Goal keeps its active status and keeps accruing active time; " +
+						"/goal pause, not disabling the extension, stops that clock. Re-enable goal.enabled to admit Goal work again.",
+					"warning",
+				);
+			} else if (store.isWrapUpPending()) {
+				notify(
+					ctx,
+					`Goal ${current?.id ?? ""} is budget_limited with its one bounded wrap-up still owed, but pi-goal is ` +
+						"disabled (goal.enabled is false), so it was not delivered. The wrap-up stays pending and is delivered at " +
+						"the first settlement after the setting is re-enabled.",
+					"warning",
+				);
+			}
+			closeGoalTurn(ctx);
+			return;
+		}
+
 		if (store.isWrapUpPending()) {
 			// Exactly one bounded wrap-up, then the Goal stops for good.
 			const delivered = store.consumeWrapUp(pi);
@@ -1428,7 +1561,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const goal = store.get();
 			if (!goal) {
 				return {
-					content: [{ type: "text", text: formatNoGoal() }],
+					content: [{ type: "text", text: formatNoGoal(admission.enabled) }],
 					structuredContent: { goal: null },
 					details: { goal: null as GoalPublicState | null },
 				};
@@ -1444,7 +1577,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					: `\nBlocker identity: ${state.blockerId} (pass it back verbatim in update_goal's blocker_id for the ` +
 						"same condition; omit it for a genuinely different one)";
 			return {
-				content: [{ type: "text", text: `${formatGoalSummary(state)}${identity}` }],
+				content: [{ type: "text", text: `${formatGoalSummary(state, { admissionEnabled: admission.enabled })}${identity}` }],
 				structuredContent: { goal: state },
 				details: { goal: state },
 			};
@@ -1514,6 +1647,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			_onUpdate,
 			ctx,
 		) {
+			// Admission control first: a disabled extension refuses before it validates
+			// anything, and the refusal leaves the Goal (if any) and the one-shot
+			// creation authority untouched, so a corrected call can still retry after
+			// the setting is re-enabled.
+			if (!admission.enabled) {
+				return admissionDisabledToolError("Goal not created:");
+			}
 			const validation = validateObjective(String(params.objective ?? ""));
 			if (!validation.ok) {
 				return goalToolError(validation.error, null);
@@ -1707,7 +1847,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		) {
 			const goal = store.get();
 			if (!goal) {
-				return goalToolError(formatNoGoal(), null);
+				return goalToolError(formatNoGoal(admission.enabled), null);
 			}
 			/**
 			 * Refuse a call whose decision was prepared against a different Goal
@@ -2095,7 +2235,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	function pauseGoal(ctx: ExtensionCommandContext): void {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
 			return;
 		}
 		if (goal.status === "paused") {
@@ -2128,7 +2268,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	function resumeGoal(ctx: ExtensionCommandContext, budget: ResumeBudgetRequest): void {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
+			return;
+		}
+		// A resume admits new Goal work — the resume message restarts the loop — so a
+		// disabled extension refuses it and the Goal keeps whatever status it has.
+		if (!admission.enabled) {
+			ctx.ui.notify(admissionDisabledRefusal("Goal not resumed:"), "warning");
 			return;
 		}
 		if (budget.kind === "value" && goal.status !== "budget_limited") {
@@ -2201,7 +2347,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	function clearGoal(ctx: ExtensionCommandContext): void {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
 			return;
 		}
 		const cleared = store.clear(pi);
@@ -2259,6 +2405,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify("There is no Goal to edit. Create one with /goal <objective> first.", "warning");
 			return;
 		}
+		// Refuse before opening the dialog: an edit of an active Goal is
+		// work-admitting, so a disabled extension must not invite the user to write a
+		// new objective it will then decline to deliver.
+		if (goal.status === "active" && !admission.enabled) {
+			refuseWorkAdmittingEdit(ctx, goal);
+			return;
+		}
 		if (!ctx.hasUI) {
 			ctx.ui.notify(
 				"Interactive objective editing needs a UI, which this Pi mode does not have. " +
@@ -2290,6 +2443,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify("There is no Goal to edit. Create one with /goal <objective> first.", "warning");
 			return;
 		}
+		// An edit of an *active* Goal is work-admitting: it steers a new objective
+		// into the running work, which is new Goal work. An edit of a Goal that is
+		// already stopped admits nothing — it only rewrites durable state — so it
+		// stays available while the extension is disabled.
+		if (goal.status === "active" && !admission.enabled) {
+			refuseWorkAdmittingEdit(ctx, goal);
+			return;
+		}
 		const edited = store.editObjective(pi, validation.objective);
 		if (!edited.ok) {
 			notifyMutationFailure(ctx, "edited", edited);
@@ -2307,11 +2468,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			);
 			return;
 		}
+		// Nothing was started for a Goal that is already stopped, so the notice says
+		// what restarts it — and, while the extension is disabled, that nothing was
+		// started because admission is off rather than because the Goal moved.
+		const restart = admission.enabled
+			? updated.status === "budget_limited"
+				? "/goal resume --budget <new-total> restarts work with a higher cumulative ceiling."
+				: "/goal resume restarts work."
+			: "pi-goal is disabled (goal.enabled is false), so no work was started and /goal resume stays refused " +
+					"until it is re-enabled.";
 		ctx.ui.notify(
-			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ` +
-				(updated.status === "budget_limited"
-					? "/goal resume --budget <new-total> restarts work with a higher cumulative ceiling."
-					: "/goal resume restarts work."),
+			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ${restart}`,
 			"info",
 		);
 	}
@@ -2340,6 +2507,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	async function createOrReplaceGoal(rawObjective: string, ctx: ExtensionCommandContext): Promise<void> {
+		// Admission control before anything else: a disabled extension refuses a
+		// creation *and* a replacement, and it refuses before the confirmation
+		// dialog — asking the user to confirm a replacement that cannot happen would
+		// be a lie about what the extension will do.
+		if (!admission.enabled) {
+			ctx.ui.notify(admissionDisabledRefusal("Goal not created:"), "warning");
+			return;
+		}
 		// Budget flags are a leading prefix of a create (`/goal --budget 5000 <objective>`),
 		// so an objective that merely contains the word `--budget` is never truncated.
 		// `--no-budget` asks for an unbounded Goal even when a default is configured.
@@ -2570,9 +2745,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	async function reportStatus(ctx: ExtensionCommandContext): Promise<void> {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
 			return;
 		}
-		ctx.ui.notify(formatGoalSummary(toPublicState(goal)), "info");
+		ctx.ui.notify(formatGoalSummary(toPublicState(goal), { admissionEnabled: admission.enabled }), "info");
 	}
 }

@@ -116,5 +116,10 @@ exactly one fresh wrap-up. Editing the objective without resuming does not
 cancel an owed wrap-up; an undelivered wrap-up uses the latest durable
 objective, and an in-flight or completed wrap-up is never duplicated by an edit.
 
+A disabled extension (`goal.enabled: false`) defers an owed wrap-up instead of
+delivering it, because the wrap-up is unattended Goal work. The pending-wrap-up
+flag is durable, so nothing is lost: the wrap-up is delivered at the first
+settlement after the setting is re-enabled, exactly once.
+
 Raising the budget or changing the objective is a user decision; a
 `budget_limited` Goal is resumed with `/goal resume --budget <new-total>`.

@@ -111,6 +111,13 @@ checkpointed durably at most once per accounted second of Goal activity, at ever
 settlement, and at shutdown. Because the source is monotonic, a clock adjustment
 cannot make accounted time jump or shrink.
 
+Disabling the extension (`goal.enabled: false`) does **not** stop this clock: an
+active-but-disabled Goal keeps its `active` status, so idle-active time keeps
+accruing until the user pauses it. Pausing the Goal, not disabling the extension,
+is what stops Active elapsed time. For the same reason, no new Goal-owned usage
+is admitted while the extension is disabled: every run starts from a user prompt,
+and a user prompt closes the admission segment.
+
 Checkpoints are event-driven, not periodic: an *idle* active Goal accrues active
 time that only becomes durable at its next settlement or shutdown, so an unclean
 exit can lose more than one second of active time. Tokens are never lost that way —
