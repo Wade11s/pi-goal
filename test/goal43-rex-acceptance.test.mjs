@@ -29,6 +29,7 @@ import {
 	hashTree,
 	rexAvailable,
 	startRexAcceptanceEnv,
+	stopClients,
 	stopServer,
 } from "./helpers/rex-acceptance.mjs";
 import {
@@ -183,6 +184,61 @@ test("the isolated server teardown reaps the whole process group, not just the l
 	// The child, in the leader's process group, must be reaped with the leader:
 	// proving the teardown signals the group, not just the server pid.
 	await waitForProcessGone(childPid);
+});
+
+test("a client that ignores SIGTERM is still reaped within the bounded teardown", async (t) => {
+	// A direct child of the test process that refuses to stop gracefully, the way
+	// a `rex` or released-CLI client wedged on a vanished socket would. Teardown
+	// must escalate to SIGKILL and still finish inside its bound.
+	const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => {}, 300000)"], { stdio: "ignore" });
+	const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+	t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
+	const started = Date.now();
+	await stopClients(new Set([child]), 1000);
+	const elapsed = Date.now() - started;
+	assert.ok(elapsed < 1000 + 1000, `teardown must escalate within the bounded wait (took ${elapsed}ms)`);
+	await waitForProcessGone(child.pid);
+});
+
+test("environment teardown reaps the clients a timed-out or thrown call left running", skipLive, async (t) => {
+	// The state a failing scenario leaves behind: a `wait` client still blocked on
+	// its --for deadline because the child never settles, a second call that
+	// throws while it runs, and a client that neither notices the server's death
+	// nor honors SIGTERM. Teardown must complete, bounded, and reap all of them
+	// rather than leave them running past the socket and temp tree they used.
+	const env = await startRexAcceptanceEnv();
+	t.after(async () => {
+		await env.stop();
+	});
+	env.provider.armHold();
+	const spawned = await env.cli([
+		"spawn", "--name", "abandoned", "--provider", "rexdeterministic", "--model", "child-model", "--prompt", "never settles", "--json",
+	]);
+	const handle = JSON.parse(spawned.stdout).handle;
+	await env.provider.waitForChildRequest();
+	// Abandoned on purpose: the scenario gives up on this call, so its client stays
+	// alive against the held child until teardown reaches it.
+	const abandoned = env.waitForRun(handle).catch(() => undefined);
+	// A real client call that throws while that client still runs: the deadline
+	// expires, the CLI exits non-zero, and cli() rejects.
+	await assert.rejects(
+		env.cli(["wait", handle, "--for", "1s", "--json"]),
+		/failed \(1\)/,
+		"a client call whose --for deadline expires throws",
+	);
+	// A client only teardown can stop: it ignores SIGTERM and never talks to the
+	// server, so nothing but the bounded escalation can reap it. Its survival
+	// would otherwise be invisible, because the server's death reaps the rest.
+	const stubborn = env.runProcess(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => {}, 300000)"]);
+	const pids = env.clientPids();
+	assert.equal(pids.length, 2, "every live client is retained for teardown");
+	const started = Date.now();
+	await env.stop();
+	const elapsed = Date.now() - started;
+	assert.ok(elapsed < 15_000, `teardown must not wait on the abandoned clients (took ${elapsed}ms)`);
+	for (const pid of pids) await waitForProcessGone(pid);
+	await abandoned;
+	assert.equal(env.clientPids().length, 0, "teardown reaped every client it spawned");
 });
 
 test("released Rex v0.2.0 child usage is charged once inside the Goal admission segment", skipLive, async (t) => {

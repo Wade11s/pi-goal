@@ -73,11 +73,26 @@ what it cannot preempt, and what is intentionally left to the user.
   reports `budgetExhausted: true` with `remaining: 0` in the meantime.
 - Token accounting is provider-neutral but not invoice-exact: it excludes cached
   reads and counts cache writes, and it does not reconcile against provider
-  billing. Pi's cache-warming `usage` entries are not counted.
+  billing. Pi's cache-warming `usage` entries are not counted. External child
+  usage uses observation-time ownership in V1: work performed while a Goal is
+  paused but first observed after resume can belong to the observing segment,
+  not the segment in which the child executed it. Strict lifecycle attribution
+  is not claimed, and work a crashed child never persisted to its session or a
+  durable usage snapshot cannot be recovered.
 - Migrated 0.1.0 Goals report **legacy reconstructed totals**: a one-time
   baseline under the 0.1.0 status-only rule, not exact Goal-owned attribution
   rebuilt under the repaired rules. Only work after the branch-local cutover is
   attributed under the repaired contract.
+- Pi nested tool usage (`toolResult.usage`) is counted, but model usage inside an
+  independent subprocess is not visible automatically. Each `pi-rex-subagent`
+  child is a separate Pi session, so its usage does not count toward the parent
+  Goal or its budget until a parent tool reports the child's delta as
+  `toolResult.usage`. The proposed bridge is specified in
+  [Subagent usage reporting](subagent-usage.md).
+- pi-goal emits Pi notifications and durable Goal entries, not Codex's
+  `ThreadGoalUpdated` protocol events, analytics events, or otel metrics. A local
+  integration could subscribe to a future `pi.events` event; hosted telemetry
+  would additionally require an explicit exporter and privacy policy.
 - Active time is durable to within one accounted second; an unclean exit loses
   at most that.
 - The activity-free and execution-unavailable counters are per session, not

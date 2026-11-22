@@ -8,25 +8,13 @@ The main Pi session is the orchestrator. It owns repository planning, uses the `
 
 ### Implementation workers
 
-Implementation issues are delegated through `rex-subagent` to this worker pool, using high thinking effort:
+Implementation issues are delegated through `rex-subagent`. Select the worker model from the task pools in `docs/agents/subagents.md`: routine implementation, localized fixes, and test runs use the rotating primary pool; cross-module implementation, difficult debugging, and architecture analysis use the difficult-work pool.
 
-| Worker model |
-| --- |
-| `magpie/longcat/LongCat-2.5:max` |
-| `magpie/stepfun-cn/step-5-preview:high` |
-| `magpie/deepai/deepseek-v4.1-flash:high` |
-
-Balance assignments across the pool by active workload, issue size, and relevant experience. Do not assign all tickets to one model. Keep each issue assignment and result traceable to its subagent handle.
+Balance assignments across the pool by active workload, issue size, and relevant experience, advancing the routine-implementation cycle for each new task. Do not assign all tickets to one model. Keep each issue assignment and result traceable to its subagent handle.
 
 ### PR reviewers
 
-Pull requests are reviewed through `rex-subagent` by this reviewer pool, using high thinking effort:
-
-| Reviewer model |
-| --- |
-| `magpie/workbuddy/deepseek-v4.1-flash:high` |
-| `magpie/workbuddy/hy4free:high` |
-| `magpie/zcode/GLM-5.3:max` |
+Pull requests are reviewed through `rex-subagent`. Select reviewers from the independent-review pool in `docs/agents/subagents.md`, alternating primaries and preferring a different model family than the implementer; security, data-loss-risk, and final high-risk reviews use the high-risk review pool. Every review subagent follows the `open-code-review-delegate` workflow defined in the root `AGENTS.md`.
 
 The orchestrator dispatches reviews, routes requested changes back to the implementation worker, and verifies the resulting updates.
 
@@ -42,4 +30,4 @@ The orchestrator dispatches reviews, routes requested changes back to the implem
 
 ## Subagent operation
 
-Use `rex-subagent` for every worker and reviewer dispatch. Wait for delegated runs, read their logs, and independently verify reported results before treating them as complete. Stop subagents when their results are no longer needed.
+Use `rex-subagent` for every worker and reviewer dispatch. Read `docs/agents/subagents.md` before each dispatch and pass `--model` and `--thinking` explicitly. Wait for delegated runs, read their logs, and independently verify reported results before treating them as complete. Stop subagents when their results are no longer needed.
