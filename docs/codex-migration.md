@@ -12,10 +12,10 @@ substitute for the per-capability table.
 | Side | Baseline |
 | --- | --- |
 | Codex | [`openai/codex@ab541fb`](https://github.com/openai/codex/tree/ab541fb9908198d95e9420668bb03f94dfe6324e/codex-rs/ext/goal), the source revision named in [NOTICE.md](../NOTICE.md), plus the Goal TUI files under `codex-rs/tui/` at the same revision |
-| pi-goal | `main` at `13a341f`, package version 0.1.1 |
-| pi-rex-subagent | `5c81045967515804b29e133747472e5d93e0079f`, for the integration proposal below |
+| pi-goal | `integration/complete-codex-migration-42` at `63dac78` (P0–P3 delivery; `main` stays at `13a341f` until the spec lands) |
+| pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43 and #44 |
 | Pi API evidence | pi-goal's declared minimum, Pi 1.5.1; selected behavior also checked against the installed Pi 1.6.0 documentation and type definitions |
-| Verification on 2026-11-21 | `npm run typecheck` passed; `npm test` passed 465/465 tests |
+| Verification on 2026-11-22 | `npm run typecheck` passed; `npm test` passed 564/564 tests |
 
 The comparison covers the behavior in Codex `ext/goal`, its user-facing TUI
 integration, and the corresponding pi-goal behavior. Codex's Rust implementation
@@ -65,7 +65,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Automatic continuation | `on_thread_idle` starts a Goal-triggered turn if idle | One provider request at `agent_before_settle`, after Pi-owned retries, recovery, and queued work | Ported through Pi's native seam |
 | Evidence and completion audit | Continuation requires current-state, requirement-by-requirement evidence | Same contract, with the objective restated verbatim on every continuation | Ported |
 | No-progress contract | Progress / verified wait / no progress | Same classification and live-handle requirements | Ported |
-| Progress planning prompt | Conditional `update_plan` instructions | Not reproduced; no built-in Pi `update_plan` equivalent | Partial; optional custom-tool integration |
+| Progress planning prompt | Conditional `update_plan` instructions | Opt-in structured plan tool and conditional Continuation wording in review (#53) | Partial; optional tool, no host-name parity |
 | Blocked audit | Three consecutive Goal turns; semantic sameness is model-judged | Extension-issued opaque Blocker identity, durable count, per-turn idempotence, and enforced resets | Strengthened |
 | Activity-free stop | Three consecutive empty automatic turns become `blocked` | Three consecutive activity-free automatic Goal turns become `blocked`; attended runs do not count | Ported |
 | Execution-unavailable stop | Three consecutive execution-failure turns become `blocked` | Three consecutive automatic turns where the shell could not run become `blocked`; ordinary non-zero exits/timeouts/aborts are excluded | Ported |
@@ -76,12 +76,12 @@ Two corrections prevent an over-broad “complete” claim:
 | Budget recovery | External Goal updates can change the budget | `/goal resume --budget <new-total>` raises the cumulative ceiling with explicit headroom/maximum validation | Ported with a clearer user surface |
 | Token formula | `input - cached_input + output` | `input + output + cacheWrite`; cached reads excluded, reasoning not added twice | Intentional adapter-specific difference; see below |
 | In-process nested model usage | Descendant usage can be folded into root accounting | `toolResult.usage` is charged once by tool-call identity and replayed from the parent branch | Ported |
-| External descendant-process usage | Codex thread hierarchy reports descendant token usage to the root accounting state | No automatic bridge for independent external Pi processes | Partial; use the [plugin-neutral provider contract](subagent-usage.md) |
+| External descendant-process usage | Codex thread hierarchy reports descendant token usage to the root accounting state | Released Rex v0.2.0 reports each child's delta through Pi's standard parent `toolResult.usage`; #43/#44 accept parallel, restart, branch, replacement, adoption, nested, and final-collection behavior without a core change | Ported through Pi's tool-result seam; provider-neutral conformance contract in #45, encoded in the [plugin-neutral provider contract](subagent-usage.md) |
 | Active elapsed time | Wall-clock deltas are persisted with Goal usage | Monotonic active clock, stopped in every non-active state and during downtime | Strengthened |
 | Persistence | `thread_goals` state DB records; fork flushes in-flight progress | `goal-state` / `goal-usage` entries on the selected session branch, tombstones, superseded records, and legacy cutover | Strengthened for Pi's tree model |
 | Ephemeral sessions | Ephemeral threads reject Goals | `--no-session` refuses Goal creation | Ported |
 | Stale model transitions | `expected_goal_id` guards persistent updates | Execution binding plus identity/revision checks reject transitions from pre-replacement or otherwise stale runs | Strengthened |
-| Automated evidence | Rust unit/integration tests | 465 real-Pi RPC and unit tests at the recorded baseline | Ported with host-level coverage |
+| Automated evidence | Rust unit/integration tests | 564 real-Pi RPC and unit tests at the recorded baseline | Ported with host-level coverage |
 
 ## Per-capability comparison: host and UX integration
 
@@ -90,16 +90,16 @@ Two corrections prevent an over-broad “complete” claim:
 | Compact status indicator | Goal status, usage, remaining budget, elapsed time | Equivalent status line across all six states | Ported |
 | Full Goal summary | TUI history summary | Bare `/goal` and structured `get_goal` | Ported |
 | Interactive objective editor | Prefilled edit prompt | `ctx.ui.editor()` with TUI/RPC support and a headless fallback | Ported |
-| Resume prompt after reopening a stopped Goal | TUI can offer “Resume paused goal?” | Restore notification only; resume is explicitly user-owned | Pi-ready via `session_start` + `ctx.ui.select/confirm`; intentional conservative default |
-| Rich objective materialization | Oversized text, pasted text, local images, and remote image URLs can become attachment files | Plain text objective, 3–2000 characters; no attachment pipeline | Partial Pi-ready gap; see below |
+| Resume prompt after reopening a stopped Goal | TUI can offer “Resume paused goal?” | Opt-in `goal.resumePrompt` (default false) offers one confirmation for a restored paused Goal; accepting reuses the durable user resume | Ported, conservatively opt-in |
+| Rich objective materialization | Oversized text, pasted text, local images, and remote image URLs can become attachment files | Explicit local text-file and image options materialize an immutable per-Goal manifest; Objective stays verbatim (#49, in review). Remote image URLs are #50 | Partial; local text/images in review, remote fetch pending |
 | Objective length | 1–4000 characters | 3–2000 characters | Intentional local validation choice |
-| Thread preview from objective | Empty thread preview is filled from the objective | No automatic session-title/preview update | Pi-ready through `pi.setSessionName()` if desired; avoid overwriting a user-provided name |
-| Enable/disable setting | `GoalExtensionConfig.enabled` can be changed by the host | No `goal.enabled`; uninstalling disables the package | Pi-ready through `pi.getSettings()` plus guards on commands, tools, and continuation |
-| Completion usage report | Completing a budgeted Goal returns instructions to report final token/time usage | Final usage remains available in the structured result, but there is no equivalent explicit report instruction | Small Pi-ready prompt/tool-result addition |
-| Goal update events | `ThreadGoalUpdated` protocol event | UI notifications and durable snapshots; no dedicated public protocol event | Pi-ready locally through `pi.events.emit("pi-goal:updated", …)` |
-| Analytics and metrics | Analytics events plus otel counters/histograms | No analytics exporter | Local event/metric production is Pi-ready; hosted telemetry needs an explicit exporter and privacy policy |
-| External app-server methods | `thread/goal/get`, `set`, and `clear` | Pi RPC can invoke the command surface; there is no identically shaped Goal RPC namespace | Host-specific; use Pi RPC commands or a small companion RPC adapter if needed |
-| Review-subagent tool visibility | Goal tools are hidden from Codex review subagents | No analogous built-in Pi review-thread classification | Host-specific; a Rex child can instead use `--tools` / `--exclude-tools` |
+| Thread preview from objective | Empty thread preview is filled from the objective | Opt-in `goal.sessionNameFromObjective` (default false) names only an unnamed session | Ported, never overwriting a user name |
+| Enable/disable setting | `GoalExtensionConfig.enabled` can be changed by the host | `goal.enabled` (default true) gates admission only: no status rewrite, no clock stop | Ported |
+| Completion usage report | Completing a budgeted Goal returns instructions to report final token/time usage | A budgeted completion returns `completionReport` with the instruction, tokens, budget, remaining capacity, and Active elapsed time | Ported |
+| Goal update events | `ThreadGoalUpdated` protocol event | Versioned `pi-goal:updated` on Pi's shared event bus after every durable transition | Ported locally; hosted protocol events remain out of scope |
+| Analytics and metrics | Analytics events plus otel counters/histograms | Privacy-safe local projection in review (#55); no hosted exporter in core | Partial; hosted export is a companion-only path |
+| External app-server methods | `thread/goal/get`, `set`, and `clear` | Pi RPC can invoke the command surface; a companion adapter is planned in #56 | Host-specific; optional companion, never a core dependency |
+| Review-subagent tool visibility | Goal tools are hidden from Codex review subagents | No built-in Pi review-thread classification; a documented launch profile is planned in #57 | Host-specific; Rex `--tools` / `--exclude-tools` is the seam |
 | Plan-mode accounting exclusion | Codex Plan collaboration mode is excluded from Goal token accounting | No identical Pi collaboration mode | Not applicable to current Pi |
 
 ## What to do with each divergence or gap
