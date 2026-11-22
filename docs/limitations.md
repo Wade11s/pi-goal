@@ -75,6 +75,14 @@ what it cannot preempt, and what is intentionally left to the user.
   usage is admitted while it is disabled, because every run starts from a user
   prompt that closes the admission segment. Work already queued when the
   extension is disabled is delivered as ordinary work rather than dropped.
+- `goal.resumePrompt` (default `false`) is asked **once per session start** and
+  only for a restored `paused` Goal with a dialog-capable UI. Restarting again
+  asks again; there is no durable "already asked" marker. It never prompts for
+  `active`, `complete`, `blocked`, `usage_limited`, or `budget_limited` work, and
+  branch navigation does not ask even when it restores a paused Goal. The dialog
+  is bounded by its own safety timeout, so an unanswered prompt resolves to "no"
+  rather than waiting forever, and because `session_start` never awaits it a
+  headless RPC host is usable while the request is still pending.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.

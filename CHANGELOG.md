@@ -6,6 +6,14 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
+  one confirmation at session start for a restored `paused` Goal. Accepting runs
+  the same durable `/goal resume` transition (same identity and history, fresh
+  Blocked audit); declining, dismissing, timing out, or having no interactive UI
+  leaves the Goal unchanged. It is never offered for any other Lifecycle status,
+  never makes print/JSON/headless startup wait, and is not offered at all while
+  `goal.enabled` is false. The contract is documented in
+  `docs/behavior/lifecycle.md`.
 - Add the opt-in `goal.sessionNameFromObjective` setting (default `false`): after a
   successful *fresh* creation it names an otherwise unnamed session from the
   Objective's first line — whitespace-collapsed, capped at 80 characters, and
