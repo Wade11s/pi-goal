@@ -5,6 +5,7 @@ Read this before spawning or steering a `rex-subagent`. Explicit user instructio
 ## Selection rules
 
 - Select models from Pi's current scoped-models (`enabledModels`). If a listed route is absent or unavailable, use another primary in the same row before trying its backups.
+- Quota substitution: when a `magpie/zhipu/glm-5.3` route cannot be used because its quota is exhausted, substitute `magpie/deepai/muse-ember` + `medium` for that slot instead of skipping the review or waiting for the quota. Record the substitution and its reason in the review report.
 - Pass `--model` and `--thinking` explicitly. Thinking support is model-specific; do not assume that every model supports `medium`.
 - Keep every DeepAI model in a backup role. Primary rotations contain only non-DeepAI models.
 - Reserve `max` and `xhigh` for exceptionally difficult or high-risk work. In the table, `high → max` means start at `high` and escalate only when warranted.
@@ -36,6 +37,9 @@ For each new independent-review task, alternate between:
 magpie/grok/grok-4.7-build-fast@500k:high
 ↔ magpie/zhipu/glm-5.3:high
 ```
+
+When the glm slot is unavailable because of exhausted quota, use
+`magpie/deepai/muse-ember:medium` for that turn.
 
 Assign parallel independent tasks to different primary models when practical. When multiple reviewers inspect the same change, use both reviewer primaries. Prefer a reviewer from a different model family than the implementer.
 
