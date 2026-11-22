@@ -6,6 +6,16 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the privacy-safe `pi-goal:metrics` projection derived only from committed
+  Goal-updated events: transition kind, Lifecycle status, token totals, Active
+  elapsed time, budget state, extension version, and timestamp. The projection
+  is an allowlist built field by field, so Objective text, Blocker descriptions,
+  attachment contents, source file names, source URLs, session identifiers,
+  Goal identity, and raw prompts are absent by construction. pi-goal performs no
+  network export and installs no exporter dependency; the optional local
+  consumer seam is failure-isolated, and the on-demand hosted companion's
+  consent, redaction, retry, and credential ownership are documented in
+  `docs/behavior/metrics.md`.
 - Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
   one confirmation at session start for a restored `paused` Goal. Accepting runs
   the same durable `/goal resume` transition (same identity and history, fresh

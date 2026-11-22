@@ -29,6 +29,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | [behavior/accounting.md](behavior/accounting.md) | The `input + output + cacheWrite` formula, deduplication, admission segments, active time, and durable-write ordering |
 | [behavior/persistence.md](behavior/persistence.md) | `goal-state` and `goal-usage` entries, reconstruction, forks, tombstones, superseded records, and the 0.1.0 cutover |
 | [behavior/events.md](behavior/events.md) | The local `pi-goal:updated` event stream: payload, transition kinds, durable-before-announced ordering, no-flood rules, and listener-failure isolation |
+| [behavior/metrics.md](behavior/metrics.md) | The privacy-safe `pi-goal:metrics` projection, its allowlist, the local consumer seam, and the on-demand hosted companion's consent, redaction, retry, and credential rules |
 
 ## Reference
 
