@@ -89,6 +89,23 @@ alone. The narrow injected-fault seams — a failing append at the durable commi
 the in-memory budget stop versus its durable flush, audit bookkeeping — are
 unit-tested in `test/goal48-events-store.test.mjs` against a fake Pi API.
 
+Operational metrics (issue #55) are tested at both seams. The pure projection,
+its pinned key set, the budget arithmetic (unbounded, within, exact exhaustion,
+overshoot), the allowlist treatment of hostile extra event fields, the
+publisher's sync-throw and rejected-promise isolation, and the default no-network
+shape (a stubbed `fetch`, a scan of the projection and wiring, and the
+package's dependency-free manifest) are unit-tested in
+`test/goal55-metrics-store.test.mjs`. The end-to-end seam is
+`test/extensions/metrics-peer.ts`: a second extension subscribes to the public
+`pi-goal:metrics` channel, records each projection as a `goal-metrics-log`
+entry paired with the process's fetch-attempt count, and can arm an injected
+consumer failure. `test/goal55-metrics.test.mjs` then proves that metrics mirror
+the committed `goal-state` snapshots, that no Objective, identity, path, or URL
+reaches them, that a throwing consumer cannot roll back a transition or turn
+its failure into a pi-goal durability problem, and that a full
+creation → completion → clear scenario makes zero fetch attempts. No hosted
+credential, host, or network service is involved.
+
 Objective attachments (issue #49) are covered by
 `test/goal49-attachments.test.mjs` through real Pi RPC sessions. Local fixtures
 exercise encoded hostile text and real PNG/JPEG/GIF/WebP image blocks in the

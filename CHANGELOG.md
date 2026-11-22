@@ -17,6 +17,16 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   Goal-tool calls to Pi's `Tool <name> not found` refusal without a Goal write;
   a live scenario inspects the released provider's child launch arguments. An
   upstream Rex review preset remains a separate enhancement request.
+- Add the privacy-safe `pi-goal:metrics` projection derived only from committed
+  Goal-updated events: transition kind, Lifecycle status, token totals, Active
+  elapsed time, budget state, extension version, and timestamp. The projection
+  is an allowlist built field by field, so Objective text, Blocker descriptions,
+  attachment contents, source file names, source URLs, session identifiers,
+  Goal identity, and raw prompts are absent by construction. pi-goal performs no
+  network export and installs no exporter dependency; the optional local
+  consumer seam is failure-isolated, and the on-demand hosted companion's
+  consent, redaction, retry, and credential ownership are documented in
+  `docs/behavior/metrics.md`.
 - Add explicit local Objective attachments through repeatable leading `/goal
   --file <path>` and `--image <path>` options at creation and Replacement Goal
   time. Materialize UTF-8 text and PNG/JPEG/GIF/WebP images into an immutable,
