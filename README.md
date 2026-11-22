@@ -132,7 +132,7 @@ occupied, so none of them wait for idle. Details:
 | Status | Meaning |
 | --- | --- |
 | `active` | Continues automatically; active time accrues. |
-| `paused` | The user stopped admission. In-flight work finishes, nothing continues, and the clock stops. `/goal resume` restarts. |
+| `paused` | The user stopped admission. In-flight work finishes, nothing continues, and the clock stops. `/goal resume` restarts it (an opt-in resume prompt may offer that at session start). |
 | `blocked` | Three consecutive Goal turns reported the same genuine blocker, or made no activity. `/goal resume` restarts with a fresh audit. |
 | `usage_limited` | The provider reported an exhausted plan or quota. `/goal resume` restarts. |
 | `budget_limited` | The token budget was reached. One bounded wrap-up is allowed, then no continuation. Raise the cumulative budget to resume. |
@@ -234,6 +234,23 @@ pi-goal admits no new Goal work, so nothing unattended starts.
 
 → [Goal lifecycle](docs/behavior/lifecycle.md)
 
+### Optional resume prompt
+
+```json
+{ "goal": { "resumePrompt": true } }
+```
+
+`goal.resumePrompt` (default `false`) offers **one** confirmation dialog at
+session start when a restored Goal is `paused`: accepting runs the same durable
+transition as `/goal resume` (same identity and history, fresh Blocked audit),
+while declining, dismissing, timing out, or having no dialog-capable UI leaves
+the Goal paused and unchanged. Only `paused` is ever prompted for — `blocked`,
+`usage_limited`, and `budget_limited` recovery stays an explicit user decision —
+and the prompt is never awaited by startup, so print, JSON, and headless RPC
+flows never wait for it. While `goal.enabled` is false the prompt is not offered
+at all; the restore notice says so instead. →
+[Opt-in resume prompt](docs/behavior/lifecycle.md#opt-in-resume-prompt)
+
 ### Usage accounting
 
 The accounted total is `input + output + cacheWrite`. Cached reads are prompt
@@ -281,6 +298,11 @@ sessions (`--no-session`) refuse to create a Goal at all.
   mid-session. While the extension is disabled, an active Goal accrues no new
   Goal-owned usage either, because every run starts from a user prompt that
   closes the admission segment.
+- `goal.resumePrompt` is a convenience over the explicit `/goal resume`, never a
+  replacement for it: it is off by default, asks only once per session start and
+  only for a restored `paused` Goal, and every answer other than an explicit
+  "yes" — decline, dismissal, timeout, no UI — leaves the Goal untouched. It
+  never resumes `blocked`, `usage_limited`, or `budget_limited` work.
 - Accounting is provider-neutral but not invoice-exact: cached reads are
   excluded, cache writes counted, and provider billing is not reconciled.
   Migrated 0.1.0 Goals report **legacy reconstructed totals**, not exact

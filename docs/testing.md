@@ -85,6 +85,27 @@ alone. The narrow injected-fault seams — a failing append at the durable commi
 the in-memory budget stop versus its durable flush, audit bookkeeping — are
 unit-tested in `test/goal48-events-store.test.mjs` against a fake Pi API.
 
+The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
+surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
+durable Lifecycle status, is stopped, and is reopened from a copy of its session
+file with `goal.resumePrompt` in its settings; the test then answers the dialog
+over the `confirm` extension-UI subprotocol with accept, decline, dismissal, or
+nothing at all, and asserts the durable snapshot, run/continuation counts, and
+notifications. `PI_GOAL_DIALOG_TIMEOUT_MS` shortens the dialog safety bound for
+the timeout case (see [Dialog timeouts](#dialog-timeouts)); the UI-less behavior
+of print and JSON modes is covered against the handler directly, with a fake Pi
+API, because those modes have no dialog to observe through the RPC harness.
+
+### Dialog timeouts
+
+Every interactive dialog pi-goal opens (a replacement confirmation, the
+interactive objective editor, the resume prompt) carries a `timeout` and a safe
+default answer, so an unattended host cannot make a command wait forever.
+`PI_GOAL_DIALOG_TIMEOUT_MS` overrides that bound with a positive integer number
+of milliseconds; it exists so the timeout branches are testable through the
+real-Pi harness without waiting the production interval out. An unset or invalid
+value leaves the production defaults untouched, so it changes nothing for users.
+
 ### Rex provider acceptance
 
 `test/goal43-rex-acceptance.test.mjs` accepts the *released* pi-rex-subagent

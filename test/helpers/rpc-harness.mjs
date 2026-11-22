@@ -319,6 +319,30 @@ export class PiRpcSession {
 	}
 
 	/**
+	 * Wait for a blocking extension confirm dialog and dismiss it.
+	 *
+	 * Dismissal is a different wire answer from an explicit "No": a host that
+	 * closes the dialog sends `cancelled: true`, which Pi maps to the dialog's
+	 * default answer without the user having decided anything. The extension
+	 * cannot observe the difference, so this is how a test pins dismissal as its
+	 * own path rather than reusing the decline answer.
+	 */
+	async dismissConfirm(matcher) {
+		const request = await this.waitFor("unanswered matching extension confirm dialog", (records) =>
+			records.find(
+				(r) =>
+					r.type === "extension_ui_request" &&
+					r.method === "confirm" &&
+					!this.answeredUiRequests.has(r.id) &&
+					matcher(r),
+			),
+		);
+		this.answeredUiRequests.add(request.id);
+		this.writeCommand({ type: "extension_ui_response", id: request.id, cancelled: true });
+		return request;
+	}
+
+	/**
 	 * Wait for a blocking extension editor dialog and answer it with `value`.
 	 *
 	 * Mirrors `respondToConfirm` for the `editor` method, which carries the

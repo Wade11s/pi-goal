@@ -6,6 +6,14 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
+  one confirmation at session start for a restored `paused` Goal. Accepting runs
+  the same durable `/goal resume` transition (same identity and history, fresh
+  Blocked audit); declining, dismissing, timing out, or having no interactive UI
+  leaves the Goal unchanged. It is never offered for any other Lifecycle status,
+  never makes print/JSON/headless startup wait, and is not offered at all while
+  `goal.enabled` is false. The contract is documented in
+  `docs/behavior/lifecycle.md`.
 - Emit a local `pi-goal:updated` event on Pi's shared extension event bus after
   every meaningful durable Goal transition (creation, replacement, objective
   edit, pause, resume, budget recovery, clear, blocked, usage-limited,
