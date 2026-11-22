@@ -51,6 +51,15 @@ starts at the first subsequent Continuation; pre-creation responses, creation
 controls, and unrelated same-batch tool results are excluded. Ordinary prompts
 are excluded in every lifecycle status.
 
+External child usage follows **observation-time ownership** in V1. A provider
+returns only the newly observed delta on the parent tool result, and that delta
+belongs to the admission segment that observes it. Consequently, child work
+performed while a Goal is paused but first observed after `/goal resume` can
+belong to the resumed segment; it is not retroactively attributed to the paused
+segment. The same boundary rule applies to durable replay: the persisted parent
+tool result, not the child's private snapshot, is the accounting record. Strict
+reconciliation at every pause/resume boundary is deliberately not claimed.
+
 Delivery is the seam at both ends because it is the entry the branch replay reads
 back. A steer queued during an in-flight response reaches the branch only *after*
 that response and its tool results, so a segment opened at queue time would charge
@@ -103,8 +112,12 @@ post-completion work as Goal usage.
 The formula is the extension's accounting rule applied to what Pi reports, never
 an invoice: provider billing is not reconciled, cached reads are excluded, and a
 migrated 0.1.0 Goal carries legacy reconstructed totals rather than exact
-Goal-owned attribution. A budgeted Goal's completion says so explicitly next to
-the numbers it reports (see
+Goal-owned attribution. Observation-time ownership is an attribution
+approximation, not strict lifecycle attribution. A child crash can also leave
+work that never reached either its Pi session or a durable provider snapshot;
+that unrecorded work is unrecoverable, and terminal missing-snapshot recovery
+reports zero *observed* usage rather than claiming the child did no work. A
+budgeted Goal's completion says so explicitly next to the numbers it reports (see
 [completion usage report](budgets.md#completion-usage-report)).
 
 **Active time.** A monotonic clock (`performance.now()`, sampled exactly once per
