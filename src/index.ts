@@ -91,6 +91,7 @@ import {
 	updateGoalOutputSchema,
 } from "./goal.ts";
 import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
+import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
 import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
@@ -329,8 +330,37 @@ function parseGoalCommand(args: string): GoalCommand {
 }
 
 export default function goalExtension(pi: ExtensionAPI): void {
-	const store = new GoalStore();
+	const store = new GoalStore({
+		// The store owns every durable commit point, so it is what announces each
+		// committed transition to the local event stream — including creation and
+		// replacement, whose commit is the durable bar the event uses. The /goal
+		// command's separate on-disk durability poll stays a gate for the
+		// *user-facing* announcement only (see `emitGoalUpdated` and
+		// docs/behavior/events.md).
+		onDurableTransition: (kind, goal, committedAt) => {
+			emitGoalUpdated(toGoalUpdatedEvent(kind, goal, committedAt));
+		},
+	});
 	const safety = new GoalSafetyMonitor();
+
+	/**
+	 * Publish one committed Goal-updated event on Pi's shared extension event bus.
+	 *
+	 * Emitted only after the durable write it describes, exactly like the UI
+	 * announcement: the transition is already committed when this runs, so the
+	 * event surface is best effort by construction. The bus isolates listeners
+	 * (a handler failure is caught and logged by the bus itself, never
+	 * propagated to the emitter), and this catch is the mirror image for a
+	 * failure of the emit call: it must never surface as — or be mistaken for —
+	 * a durability failure of the transition underneath.
+	 */
+	function emitGoalUpdated(event: GoalUpdatedEvent): void {
+		try {
+			pi.events.emit(GOAL_UPDATED_EVENT, event);
+		} catch {
+			// The transition is already durable; the event surface is best effort.
+		}
+	}
 
 	/**
 	 * What started the next run, set by whoever starts it: the kickoff the /goal
@@ -1599,7 +1629,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// session whose file already exists, and appendEntry writes synchronously
 			// and throws on failure. The existing-Goal guard, the stage, and the commit
 			// above also contain no await, so two create_goal calls issued in one
-			// assistant turn cannot both pass the guard.
+			// assistant turn cannot both pass the guard. The committed creation was
+			// announced on the event stream by the store's commit.
 			updateStatus(ctx);
 			const state = toPublicState(goal);
 			return {
@@ -2558,6 +2589,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
+			// The creation (or replacement) was announced on the event stream by the
+			// store's commit, at the moment its snapshot's append succeeded — the same
+			// durable bar every other transition uses. This announcement waits for the
+			// on-disk poll instead, because the user-facing message must not outlive a
+			// session file that never appeared.
 			ctx.ui.notify(
 				replacing
 					? `Goal ${goal.id} created and activated, replacing ${previous!.id}. Initial work ${delivery === "started" ? "started" : "steered into the running work"}.`

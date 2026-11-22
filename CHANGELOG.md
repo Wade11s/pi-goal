@@ -4,6 +4,18 @@ Notable changes to pi-goal. Version headings match the `version` field in
 `package.json`; install a release with `pi install
 git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
+## [Unreleased]
+
+- Emit a local `pi-goal:updated` event on Pi's shared extension event bus after
+  every meaningful durable Goal transition (creation, replacement, objective
+  edit, pause, resume, budget recovery, clear, blocked, usage-limited,
+  budget-limited, completion), carrying the committed identity, revision,
+  transition kind, status, objective metadata, usage summary, active time, and
+  timestamp. Refused, failed, and retracted transitions emit nothing; token
+  deltas and active-time ticks never emit. Listener failures are isolated by
+  the bus and never roll back committed state. The contract is documented in
+  `docs/behavior/events.md`.
+
 ## [0.1.1] - 2026-11-16
 
 - Add the docs map: the behavioral contract lives in `docs/behavior/`, the model

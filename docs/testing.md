@@ -74,6 +74,17 @@ issues can be read out of a structured tool result and passed back by the later
 turns — exactly what a real model does after calling `get_goal`, and race-free
 because no request after the gate is made until the gate file exists.
 
+The Goal-updated event stream (issue #48) is tested through
+`test/extensions/events-peer.ts`: a second extension subscribes to the public
+`pi-goal:updated` channel on Pi's shared extension event bus and records every
+event it receives as a durable `goal-events-log` session entry, so
+`test/goal48-events.test.mjs` can assert payload, ordering against the
+interleaved `goal-state` entries, transition coverage, refusal/rollback silence,
+and listener-failure isolation from the session file and the RPC record stream
+alone. The narrow injected-fault seams — a failing append at the durable commit,
+the in-memory budget stop versus its durable flush, audit bookkeeping — are
+unit-tested in `test/goal48-events-store.test.mjs` against a fake Pi API.
+
 ### Rex provider acceptance
 
 `test/goal43-rex-acceptance.test.mjs` accepts the *released* pi-rex-subagent
