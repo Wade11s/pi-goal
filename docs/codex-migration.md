@@ -12,10 +12,10 @@ substitute for the per-capability table.
 | Side | Baseline |
 | --- | --- |
 | Codex | [`openai/codex@ab541fb`](https://github.com/openai/codex/tree/ab541fb9908198d95e9420668bb03f94dfe6324e/codex-rs/ext/goal), the source revision named in [NOTICE.md](../NOTICE.md), plus the Goal TUI files under `codex-rs/tui/` at the same revision |
-| pi-goal | `integration/complete-codex-migration-42` base `63dac78`, plus #45 on `issue-45` (P0–P3 delivery; `main` stays at `13a341f` until the spec lands) |
+| pi-goal | `integration/complete-codex-migration-42` at `6376718` (P0–P4 delivered; `main` stays at `13a341f` until the spec lands) |
 | pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43, #44, and the neutral #45 suite |
 | Pi API evidence | pi-goal's declared minimum, Pi 1.5.1; selected behavior also checked against the installed Pi 1.6.0 documentation and type definitions |
-| Verification on 2026-11-22 | Before #45: `npm test` passed 564/564. The #45 branch merged the integration tip (`107d2a9`): `npm run typecheck` passed and `npm test` passed 620/620, including all 14 neutral conformance cases (seven cases against each provider) with zero skips |
+| Verification on 2026-11-22 | At the P0–P4 tip `6376718`: `npm run typecheck` passed and `npm test` passed 707/707, including the 14 provider-neutral conformance cases (seven against each provider), the released-Rex acceptance suites, and the companion public-protocol tests, with zero skips |
 
 The comparison covers the behavior in Codex `ext/goal`, its user-facing TUI
 integration, and the corresponding pi-goal behavior. Codex's Rust implementation
@@ -36,10 +36,13 @@ public extension API.
 
 The Goal state machine, automatic continuation, deterministic stopping rules,
 budgets, durable accounting, and restart/branch reconstruction are migrated. Some
-of them are stricter than Codex. Released Rex child usage now crosses Pi's
-standard tool-result seam and has a provider-neutral conformance contract. The
-remaining differences are concentrated in telemetry, rich objective attachments,
-and a few convenience or host-integration surfaces.
+of them are stricter than Codex. Released Rex child usage crosses Pi's standard
+tool-result seam and has a provider-neutral conformance contract. Rich objective
+attachments, the resume prompt, session naming, the progress-plan tool, durable
+audit history, admission control, completion reporting, local events, and local
+metrics are delivered; the Codex-shaped RPC companion and the read-only review
+launch profile are optional host integrations. Remaining differences are
+intentional safety choices or host-specific surfaces, not missing mechanics.
 
 Two corrections prevent an over-broad “complete” claim:
 
@@ -67,7 +70,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Automatic continuation | `on_thread_idle` starts a Goal-triggered turn if idle | One provider request at `agent_before_settle`, after Pi-owned retries, recovery, and queued work | Ported through Pi's native seam |
 | Evidence and completion audit | Continuation requires current-state, requirement-by-requirement evidence | Same contract, with the objective restated verbatim on every continuation | Ported |
 | No-progress contract | Progress / verified wait / no progress | Same classification and live-handle requirements | Ported |
-| Progress planning prompt | Conditional `update_plan` instructions | Opt-in structured plan tool and conditional Continuation wording in review (#53) | Partial; optional tool, no host-name parity |
+| Progress planning prompt | Conditional `update_plan` instructions | Opt-in structured `update_plan` tool; Continuation names it only when registration succeeded | Ported as an opt-in tool; no host-name parity |
 | Blocked audit | Three consecutive Goal turns; semantic sameness is model-judged | Extension-issued opaque Blocker identity, durable count, per-turn idempotence, and enforced resets | Strengthened |
 | Activity-free stop | Three consecutive empty automatic turns become `blocked` | Three consecutive activity-free automatic Goal turns become `blocked`; attended runs do not count | Ported |
 | Execution-unavailable stop | Three consecutive execution-failure turns become `blocked` | Three consecutive automatic turns where the shell could not run become `blocked`; ordinary non-zero exits/timeouts/aborts are excluded | Ported |
@@ -83,7 +86,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Persistence | `thread_goals` state DB records; fork flushes in-flight progress | `goal-state` / `goal-usage` entries on the selected session branch, tombstones, superseded records, and legacy cutover | Strengthened for Pi's tree model |
 | Ephemeral sessions | Ephemeral threads reject Goals | `--no-session` refuses Goal creation | Ported |
 | Stale model transitions | `expected_goal_id` guards persistent updates | Execution binding plus identity/revision checks reject transitions from pre-replacement or otherwise stale runs | Strengthened |
-| Automated evidence | Rust unit/integration tests | 620 real-Pi RPC and unit tests across the integration tip and #45, including 14 provider-neutral conformance cases | Ported with host-level coverage |
+| Automated evidence | Rust unit/integration tests | 707 real-Pi RPC and unit tests at the delivery tip, including 14 provider-neutral conformance cases | Ported with host-level coverage |
 
 ## Per-capability comparison: host and UX integration
 
@@ -100,9 +103,9 @@ Two corrections prevent an over-broad “complete” claim:
 | Completion usage report | Completing a budgeted Goal returns instructions to report final token/time usage | A budgeted completion returns `completionReport` with the instruction, tokens, budget, remaining capacity, and Active elapsed time | Ported |
 | Goal update events | `ThreadGoalUpdated` protocol event | Versioned `pi-goal:updated` on Pi's shared event bus after every durable transition | Ported locally; hosted protocol events remain out of scope |
 | Durable audit/event history | `thread_goals` state DB plus goal history events | Branch-local `goal-history` entries after every committed transition, projected from the event payload and rendered read-only by `/goal history` | Ported; non-authoritative by construction, no second lifecycle source of truth |
-| Analytics and metrics | Analytics events plus otel counters/histograms | Privacy-safe local projection in review (#55); no hosted exporter in core | Partial; hosted export is a companion-only path |
+| Analytics and metrics | Analytics events plus otel counters/histograms | Privacy-safe local `pi-goal:metrics` projection; hosted exporter documented as a companion with consent, redaction, retry, and credential ownership | Ported locally; hosted export is companion-only and never in core |
 | External app-server methods | `thread/goal/get`, `set`, and `clear` | Optional [Goal RPC companion](../companion/goal-rpc) maps those three methods onto the user command surface through the generic `pi-goal:command-bridge` seam; `ok` is proved by a durable commit, not by a message | Host-specific and optional; not wire-compatible with Codex's private app-server, and never a core dependency |
-| Review-subagent tool visibility | Goal tools are hidden from Codex review subagents | No built-in Pi review-thread classification; a documented launch profile is planned in #57 | Host-specific; Rex `--tools` / `--exclude-tools` is the seam |
+| Review-subagent tool visibility | Goal tools are hidden from Codex review subagents | Documented read-only review-child profile (`read,bash,grep,find,ls`; `edit`, `write`, and the Goal tools excluded), with a deterministic launch/refusal test | Ported as a host launch profile; no Pi built-in review-thread classification |
 | Plan-mode accounting exclusion | Codex Plan collaboration mode is excluded from Goal token accounting | No identical Pi collaboration mode | Not applicable to current Pi |
 
 ## What to do with each divergence or gap
