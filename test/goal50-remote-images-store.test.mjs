@@ -245,7 +245,7 @@ test("a fetch is bounded, follows only revalidated HTTPS redirects, sends no cre
 		const hostnameOrigin = `https://localhost:${new URL(fixture.origin).port}`;
 		const viaHostname = await fetchRemoteImage(
 			`${hostnameOrigin}/png`,
-			{ testOnly: { allowedOrigins: [hostnameOrigin], ca: CA } },
+			{ testOnly: { allowedOrigins: [hostnameOrigin], ca: CA, resolver: REMOTE_IMAGE_DNS_STUB } },
 		);
 		assert.equal(viaHostname.ok, true, JSON.stringify(viaHostname));
 		assert.deepEqual(Buffer.from(viaHostname.bytes), PNG_BYTES);
