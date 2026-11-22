@@ -24,6 +24,11 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   blocked audit is open it restates that audit's Blocker identity, latest
   description, and count, and it states the three-consecutive-Goal-turn blocked
   audit the extension enforces.
+- With `goal.planTool` enabled the same message adds a short *Progress plan*
+  section naming `update_plan`, its one-in-progress rule, and the fact that a plan
+  is narration rather than Goal state. The section is emitted only when the tool
+  is really registered, so the model is never told to call a tool that is not in
+  its loadout. → [Optional progress plan](lifecycle.md#optional-progress-plan)
 - The continuation requests exactly one further provider request per
   settlement. If queued work already causes that request, Pi satisfies the
   decision with it and makes no extra one.

@@ -100,3 +100,21 @@ what it cannot preempt, and what is intentionally left to the user.
   start, so a changed value takes effect on the next session start or reload,
   never for a Goal that already exists. A non-boolean value is reported once and
   ignored, which leaves sessions unnamed exactly as an unset value does.
+- `goal.planTool` (default `false`) is also read at session start, and it is the
+  one setting here that changes what is *registered*. Because Pi has no
+  unregister-tool seam, a value changed mid-session leaves the registration in
+  place: the tool then refuses its calls — saying the setting is off and that a
+  reload reconciles the two — until the session is reloaded.
+- The plan tool's record is the model's own narration, never verified progress.
+  Nothing checks that a `completed` step really happened, and a plan is not
+  surfaced by `get_goal`, bare `/goal`, or any event: the model reads it back from
+  its own tool result. It is a visibility aid for long Goals, not an audit trail.
+- A plan is only ever recorded for a session that has a Goal, so a plan written
+  while a Goal was active stays on the branch after a clear or a replacement as
+  ordinary session history. It describes no current Goal, and no Goal record is
+  derived from it.
+- If another extension already registered a tool named `update_plan`, pi-goal
+  registers nothing, reports why, and no Continuation mentions the tool. pi-goal
+  will not replace another extension's tool for the sake of a conventional name,
+  and the tool's own registration is confirmed rather than assumed for the same
+  reason.

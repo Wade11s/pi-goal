@@ -409,6 +409,28 @@ the steps below reproduce the user-visible surface by hand.
 6. A long objective (over 80 characters) is named with exactly its first 80
    characters, and a multi-line objective with only its first line.
 
+## 24. Optional: the structured progress plan (`goal.planTool`)
+
+`goal.planTool` (default `false`) registers an `update_plan` model tool. The
+deterministic coverage is `test/goal53-progress-plan.test.mjs` (a real `pi --mode
+rpc` session per case, driving real model tool calls); the steps below reproduce
+the user-visible surface by hand.
+
+1. Add `"goal": { "planTool": true }` to Pi settings and restart Pi.
+2. `/goal <objective>` and let one Continuation run. Ask the model to keep a plan.
+   Expect an `update_plan` call whose result restates the steps and their statuses,
+   and expect the tool to appear in the model's tool list.
+3. Ask for a plan with two steps marked in progress. Expect a refusal naming the
+   one-in-progress rule, with no plan recorded.
+4. Ask the model to mark every step completed. Expect the Goal to stay `active`
+   with an unchanged revision, and expect the next turn to keep working: only
+   `update_goal` with `complete` ends the Goal.
+5. Restart Pi on the same session. The plan is still part of the model's context,
+   and the tool is registered again.
+6. Remove the setting (or set it to `false`) and restart. Expect no `update_plan`
+   in the tool list, no mention of it in any Continuation, and a refusal if the
+   model calls it anyway.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -461,6 +483,14 @@ the steps below reproduce the user-visible surface by hand.
 - [ ] A session name the user provided is never overwritten, an Objective edit and
       a Replacement Goal never rename it, and a failed or rolled-back creation
       leaves the session unnamed.
+- [ ] With `goal.planTool: true`, an `update_plan` call records an ordered plan
+      with at most one in-progress step, and the plan is visible in the model's
+      context again after a restart.
+- [ ] A plan with two in-progress steps is refused and records nothing, and a plan
+      that marks every step completed leaves the Goal `active` with an unchanged
+      revision — only `update_goal` completes it.
+- [ ] With the setting absent or `false`, no `update_plan` tool is registered and
+      no Continuation mentions it.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with

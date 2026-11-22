@@ -6,6 +6,19 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the opt-in structured progress-plan tool (`goal.planTool`, default `false`),
+  registered as the `update_plan` model tool. It takes one ordered list of steps,
+  each `pending`, `in_progress`, or `completed`, with at most one `in_progress`,
+  so verified progress and remaining work stay visible across Continuations. Its
+  record is the tool result's persisted `details` — the ordinary session-branch
+  tool result — so it survives a restart and is visible in the model's own context
+  with no second Goal record: no `goal-state` entry, no revision, and no
+  `pi-goal:updated` event. It never mutates a Lifecycle status, so a plan that
+  marks every step completed cannot complete or bypass the Completion audit, and
+  it is accounted like any other tool call. While the setting is off the tool is
+  not registered at all and no Continuation mentions it; a name already owned by
+  another extension is never replaced. The contract is documented in
+  `docs/behavior/lifecycle.md` and `docs/tools.md`.
 - Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
   one confirmation at session start for a restored `paused` Goal. Accepting runs
   the same durable `/goal resume` transition (same identity and history, fresh

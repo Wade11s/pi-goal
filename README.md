@@ -275,6 +275,36 @@ flows never wait for it. While `goal.enabled` is false the prompt is not offered
 at all; the restore notice says so instead. →
 [Opt-in resume prompt](docs/behavior/lifecycle.md#opt-in-resume-prompt)
 
+### Optional progress plan
+
+```json
+{ "goal": { "planTool": true } }
+```
+
+`goal.planTool` (default `false`) registers an `update_plan` model tool for long
+Goals. It takes one ordered list of steps, each `pending`, `in_progress`, or
+`completed`, with **at most one in progress**, so verified progress and
+remaining work stay visible across Continuations.
+
+- **Off by default.** While it is off the tool is not registered at all: it is
+  not in the model's tool list, no Continuation mentions it, and a call to it is
+  refused by Pi. A non-boolean value is reported once and ignored.
+- **It is narration, not state.** The plan lives in the tool result's `details`,
+  which Pi already persists on the session branch — there is no second Goal
+  record, no `goal-state` entry, and no `pi-goal:updated` event. A plan call
+  never changes the Lifecycle status, and marking every step completed never
+  completes the Goal: only `update_goal` with `complete`, after the evidence
+  audit, does that.
+- **It is accounted like any other tool call.** No plan-specific accounting
+  branch exists, so a plan turn's tokens count against the Token budget exactly
+  like every other Goal turn.
+- **It never takes another extension's tool.** If something else already
+  registered `update_plan`, pi-goal registers nothing, says so, and no
+  Continuation names the tool.
+
+→ [Model tools](docs/tools.md#model-tool-update_plan) ·
+[Goal lifecycle](docs/behavior/lifecycle.md#optional-progress-plan)
+
 ### Usage accounting
 
 The accounted total is `input + output + cacheWrite`. Cached reads are prompt
@@ -331,6 +361,11 @@ sessions (`--no-session`) refuse to create a Goal at all.
   only for a restored `paused` Goal, and every answer other than an explicit
   "yes" — decline, dismissal, timeout, no UI — leaves the Goal untouched. It
   never resumes `blocked`, `usage_limited`, or `budget_limited` work.
+- `goal.planTool` is off by default and registers nothing while off. It is read
+  at session start, so a changed value takes effect on the next session start or
+  reload; the plan it records is the model's own narration, never verified
+  progress, and it is never part of the Lifecycle, of accounting, or of the
+  event stream.
 - Accounting is provider-neutral but not invoice-exact: cached reads are
   excluded, cache writes counted, and provider billing is not reconciled.
   Migrated 0.1.0 Goals report **legacy reconstructed totals**, not exact
