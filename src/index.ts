@@ -2834,8 +2834,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * tests run a local HTTPS fixture and must opt that exact origin in. The
 	 * override is read only when the real-Pi test harness is driving this process
 	 * (`PI_GOAL_TEST_SCRIPT`), applies only to exact HTTPS origins, and shortens
-	 * the overall timeout only for the timeout scenario. Users never configure
-	 * remote fetching through these variables; see `docs/testing.md`.
+	 * the overall timeout only for the timeout scenario. A third seam supplies a
+	 * fixed host-name-to-addresses map so no test consults the host's resolver.
+	 * Users never configure remote fetching through these variables; see
+	 * `docs/testing.md`.
 	 */
 	function remoteImageFetchOptions(): RemoteImageFetchOptions | undefined {
 		if (!process.env.PI_GOAL_TEST_SCRIPT) return undefined;
@@ -2846,11 +2848,44 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const rawTimeout = process.env.PI_GOAL_TEST_REMOTE_IMAGE_TIMEOUT_MS;
 		const timeout = rawTimeout === undefined ? Number.NaN : Number(rawTimeout);
 		const timeoutMs = Number.isSafeInteger(timeout) && timeout > 0 ? timeout : undefined;
-		if (origins.length === 0 && timeoutMs === undefined) return undefined;
+		const resolver = testRemoteImageResolver(process.env.PI_GOAL_TEST_REMOTE_IMAGE_DNS);
+		if (origins.length === 0 && timeoutMs === undefined && resolver === undefined) return undefined;
+		const testOnly = {
+			...(origins.length === 0 ? {} : { allowedOrigins: origins }),
+			...(resolver === undefined ? {} : { resolver }),
+		};
 		return {
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
-			...(origins.length === 0 ? {} : { testOnly: { allowedOrigins: origins } }),
+			...(Object.keys(testOnly).length === 0 ? {} : { testOnly }),
 		};
+	}
+
+	/**
+	 * Parse the deterministic DNS fixture for the real-Pi suite.
+	 *
+	 * The value is a JSON object of host name to a fixed address list. A malformed
+	 * value becomes an empty, still-authoritative stub: every host name then fails
+	 * to resolve instead of silently falling back to the host's resolver, so a
+	 * typo can never make a test reach `/etc/hosts`, a local resolver, or the
+	 * public internet.
+	 */
+	function testRemoteImageResolver(
+		raw: string | undefined,
+	): Record<string, readonly string[]> | undefined {
+		if (raw === undefined || raw.trim() === "") return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			return {};
+		}
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+		const resolver: Record<string, readonly string[]> = {};
+		for (const [name, addresses] of Object.entries(parsed)) {
+			if (!Array.isArray(addresses) || addresses.some((address) => typeof address !== "string")) return {};
+			resolver[name.toLowerCase()] = addresses as string[];
+		}
+		return resolver;
 	}
 
 	/** The refusal for work whose attachments cannot be verified. */
@@ -3473,6 +3508,40 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					}
 					goal.attachments = materialized.attachments;
 					attachmentContents = materialized.contents;
+				}
+				// The remote fetch is a real network await, and the create lock
+				// excludes only other create/replace commands: a /goal clear, an
+				// edit, a lifecycle command, or a create_goal tool call can run
+				// while DNS and the body read are pending. Revalidate the exact
+				// record this command captured — null included, for a fresh
+				// creation — immediately after materialization and before any
+				// durable transition (the superseded freeze, the stage, and the
+				// commit). On a mismatch the current Goal stays untouched, the
+				// never-committed artifacts are retracted, and no success event
+				// is emitted.
+				const captured = previous ?? null;
+				const afterMaterialization = store.get();
+				const unchanged =
+					captured === null
+						? afterMaterialization == null
+						: afterMaterialization != null &&
+							afterMaterialization.id === captured.id &&
+							afterMaterialization.revision === captured.revision;
+				if (!unchanged) {
+					if (uncommittedAttachmentRoot) {
+						discardUncommittedArtifacts(uncommittedAttachmentRoot, goal.id);
+					}
+					ctx.ui.notify(
+						"Goal not created: the Goal changed while the remote image was being fetched" +
+							(afterMaterialization
+								? ` (now ${afterMaterialization.status}, revision ${afterMaterialization.revision})`
+								: " (no Goal is set anymore)") +
+							", so this command no longer described the current state. Nothing was replaced and the " +
+							"fetched artifact was retracted; the current Goal is unchanged. Run /goal again to create " +
+							"it against the current state.",
+						"warning",
+					);
+					return;
 				}
 				// Replacement must preserve the superseded Goal's already-accounted
 				// totals as a durable historical record before the new identity takes

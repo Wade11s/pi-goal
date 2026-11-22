@@ -11,8 +11,11 @@
  *
  * The routes cover the acceptance matrix: a valid image, every supported
  * media type, byte-driven MIME mismatches, SVG and unknown content, redirect
- * chains and hostile redirect targets, a hanging response, oversized
- * `content-length` and chunked bodies, credentials, and HTTP.
+ * chains and hostile redirect targets, a hanging response, an explicitly held
+ * response (for stalled-fetch races), oversized `content-length` and chunked
+ * bodies, credentials, and HTTP. `REMOTE_IMAGE_DNS_STUB` is the deterministic
+ * resolver the suites install, so no test depends on `/etc/hosts` or a host
+ * resolver.
  */
 import { createServer } from "node:https";
 import { readFileSync } from "node:fs";
@@ -32,6 +35,33 @@ export const GIF_BYTES = Buffer.concat([Buffer.from("GIF89a"), Buffer.from([1, 0
 export const WEBP_BYTES = Buffer.concat([Buffer.from("RIFF"), Buffer.from([4, 0, 0, 0]), Buffer.from("WEBPVP8 ")]);
 export const SVG_BYTES = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>', "utf8");
 
+/**
+ * Deterministic DNS answers shared by the store suite and the spawned Pi.
+ *
+ * `localhost` is the only name the fixture certificate covers, so the positive
+ * hostname path pins it here instead of reading `/etc/hosts`. The remaining
+ * names use the reserved `.test` TLD (never resolved for real), and every one
+ * is listed so the stub is authoritative: an unlisted name is a hard failure,
+ * never a fallback to the host's resolver or the public internet. The mixed
+ * answers exercise the rebinding policy without making any connection.
+ */
+export const REMOTE_IMAGE_DNS_STUB = Object.freeze({
+	localhost: ["127.0.0.1"],
+	"loopback.remote-image.test": ["127.0.0.1"],
+	"rebind.remote-image.test": ["93.184.216.34", "127.0.0.1"],
+	"translatable.remote-image.test": ["::ffff:0:7f00:1"],
+	"translatable-private.remote-image.test": ["::ffff:0:a00:1"],
+	"translatable-rebind.remote-image.test": ["93.184.216.34", "::ffff:0:7f00:1"],
+	"nat64-local.remote-image.test": ["64:ff9b:1::a00:1"],
+	"six-to-four.remote-image.test": ["2002:7f00:1::1"],
+	"teredo.remote-image.test": ["2001:0:4136:e378:8000:63bf:3fff:fdd2"],
+	"public.remote-image.test": ["93.184.216.34"],
+	"unresolvable.remote-image.test": [],
+});
+
+/** The same stub in the form the spawned Pi reads from its environment. */
+export const REMOTE_IMAGE_DNS_STUB_JSON = JSON.stringify(REMOTE_IMAGE_DNS_STUB);
+
 function imageBuffer(size) {
 	const buffer = Buffer.alloc(size);
 	PNG_BYTES.copy(buffer);
@@ -44,6 +74,10 @@ export class RemoteImageFixture {
 		this.origin = origin;
 		/** Every request the fixture received, in arrival order. */
 		this.requests = [];
+		/** Responses held open for a stalled-fetch scenario, released explicitly. */
+		this.held = [];
+		/** Pending `waitForRequest` resolvers, one per awaited path. */
+		this.requestWaiters = [];
 		this.sockets = new Set();
 		this.closed = false;
 	}
@@ -82,8 +116,38 @@ export class RemoteImageFixture {
 		return this.requests.filter((request) => new URL(request.url, this.origin).pathname === pathname).length;
 	}
 
+	/** Wait until the fixture has received a request for exactly this path. */
+	waitForRequest(pathname) {
+		const seen = () =>
+			this.requests.some((request) => new URL(request.url, this.origin).pathname === pathname);
+		if (seen()) return Promise.resolve();
+		return new Promise((resolve) => {
+			const check = () => {
+				if (!seen()) return false;
+				resolve();
+				return true;
+			};
+			if (check()) return;
+			this.requestWaiters.push({ pathname, check });
+		});
+	}
+
+	/** Send the image to every response a `/hold` route left open. */
+	releaseHeld(bytes = PNG_BYTES) {
+		for (const response of this.held.splice(0)) {
+			if (response.destroyed || response.writableEnded) continue;
+			response.writeHead(200, { "content-type": "image/png" });
+			response.end(bytes);
+		}
+	}
+
+	releaseWaiters() {
+		this.requestWaiters = this.requestWaiters.filter((waiter) => !waiter.check());
+	}
+
 	handle(request, response) {
 		this.requests.push({ url: request.url, method: request.method, headers: request.headers });
+		this.releaseWaiters();
 		const url = new URL(request.url, this.origin);
 		const path = url.pathname;
 		const send = (status, headers, body) => {
@@ -143,7 +207,16 @@ export class RemoteImageFixture {
 				redirect("https://10.0.0.1/png");
 				return;
 			case "/redirect-loopback-name":
-				redirect(`https://localhost:${this.server.address().port}/png`);
+				redirect(`https://loopback.remote-image.test:${this.server.address().port}/png`);
+				return;
+			case "/redirect-translatable":
+				redirect("https://[::ffff:0:7f00:1]/png");
+				return;
+			case "/redirect-nat64-local":
+				redirect("https://[64:ff9b:1::a00:1]/png");
+				return;
+			case "/redirect-rebind":
+				redirect(`https://rebind.remote-image.test:${this.server.address().port}/png`);
 				return;
 			case "/redirect-linklocal":
 				redirect("https://169.254.169.254/latest/meta-data/");
@@ -153,6 +226,10 @@ export class RemoteImageFixture {
 				return;
 			case "/slow":
 				// Never respond; the fetch deadline must tear the socket down.
+				return;
+			case "/hold":
+				// Hold the response until `releaseHeld()`; a stalled network await.
+				this.held.push(response);
 				return;
 			case "/partial":
 				response.writeHead(200, { "content-type": "image/png" });
@@ -205,6 +282,8 @@ export class RemoteImageFixture {
 	async close() {
 		if (this.closed) return;
 		this.closed = true;
+		this.held.length = 0;
+		this.requestWaiters.length = 0;
 		for (const socket of this.sockets) socket.destroy();
 		this.sockets.clear();
 		await new Promise((resolve) => this.server.close(resolve));

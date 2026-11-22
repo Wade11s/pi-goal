@@ -3,10 +3,13 @@
  *
  * These cover the pieces a real-Pi RPC scenario cannot reach cheaply: URL shape
  * validation and label derivation, the destination-address policy (IPv4, IPv6,
- * mapped, private, loopback, link-local, documentation, and public controls),
- * the bounded fetch/redirect/timeout behavior against the local TLS fixture,
- * and the interaction between fetched bytes and the existing per-image and
- * cumulative materialization limits.
+ * mapped, IPv4-translatable, NAT64, 6to4, Teredo, private, loopback,
+ * link-local, documentation, and public controls), the bounded
+ * fetch/redirect/timeout behavior against the local TLS fixture, and the
+ * interaction between fetched bytes and the existing per-image and cumulative
+ * materialization limits. Every host name resolves through the fixture's
+ * deterministic resolver stub, so no test reads `/etc/hosts` or contacts a
+ * public destination.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -28,7 +31,7 @@ import {
 	storedGoalIds,
 	verifyAttachments,
 } from "../src/attachments.ts";
-import { FIXTURE_CA, PNG_B64, PNG_BYTES, RemoteImageFixture } from "./helpers/remote-image-fixture.mjs";
+import { FIXTURE_CA, PNG_B64, PNG_BYTES, REMOTE_IMAGE_DNS_STUB, RemoteImageFixture } from "./helpers/remote-image-fixture.mjs";
 
 const CA = readFileSync(FIXTURE_CA);
 const PNG_SHA256 = createHash("sha256").update(Buffer.from(PNG_B64, "base64")).digest("hex");
@@ -46,8 +49,13 @@ function tempStore() {
 function fixtureOptions(fixture, extra = {}) {
 	return {
 		...extra,
-		testOnly: { allowedOrigins: [fixture.origin], ca: CA },
+		testOnly: { allowedOrigins: [fixture.origin], ca: CA, resolver: REMOTE_IMAGE_DNS_STUB },
 	};
+}
+
+/** The same deterministic resolver without opting any origin in. */
+function policyOptions(extra = {}) {
+	return { ...extra, testOnly: { resolver: REMOTE_IMAGE_DNS_STUB } };
 }
 
 test("remote URLs are HTTPS-only, credential-free, and labelled from the path without persisting the URL", () => {
@@ -103,11 +111,18 @@ test("the destination policy refuses loopback, link-local, private, mapped, and 
 		"::1",
 		"::ffff:127.0.0.1",
 		"::ffff:10.0.0.1",
+		"::ffff:0:7f00:1",
+		"::ffff:0:a00:1",
+		"::ffff:0:c0a8:101",
+		"::ffff:0:0",
+		"::0.0.0.1",
 		"64:ff9b::7f00:1",
-		"100::1",
-		"2001::1",
-		"2001:db8::1",
-		"2002:7f00:1::1",
+		"64:ff9b:1::7f00:1",
+		"64:ff9b:1::a00:1",
+		"64:ff9b:1::c0a8:101",
+		"5f00::1",
+		"2001:2::1",
+		"2001:0:4136:e378:8000:63bf:3fff:fdd2",
 		"fc00::1",
 		"fd12:3456::1",
 		"fe80::1",
@@ -121,10 +136,89 @@ test("the destination policy refuses loopback, link-local, private, mapped, and 
 		"8.8.8.8",
 		"1.1.1.1",
 		"93.184.216.34",
+		// A public IPv4 stays reachable through its IPv4-mapped form; only the
+		// embedded private destination is refused above.
+		"::ffff:8.8.8.8",
 		"2606:4700:4700::1111",
 		"2001:4860:4860::8888",
 	]) {
 		assert.equal(isForbiddenDestinationAddress(address), false, address);
+	}
+});
+
+test("IPv4 translation forms cannot smuggle a private destination past literals, DNS answers, or redirects", async () => {
+	// Literal IPv6 translation forms embed an IPv4 destination and are refused
+	// before any socket is opened: no fixture, resolver, or public host is used.
+	for (const url of [
+		"https://[::ffff:0:7f00:1]/image.png",
+		"https://[::ffff:0:a00:1]/image.png",
+		"https://[::ffff:0:c0a8:101]/image.png",
+		"https://[64:ff9b::7f00:1]/image.png",
+		"https://[64:ff9b:1::7f00:1]/image.png",
+		"https://[64:ff9b:1::a00:1]/image.png",
+		"https://[2002:7f00:1::1]/image.png",
+		"https://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/image.png",
+	]) {
+		const refused = await fetchRemoteImage(url);
+		assert.equal(refused.ok, false, url);
+		assert.match(refused.error, /loopback, link-local, or private-network/, url);
+	}
+
+	const fixture = await RemoteImageFixture.start();
+	const port = new URL(fixture.origin).port;
+	try {
+		// Every DNS answer is checked, so a name that embeds a private IPv4 inside
+		// an IPv4-translatable, local-use NAT64, 6to4, or Teredo form is refused
+		// before a connection. The resolver stub is authoritative: these names are
+		// never handed to the host's resolver.
+		const requestsBefore = fixture.requests.length;
+		for (const hostname of [
+			"translatable.remote-image.test",
+			"translatable-private.remote-image.test",
+			"nat64-local.remote-image.test",
+			"six-to-four.remote-image.test",
+			"teredo.remote-image.test",
+			"rebind.remote-image.test",
+			"translatable-rebind.remote-image.test",
+		]) {
+			const refused = await fetchRemoteImage(`https://${hostname}:${port}/png`, policyOptions());
+			assert.equal(refused.ok, false, hostname);
+			assert.match(refused.error, /loopback, link-local, or private-network/, hostname);
+		}
+		assert.equal(fixture.requests.length, requestsBefore, "no refused destination was contacted");
+
+		// A name the stub does not list does not resolve at all: a test can never
+		// fall through to `/etc/hosts`, a local resolver, or the public internet.
+		const unresolved = await fetchRemoteImage(
+			`https://unmapped.remote-image.test:${port}/png`,
+			policyOptions(),
+		);
+		assert.equal(unresolved.ok, false);
+		assert.match(unresolved.error, /host name could not be resolved/);
+		const empty = await fetchRemoteImage(
+			`https://unresolvable.remote-image.test:${port}/png`,
+			policyOptions(),
+		);
+		assert.equal(empty.ok, false);
+		assert.match(empty.error, /host name could not be resolved/);
+		assert.equal(fixture.requests.length, requestsBefore, "no unresolved name was contacted");
+
+		// Redirect targets go through the same literal and DNS policy; the target
+		// image is never requested.
+		const redirectTargets = [
+			"/redirect-translatable",
+			"/redirect-nat64-local",
+			"/redirect-rebind",
+			`/redirect?to=${encodeURIComponent(`https://translatable.remote-image.test:${port}/png`)}`,
+		];
+		for (const path of redirectTargets) {
+			const refused = await fetchRemoteImage(fixture.url(path), fixtureOptions(fixture));
+			assert.equal(refused.ok, false, path);
+			assert.match(refused.error, /loopback, link-local, or private-network/, path);
+		}
+		assert.equal(fixture.countExact("/png"), 0, "no redirect reached the private-IPv4 target");
+	} finally {
+		await fixture.close();
 	}
 });
 
@@ -144,9 +238,10 @@ test("a fetch is bounded, follows only revalidated HTTPS redirects, sends no cre
 		assert.equal(relative.ok, true);
 		assert.deepEqual(Buffer.from(relative.bytes), PNG_BYTES);
 
-		// The DNS-resolved path is exercised through `localhost`: the exact
-		// fixture origin is opted in, the resolved loopback address is pinned into
-		// the connection, and TLS still verifies the `localhost` name.
+		// The DNS-resolved path is exercised through `localhost`: the deterministic
+		// resolver stub pins it to loopback, the exact fixture origin is opted in,
+		// the resolved loopback address is pinned into the connection, and TLS
+		// still verifies the `localhost` name.
 		const hostnameOrigin = `https://localhost:${new URL(fixture.origin).port}`;
 		const viaHostname = await fetchRemoteImage(
 			`${hostnameOrigin}/png`,
@@ -176,7 +271,8 @@ test("a fetch is bounded, follows only revalidated HTTPS redirects, sends no cre
 		const credentialError = await fetchRemoteImage(fixture.url("/redirect-credentials"), fixtureOptions(fixture));
 		assert.ok(!credentialError.error.includes("unique-redirect-credential"), "a redirect credential is never echoed");
 
-		// The DNS result for localhost is loopback even though the URL is not.
+		// The stub's answer for `localhost` is loopback even though the URL is not
+		// the opted-in origin; no host resolver is consulted.
 		const localhost = await fetchRemoteImage(
 			`https://localhost:${new URL(fixture.origin).port}/png`,
 			fixtureOptions(fixture),

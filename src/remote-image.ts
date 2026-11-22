@@ -24,7 +24,11 @@
  * addresses. The socket therefore cannot connect to a different address than
  * the one that passed the policy, even if DNS changes between resolution and
  * connection. The TLS peer name is still validated against the URL hostname by
- * Node's normal certificate checks.
+ * Node's normal certificate checks. IPv4 addresses embedded in an IPv6
+ * translation form (IPv4-mapped, IPv4-translatable, well-known and local-use
+ * NAT64, 6to4, Teredo) are judged by the embedded IPv4 destination or refused
+ * with the translation prefix itself, so a SIIT/NAT64 host cannot turn one of
+ * those forms into a loopback or private IPv4 connection.
  *
  * The returned bytes are still untrusted content: the attachment layer decides
  * the image media type from the bytes themselves, and only then materializes
@@ -80,6 +84,14 @@ export interface RemoteImageFetchOptions {
 		allowedOrigins?: readonly string[];
 		/** Additional CA certificate for the local TLS fixture. */
 		ca?: string | Buffer;
+		/**
+		 * Deterministic resolver stub: host name (lower-cased) to fixed answers.
+		 * When present it is authoritative — a name it does not list does not
+		 * resolve and the host's resolver is never consulted — so a test can pin
+		 * loopback, mixed public/private, and private-IPv4-in-translation answers
+		 * without depending on `/etc/hosts`, a resolver, or the public internet.
+		 */
+		resolver?: Readonly<Record<string, readonly string[]>>;
 	};
 }
 
@@ -106,7 +118,10 @@ for (const [network, prefix] of [
 }
 for (const [network, prefix] of [
 	["::", 96], // unspecified, loopback, IPv4-compatible
-	["64:ff9b::", 96], // NAT64: may translate to a private IPv4 destination
+	["::ffff:0:0:0", 96], // IPv4-translatable (SIIT): embeds an IPv4 destination
+	["64:ff9b::", 96], // well-known NAT64: embeds an IPv4 destination
+	["64:ff9b:1::", 48], // local-use NAT64: embeds a possibly private IPv4 destination
+	["5f00::", 16], // segment-routing (SRv6) SIDs: not globally reachable
 	["100::", 64], // discard-only
 	["2001::", 23], // IETF protocol assignments, includes Teredo
 	["2001:db8::", 32], // documentation
@@ -239,10 +254,25 @@ function allowedOriginSet(options: RemoteImageFetchOptions): Set<string> {
  * `dns.lookup` honors the host's normal resolver (including `/etc/hosts`), and
  * its result is what the policy checks. The operation itself cannot be
  * cancelled, so a race bounds it; a late answer is ignored.
+ *
+ * A test-only resolver stub replaces the host resolver entirely when it is
+ * supplied: an unlisted host name does not resolve, so a test can never reach
+ * the host's configuration or the public internet by accident.
  */
-function resolveHostnames(hostname: string, deadline: number): Promise<Array<{ address: string; family: number }>> {
+function resolveHostnames(
+	hostname: string,
+	deadline: number,
+	resolver: Readonly<Record<string, readonly string[]>> | undefined,
+): Promise<Array<{ address: string; family: number }>> {
 	const remaining = deadline - Date.now();
 	if (remaining <= 0) return Promise.reject(timeoutError());
+	if (resolver) {
+		const addresses = resolver[hostname.toLowerCase()];
+		if (!addresses || addresses.length === 0) {
+			return Promise.reject(new Error("host name could not be resolved"));
+		}
+		return Promise.resolve(addresses.map((address) => ({ address, family: isIP(address) })));
+	}
 	return new Promise((resolve, reject) => {
 		let settled = false;
 		const timer = setTimeout(() => {
@@ -279,13 +309,14 @@ async function resolveDestination(
 	url: URL,
 	deadline: number,
 	allowedOrigins: ReadonlySet<string>,
+	resolver: Readonly<Record<string, readonly string[]>> | undefined,
 ): Promise<ResolvedDestination> {
 	const hostname = stripIpv6Brackets(url.hostname);
 	let addresses: string[];
 	if (isIP(hostname) !== 0) {
 		addresses = [hostname];
 	} else {
-		const records = await resolveHostnames(hostname, deadline);
+		const records = await resolveHostnames(hostname, deadline, resolver);
 		addresses = [...new Set(records.map((record) => record.address))];
 	}
 	if (addresses.length === 0) {
@@ -487,7 +518,7 @@ export async function fetchRemoteImage(
 	for (let followed = 0; ; followed += 1) {
 		let destination: ResolvedDestination;
 		try {
-			destination = await resolveDestination(current, deadline, allowedOrigins);
+			destination = await resolveDestination(current, deadline, allowedOrigins, options.testOnly?.resolver);
 		} catch (error) {
 			const reason = isTimeout(error)
 				? `it timed out after ${timeoutMs / 1000} seconds while resolving the host name`

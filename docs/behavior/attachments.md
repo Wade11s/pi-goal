@@ -86,7 +86,8 @@ bytes and never contacts the source URL again.
   credential-bearing target, a missing `Location`, or a target resolving to a
   forbidden address is refused before that target is contacted.
 - **Public destinations only.** Loopback, link-local, private, unique-local,
-  IPv4-mapped private, NAT64/6to4, multicast, and other reserved or
+  IPv4-mapped private, IPv4-translatable (SIIT), well-known and local-use
+  NAT64, 6to4, Teredo, segment-routing, multicast, and other reserved or
   documentation ranges are refused. The check runs on IP literals, on **every**
   DNS result (not just a preferred one), and on every redirect target. The
   validated addresses are then pinned into the connection's lookup, so a DNS
