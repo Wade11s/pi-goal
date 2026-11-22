@@ -116,6 +116,20 @@ import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure
 import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
 import { GOAL_METRICS_CHANNEL, createGoalMetricsPublisher } from "./metrics.ts";
 import {
+	GOAL_COMMAND_BRIDGE,
+	GOAL_COMMAND_BRIDGE_VERSION,
+	classifyGoalBridgeOutcome,
+	committedKindsFor,
+	commandContextForBridge,
+	goalBridgeRefusal,
+	parseGoalCommandBridgeRequest,
+	recordingCommandContext,
+	type GoalBridgeAction,
+	type GoalBridgeDiagnostic,
+	type GoalBridgeTransition,
+	type GoalCommandBridgeResult,
+} from "./command-bridge.ts";
+import {
 	attachmentStoreRoot,
 	discardUncommittedArtifacts,
 	loadAttachments,
@@ -484,6 +498,36 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	/**
+	 * Committed transitions observed while a bridged `/goal` command runs.
+	 *
+	 * Scoped by `bridgeInFlight`: a command that is not bridged never records
+	 * anything, and the sink is cleared before the reply is built so a later
+	 * transition cannot be attributed to a request that already finished.
+	 */
+	let bridgeTransitions: GoalBridgeTransition[] | null = null;
+
+	/**
+	 * One bridged command at a time.
+	 *
+	 * Serializing is what keeps attribution exact: the sink holds the transitions of
+	 * *the* command in flight, and a confirmation dialog can keep a command busy for
+	 * minutes. A second request is refused rather than queued, so a caller always
+	 * learns immediately that its request did not run.
+	 */
+	let bridgeInFlight = false;
+
+	/**
+	 * The most recent session context, captured at `session_start` (and refreshed on
+	 * input and tree navigation).
+	 *
+	 * Pi hands a context to event handlers but not to a bus listener, and a bridged
+	 * command needs one to read the session file, show dialogs, and wait for idle.
+	 * Pi's contexts are lazy handles onto the live runner, so the captured one stays
+	 * valid for the session it was captured in.
+	 */
+	let sessionContext: ExtensionContext | null = null;
+
 	const store = new GoalStore({
 		// The store owns every durable commit point, so it is what announces each
 		// committed transition to the local event stream — including creation and
@@ -494,6 +538,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// committed event, never from the live record.
 		onDurableTransition: (kind, goal, committedAt) => {
 			const event = toGoalUpdatedEvent(kind, goal, committedAt);
+			// A bridged command records the durable transitions it caused, so its
+			// caller is answered from the commit rather than from a message (see
+			// `./command-bridge.ts`). Recording happens before the announcement and
+			// only here, so nothing that failed to commit can appear in the result.
+			if (bridgeTransitions !== null) bridgeTransitions.push({ kind, goal: toPublicState(goal) });
 			emitGoalUpdated(event);
 			metrics.publish(event);
 		},
@@ -1157,6 +1206,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		// Captured for the optional command bridge (issue #56), which is invoked from
+		// an event-bus listener where Pi provides no context of its own. Pi contexts
+		// are lazy handles onto the live runner, so this stays valid for the session.
+		sessionContext = ctx;
 		clearCreationAuthority();
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
@@ -1352,6 +1405,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * instead of handing it a fresh binding it was never prepared against.
 	 */
 	pi.on("session_tree", (_event, ctx) => {
+		sessionContext = ctx;
 		clearCreationAuthority();
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
@@ -1393,6 +1447,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
 	pi.on("input", (event, ctx) => {
+		sessionContext = ctx;
 		pendingUserInputs.push({ text: event.text, source: event.source });
 		continuesGoalTurn = false;
 		// A prompt the user actually typed is never Goal-owned work, so the
@@ -2670,49 +2725,214 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		);
 	}
 
+	/**
+	 * The `/goal` command, in one place.
+	 *
+	 * Both the registered user command and the in-process command bridge call this
+	 * function with the same argument text, so a bridged command *is* the command the
+	 * user sees: the same parsing, the same replacement confirmation dialog, the same
+	 * `goal.enabled` gate, the same Token-budget validation, and the same
+	 * durable-before-announced ordering. Nothing downstream can tell the difference,
+	 * which is the point — a second entry point that re-used the lifecycle helpers
+	 * instead would be a second lifecycle path.
+	 */
+	async function handleGoalCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		try {
+			const command = parseGoalCommand(args);
+			// A direct Goal lifecycle operation is a user decision that supersedes
+			// any model-held creation authority. A bare status read is not a
+			// lifecycle operation and leaves the authority alone.
+			if (command.kind !== "status" && command.kind !== "invalid") {
+				clearCreationAuthority();
+			}
+			switch (command.kind) {
+				case "status":
+					await reportStatus(ctx);
+					return;
+				case "create":
+					await createOrReplaceGoal(command.objective, ctx);
+					return;
+				case "edit":
+					editGoal(command.objective, ctx);
+					return;
+				case "edit-dialog":
+					await editGoalInteractively(ctx);
+					return;
+				case "pause":
+					pauseGoal(ctx);
+					return;
+				case "resume":
+					resumeGoal(ctx, command.budget);
+					return;
+				case "clear":
+					clearGoal(ctx);
+					return;
+				case "invalid":
+					ctx.ui.notify(command.message, "error");
+					return;
+			}
+		} catch (error) {
+			ctx.ui.notify(`pi-goal error: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+	}
+
 	pi.registerCommand("goal", {
 		description:
 			"Create (/goal <objective>), inspect (bare /goal), edit (/goal edit <objective>), pause, resume " +
 			"(/goal resume, or /goal resume --budget <new-total> for a budget_limited Goal), or clear the session Goal",
-		handler: async (args, ctx) => {
+		handler: handleGoalCommand,
+	});
+
+	/**
+	 * The command family a parsed `/goal` command belongs to, for the bridge's
+	 * transition filter. `edit-dialog` is the interactive spelling of an objective
+	 * edit: over the bridge it opens the same editor and commits the same
+	 * `objective-edited` transition.
+	 */
+	function bridgeActionFor(command: GoalCommand): GoalBridgeAction {
+		switch (command.kind) {
+			case "status":
+				return "status";
+			case "create":
+				return "create";
+			case "edit":
+			case "edit-dialog":
+				return "edit";
+			case "pause":
+				return "pause";
+			case "resume":
+				return "resume";
+			case "clear":
+				return "clear";
+			case "invalid":
+				return "invalid";
+		}
+	}
+
+	/**
+	 * Answer one bridge request by running the same `/goal` command the user would.
+	 *
+	 * The result is built from three facts and no guesses: the durable transitions
+	 * the store announced during the command, the diagnostics the command reported
+	 * (recorded by wrapping its UI, not by parsing text), and the public state
+	 * afterwards. "Committed" additionally requires that the recorded transition is
+	 * the *current* Goal identity (or, for a clear, that no Goal is current) and
+	 * that its snapshot reached the session file — the same on-disk bar the
+	 * command's own success announcement waits for. A later legitimate transition
+	 * of the same Goal does not undo the commit, while a creation that committed in
+	 * memory and then failed its durability poll is reported as a refusal, never as
+	 * a success.
+	 */
+	async function handleBridgeRequest(payload: unknown): Promise<void> {
+		const parsed = parseGoalCommandBridgeRequest(payload);
+		if (!parsed.ok) {
+			// A malformed payload has no reply channel worth trusting: answering it
+			// would mean calling an unvalidated function from the bus.
+			return;
+		}
+		const request = parsed.request;
+		const ctx = sessionContext;
+		const current = store.get();
+		const publicState = current ? toPublicState(current) : null;
+		if (ctx === null) {
+			request.reply(
+				goalBridgeRefusal({
+					id: request.id,
+					command: request.command,
+					message:
+						"Goal command not run: pi-goal has not started a session yet, so the /goal command surface is not " +
+						"available. Retry once the session has loaded.",
+					goal: publicState,
+					admissionEnabled: admission.enabled,
+				}),
+			);
+			return;
+		}
+		if (bridgeInFlight) {
+			request.reply(
+				goalBridgeRefusal({
+					id: request.id,
+					command: request.command,
+					message:
+						"Goal command not run: another bridged /goal command is still running (it may be waiting for a " +
+						"confirmation dialog). Retry after it finishes.",
+					goal: publicState,
+					admissionEnabled: admission.enabled,
+				}),
+			);
+			return;
+		}
+
+		const command = parseGoalCommand(request.command);
+		const action = bridgeActionFor(command);
+		const recorded: GoalBridgeTransition[] = [];
+		const diagnostics: GoalBridgeDiagnostic[] = [];
+		bridgeInFlight = true;
+		bridgeTransitions = recorded;
+		try {
+			await handleGoalCommand(request.command, recordingCommandContext(commandContextForBridge(ctx), diagnostics));
+		} catch (error) {
+			// The command handler reports its own failures as notifications; this is the
+			// last-resort mirror for a throw outside them, and it is a refusal, never a
+			// success.
+			diagnostics.push({ level: "error", text: `pi-goal error: ${describeError(error)}` });
+		} finally {
+			bridgeTransitions = null;
+			bridgeInFlight = false;
+		}
+
+		const transitions = recorded.filter((transition) => committedKindsFor(action).includes(transition.kind));
+		const last = transitions.at(-1);
+		const after = store.get() ?? null;
+		// "Landed" is identity plus durability, never the exact revision: a Goal that
+		// committed and then took another legitimate transition (a continuation that
+		// completed it while the reply was being built) still committed. A retracted
+		// creation or a replacement the durability poll restored fails here, because
+		// the current Goal is then null or a different identity.
+		const committed =
+			last !== undefined &&
+			(last.kind === "cleared"
+				? after === null
+				: after !== null && after.id === last.goal.id && store.isDurable(ctx, after.id));
+		const outcome = classifyGoalBridgeOutcome({ action, transitions, diagnostics, committed });
+		const result: GoalCommandBridgeResult = {
+			version: GOAL_COMMAND_BRIDGE_VERSION,
+			id: request.id,
+			command: request.command,
+			ok: outcome.ok,
+			disposition: outcome.disposition,
+			action,
+			goal: after ? toPublicState(after) : null,
+			admissionEnabled: admission.enabled,
+			transitions,
+			diagnostics,
+		};
+		request.reply(result);
+	}
+
+	// The optional companion seam (issue #56): an in-process request/response for
+	// extensions that need the user command surface with a structured outcome. The
+	// listener never throws into the bus and answers exactly once per request, so a
+	// companion cannot mistake a dropped reply for a committed Goal.
+	pi.events.on(GOAL_COMMAND_BRIDGE, (payload) => {
+		handleBridgeRequest(payload).catch((error: unknown) => {
 			try {
-				const command = parseGoalCommand(args);
-				// A direct Goal lifecycle operation is a user decision that supersedes
-				// any model-held creation authority. A bare status read is not a
-				// lifecycle operation and leaves the authority alone.
-				if (command.kind !== "status" && command.kind !== "invalid") {
-					clearCreationAuthority();
-				}
-				switch (command.kind) {
-					case "status":
-						await reportStatus(ctx);
-						return;
-					case "create":
-						await createOrReplaceGoal(command.objective, ctx);
-						return;
-					case "edit":
-						editGoal(command.objective, ctx);
-						return;
-					case "edit-dialog":
-						await editGoalInteractively(ctx);
-						return;
-					case "pause":
-						pauseGoal(ctx);
-						return;
-					case "resume":
-						resumeGoal(ctx, command.budget);
-						return;
-					case "clear":
-						clearGoal(ctx);
-						return;
-					case "invalid":
-						ctx.ui.notify(command.message, "error");
-						return;
-				}
-			} catch (error) {
-				ctx.ui.notify(`pi-goal error: ${error instanceof Error ? error.message : String(error)}`, "error");
+				const parsed = parseGoalCommandBridgeRequest(payload);
+				if (!parsed.ok) return;
+				const goal = store.get();
+				parsed.request.reply(
+					goalBridgeRefusal({
+						id: parsed.request.id,
+						command: parsed.request.command,
+						message: `pi-goal error: ${describeError(error)}`,
+						goal: goal ? toPublicState(goal) : null,
+						admissionEnabled: admission.enabled,
+					}),
+				);
+			} catch {
+				// Nothing left to report to: the caller's own timeout covers this case.
 			}
-		},
+		});
 	});
 
 	/**

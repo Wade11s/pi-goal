@@ -52,6 +52,10 @@ export class PiRpcSession {
 		// User-level settings written to <agent-dir>/settings.json before the spawn,
 		// for tests that need deterministic retry or compaction behavior.
 		this.settings = options.settings ?? undefined;
+		// Whether the pi-goal package itself is loaded. The companion adapter's
+		// optionality test loads only the companion, which is what proves the
+		// companion is not a mandatory dependency of pi-goal (and vice versa).
+		this.loadPiGoal = options.loadPiGoal ?? true;
 		// Pi's `--tools` allowlist and `--exclude-tools` denylist, verbatim. The
 		// review-child profile test passes the documented launch arguments here so a
 		// real Pi session proves which tools are actually active.
@@ -92,9 +96,8 @@ export class PiRpcSession {
 		}
 		const args = ["--mode", "rpc"];
 		for (const extension of this.preExtensions) args.push("-e", extension);
+		if (this.loadPiGoal) args.push("-e", join(repoRoot)); // load pi-goal via its package.json pi manifest
 		args.push(
-			"-e",
-			join(repoRoot), // load the pi-goal package via its package.json pi manifest
 			"-e",
 			join(repoRoot, "test", "extensions", "scripted-provider.ts"),
 			"--provider",

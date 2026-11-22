@@ -41,6 +41,14 @@ function fakePi(sessionFile) {
 			}
 		},
 		sendUserMessage() {},
+		// pi-goal's optional companion seam registers a bridge listener at load, so a
+		// faithful fake Pi needs the shared event bus Pi always provides.
+		events: {
+			on() {
+				return () => {};
+			},
+			emit() {},
+		},
 	};
 	return { pi, handlers, tools, getCommand: () => command };
 }

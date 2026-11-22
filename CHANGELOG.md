@@ -6,6 +6,28 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the optional Codex-shaped Goal RPC companion
+  (`companion/goal-rpc`): independently installable, no dependency on pi-goal,
+  removable without affecting pi-goal. It maps `thread/goal/get`,
+  `thread/goal/set`, and `thread/goal/clear` onto the *user* command surface
+  through the new generic in-process bridge (`pi-goal:command-bridge`), so
+  replacement confirmation, `goal.enabled` admission, Token-budget and attachment
+  validation, the execution binding, and durable-before-announced ordering all
+  stay in one lifecycle: no snapshot, tombstone, or usage checkpoint is read or
+  written by the adapter. Each call answers with one `goal-rpc-response` session
+  entry whose `ok` is true only for a durable commit (a transition of the kind
+  that answers the requested action, still the current Goal identity, and on
+  disk) — a creation that committed and then failed its on-disk durability poll
+  is reported as `refused` — and whose `error.code` names the refused, declined,
+  invalid, unauthorized, or unavailable outcome, never a claimed success.
+  Mutating methods require an asserted `authority: "external-user"`; `model` is
+  refused and pointed at `create_goal`, and the companion registers no
+  model-callable tool, so model-driven creation keeps pi-goal's creation
+  authority. The bridge and companion are documented in
+  `docs/behavior/companion.md`, including the honest difference from Codex's
+  private in-tree app-server methods (Codex-shaped names, not a wire-compatible
+  protocol). Deterministic coverage: `test/goal56-command-bridge.test.mjs` and
+  `test/goal56-goal-rpc-companion.test.mjs`.
 - Document the read-only review-child launch profile for `rex-subagent`
   dispatches in `docs/agents/subagents.md` and `docs/agents/orchestration.md`:
   `tools` = `read,bash,grep,find,ls`, `excludeTools` =

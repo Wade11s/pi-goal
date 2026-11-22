@@ -100,7 +100,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Completion usage report | Completing a budgeted Goal returns instructions to report final token/time usage | A budgeted completion returns `completionReport` with the instruction, tokens, budget, remaining capacity, and Active elapsed time | Ported |
 | Goal update events | `ThreadGoalUpdated` protocol event | Versioned `pi-goal:updated` on Pi's shared event bus after every durable transition | Ported locally; hosted protocol events remain out of scope |
 | Analytics and metrics | Analytics events plus otel counters/histograms | Privacy-safe local projection in review (#55); no hosted exporter in core | Partial; hosted export is a companion-only path |
-| External app-server methods | `thread/goal/get`, `set`, and `clear` | Pi RPC can invoke the command surface; a companion adapter is planned in #56 | Host-specific; optional companion, never a core dependency |
+| External app-server methods | `thread/goal/get`, `set`, and `clear` | Optional [Goal RPC companion](../companion/goal-rpc) maps those three methods onto the user command surface through the generic `pi-goal:command-bridge` seam; `ok` is proved by a durable commit, not by a message | Host-specific and optional; not wire-compatible with Codex's private app-server, and never a core dependency |
 | Review-subagent tool visibility | Goal tools are hidden from Codex review subagents | No built-in Pi review-thread classification; a documented launch profile is planned in #57 | Host-specific; Rex `--tools` / `--exclude-tools` is the seam |
 | Plan-mode accounting exclusion | Codex Plan collaboration mode is excluded from Goal token accounting | No identical Pi collaboration mode | Not applicable to current Pi |
 
@@ -138,6 +138,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Long objectives and explicit file references | Node filesystem APIs, `ctx.ui.editor()`, and the existing encoded-objective boundary | Medium; raising the length limit is easy, lifecycle/cleanup of referenced files needs a contract |
 | Images in Goal kickoff | `pi.sendUserMessage()` accepts text/image content arrays | Medium; durable attachment ownership and every later continuation must reference the same artifacts |
 | Composer-style pending pastes and image drafts | No equivalent extension-command input object exposes Codex's composer draft directly | Host-specific; use explicit files or a custom UI rather than pretending slash-command arguments contain attachments |
+| Host-specific Goal RPC methods | `pi.events` request/response bridge onto the registered `/goal` command handler, so the handler runs unchanged | Delivered as an optional companion (#56); one lifecycle path with a structured answer, never a second lifecycle |
 | Hosted analytics | A local `pi.events` listener can export to a chosen backend | Integration work, including redaction and consent; not required for Goal correctness |
 | `update_plan` parity | Register a Pi custom plan tool and conditionally reference it in the continuation | Optional; do not instruct the model to call a tool that is not registered |
 

@@ -31,6 +31,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | [behavior/persistence.md](behavior/persistence.md) | `goal-state` and `goal-usage` entries, reconstruction, forks, tombstones, superseded records, and the 0.1.0 cutover |
 | [behavior/events.md](behavior/events.md) | The local `pi-goal:updated` event stream: payload, transition kinds, durable-before-announced ordering, no-flood rules, and listener-failure isolation |
 | [behavior/metrics.md](behavior/metrics.md) | The privacy-safe `pi-goal:metrics` projection, its allowlist, the local consumer seam, and the on-demand hosted companion's consent, redaction, retry, and credential rules |
+| [behavior/companion.md](behavior/companion.md) | The optional Codex-shaped Goal RPC companion and the generic `pi-goal:command-bridge` seam it is built on: install, protocol, creation authority, durability proof, and the intentional difference from Codex's private app-server methods |
 
 ## Reference
 
