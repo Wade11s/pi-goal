@@ -17,10 +17,10 @@ Read this before spawning or steering a `rex-subagent`. Explicit user instructio
 | --- | --- | --- |
 | File location, log summarization, mechanical extraction | `magpie/workbuddy/hy4flash-free` + `high` (its only supported level) | `magpie/dgx-spark/inkling-2-mini` + `off` for pure extraction or `low` for light synthesis; `magpie/deepai/deepseek-v4.1-flash` + `minimal/low` |
 | Read-only code exploration, routine research | `magpie/workbuddy/hy4flash-free` + `high`; `magpie/dgx-spark/inkling-2-mini` + `high` | `magpie/stepfun-cn/step-5-preview` + `medium`; `magpie/zhipu/glm-5.3-flash` + `high`; `magpie/deepai/glm-5.3-flash` + `medium` |
-| Routine implementation, localized fixes, test runs | `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/mistral/deepseek-v4-1-flash-1017` + `high` | `magpie/kimi-code-cn/k3.1-pro` + `high`; `magpie/deepai/deepseek-v4.1-flash` + `high` |
-| Cross-module implementation, difficult debugging, architecture analysis | `magpie/kimi-code-cn/k3.1-pro` + `high → max` | `magpie/zhipu/glm-5.3` + `high → max`; `magpie/workbuddy/deepseek-v4.1-flash` + `max` |
+| Routine implementation, localized fixes, test runs | `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/mistral/deepseek-v4-1-flash-1017` + `high` | `magpie/kimi-code-cn/k3.1-pro-highspeed` + `high`; `magpie/deepai/deepseek-v4.1-flash` + `high` |
+| Cross-module implementation, difficult debugging, architecture analysis | `magpie/kimi-code-cn/k3.1-pro-highspeed` + `high → max` | `magpie/zhipu/glm-5.3` + `high → max`; `magpie/workbuddy/deepseek-v4.1-flash` + `max` |
 | Independent code review, second opinion | `magpie/grok/grok-4.7@500k` + `high`; `magpie/zhipu/glm-5.3` + `high` | `magpie/dgx-spark/inkling-2-mini` + `max`; `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/deepai/muse-ember` + `medium` |
-| Security review, data-loss risk, final high-risk review | `magpie/grok/grok-4.7@500k` + `xhigh` | A different model family from the implementer: `magpie/zhipu/glm-5.3` + `max` or `magpie/kimi-code-cn/k3.1-pro` + `max` |
+| Security review, data-loss risk, final high-risk review | `magpie/grok/grok-4.7@500k` + `xhigh` | A different model family from the implementer: `magpie/zhipu/glm-5.3` + `max` or `magpie/kimi-code-cn/k3.1-pro-highspeed` + `max` |
 
 ## Load balancing
 
