@@ -108,6 +108,23 @@ function truncateHistoryRecord(sessionFile, index) {
 }
 
 /**
+ * Overwrite specific fields of one `goal-history` entry's payload in place, exactly
+ * as a hand-edited or future-version entry would: a record whose transition kind or
+ * committed status this build does not recognize. The entry's own id, parent, and
+ * timestamp survive, so the branch stays connected and only the record's legitimacy
+ * is lost.
+ */
+function corruptHistoryField(sessionFile, index, patch) {
+	const lines = readFileSync(sessionFile, "utf8").split("\n").filter((line) => line.trim());
+	const entries = lines.map((line) => JSON.parse(line));
+	const history = entries.filter((entry) => entry.customType === "goal-history");
+	assert.ok(history[index], `history record ${index} exists`);
+	Object.assign(history[index].data, patch);
+	const rewritten = entries.map((entry) => JSON.stringify(entry)).join("\n");
+	writeFileSync(sessionFile, `${rewritten}\n`, "utf8");
+}
+
+/**
  * Remove one session entry line, re-parenting its child so the branch stays
  * connected. This is the file a crash between a lifecycle commit and its history
  * append leaves behind: the snapshot is there, the record that would have
@@ -653,6 +670,61 @@ test("malformed history is skipped, surfaced as a notice, and cannot change the 
 				1,
 				"the truncated entry is still there, still ignored",
 			);
+			assertCleanRun(reloaded);
+			assert.equal(reloaded.extensionErrors().length, 0, JSON.stringify(reloaded.extensionErrors()));
+		} finally {
+			await reloaded.stop();
+		}
+
+		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+		cleanupDirs(dirs);
+	}
+});
+
+test("an unknown transition kind or status is malformed, never a real timeline entry", async () => {
+	const dirs = sharedDirs();
+	const session = await PiRpcSession.start({ sessionDir: dirs.sessionDir, cwd: dirs.workDir });
+	script([{ text: "On it.", usage: { input: 40, output: 10 } }, { hang: true }], session);
+	try {
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await abortActiveLoop(session, 2);
+		await session.prompt("/goal pause");
+		await session.waitForNotify((r) => r.message.includes("paused (revision 1)"));
+		await session.prompt(`/goal edit ${EDITED}`);
+		await session.waitForNotify((r) => r.message.includes("objective updated"));
+		const sessionFile = await session.sessionFile();
+		const before = readSessionEntries(sessionFile);
+		assert.deepEqual(historyKinds(before), ["created", "paused", "objective-edited"]);
+		const goalId = goalSnapshots(before)[0].data.goal.id;
+
+		// Corrupt one record's transition kind and another's committed status, exactly
+		// as a hand-edited or future-version entry would: neither names a transition
+		// this build knows, so neither may render as a real timeline entry.
+		corruptHistoryField(sessionFile, 0, { kind: "not-a-transition" });
+		corruptHistoryField(sessionFile, 2, { to: "not-a-status" });
+		assert.equal(historyRecords(readSessionEntries(sessionFile)).length, 3, "all three entries are still there");
+
+		const reloaded = await PiRpcSession.start({ sessionFile });
+		try {
+			// Reconstruction is untouched by the corrupt timeline.
+			const restored = goalSnapshots(readSessionEntries(sessionFile)).at(-1).data.goal;
+			assert.equal(restored.status, "paused");
+			assert.equal(restored.revision, 2);
+			assert.equal(restored.objective, EDITED);
+
+			// The rendering skips both unknown entries, counts them, and still renders the
+			// one good record — never the invented kind or the invented status.
+			const rendered = await renderHistory(reloaded);
+			assert.match(rendered, /1 record/);
+			assert.match(rendered, new RegExp(`paused\\s+${goalId}\\s+revision 1`));
+			assert.match(rendered, /2 history entries on this branch could not be read/);
+			assert.match(rendered, /were skipped/);
+			assert.equal(rendered.includes("not-a-transition"), false, "an unknown kind is never a timeline entry");
+			assert.equal(rendered.includes("not-a-status"), false, "and neither is an unknown status");
 			assertCleanRun(reloaded);
 			assert.equal(reloaded.extensionErrors().length, 0, JSON.stringify(reloaded.extensionErrors()));
 		} finally {

@@ -33,9 +33,9 @@
  * applies, replays, or reverts a history record: the only reader is the read-only
  * `/goal history` rendering, and the only writer is the committed-transition seam.
  */
-import type { GoalTransitionKind } from "./events.ts";
+import { GOAL_TRANSITION_KINDS, type GoalTransitionKind } from "./events.ts";
 import type { GoalEventAttachment, GoalEventUsage, GoalUpdatedEvent } from "./events.ts";
-import type { GoalStatus } from "./goal.ts";
+import { GOAL_STATUSES, type GoalStatus } from "./goal.ts";
 
 /** Custom-entry channel for history records, kept apart from `goal-state`. */
 export const HISTORY_ENTRY_TYPE = "goal-history";
@@ -90,6 +90,14 @@ export interface GoalHistoryView {
 	records: GoalHistoryRecord[];
 	/** How many `goal-history` entries could not be read and were skipped. */
 	malformed: number;
+	/**
+	 * True when the branch itself could not be read — as distinct from a branch that
+	 * was read and found empty, or read and found to hold only malformed entries.
+	 * The renderer says the history could not be read rather than claiming the branch
+	 * is empty; it is a rendering diagnostic only and never affects reconstruction,
+	 * which reads `goal-state` alone.
+	 */
+	unreadable?: boolean;
 }
 
 /** Structural shape of a session-branch entry, so history.ts stays Pi-free. */
@@ -131,16 +139,31 @@ export function toGoalHistoryRecord(
 	};
 }
 
+/**
+ * The transition kinds and Lifecycle statuses a record may legitimately name.
+ *
+ * A record's `kind` and its `from`/`to` statuses are only valid when they come from
+ * these shared vocabularies — the same ones the event stream and the Goal model
+ * use. An entry naming anything else is a corrupt or future-version record, not a
+ * transition this build understands, so validation rejects it and the reader skips
+ * and counts it like any other malformed entry, rather than rendering an invented
+ * transition or a status the Goal never held.
+ */
+const GOAL_TRANSITION_KIND_SET = new Set<string>(GOAL_TRANSITION_KINDS);
+const GOAL_STATUS_SET = new Set<string>(GOAL_STATUSES);
+
 /** Whether a value is a structurally valid history record. */
 export function isGoalHistoryRecord(value: unknown): value is GoalHistoryRecord {
 	if (!value || typeof value !== "object") return false;
 	const record = value as Record<string, unknown>;
 	if (record.version !== 1) return false;
-	if (typeof record.kind !== "string" || record.kind === "") return false;
+	if (typeof record.kind !== "string" || !GOAL_TRANSITION_KIND_SET.has(record.kind)) return false;
 	if (typeof record.goalId !== "string" || record.goalId === "") return false;
 	if (typeof record.revision !== "number" || !Number.isInteger(record.revision) || record.revision < 0) return false;
-	if (record.from !== null && typeof record.from !== "string") return false;
-	if (typeof record.to !== "string" || record.to === "") return false;
+	// A creation has no previous status (`null`); every other transition names a known
+	// Lifecycle status. An unknown `from`/`to` is malformed, never a real record.
+	if (record.from !== null && (typeof record.from !== "string" || !GOAL_STATUS_SET.has(record.from))) return false;
+	if (typeof record.to !== "string" || !GOAL_STATUS_SET.has(record.to)) return false;
 	if (typeof record.timestamp !== "string" || Number.isNaN(Date.parse(record.timestamp))) return false;
 	if (!record.usage || typeof record.usage !== "object") return false;
 	const usage = record.usage as Record<string, unknown>;
@@ -219,12 +242,58 @@ function formatStatusChange(record: GoalHistoryRecord): string {
 	return `${record.from} → ${record.to}`;
 }
 
+/**
+ * Rendered-length caps for the untrusted string fields of a record.
+ *
+ * History is diagnostic data read straight off the session branch, so a hand-edited
+ * or corrupt entry can carry any bytes. These caps keep one bad record from flooding
+ * a timeline notice with a wall of text. They touch only the *rendering* — the
+ * durable record is never rewritten — and each is generous enough that a legitimate
+ * value is never truncated.
+ */
+const MAX_RENDERED_LABEL = 80; // an attachment basename; real ones are far shorter
+const MAX_RENDERED_MEDIA_TYPE = 64; // e.g. "text/plain"; well under this
+const MAX_RENDERED_HASH = 12; // the abbreviated digest, already sliced to 12 hex chars
+const MAX_RENDERED_KIND = 24; // the longest transition kind is 16 characters
+const MAX_RENDERED_GOAL_ID = 64; // a real id is "goal_" plus 8 hex (13 characters)
+const MAX_RENDERED_REVISION = 20; // any rendered integer fits well inside this
+const MAX_RENDERED_TIMESTAMP = 32; // an ISO-8601 instant is 24 characters
+
+/** ANSI escape sequences: the CSI form (`\x1b[ … final-byte`) and the single-char Fe forms. */
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])/g;
+
+/** C0/C1 control characters, except the tab/newline/carriage-return that get collapsed. */
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
+
+/**
+ * Render one untrusted string field safely for the single-line timeline.
+ *
+ * Strips ANSI escape sequences (so a corrupt label cannot paint terminal colors or
+ * move the cursor) and the remaining control characters, collapses every whitespace
+ * run — newlines included — to one space (so a value can never forge a second line),
+ * trims, and caps the length with a trailing ellipsis. A purely rendering transform:
+ * the durable record is read, never written.
+ */
+function renderText(value: string, maxLength: number): string {
+	const cleaned = value
+		.replace(ANSI_ESCAPE, "")
+		.replace(CONTROL_CHARS, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength - 3)}...` : cleaned;
+}
+
 /** The one-line summary of one record. */
 function formatHistoryLine(record: GoalHistoryRecord): string {
 	const usage = record.usage;
 	const total = Number.isFinite(usage.totalTokens) ? usage.totalTokens : 0;
 	return (
-		`${record.timestamp}  ${record.kind}  ${record.goalId}  revision ${record.revision}  ` +
+		`${renderText(record.timestamp, MAX_RENDERED_TIMESTAMP)}  ` +
+		`${renderText(record.kind, MAX_RENDERED_KIND)}  ` +
+		`${renderText(record.goalId, MAX_RENDERED_GOAL_ID)}  ` +
+		`revision ${renderText(String(record.revision), MAX_RENDERED_REVISION)}  ` +
 		`${formatStatusChange(record)}  ${total} tokens  active ${formatSeconds(usage.activeSeconds)}`
 	);
 }
@@ -243,8 +312,9 @@ function formatAttachmentLine(record: GoalHistoryRecord): string | null {
 	const items = record.attachments
 		.map(
 			(attachment) =>
-				`${attachment.label} (${attachment.mediaType}, ${formatBytes(attachment.bytes)}) ` +
-				`sha256:${attachment.hash.slice(0, 12)}`,
+				`${renderText(attachment.label, MAX_RENDERED_LABEL)} ` +
+				`(${renderText(attachment.mediaType, MAX_RENDERED_MEDIA_TYPE)}, ${formatBytes(attachment.bytes)}) ` +
+				`sha256:${renderText(attachment.hash.slice(0, 12), MAX_RENDERED_HASH)}`,
 		)
 		.join("; ");
 	return `    attachments: ${items}`;
@@ -264,6 +334,17 @@ function formatAttachmentLine(record: GoalHistoryRecord): string | null {
  */
 export function formatGoalHistory(view: GoalHistoryView): string {
 	const lines: string[] = [];
+	// An unreadable branch is its own case: it is not an empty timeline, and claiming
+	// one would understate what the branch holds. It is a rendering failure only — the
+	// authoritative Goal is reconstructed from `goal-state`, which is unaffected.
+	if (view.unreadable) {
+		lines.push(
+			"Goal history could not be read on this branch (the branch itself could not be read). " +
+				"This affects only this timeline: the current Goal is reconstructed from its durable snapshots " +
+				"and tombstones, which are unaffected.",
+		);
+		return lines.join("\n");
+	}
 	if (view.records.length === 0) {
 		lines.push("No Goal history on this branch yet.");
 	} else {

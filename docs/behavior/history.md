@@ -65,10 +65,15 @@ Not recorded:
   (the Goal keeps working), an audit reset, the budget wrap-up's delivery and its
   disarm, and a superseded identity's freeze are bookkeeping rather than
   transitions — each writes a `goal-state` snapshot without a history record.
-- **Retractions.** A rolled-back creation and a durability-rollback restore
-  correct history rather than deciding a lifecycle transition, so they append
-  nothing. A rolled-back creation therefore leaves the `created` record its commit
-  already wrote, exactly as the event stream announces it, and nothing more.
+- **Retractions — an accepted corner.** A creation whose durability poll later
+  fails is retracted with a tombstone, and a durability-rollback restore rewrites
+  the previous record. Neither is a lifecycle transition, so the retraction path
+  itself writes **no** history record — this is the "no records for rolled-back
+  transitions" rule. The one record that survives is the `created` entry the
+  transition's *commit* already wrote, because the commit announced the creation
+  exactly as the `pi-goal:updated` stream does (the same accepted corner documented
+  in [events](events.md)); the later retraction takes the Goal back on the
+  authoritative `goal-state` channel and appends nothing further.
 - **A declined replacement confirmation.** Nothing was committed, so nothing is
   recorded.
 

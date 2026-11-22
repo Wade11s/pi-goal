@@ -16,8 +16,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { GoalStore } from "../src/store.ts";
-import { CUSTOM_ENTRY_TYPE, toPublicState } from "../src/goal.ts";
-import { toGoalUpdatedEvent } from "../src/events.ts";
+import { CUSTOM_ENTRY_TYPE, GOAL_STATUSES, toPublicState } from "../src/goal.ts";
+import { GOAL_TRANSITION_KINDS, toGoalUpdatedEvent } from "../src/events.ts";
 import {
 	formatGoalHistory,
 	HISTORY_ENTRY_TYPE,
@@ -428,7 +428,7 @@ test("the store's own reader returns the branch view and never throws", () => {
 	assert.equal(view.malformed, 0);
 
 	const broken = { sessionManager: { getBranch: () => { throw new Error("no branch"); } } };
-	assert.deepEqual(store.readHistory(broken), { records: [], malformed: 0 });
+	assert.deepEqual(store.readHistory(broken), { records: [], malformed: 0, unreadable: true });
 });
 
 test("the rendering is readable, read-only, and honest about gaps", () => {
@@ -457,6 +457,87 @@ test("the rendering is readable, read-only, and honest about gaps", () => {
 		formatGoalHistory({ records: [], malformed: 2 }),
 		/2 history entries on this branch could not be read .* were skipped/,
 	);
+});
+
+test("a corrupt or oversized label renders single-line, escape-free, and bounded, without mutating history", () => {
+	const evilLabel = "report\u001b[31m.txt\u001b[0m\nrm -rf /";
+	const oversized = "x".repeat(200_000);
+	const base = {
+		version: 1,
+		kind: "created",
+		goalId: "goal_aaaaaaaa",
+		revision: 0,
+		from: null,
+		to: "active",
+		timestamp: new Date(0).toISOString(),
+		usage: {
+			totalTokens: 0,
+			inputTokens: 0,
+			outputTokens: 0,
+			cacheWriteTokens: 0,
+			cachedReadTokens: 0,
+			reasoningTokens: 0,
+			nestedTokens: 0,
+			activeSeconds: 0,
+		},
+		attachments: [],
+	};
+	const evil = {
+		...base,
+		attachments: [{ hash: "a".repeat(64), mediaType: "text/plain", bytes: 10, label: evilLabel }],
+	};
+	const big = {
+		...base,
+		attachments: [{ hash: "b".repeat(64), mediaType: "text/plain", bytes: 10, label: oversized }],
+	};
+
+	// A label carrying an ANSI escape and a newline renders on one line, the escape
+	// stripped and the newline collapsed: the corrupt record is still surfaced, but
+	// safely — never as a colored or multi-line entry.
+	const evilRendered = formatGoalHistory({ records: [evil], malformed: 0 });
+	const evilLines = evilRendered.split("\n");
+	assert.equal(evilLines.length, 3, "header, the record line, and one attachment line — no injected line");
+	const evilAttachment = evilLines.find((line) => line.includes("attachments:"));
+	assert.ok(evilAttachment, "the record is still surfaced");
+	assert.equal(evilAttachment.includes("\u001b"), false, "no escape sequence survives");
+	assert.ok(!/[\x00-\x08\x0b-\x1f\x7f]/.test(evilAttachment), "no control character survives");
+	assert.ok(evilAttachment.includes("report.txt rm -rf /"), "the newline collapsed to a space, the escape stripped");
+
+	// An oversized label is capped, so the notice stays bounded and single-line.
+	const bigRendered = formatGoalHistory({ records: [big], malformed: 0 });
+	const bigLines = bigRendered.split("\n");
+	assert.equal(bigLines.length, 3, "still exactly one line per record");
+	const bigAttachment = bigLines.find((line) => line.includes("attachments:"));
+	assert.ok(bigAttachment.length < 200, `the attachment line is bounded (got ${bigAttachment.length})`);
+	assert.ok(bigAttachment.includes("..."), "an over-long label is truncated with an ellipsis");
+
+	// The rendering is read-only: the durable records keep their corrupt labels.
+	assert.equal(evil.attachments[0].label, evilLabel, "history is not mutated by rendering");
+	assert.equal(big.attachments[0].label, oversized);
+});
+
+test("an unreadable branch is distinguished from an empty one, and never claimed empty", () => {
+	const pi = fakePi();
+	const { store } = startedGoal(pi);
+
+	// A branch that reads fine but holds no history is empty, not unreadable.
+	const empty = store.readHistory(
+		fakeCtx(pi.entries.filter((entry) => entry.customType !== HISTORY_ENTRY_TYPE)),
+	);
+	assert.equal(empty.unreadable, undefined, "a read-but-empty branch is not flagged unreadable");
+	assert.equal(formatGoalHistory(empty), "No Goal history on this branch yet.");
+
+	// A branch whose read throws is unreadable, and is not rendered as empty.
+	const broken = { sessionManager: { getBranch: () => { throw new Error("no branch"); } } };
+	const view = store.readHistory(broken);
+	assert.equal(view.unreadable, true);
+	const rendered = formatGoalHistory(view);
+	assert.match(rendered, /could not be read on this branch/);
+	assert.equal(rendered.includes("No Goal history"), false, "an unreadable branch is never claimed empty");
+
+	// The read failure cannot change the Goal: reconstruction reads goal-state alone.
+	const reconstructed = new GoalStore().reconstruct(fakeCtx(pi.entries));
+	assert.equal(reconstructed?.id, store.get()?.id, "the unreadable timeline cannot change the Goal");
 });
 
 test("a history record is structurally validated, so a truncated entry is never rendered as data", () => {
@@ -505,6 +586,63 @@ test("a history record is structurally validated, so a truncated entry is never 
 	assert.equal(isGoalHistoryRecord({ ...valid, kind: "cleared", from: "complete", to: "complete" }), true);
 	// A creation has no previous status.
 	assert.equal(isGoalHistoryRecord({ ...valid, kind: "created", from: null }), true);
+});
+
+test("an unknown transition kind or unknown status is malformed, never a real timeline entry", () => {
+	const valid = {
+		version: 1,
+		kind: "paused",
+		goalId: "goal_aaaaaaaa",
+		revision: 3,
+		from: "active",
+		to: "paused",
+		timestamp: new Date(0).toISOString(),
+		usage: {
+			totalTokens: 1,
+			inputTokens: 1,
+			outputTokens: 0,
+			cacheWriteTokens: 0,
+			cachedReadTokens: 0,
+			reasoningTokens: 0,
+			nestedTokens: 0,
+			activeSeconds: 0,
+		},
+		attachments: [],
+	};
+	// An unknown kind, or an unknown from/to status, is not a transition this build
+	// understands, so it is malformed rather than a legitimate record.
+	assert.equal(isGoalHistoryRecord({ ...valid, kind: "not-a-transition" }), false);
+	assert.equal(isGoalHistoryRecord({ ...valid, from: "not-a-status" }), false);
+	assert.equal(isGoalHistoryRecord({ ...valid, to: "not-a-status" }), false);
+	assert.equal(isGoalHistoryRecord({ ...valid, from: 7 }), false);
+
+	// Every kind the stream covers, and every Lifecycle status, stays valid.
+	for (const kind of GOAL_TRANSITION_KINDS) {
+		assert.equal(isGoalHistoryRecord({ ...valid, kind }), true, kind);
+	}
+	for (const status of GOAL_STATUSES) {
+		assert.equal(isGoalHistoryRecord({ ...valid, from: status, to: status }), true, status);
+		assert.equal(isGoalHistoryRecord({ ...valid, kind: "cleared", from: status, to: status }), true);
+	}
+	// A creation's null previous status is still valid.
+	assert.equal(isGoalHistoryRecord({ ...valid, kind: "created", from: null }), true);
+
+	// The reader skips and counts the unknown entries beside a good record, exactly
+	// like any other malformed entry, and never returns them as records.
+	const view = readGoalHistory([
+		{ type: "custom", customType: HISTORY_ENTRY_TYPE, data: valid },
+		{ type: "custom", customType: HISTORY_ENTRY_TYPE, data: { ...valid, kind: "not-a-transition" } },
+		{ type: "custom", customType: HISTORY_ENTRY_TYPE, data: { ...valid, from: "active", to: "not-a-status" } },
+	]);
+	assert.deepEqual(view.records.map((record) => record.kind), ["paused"]);
+	assert.equal(view.malformed, 2);
+
+	// And the rendering shows the one good record, never the invented kind or status.
+	const rendered = formatGoalHistory(view);
+	assert.match(rendered, /paused\s+goal_aaaaaaaa\s+revision 3/);
+	assert.equal(rendered.includes("not-a-transition"), false, "an unknown kind is never a timeline entry");
+	assert.equal(rendered.includes("not-a-status"), false, "and neither is an unknown status");
+	assert.match(rendered, /2 history entries on this branch could not be read/);
 });
 
 test("the projection never mutates the event payload or the Goal record it came from", () => {

@@ -579,15 +579,17 @@ export class GoalStore {
 	 * fork or a tree navigation shows the timeline that belongs to the selected
 	 * branch and never one from a branch the session left behind.
 	 *
-	 * Never throws: an unreadable branch yields an empty view, exactly as a branch
-	 * without history does.
+	 * Never throws: an unreadable branch yields a view flagged `unreadable` (empty
+	 * records, but distinguishable from a branch that was read and found empty), so the
+	 * renderer can say the history could not be read rather than claiming the branch
+	 * holds none.
 	 */
 	readHistory(ctx: ExtensionContext): GoalHistoryView {
 		try {
 			return readGoalHistory(ctx.sessionManager.getBranch());
 		} catch (error) {
 			console.error("[pi-goal] failed to read Goal history:", error);
-			return { records: [], malformed: 0 };
+			return { records: [], malformed: 0, unreadable: true };
 		}
 	}
 
