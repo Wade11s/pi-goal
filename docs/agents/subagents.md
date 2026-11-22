@@ -19,7 +19,7 @@ Read this before spawning or steering a `rex-subagent`. Explicit user instructio
 | Read-only code exploration, routine research | `magpie/workbuddy/hy4flash-free` + `high`; `magpie/dgx-spark/inkling-2-mini` + `high` | `magpie/stepfun-cn/step-5-preview` + `medium`; `magpie/zhipu/glm-5.3-flash` + `high`; `magpie/deepai/glm-5.3-flash` + `medium` |
 | Routine implementation, localized fixes, test runs | `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/mistral/deepseek-v4-1-flash-1017` + `high` | `magpie/kimi-code-cn/k3.1-pro` + `high`; `magpie/deepai/deepseek-v4.1-flash` + `high` |
 | Cross-module implementation, difficult debugging, architecture analysis | `magpie/kimi-code-cn/k3.1-pro` + `high → max` | `magpie/zhipu/glm-5.3` + `high → max`; `magpie/workbuddy/deepseek-v4.1-flash` + `max` |
-| Independent code review, second opinion | `magpie/grok/grok-4.7-build-fast@500k` + `high`; `magpie/zhipu/glm-5.3` + `high` | `magpie/dgx-spark/inkling-2-mini` + `max`; `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/deepai/muse-ember` + `medium` |
+| Independent code review, second opinion | `magpie/grok/grok-4.7@500k` + `high`; `magpie/zhipu/glm-5.3` + `high` | `magpie/dgx-spark/inkling-2-mini` + `max`; `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/deepai/muse-ember` + `medium` |
 | Security review, data-loss risk, final high-risk review | `magpie/grok/grok-4.7@500k` + `xhigh` | A different model family from the implementer: `magpie/zhipu/glm-5.3` + `max` or `magpie/kimi-code-cn/k3.1-pro` + `max` |
 
 ## Load balancing
@@ -34,7 +34,7 @@ magpie/stepfun-cn/step-5-preview:high
 For each new independent-review task, alternate between:
 
 ```text
-magpie/grok/grok-4.7-build-fast@500k:high
+magpie/grok/grok-4.7@500k:high
 ↔ magpie/zhipu/glm-5.3:high
 ```
 
