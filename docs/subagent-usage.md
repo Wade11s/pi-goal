@@ -153,18 +153,25 @@ notice.
 
 ## Conformance
 
-`test/helpers/subagent-usage-conformance.mjs` runs the same six public-seam cases
-against a provider adapter:
+`test/helpers/subagent-usage-conformance.mjs` runs the same seven public-seam
+cases against a provider adapter:
 
 1. spawn baseline, first/repeated/zero-delta observations, and complete Usage;
 2. parallel runs, repeated handles, and overlapping observations;
-3. malformed, regressed, negative-delta, changed-generation, unrelated-parent,
-   and same-sequence-conflict rejection followed by exact recovery;
-4. adoption baseline and post-adoption delta;
-5. restart and selected-branch reconstruction with no reconstruction charge;
-6. final collection before removal.
+3. malformed, regressed, negative-delta, negative-component, changed
+   child-session, changed-generation, unrelated-parent, wrong-run-identity, and
+   same-sequence-conflict rejection followed by exact recovery;
+4. a rejected multi-run observation commits none of its cursors, so a later
+   single-run observation still collects the exact outstanding delta;
+5. adoption baseline and post-adoption delta;
+6. restart and selected-branch reconstruction with no reconstruction charge;
+7. final collection before removal.
 
-`test/goal45-subagent-usage-conformance.test.mjs` executes all six against the
+Every observation assertion also enforces the seam itself: no child
+active/elapsed field name may appear in the returned result, and the planted
+child-active fixtures appear nowhere in it, `content` included.
+
+`test/goal45-subagent-usage-conformance.test.mjs` executes all seven against the
 deterministic fake provider and released Rex v0.2.0. The fake is file-backed for
 fixture administration, but every behavior under test is returned by its real
 Pi custom tools. Rex uses the isolated released-provider environment from

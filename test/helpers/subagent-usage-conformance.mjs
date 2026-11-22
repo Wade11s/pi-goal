@@ -83,12 +83,14 @@ function assertSuccess(event) {
 	assert.equal(event.result?.isError, undefined, resultText(event));
 	assert.equal(event.result?.details?.version, 1);
 	assert.equal(typeof event.result?.details?.parentSessionId, "string");
+	assertNoChildElapsed(event);
 }
 
 function assertFailure(event, pattern = /invalid|regress|negative|generation|owner|parent|conflict|baseline/i) {
 	assert.equal(event.isError, true, resultText(event));
 	assert.equal(event.result?.usage, undefined, "a rejected observation never charges usage");
 	assert.match(resultText(event), pattern);
+	assertNoChildElapsed(event);
 }
 
 function assertUsage(event, expected) {
@@ -111,17 +113,39 @@ function assertCursor(event, runId, sequence, cumulative) {
 	assert.equal(typeof (actual.generation ?? actual.childSessionGeneration), "string");
 }
 
-/** Only token Usage crosses the seam: no child active/elapsed time is representable. */
-function assertNoChildElapsed(value) {
+/** The child active time the fake keeps only in its private run record. */
+const PLANTED_CHILD_ACTIVE_MS = [123456, 987654];
+
+/**
+ * Only token Usage crosses the seam: no child active/elapsed time is representable.
+ *
+ * Every observation assertion calls this, so no case can skip it: the field-name
+ * walk covers `usage`, `details`, and `content`, and the planted-value scan covers
+ * the serialized result as a whole, including free-form text a provider might use
+ * to smuggle a duration into `content`.
+ */
+function assertNoChildElapsed(event) {
+	const serialized = JSON.stringify(event.result ?? null);
+	for (const planted of PLANTED_CHILD_ACTIVE_MS) {
+		assert.ok(
+			!serialized.includes(String(planted)),
+			`planted child active time ${planted} must not cross the tool-result seam`,
+		);
+	}
 	const visit = (current) => {
 		if (!current || typeof current !== "object") return;
+		if (Array.isArray(current)) {
+			for (const item of current) visit(item);
+			return;
+		}
 		for (const [key, child] of Object.entries(current)) {
 			assert.doesNotMatch(key, /active|elapsed/i, `child time field ${key} must not cross the tool-result seam`);
 			visit(child);
 		}
 	};
-	visit(value.result?.usage);
-	visit(value.result?.details);
+	visit(event.result?.usage);
+	visit(event.result?.details);
+	visit(event.result?.content);
 }
 
 function snapshotFor(provider, current, sequence, usage, overrides = {}) {
@@ -300,14 +324,12 @@ export function runSubagentUsageConformance({ name, skip, createProvider }) {
 		const baseline = cursor(spawned, runId);
 		assert.equal(baseline.sequence, 0);
 		assert.equal(baseline.cumulative.totalTokens, 0);
-		assertNoChildElapsed(spawned);
 
 		const current = await provider.snapshot(runId);
 		await provider.publish(runId, snapshotFor(provider, current, 7, FIRST_USAGE));
 		const first = await provider.observe([runId]);
 		assertUsage(first, FIRST_USAGE);
 		assertCursor(first, runId, 7, FIRST_USAGE);
-		assertNoChildElapsed(first);
 
 		assertZeroDelta(await provider.observe([runId]), runId, 7);
 		await provider.publish(runId, snapshotFor(provider, current, 8, FIRST_USAGE));
@@ -341,23 +363,77 @@ export function runSubagentUsageConformance({ name, skip, createProvider }) {
 
 		const malformed = snapshotFor(provider, original, 3, SECOND_USAGE);
 		malformed.usage = { ...SECOND_USAGE, input: "not-a-number" };
+		// One fail-closed rule per entry, with the rejection text pinned: a deleted
+		// check that silently clamps, resets, or zero-defaults cannot pass here.
 		const cases = [
-			malformed,
-			snapshotFor(provider, original, 1, SECOND_USAGE),
-			snapshotFor(provider, original, 3, { ...FIRST_USAGE, input: FIRST_USAGE.input - 1 }),
-			snapshotFor(provider, original, 3, SECOND_USAGE, { childSessionGeneration: `${original.childSessionGeneration}-changed` }),
-			snapshotFor(provider, original, 3, SECOND_USAGE, { parentSessionId: "unrelated-parent" }),
-			snapshotFor(provider, original, 2, SECOND_USAGE),
+			{ value: malformed, pattern: /invalid/i },
+			{ value: snapshotFor(provider, original, 1, SECOND_USAGE), pattern: /regress/i },
+			{
+				value: snapshotFor(provider, original, 3, { ...FIRST_USAGE, input: FIRST_USAGE.input - 1 }),
+				pattern: /negative/i,
+			},
+			// A negative component is unreadable data, not a delta to clamp: both
+			// providers reject it while parsing, before any delta is computed.
+			{ value: snapshotFor(provider, original, 3, { ...SECOND_USAGE, output: -1 }), pattern: /invalid/i },
+			{
+				value: snapshotFor(provider, original, 3, SECOND_USAGE, {
+					childSessionId: `${original.childSessionId}-changed`,
+				}),
+				pattern: /changed child session/i,
+			},
+			{
+				value: snapshotFor(provider, original, 3, SECOND_USAGE, {
+					childSessionGeneration: `${original.childSessionGeneration}-changed`,
+				}),
+				pattern: /generation/i,
+			},
+			{
+				value: snapshotFor(provider, original, 3, SECOND_USAGE, { parentSessionId: "unrelated-parent" }),
+				pattern: /parent|owner/i,
+			},
+			// The snapshot file belongs to this run but claims another run identity.
+			{
+				value: snapshotFor(provider, original, 3, SECOND_USAGE, { runId: "foreign-run-identity" }),
+				pattern: /identity|invalid/i,
+			},
+			{ value: snapshotFor(provider, original, 2, SECOND_USAGE), pattern: /conflict/i },
 		];
-		for (const value of cases) {
+		for (const { value, pattern } of cases) {
 			await provider.publish(runId, value);
-			assertFailure(await provider.observe([runId]));
+			assertFailure(await provider.observe([runId]), pattern);
 		}
 
 		await provider.publish(runId, snapshotFor(provider, original, 3, SECOND_USAGE));
 		const recovered = await provider.observe([runId]);
 		assertUsage(recovered, DELTA_USAGE);
 		assertCursor(recovered, runId, 3, SECOND_USAGE);
+	});
+
+	conformanceTest("a rejected multi-run observation commits none of its cursors", async (provider) => {
+		const a = (await provider.spawn("atomic-a")).runId;
+		const b = (await provider.spawn("atomic-b")).runId;
+		const originalA = await provider.snapshot(a);
+		const originalB = await provider.snapshot(b);
+		await provider.publish(a, snapshotFor(provider, originalA, 2, FIRST_USAGE));
+		assertUsage(await provider.observe([a]), FIRST_USAGE);
+
+		// One walk over [a, b]: `a` advances legitimately, `b` is unreadable. A
+		// provider that commits cursors per run would leave `a` at sequence 3 with
+		// nothing outstanding, so the failed call must commit neither cursor.
+		await provider.publish(a, snapshotFor(provider, originalA, 3, SECOND_USAGE));
+		const malformedB = snapshotFor(provider, originalB, 2, FIRST_USAGE);
+		malformedB.usage = { ...FIRST_USAGE, input: "not-a-number" };
+		await provider.publish(b, malformedB);
+		assertFailure(await provider.observe([a, b]), /invalid/i);
+
+		const outstandingA = await provider.observe([a]);
+		assertUsage(outstandingA, DELTA_USAGE);
+		assertCursor(outstandingA, a, 3, SECOND_USAGE);
+
+		await provider.publish(b, snapshotFor(provider, originalB, 2, FIRST_USAGE));
+		const outstandingB = await provider.observe([b]);
+		assertUsage(outstandingB, FIRST_USAGE);
+		assertCursor(outstandingB, b, 2, FIRST_USAGE);
 	});
 
 	conformanceTest("adoption establishes a free baseline and excludes earlier work", async (provider) => {
@@ -401,7 +477,6 @@ export function runSubagentUsageConformance({ name, skip, createProvider }) {
 		const stopped = await provider.stop(runId);
 		assertUsage(stopped, last.usage);
 		assert.equal(cursor(stopped, runId).final, true);
-		assertNoChildElapsed(stopped);
 		assert.equal(await provider.hasRun(runId), false, "records are removed only after final observation succeeds");
 	});
 }

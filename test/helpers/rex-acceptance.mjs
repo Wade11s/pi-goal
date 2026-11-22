@@ -645,7 +645,9 @@ export async function startRexConformanceProvider() {
 			writeFileSync(join(env.runDir(runId), "usage.json"), `${JSON.stringify({
 				version: snapshot.version,
 				source: snapshot.source,
-				runHandle: runId,
+				// Fixture administration writes exactly what the case asked for, so a
+				// snapshot that claims a foreign run identity is reachable.
+				runHandle: snapshot.runId ?? runId,
 				parentSessionId: snapshot.parentSessionId,
 				childSessionId: snapshot.childSessionId,
 				childSessionGeneration: snapshot.childSessionGeneration,
