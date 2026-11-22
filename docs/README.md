@@ -36,6 +36,8 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | --- | --- |
 | [tools.md](tools.md) | `get_goal`, `create_goal` and its creation authority, the objective's trust boundary, `update_goal` and its execution binding, structured tool responses |
 | [limitations.md](limitations.md) | What the extension does not understand, cannot preempt, or intentionally leaves to the user |
+| [codex-migration.md](codex-migration.md) | Per-capability Codex comparison and Pi-feasible follow-ups |
+| [subagent-usage.md](subagent-usage.md) | Proposed plugin-neutral usage provider contract, with Rex as one interchangeable provider |
 
 ## Testing and verification
 
