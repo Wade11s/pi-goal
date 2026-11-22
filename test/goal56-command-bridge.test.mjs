@@ -28,6 +28,7 @@ import {
 	GOAL_COMMAND_BRIDGE,
 	GOAL_COMMAND_BRIDGE_VERSION,
 	classifyGoalBridgeOutcome,
+	commandContextForBridge,
 	committedKindsFor,
 	parseGoalCommandBridgeRequest,
 } from "../src/command-bridge.ts";
@@ -411,6 +412,84 @@ test("a replacement declined through the user dialog changes nothing", async (t)
 		JSON.stringify(declined.diagnostics),
 	);
 	assert.equal(goalStateBytes(sessionFile), before, "a declined replacement writes no Goal bytes");
+});
+
+test("a bridged command cannot take over the session", () => {
+	// Pi hands a command handler session control and agent/process control. A
+	// bridged command is one Goal command on behalf of an external client, so every
+	// one of those entry points must throw instead of quietly aborting a run,
+	// compacting the context, exiting Pi, or switching the user's session.
+	const calls = [];
+	const record = (name) => (...args) => {
+		calls.push([name, ...args]);
+	};
+	const base = {
+		ui: { notify() {} },
+		mode: "rpc",
+		hasUI: true,
+		cwd: "/tmp",
+		signal: undefined,
+		isIdle: () => true,
+		isProjectTrusted: () => true,
+		hasPendingMessages: () => false,
+		getContextUsage: () => undefined,
+		getSystemPrompt: () => "",
+		abort: record("abort"),
+		shutdown: record("shutdown"),
+		compact: record("compact"),
+		newSession: record("newSession"),
+		fork: record("fork"),
+		navigateTree: record("navigateTree"),
+		switchSession: record("switchSession"),
+		reload: record("reload"),
+	};
+	const view = commandContextForBridge(base);
+
+	for (const name of [
+		"abort",
+		"shutdown",
+		"compact",
+		"newSession",
+		"fork",
+		"navigateTree",
+		"switchSession",
+		"reload",
+	]) {
+		assert.equal(typeof view[name], "function", `${name} is present so a future call fails loudly`);
+		assert.throws(() => view[name]("x"), /may not call .*\(\)/, `${name} must throw`);
+	}
+	assert.deepEqual(calls, [], "the session was never touched through the bridge context");
+
+	// The capabilities the command handler does need still work: reads pass through
+	// and `waitForIdle` is synthesized from the same `isIdle` predicate.
+	assert.equal(view.mode, "rpc");
+	assert.equal(view.isIdle(), true);
+	assert.equal(typeof view.waitForIdle, "function");
+});
+
+test("the bridge calls reply exactly once, even when the callback throws", async (t) => {
+	const dir = withTempDir(t);
+	const { pi } = await startBridgeHarness(dir);
+	let calls = 0;
+	const thrown = [];
+	pi.events.emit(GOAL_COMMAND_BRIDGE, {
+		version: GOAL_COMMAND_BRIDGE_VERSION,
+		id: "reply-throws",
+		command: `${OBJECTIVE}`,
+		reply: () => {
+			calls += 1;
+			const error = new Error("host reply channel is broken");
+			thrown.push(error);
+			throw error;
+		},
+	});
+	// The refusal mirror in the listener must not answer a request whose reply
+	// callback was already entered: one answer, attempted once.
+	const deadline = Date.now() + 5000;
+	while (calls === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.equal(calls, 1, "a throwing reply callback must not be called a second time");
+	assert.equal(thrown.length, 1);
 });
 
 test("the bridge answers a request that arrives before any session started", async (t) => {

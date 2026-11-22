@@ -28,10 +28,15 @@ One JSON request per call, over the ordinary Pi interaction surfaces (an RPC
 `prompt`, a TUI keystroke, or an extension-dispatched command):
 
 ```
-/goal-rpc {"id":"1","method":"thread/goal/get"}
-/goal-rpc {"id":"2","method":"thread/goal/set","params":{"objective":"Ship the release notes","budget":40000},"authority":"external-user"}
-/goal-rpc {"id":"3","method":"thread/goal/clear","authority":"external-user"}
+/goal-rpc {"version":1,"id":"1","method":"thread/goal/get"}
+/goal-rpc {"version":1,"id":"2","method":"thread/goal/set","params":{"objective":"Ship the release notes","budget":40000},"authority":"external-user"}
+/goal-rpc {"version":1,"id":"3","method":"thread/goal/clear","authority":"external-user"}
 ```
+
+`version` is required and must be `1`, and a request carries only `version`, `id`,
+`method`, `params`, and `authority`. A missing or future version, an unknown
+top-level field, an unknown parameter, and an unknown method are all answered
+`invalid-request` rather than ignored.
 
 | Method | Params | pi-goal equivalent |
 | --- | --- | --- |
@@ -78,8 +83,14 @@ local paths handed to pi-goal's attachment options.
 
 - A `set` against an unfinished Goal opens pi-goal's replacement confirmation; the
   call stays unanswered until the host answers the dialog (or it times out).
-- `files`/`images` paths with whitespace, and objectives beginning with
-  `--budget`/`--no-budget`/`--file`/`--image`, are refused rather than reinterpreted
+- A `set` objective is refused when pi-goal's command surface would read it as
+  something other than a create: the subcommands `pause`/`clear`/`history`/`edit`/
+  `resume`, anything led by `edit` or `resume --budget`, and anything led by
+  `--budget`/`--no-budget`/`--file`/`--image`/`--remote-image`. The refusal names
+  the collision and states that nothing ran, so a `set` can never clear, pause,
+  resume, or edit the current Goal. An objective that merely *starts* with one of
+  those words ("clear the cache") is still a create.
+- `files`/`images` paths with whitespace are refused rather than reinterpreted
   (pi-goal's command surface has no quoting).
 - `PI_GOAL_RPC_TIMEOUT_MS` bounds the wait for a pi-goal answer (default 120 s); a
   timeout is `unavailable`, never a success.

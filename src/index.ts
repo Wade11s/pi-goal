@@ -135,6 +135,7 @@ import {
 	type GoalBridgeAction,
 	type GoalBridgeDiagnostic,
 	type GoalBridgeTransition,
+	type GoalCommandBridgeRequest,
 	type GoalCommandBridgeResult,
 } from "./command-bridge.ts";
 import {
@@ -2851,11 +2852,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * The command family a parsed `/goal` command belongs to, for the bridge's
 	 * transition filter. `edit-dialog` is the interactive spelling of an objective
 	 * edit: over the bridge it opens the same editor and commits the same
-	 * `objective-edited` transition.
+	 * `objective-edited` transition. `history` is another read-only rendering, so it
+	 * belongs to the same family as the bare status report: nothing to commit, and
+	 * the answer is the state the branch already holds.
 	 */
 	function bridgeActionFor(command: GoalCommand): GoalBridgeAction {
 		switch (command.kind) {
 			case "status":
+			case "history":
 				return "status";
 			case "create":
 				return "create";
@@ -2887,19 +2891,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * memory and then failed its durability poll is reported as a refusal, never as
 	 * a success.
 	 */
-	async function handleBridgeRequest(payload: unknown): Promise<void> {
-		const parsed = parseGoalCommandBridgeRequest(payload);
-		if (!parsed.ok) {
-			// A malformed payload has no reply channel worth trusting: answering it
-			// would mean calling an unvalidated function from the bus.
-			return;
-		}
-		const request = parsed.request;
+	async function handleBridgeRequest(
+		request: GoalCommandBridgeRequest,
+		reply: (result: GoalCommandBridgeResult) => void,
+	): Promise<void> {
 		const ctx = sessionContext;
 		const current = store.get();
 		const publicState = current ? toPublicState(current) : null;
 		if (ctx === null) {
-			request.reply(
+			reply(
 				goalBridgeRefusal({
 					id: request.id,
 					command: request.command,
@@ -2913,7 +2913,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (bridgeInFlight) {
-			request.reply(
+			reply(
 				goalBridgeRefusal({
 					id: request.id,
 					command: request.command,
@@ -2971,7 +2971,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			transitions,
 			diagnostics,
 		};
-		request.reply(result);
+		reply(result);
 	}
 
 	// The optional companion seam (issue #56): an in-process request/response for
@@ -2979,15 +2979,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	// listener never throws into the bus and answers exactly once per request, so a
 	// companion cannot mistake a dropped reply for a committed Goal.
 	pi.events.on(GOAL_COMMAND_BRIDGE, (payload) => {
-		handleBridgeRequest(payload).catch((error: unknown) => {
+		const parsed = parseGoalCommandBridgeRequest(payload);
+		// A malformed payload has no reply channel worth trusting: answering it would
+		// mean calling an unvalidated function from the bus.
+		if (!parsed.ok) return;
+		const request = parsed.request;
+		// "Called exactly once" includes the failure case: a reply callback that
+		// throws (a broken host channel) has already been *called*, so the last-resort
+		// refusal below must not call it a second time. Attempt-once is the honest
+		// reading of the contract — the caller's own timeout covers a lost answer.
+		let answered = false;
+		const reply = (result: GoalCommandBridgeResult): void => {
+			if (answered) return;
+			answered = true;
+			request.reply(result);
+		};
+		handleBridgeRequest(request, reply).catch((error: unknown) => {
 			try {
-				const parsed = parseGoalCommandBridgeRequest(payload);
-				if (!parsed.ok) return;
 				const goal = store.get();
-				parsed.request.reply(
+				reply(
 					goalBridgeRefusal({
-						id: parsed.request.id,
-						command: parsed.request.command,
+						id: request.id,
+						command: request.command,
 						message: `pi-goal error: ${describeError(error)}`,
 						goal: goal ? toPublicState(goal) : null,
 						admissionEnabled: admission.enabled,

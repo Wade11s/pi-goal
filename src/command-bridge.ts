@@ -267,10 +267,18 @@ const IDLE_POLL_MS = 15;
  * same predicate, so waiting is an observable poll of it rather than a second
  * interpretation of idleness.
  *
- * The session-control methods a bridge must never perform (`newSession`, `fork`,
- * `navigateTree`, `switchSession`, `reload`) are present but throw: `/goal` does
- * not call them, so a future change that started to would fail loudly instead of
- * silently switching a user's session out from under an external client.
+ * The capabilities a bridged command must never use are absent by contract: Pi
+ * hands a command handler session control (`newSession`, `fork`, `navigateTree`,
+ * `switchSession`, `reload`) and agent/process control (`abort`, `shutdown`,
+ * `compact`), while a bridged command is one Goal command on behalf of an
+ * external client. `/goal` uses none of them, so they are present but throw:
+ * a future change that started to would fail loudly instead of silently
+ * switching, compacting, aborting, or shutting down a user's session out from
+ * under an external caller. That is the whole session-control surface of
+ * {@link ExtensionCommandContext}/{@link ExtensionContext}, so "no session
+ * control" is an exhaustive promise rather than a list of favourite methods.
+ * `signal` stays readable (it is the *current* run's signal, and reading it
+ * cannot cancel anything); only the mutating entry points throw.
  */
 export function commandContextForBridge(ctx: ExtensionContext): ExtensionCommandContext {
 	const base = ctx as ExtensionContext & Partial<ExtensionCommandContext>;
@@ -288,11 +296,18 @@ export function commandContextForBridge(ctx: ExtensionContext): ExtensionCommand
 							await new Promise((resolve) => setTimeout(resolve, IDLE_POLL_MS));
 						}
 					};
+				// Session control: none of these can be undone from a command that an
+				// external caller is waiting on.
 				case "newSession":
 				case "fork":
 				case "navigateTree":
 				case "switchSession":
 				case "reload":
+				// Agent and process control: aborting the user's run, compacting the
+				// context, or exiting Pi are all outside one Goal command's scope.
+				case "abort":
+				case "shutdown":
+				case "compact":
 					return forbidden(String(property));
 				case "getSystemPromptOptions":
 					if (typeof base.getSystemPromptOptions === "function") return base.getSystemPromptOptions.bind(ctx);

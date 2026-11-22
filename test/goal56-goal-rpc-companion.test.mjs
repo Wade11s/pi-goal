@@ -47,6 +47,8 @@ import {
 
 const COMPANION = join(import.meta.dirname, "..", "companion", "goal-rpc");
 const RESPONSE_ENTRY = "goal-rpc-response";
+/** The request envelope version the companion requires. */
+const REQUEST_VERSION = 1;
 const OBJECTIVE = "Ship the release notes page";
 const REPLACEMENT = "Ship the migration guide instead";
 
@@ -111,7 +113,7 @@ async function waitForSuperseded(session, timeoutMs = 15_000) {
  * host answers the dialog.
  */
 function submit(session, id, method, params, authority) {
-	const request = { id, method };
+	const request = { version: REQUEST_VERSION, id, method };
 	if (params !== undefined) request.params = params;
 	if (authority !== undefined) request.authority = authority;
 	const promptId = `goal-rpc-${id}`;
@@ -122,9 +124,31 @@ function submit(session, id, method, params, authority) {
 	return { accepted, response: waitForResponse(session, id) };
 }
 
+/**
+ * Submit one arbitrary request object, including envelopes the helper would never
+ * build (a missing or future `version`, an unknown top-level field).
+ */
+function submitRaw(session, id, request) {
+	const promptId = `goal-rpc-raw-${id}`;
+	const accepted = session.waitFor(`prompt response ${promptId}`, (records) =>
+		records.find((record) => record.type === "response" && record.id === promptId),
+	);
+	session.writeCommand({ id: promptId, type: "prompt", message: `/goal-rpc ${JSON.stringify(request)}` });
+	return { accepted, response: waitForResponse(session, id) };
+}
+
 /** Submit one method call that needs no dialog, and return its structured response. */
 async function call(session, id, method, params, authority) {
 	const { accepted, response } = submit(session, id, method, params, authority);
+	const prompt = await accepted;
+	assert.equal(prompt.success, true, `the request was rejected: ${JSON.stringify(prompt)}`);
+	assert.equal(prompt.data.disposition, "handled", "an extension command handles the prompt instead of starting a run");
+	return response;
+}
+
+/** Submit one raw request object and return its structured response. */
+async function callRaw(session, id, request) {
+	const { accepted, response } = submitRaw(session, id, request);
 	const prompt = await accepted;
 	assert.equal(prompt.success, true, `the request was rejected: ${JSON.stringify(prompt)}`);
 	assert.equal(prompt.data.disposition, "handled", "an extension command handles the prompt instead of starting a run");
@@ -385,7 +409,7 @@ test("invalid budgets are refused by pi-goal's own budget rules", async (t) => {
 	);
 	assert.equal(flagObjective.ok, false);
 	assert.equal(flagObjective.error.code, "invalid-request");
-	assert.match(flagObjective.error.message, /may not begin with/);
+	assert.match(flagObjective.error.message, /collides with pi-goal's \/goal command surface/);
 	assert.equal(await goalBytes(session), "");
 
 	// The same command surface still accepts a valid budget afterwards: the
@@ -543,4 +567,131 @@ test("the companion works without pi-goal and reports it as unavailable", async 
 	assert.match(malformed.error.message, /not valid JSON/);
 	assert.equal(malformed.method, "");
 	assertStepsConsumed(session, 0);
+});
+
+test("an objective the command surface would read as a lifecycle command is refused", async (t) => {
+	tempDir(t);
+	const session = await PiRpcSession.start({ extraExtensions: [COMPANION] });
+	t.after(() => session.stop());
+	script(
+		[
+			// The Goal that must survive every refusal below.
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+			// The two ordinary objectives that merely *start* with a lifecycle word.
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
+
+	const created = await call(session, "set-base", "thread/goal/set", { objective: OBJECTIVE }, "external-user");
+	assert.equal(created.ok, true, JSON.stringify(created));
+	await waitForSnapshot(
+		session,
+		(snapshot) => snapshot.data.goal?.status === "complete",
+		"the base Goal to complete",
+	);
+	// `set` renders `/goal <objective>`, so these objectives would not create a Goal
+	// at all: they would clear, pause, resume, or edit the *current* one. Each must be
+	// refused before any command text exists.
+	const before = await goalBytes(session);
+	const beforeSnapshots = goalSnapshots(readSessionEntries(await session.sessionFile())).length;
+	const collisions = [
+		["set-clear-word", "clear", /rendered as \/goal clear/],
+		["set-pause-word", "pause", /rendered as \/goal pause/],
+		["set-history-word", "history", /rendered as \/goal history/],
+		["set-resume-word", "resume", /rendered as \/goal resume/],
+		["set-edit-word", "edit", /rendered as \/goal edit/],
+		["set-edit-objective", "edit the release notes", /rendered as \/goal edit the release notes/],
+		["set-resume-budget", "resume --budget 90000", /resume the current Goal with a new budget/],
+		["set-leading-option", "--no-budget do something else", /token as an option/],
+	];
+	for (const [id, objective, pattern] of collisions) {
+		const refused = await call(session, id, "thread/goal/set", { objective }, "external-user");
+		assert.equal(refused.ok, false, `${objective} must be refused`);
+		assert.equal(refused.disposition, "invalid-request");
+		assert.equal(refused.error.code, "invalid-request");
+		assert.match(refused.error.message, pattern);
+		assert.match(refused.error.message, /Nothing was run and no Goal was changed/);
+		assert.match(refused.error.message, /\/goal <objective>/, "the caller is told to use the command surface");
+		assert.deepEqual(refused.transitions, [], `${objective} committed no transition`);
+		assert.equal(await goalBytes(session), before, `${objective} wrote no Goal bytes`);
+	}
+
+	// The current Goal is untouched: same identity, same status, same durable record.
+	const survived = await call(session, "get-after-collisions", "thread/goal/get");
+	assert.equal(survived.ok, true);
+	assert.equal(survived.goal.id, created.goal.id);
+	assert.equal(survived.goal.status, "complete");
+	assert.equal(survived.goal.objective, OBJECTIVE);
+	assert.equal(
+		goalSnapshots(readSessionEntries(await session.sessionFile())).length,
+		beforeSnapshots,
+		"no snapshot or tombstone was appended by a refused objective",
+	);
+
+	// An objective that merely *begins* with a lifecycle word is still a create: the
+	// guard is a parse check, not a banned-word list.
+	for (const [id, objective] of [
+		["set-clear-sentence", "clear the cache"],
+		["set-history-sentence", "history of the release"],
+	]) {
+		const ordinary = await call(session, id, "thread/goal/set", { objective }, "external-user");
+		assert.equal(ordinary.ok, true, `${objective}: ${JSON.stringify(ordinary)}`);
+		assert.equal(ordinary.goal.objective, objective, "the objective is not truncated or reinterpreted");
+		assert.equal(ordinary.goal.status, "active");
+		await waitForSnapshot(
+			session,
+			(snapshot) => snapshot.data.goal?.status === "complete" && snapshot.data.goal?.objective === objective,
+			`${objective} to complete`,
+		);
+	}
+
+	await call(session, "clear-final", "thread/goal/clear", undefined, "external-user");
+	assertStepsConsumed(session, 6);
+	assertCleanRun(session);
+});
+
+test("the request envelope is strict: version is required and unknown fields are refused", async (t) => {
+	tempDir(t);
+	const session = await PiRpcSession.start({ extraExtensions: [COMPANION] });
+	t.after(() => session.stop());
+
+	// No version: refused rather than defaulted. A request that never declared a
+	// protocol is not this package's request.
+	const noVersion = await callRaw(session, "env-no-version", { id: "env-no-version", method: "thread/goal/get" });
+	assert.equal(noVersion.ok, false);
+	assert.equal(noVersion.error.code, "invalid-request");
+	assert.match(noVersion.error.message, /must declare "version": 1/);
+
+	// A future version is refused, not guessed at.
+	const futureVersion = await callRaw(session, "env-future-version", {
+		version: REQUEST_VERSION + 1,
+		id: "env-future-version",
+		method: "thread/goal/get",
+	});
+	assert.equal(futureVersion.ok, false);
+	assert.equal(futureVersion.error.code, "invalid-request");
+	assert.match(futureVersion.error.message, /unsupported request version 2/);
+
+	// A field this package does not read is a field the caller expected something to
+	// read: ignoring it would answer `ok: true` to a request that was never sent.
+	const futureField = await callRaw(session, "env-future-field", {
+		version: REQUEST_VERSION,
+		id: "env-future-field",
+		method: "thread/goal/get",
+		futureField: true,
+	});
+	assert.equal(futureField.ok, false);
+	assert.equal(futureField.error.code, "invalid-request");
+	assert.match(futureField.error.message, /unknown top-level field "futureField"/);
+	assert.equal(futureField.goal, null);
+
+	// None of it reached pi-goal or the lifecycle.
+	assert.equal(await goalBytes(session), "");
+	assert.equal(runCount(session), 0);
+	assertCleanRun(session);
 });

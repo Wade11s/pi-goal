@@ -22,6 +22,13 @@
  * a Goal snapshot, never writes one, never touches a tombstone or a usage
  * checkpoint, and imports nothing from pi-goal.
  *
+ * Because `set` renders command *text*, the one thing this package must check
+ * itself is that the text it renders is still a create: an objective of `clear`
+ * would render `/goal clear`, which clears the current Goal. Objectives whose
+ * trimmed form the command surface parses as any non-`create` kind are refused
+ * before rendering, so a `set` can never smuggle a lifecycle subcommand (see
+ * `commandCollision`).
+ *
  * ## Why it is optional
  *
  * The companion declares no dependency on pi-goal and speaks to it only over a
@@ -51,8 +58,16 @@
  * keystroke, or an extension-dispatched command:
  *
  * ```
- * /goal-rpc {"id":"1","method":"thread/goal/set","params":{"objective":"Ship the release notes","budget":40000},"authority":"external-user"}
+ * /goal-rpc {"version":1,"id":"1","method":"thread/goal/set","params":{"objective":"Ship the release notes","budget":40000},"authority":"external-user"}
  * ```
+ *
+ * The envelope is strict and versioned: `version` must be present and equal to
+ * {@link GOAL_RPC_VERSION}, and a request carries only `version`, `id`, `method`,
+ * `params`, and `authority`. An unknown version, an unknown top-level field, an
+ * unknown parameter, and an unknown method are all `invalid-request` rather than
+ * ignored — this is a protocol boundary, not a permissive config reader, and a
+ * field the package does not read is a field the caller expected something to
+ * read.
  *
  * One response is appended to the session as a `goal-rpc-response` custom entry,
  * which Pi also publishes on its RPC stream as `entry_appended`. The response is
@@ -164,8 +179,103 @@ const ACCEPTED_PARAMS: Record<GoalRpcMethod, ReadonlySet<string>> = {
 	"thread/goal/clear": new Set(),
 };
 
+/**
+ * The accepted top-level request fields; anything else is a typo or a protocol
+ * from the future, and both are refused rather than ignored.
+ *
+ * A stricter envelope is the only honest one here: this is a protocol boundary,
+ * so a field the package does not read is a field the caller expected *something*
+ * to read. Ignoring it would run a request the host did not send while answering
+ * `ok: true`, which is exactly the sort of plausible-looking default this package
+ * refuses to invent.
+ */
+const ACCEPTED_FIELDS: ReadonlySet<string> = new Set(["version", "id", "method", "params", "authority"]);
+
 /** Leading options pi-goal's command surface would read as flags rather than as the objective. */
-const LEADING_FLAGS = ["--budget", "--no-budget", "--file", "--image"] as const;
+const LEADING_FLAGS = ["--budget", "--no-budget", "--file", "--image", "--remote-image"] as const;
+
+/**
+ * The whole-argument subcommands pi-goal's command surface accepts.
+ *
+ * Kept as a local list rather than imported: the companion must not depend on
+ * pi-goal, and a dependency would make "independently installable" a fiction.
+ * The list is therefore *synchronized by hand* with `parseGoalCommand` in
+ * `src/index.ts`, and the two are pinned together by tests on both sides.
+ */
+const LIFECYCLE_WHOLE_WORD_COMMANDS = ["pause", "clear", "history", "edit", "resume"] as const;
+
+/** One collision between an objective and the `/goal` command surface. */
+interface CommandCollision {
+	/** The subcommand or option the command surface would parse the objective as. */
+	rendered: string;
+	/** Why that parse would not create the Goal the request named. */
+	effect: string;
+}
+
+/**
+ * Does this objective render as something other than a create?
+ *
+ * The check is a local mirror of `parseGoalCommand` (and of the creation option
+ * scanner behind it), not an interpretation of the objective: it asks exactly
+ * one question — would `/goal <objective>` be read as a create? Everything the
+ * command surface treats as a lifecycle or attachment parse is named here:
+ *
+ * - the whole-argument subcommands `pause`, `clear`, `history`, `edit`, and
+ *   `resume` (matched case-insensitively, because the command surface lowercases
+ *   the first word);
+ * - any objective led by `edit`, which the command surface reads as an objective
+ *   edit, and any objective led by `resume --budget ...`, which it reads as a
+ *   budget-recovering resume;
+ * - any objective led by an option token (`--budget`, `--no-budget`, `--file`,
+ *   `--image`, `--remote-image`), which the creation scanner consumes as an
+ *   option instead of as the objective.
+ *
+ * Deliberately conservative in one direction only: an objective that merely
+ * *starts with* one of those words but keeps going (`clear the cache`,
+ * `history of the release`, `resume the migration`) is a create on both sides
+ * and stays accepted. A false negative here would let a `set` destroy or
+ * mutate the current Goal through a parse the caller never asked for, so the
+ * guard is worth its small over-refusal surface; a false positive is a stated
+ * refusal, never a silent reinterpretation.
+ */
+function commandCollision(objective: string): CommandCollision | null {
+	const trimmed = objective.trim();
+	if (trimmed === "") return null;
+	const spaceIndex = trimmed.search(/\s/);
+	const first = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
+	const remainder = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex).trim();
+	const word = first.toLowerCase();
+
+	if (remainder === "" && (LIFECYCLE_WHOLE_WORD_COMMANDS as readonly string[]).includes(word)) {
+		return {
+			rendered: `/goal ${word}`,
+			effect: `pi-goal would run the ${word} subcommand instead of creating a Goal`,
+		};
+	}
+	if (word === "edit") {
+		return {
+			rendered: `/goal edit ${remainder}`.trim(),
+			effect:
+				"pi-goal would read the text after `edit` as a new objective for the *current* Goal (or refuse it) " +
+				"instead of creating one",
+		};
+	}
+	if (word === "resume" && /^--budget(?:=|\s|$)/.test(remainder)) {
+		return {
+			rendered: `/goal ${trimmed}`,
+			effect: "pi-goal would resume the current Goal with a new budget instead of creating one",
+		};
+	}
+	if ((LEADING_FLAGS as readonly string[]).some((flag) => first === flag || first.startsWith(`${flag}=`))) {
+		return {
+			rendered: `/goal ${trimmed}`,
+			effect:
+				`pi-goal's command surface reads a leading ${LEADING_FLAGS.join("/")} token as an option, so the Goal would ` +
+				"be created with a different objective than the request named",
+		};
+	}
+	return null;
+}
 
 let generatedIds = 0;
 
@@ -185,9 +295,13 @@ function bridgeTimeoutMs(): number {
  * Validate one request envelope.
  *
  * Strict on purpose. The companion is a protocol boundary, so a typo must be a
- * typed error rather than a plausible-looking default: an unknown parameter, an
- * unknown method, or a non-object `params` is refused instead of ignored, because
- * ignoring it would silently run a *different* command than the host asked for.
+ * typed error rather than a plausible-looking default: an unknown top-level
+ * field, an unknown parameter, an unknown method, a missing or future `version`,
+ * or a non-object `params` is refused instead of ignored, because ignoring any of
+ * them would silently run a *different* request than the host sent. The version
+ * is required — not defaulted — for the same reason: a request that never
+ * declared a protocol is not this package's request, and guessing which version
+ * it meant is how a compatibility shim becomes a second command surface.
  */
 function parseRequest(text: string): ParseOutcome {
 	const fallbackId = `goal-rpc-${++generatedIds}`;
@@ -199,7 +313,7 @@ function parseRequest(text: string): ParseOutcome {
 			method: "",
 			message:
 				`Send one JSON request after /${GOAL_RPC_COMMAND}. Example: ` +
-				`/${GOAL_RPC_COMMAND} {"id":"1","method":"thread/goal/get"} ` +
+				`/${GOAL_RPC_COMMAND} {"version":${GOAL_RPC_VERSION},"id":"1","method":"thread/goal/get"} ` +
 				`(methods: ${GOAL_RPC_METHODS.join(", ")}).`,
 		};
 	}
@@ -215,6 +329,29 @@ function parseRequest(text: string): ParseOutcome {
 	const candidate = parsed as Record<string, unknown>;
 	const id = typeof candidate.id === "string" && candidate.id.length > 0 ? candidate.id : fallbackId;
 	const rawMethod = typeof candidate.method === "string" ? candidate.method : "";
+	if (candidate.version !== GOAL_RPC_VERSION) {
+		return {
+			ok: false,
+			id,
+			method: rawMethod,
+			message:
+				candidate.version === undefined
+					? `the request must declare "version": ${GOAL_RPC_VERSION}; this one declared none. Re-send it with the version field.`
+					: `unsupported request version ${JSON.stringify(candidate.version)}; this companion speaks version ${GOAL_RPC_VERSION}. ` +
+						"Upgrade the host or the companion so both speak the same version; nothing was run.",
+		};
+	}
+	for (const name of Object.keys(candidate)) {
+		if (ACCEPTED_FIELDS.has(name)) continue;
+		return {
+			ok: false,
+			id,
+			method: rawMethod,
+			message:
+				`unknown top-level field ${JSON.stringify(name)}; a request carries only ${[...ACCEPTED_FIELDS].join(", ")}. ` +
+				"Nothing was run: an ignored field could have meant anything.",
+		};
+	}
 	if (!(GOAL_RPC_METHODS as readonly string[]).includes(rawMethod)) {
 		return {
 			ok: false,
@@ -261,14 +398,18 @@ function buildCommand(method: GoalRpcMethod, params: Record<string, unknown>): {
 	if (typeof objective !== "string" || objective.trim() === "") {
 		return { ok: false, message: "thread/goal/set requires a non-empty string params.objective" };
 	}
-	const firstToken = objective.trim().split(/\s+/)[0] ?? "";
-	if ((LEADING_FLAGS as readonly string[]).some((flag) => firstToken === flag || firstToken.startsWith(`${flag}=`))) {
+	// Checked *before* the command text is rendered: a collision means the text
+	// would ask for something other than a create, and the command surface has no
+	// way to take it back. `/goal clear` from a `set` is a clear, not a Goal.
+	const collision = commandCollision(objective);
+	if (collision !== null) {
 		return {
 			ok: false,
 			message:
-				`the objective may not begin with ${JSON.stringify(firstToken)}: pi-goal's command surface reads a leading ` +
-				`${LEADING_FLAGS.join("/")} token as an option, so the Goal would be created with a different objective than ` +
-				"the request named. Reword the objective so it does not start with a leading option token.",
+				`the objective ${JSON.stringify(objective.trim())} collides with pi-goal's /goal command surface: rendered as ` +
+				`${collision.rendered}, ${collision.effect}. Nothing was run and no Goal was changed. Create the Goal ` +
+				"through the command surface (`/goal <objective>`), or use a different objective that is not read as a " +
+				"subcommand or leading option.",
 		};
 	}
 

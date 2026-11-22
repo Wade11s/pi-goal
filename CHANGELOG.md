@@ -27,7 +27,16 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   `docs/behavior/companion.md`, including the honest difference from Codex's
   private in-tree app-server methods (Codex-shaped names, not a wire-compatible
   protocol). Deterministic coverage: `test/goal56-command-bridge.test.mjs` and
-  `test/goal56-goal-rpc-companion.test.mjs`.
+  `test/goal56-goal-rpc-companion.test.mjs`. The companion refuses a `set`
+  objective that pi-goal's command surface would read as anything other than a
+  create (the subcommands `pause`/`clear`/`history`/`edit`/`resume`, anything led
+  by `edit` or `resume --budget`, and any leading option token) before rendering
+  command text, so a host `set` can never clear, pause, resume, or edit the
+  current Goal; its request envelope requires `version: 1` and refuses unknown
+  top-level fields. The bridge's session-control guard covers the whole surface Pi
+  offers a command handler (`newSession`, `fork`, `navigateTree`, `switchSession`,
+  `reload`, `abort`, `shutdown`, `compact`), and a bridged request is answered
+  exactly once even when the caller's reply callback throws.
 
 - Add the non-authoritative durable Goal audit history: every committed transition
   covered by `pi-goal:updated` is appended to the session branch as a `goal-history`

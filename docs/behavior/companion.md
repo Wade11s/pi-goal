@@ -49,7 +49,7 @@ The result:
 | --- | --- |
 | `ok` | `true` only for `committed` and `reported`, and only when the effect is in place (and, for a mutation, durable) |
 | `disposition` | `committed` · `reported` · `declined` · `refused` · `invalid` |
-| `action` | `status` · `create` · `edit` · `pause` · `resume` · `clear` · `invalid`, or `null` when the bridge refused the request itself |
+| `action` | `status` · `create` · `edit` · `pause` · `resume` · `clear` · `invalid`, or `null` when the bridge refused the request itself (`history` reports as `status`: it is another read-only rendering of the durable state) |
 | `goal` | The public Goal projection after the command (`get_goal`'s shape), or `null` |
 | `admissionEnabled` | Whether `goal.enabled` admission was on while the command ran |
 | `transitions` | The committed transitions that answer this command, in commit order |
@@ -101,7 +101,9 @@ consumer that reacts to commits should keep reading the event stream.
 ### Guards
 
 - **One command at a time.** A confirmation dialog can keep a command busy for
-  minutes, so a second bridged command is refused immediately rather than queued.
+  minutes, so a second bridged command is refused immediately rather than queued,
+  and the answer is `refused` (retryable — nothing ran) rather than `unavailable`
+  (permanently missing).
   The alternative — overlapping dialogs and interleaved transitions — is exactly
   how "which command committed?" becomes unanswerable.
 - **No session yet.** Before `session_start`, pi-goal has no session context, so
@@ -109,8 +111,16 @@ consumer that reacts to commits should keep reading the event stream.
 - **Validated envelopes.** A malformed or future-version request is dropped (it
   has no trustworthy `reply`); an unknown `version` is refused rather than
   guessed.
-- **No session control.** A bridged command may not start, fork, switch, or reload
-  a session; `/goal` never does, and a future change that did would fail loudly.
+- **No session control.** A bridged command may not start, fork, navigate, switch,
+  or reload a session, and may not abort the user's run, compact its context, or
+  shut Pi down. That is the whole session-control and agent/process-control
+  surface Pi offers a command handler, and `/goal` uses none of it; every one of
+  those methods throws a loud error from a bridged context, so a future change
+  that started to reach for one would fail visibly instead of changing a user's
+  session out from under an external caller.
+- **Exactly one answer.** `reply` is called exactly once per request, including
+  when the callback itself throws: a broken host channel is a lost answer, not a
+  second attempt.
 
 ### What the bridge is *not*
 
@@ -145,8 +155,16 @@ One JSON request per invocation, sent the way a host sends any Pi interaction (a
 RPC `prompt`, a TUI keystroke, or an extension-dispatched command):
 
 ```
-/goal-rpc {"id":"1","method":"thread/goal/set","params":{"objective":"Ship the release notes","budget":40000},"authority":"external-user"}
+/goal-rpc {"version":1,"id":"1","method":"thread/goal/set","params":{"objective":"Ship the release notes","budget":40000},"authority":"external-user"}
 ```
+
+The envelope is strict in both directions. `version` is **required** and must be
+`1`; a request with no version, or any other version, is answered
+`invalid-request` instead of being guessed at. Unknown top-level fields are
+refused for the same reason — a field this package does not read is a field the
+caller expected something to read, and ignoring it would run a different request
+than the host sent while answering `ok: true`. The accepted top-level fields are
+exactly `version`, `id`, `method`, `params`, and `authority`.
 
 | Method | Params | `/goal` equivalent |
 | --- | --- | --- |
@@ -177,14 +195,44 @@ on its RPC stream as `entry_appended`. Correlate on the echoed `id`:
 | Code | Meaning |
 | --- | --- |
 | `unauthorized` | The mutating call did not declare `"authority":"external-user"`, or declared `"model"` |
-| `invalid-request` | The envelope, method, parameter, or translated command text was not acceptable to the companion |
-| `unavailable` | pi-goal did not answer: not installed, too old to speak the bridge, or another bridged command is still running |
-| `refused` | pi-goal ran the command and refused it (disabled, not applicable, rolled back, ...) |
+| `invalid-request` | The envelope (including `version` and unknown fields), method, parameter, or translated command text was not acceptable to the companion |
+| `unavailable` | pi-goal did not answer: it is not installed (or predates the bridge), or it needed longer than the timeout. Install or upgrade pi-goal, then retry |
+| `refused` | pi-goal ran the command and refused it (disabled, not applicable, rolled back, ...), **or** did not run it because another bridged command was still in flight — retryable, and nothing changed |
 | `declined` | pi-goal ran the command, changed nothing, and reported no problem (for example a declined replacement) |
 | `invalid-command` | pi-goal could not parse the translated command text |
 
+A busy pi-goal is therefore `refused`, not `unavailable`: `unavailable` means the
+call never reached a working pi-goal, while a busy bridge answered and asked for a
+retry. A host that treats `refused` as retryable and `unavailable` as a
+reinstall/upgrade signal gets both cases right.
+
 `error.message` carries pi-goal's own diagnostics verbatim where pi-goal reported
 some, so a host can show the real reason without a second lookup.
+
+### A `set` never smuggles a lifecycle command
+
+`set` renders `/goal <options> <objective>` and runs it, so an objective the
+command surface reads as a *subcommand* would ask for something else entirely:
+`"objective":"clear"` renders `/goal clear`, which clears the current Goal. The
+companion therefore refuses an objective whose trimmed form does not parse as a
+create, **before** any command text is rendered:
+
+- the whole-argument subcommands `pause`, `clear`, `history`, `edit`, `resume`;
+- any objective led by `edit` (an Objective edit of the *current* Goal) or by
+  `resume --budget …` (a budget-recovering resume);
+- any objective led by an option token — `--budget`, `--no-budget`, `--file`,
+  `--image`, `--remote-image` — which the creation scanner consumes as an option.
+
+Each refusal is `invalid-request` with a message naming the collision and the
+subcommand it would have run, and stating that nothing ran. A refused objective
+never becomes a command, so a `set` can never clear, pause, resume, or edit the
+current Goal, and never commits a tombstone or a transition of its own.
+
+The check is a local mirror of pi-goal's parser (the companion must not import
+pi-goal), kept in sync by hand and pinned by tests on both sides. It is
+conservative in one direction only: an objective that merely *begins* with one of
+those words but keeps going is a create on both sides, so `clear the cache`,
+`history of the release`, and `resume the migration` stay accepted.
 
 ### A `set` on an unfinished Goal is a decision, not a replacement
 
@@ -235,9 +283,13 @@ can prevent that.
   draft.
 - **Path and text constraints come from the command surface.** A `files`/`images`
   path containing whitespace is refused (the command parser has no quoting), and an
-  objective that begins with `--budget`, `--no-budget`, `--file`, or `--image` is
-  refused (it would be read as an option). Both are stated refusals, not silent
-  reinterpretations.
+  objective led by `--budget`, `--no-budget`, `--file`, `--image`, or
+  `--remote-image`, or read as a lifecycle subcommand (`clear`, `pause`, `resume`,
+  `edit`, `history`), is refused (it would be read as an option or a subcommand).
+  Both are stated refusals, not silent reinterpretations.
+- **The envelope is strict and versioned.** `version: 1` is required; an unknown
+  version, an unknown top-level field, an unknown parameter, or an unknown method
+  is refused rather than ignored.
 - **Authority is declared, not provable**, as described above.
 
 ### Limits
