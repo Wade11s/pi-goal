@@ -159,6 +159,27 @@ says its clock is already stopped and that the refused Resume would be what
 restarts it after re-enabling. The per-status resume hints follow the same rule,
 so a disabled report never promises that `/goal resume` starts work.
 
+## Inspect the Goal history
+
+```
+/goal history
+```
+
+Renders the branch-local timeline of committed transitions: each record's
+identity, revision, previous and current Lifecycle statuses, timestamp, usage
+summary, Active elapsed time, and attachment manifest hashes when the Goal has
+attachments. The command is **read-only** — it reads the selected branch's
+`goal-history` entries and prints them — and the timeline it prints is
+**non-authoritative**: the durable `goal-state` snapshots and tombstones remain
+the only lifecycle authority, nothing reconstructs from history, and no command,
+tool, or option mutates a Goal from a history record.
+
+`history` is a subcommand only when it is the whole argument, exactly like
+`pause` and `clear`, so `/goal history of the release pipeline` is still an
+objective. See [Goal audit history](history.md) for what is recorded, what is
+deliberately not, the documented crash gap between a lifecycle commit and its
+history append, and how a malformed entry is surfaced.
+
 ## Status indicator
 
 When a UI exists, pi-goal publishes a compact one-line indicator under the

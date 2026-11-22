@@ -394,3 +394,13 @@ The report is present only on a successful **budgeted** completion. An
 unbudgeted Goal, a refusal, and every other `update_goal` action keep the plain
 `{ goal }` payload, so no result ever claims a budget or a remaining capacity
 the Goal does not have.
+
+## No model tool for the audit history
+
+The durable audit history (see [behavior/history.md](behavior/history.md)) is
+deliberately **not** a model tool. `get_goal` is the model's authoritative view of
+the current Goal, and the history is derived diagnostic data: exposing it as a tool
+would invite the model to treat a past record as present state — to reason from a
+revision that has since moved, or to expect a record to be replayed. The timeline
+is therefore a user-facing surface only, rendered read-only by `/goal history`,
+and no tool, command, or option mutates a Goal from a record.

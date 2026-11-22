@@ -170,6 +170,27 @@ while the test is still reading the session file. The name-collision case loads
 `test/extensions/plan-name-peer.ts`, which owns the `update_plan` name first, and
 asserts that pi-goal registers nothing, that the peer's tool is the one that runs,
 and that no Continuation names it.
+The non-authoritative Goal audit history (issue #54) is tested through the same
+RPC surface in `test/goal54-history.test.mjs`. The durable `goal-history` entries
+are read straight out of the session file and asserted against the interleaved
+`goal-state` entries — every record directly follows the snapshot or tombstone it
+describes, with the committed identity, revision, previous/current statuses,
+timestamp, usage summary, Active elapsed time, and manifest hashes — across the
+whole user-command lifecycle, a restart that renders the same timeline and then
+grows it, the budget stop and its recovery, the blocked threshold, a provider
+usage limit, a declined replacement, attachment metadata (hashes, never contents),
+and real `ctx.navigateTree()` branch navigation through `test/extensions/tree-nav.ts`,
+where each selected branch renders only its own records. Two scenarios rewrite the
+session file between sessions to reach seams a live process cannot: a truncated
+record (skipped, counted, and surfaced as a notice while the Goal reconstructs
+unchanged) and a dropped record (the crash gap between the commit and the append,
+which leaves reconstruction and the next transition correct). The read-only
+property is asserted directly — rendering appends no entry and starts no run — and
+`test/goal54-history-store.test.mjs` pins the cheaper fault matrix against a fake
+Pi API: the projection contract, silence for every refused/failed/rolled-back
+path, an injected history-append failure that leaves the committed transition
+standing, branch-local reads, and the structural validation that rejects a
+truncated record.
 
 ### Dialog timeouts
 
