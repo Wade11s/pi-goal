@@ -4,8 +4,9 @@
  * These tests cover the narrow, deterministic seams a real-Pi RPC test cannot:
  * the pure projection's exact field set and budget arithmetic, its
  * deny-by-default treatment of fields it was never told to read, the
- * failure-isolation contract of the publisher, and the absence of any network
- * path in the default wiring. The end-to-end stream a real consumer receives —
+ * failure-isolation contract of the publisher, that a refused or failed
+ * transition publishes nothing at all, and the absence of any network path
+ * in the default wiring. The end-to-end stream a real consumer receives —
  * committed-transition mirroring, sensitive-data absence across a whole
  * scenario, failure isolation against a real bus, and zero fetch attempts — is
  * covered in `test/goal55-metrics.test.mjs` against a real Pi subprocess.
@@ -173,7 +174,7 @@ test("the projection is an allowlist: sensitive record fields and future event f
 	assert.equal("objective" in metrics, false, "not even objective metadata");
 });
 
-test("a refused or failed transition produces no metric because it produces no committed event", () => {
+test("a failed durable append is not a transition: no event, therefore no metric", () => {
 	const pi = fakePi();
 	const metrics = [];
 	const publisher = createGoalMetricsPublisher({ sink: (metric) => metrics.push(metric) });
@@ -188,17 +189,69 @@ test("a refused or failed transition produces no metric because it produces no c
 	store.commit(goal);
 	assert.deepEqual(metrics.map((m) => m.kind), ["created"]);
 
-	// A failed durable write is not a transition: no event, therefore no metric.
+	// The append fails, so nothing committed: no event, therefore no metric, and
+	// the Goal is still active so the pause can simply be retried.
 	pi.failNext = 1;
-	assert.equal(store.markPaused(pi).ok, false);
+	const failed = store.markPaused(pi);
+	assert.equal(failed.ok, false);
+	assert.equal(failed.reason, "persistence");
 	assert.deepEqual(metrics.map((m) => m.kind), ["created"]);
 
-	// A genuine refusal is not a transition either.
+	// The retry commits, and the transition after it still flows: one metric per
+	// committed transition, in commit order.
 	assert.equal(store.markPaused(pi).ok, true);
 	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused"]);
 	assert.equal(store.markResumed(pi).ok, true);
 	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused", "resumed"]);
 	assert.equal(metrics[2].status, "active");
+});
+
+test("a genuine refusal produces no metric because it produces no committed event", () => {
+	const pi = fakePi();
+	const metrics = [];
+	const publisher = createGoalMetricsPublisher({ sink: (metric) => metrics.push(metric) });
+	const store = new GoalStore({
+		onDurableTransition: (kind, goal, committedAt) => {
+			publisher.publish(toGoalUpdatedEvent(kind, goal, committedAt));
+		},
+	});
+
+	const goal = store.create("Project only committed work");
+	store.stage(pi, goal);
+	store.commit(goal);
+	assert.deepEqual(metrics.map((m) => m.kind), ["created"]);
+
+	// The pause commits and publishes, and leaves the Goal paused.
+	assert.equal(store.markPaused(pi).ok, true);
+	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused"]);
+
+	// An already-paused Goal cannot be paused again. The refusal happens before
+	// anything is written, so there is no committed event and no metric.
+	const repaused = store.markPaused(pi);
+	assert.equal(repaused.ok, false);
+	assert.equal(repaused.reason, "not-eligible");
+	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused"]);
+
+	// A paused Goal cannot be completed either.
+	const completed = store.markComplete(pi);
+	assert.equal(completed.ok, false);
+	assert.equal(completed.reason, "not-eligible");
+	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused"]);
+
+	// A call prepared against revision 0 is stale now that the pause advanced the
+	// Goal: refused, not committed.
+	const stale = store.markComplete(pi, { id: goal.id, revision: 0 });
+	assert.equal(stale.ok, false);
+	assert.equal(stale.reason, "stale");
+	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused"]);
+
+	// The resume commits and publishes, and an active Goal cannot be resumed again.
+	assert.equal(store.markResumed(pi).ok, true);
+	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused", "resumed"]);
+	const reresumed = store.markResumed(pi);
+	assert.equal(reresumed.ok, false);
+	assert.equal(reresumed.reason, "not-eligible");
+	assert.deepEqual(metrics.map((m) => m.kind), ["created", "paused", "resumed"]);
 });
 
 test("a throwing or rejecting consumer is isolated: no throw, no rollback, later metrics still flow", async () => {
