@@ -110,6 +110,9 @@ to be over.
   | Bare account vocabulary | `Your billing address could not be verified; update your account details`, `Billing service temporarily unavailable; please retry later` |
 - Every stop is explained to the user through a notification and recorded on the
   Goal, so `get_goal` and bare `/goal` report the blocker and the audit count.
+  While `goal.enabled` is false the usage-limit notice names the admission
+  condition as well: the stop still lands, but the `/goal resume` it names is
+  refused until the setting is re-enabled.
 - **User actions reset the counters.** A prompt the user types (including one
   queued while the agent is busy) and an abort both restart the blocked audit and
   the anti-loop counters, and a replacement Goal starts from a fresh record.

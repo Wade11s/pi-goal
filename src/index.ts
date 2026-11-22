@@ -572,13 +572,29 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * Without it a below-threshold blocker result reads as a Goal that stays active
 	 * and therefore keeps continuing, and a terminal result hides that no
 	 * continuation was admitted either.
+	 *
+	 * The clause is status-aware, for the same reason the status report is: a
+	 * complete Goal is terminal for its identity — replacing it is a new
+	 * `/goal <objective>`, not a resume — so promising that re-enabling makes
+	 * `/goal resume` work would be false. A still-active Goal is not resumed either;
+	 * the continuation is what admission withholds from it.
 	 */
-	function admissionDisabledUpdateCondition(): string {
-		return admission.enabled
-			? ""
-			: " pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted — no automatic continuation " +
-					"and no /goal resume — until it is re-enabled; this update is a lifecycle write from work already in " +
-					"flight and stands as written.";
+	function admissionDisabledUpdateCondition(status: GoalPublicState["status"]): string {
+		if (admission.enabled) return "";
+		if (status === "complete") {
+			return (
+				" pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted — no automatic continuation " +
+				"— until it is re-enabled; a complete Goal is terminal either way, so replacing it is a new " +
+				"/goal <objective>, not a resume. This update is a lifecycle write from work already in flight and stands as " +
+				"written."
+			);
+		}
+		const resume = status === "active" ? "" : " and no /goal resume";
+		return (
+			" pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted — no automatic continuation" +
+			`${resume} — until it is re-enabled; this update is a lifecycle write from work already in flight and stands ` +
+			"as written."
+		);
 	}
 
 	/**
@@ -1534,7 +1550,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(
 					`Goal ${result.goal.id} is now usage_limited: the provider reported a usage limit ` +
 						`(${failure.evidence}). Automatic continuation has stopped; /goal resume restarts it once the ` +
-						"limit is resolved, because a usage-limited Goal never continues on its own.",
+						"limit is resolved" +
+						// The stop itself is a lifecycle write and still lands, but the resume it
+						// names is admission: saying it restarts the Goal without qualification
+						// would promise a command the disabled extension refuses.
+						(admission.enabled
+							? ", because a usage-limited Goal never continues on its own."
+							: ", but pi-goal is disabled (goal.enabled is false), so that resume is refused until the setting is " +
+								"re-enabled; a usage-limited Goal never continues on its own."),
 					"warning",
 				);
 				updateStatus(ctx);
@@ -1948,7 +1971,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text" as const,
-							text: `Goal ${completed.goal!.id} marked complete.` + admissionDisabledUpdateCondition(),
+							text: `Goal ${completed.goal!.id} marked complete.` + admissionDisabledUpdateCondition(state.status),
 						},
 					],
 					structuredContent: { goal: state },
@@ -2023,7 +2046,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 								(admission.enabled
 									? "the user restarts work with /goal resume."
 									: "the user restarts work with /goal resume once pi-goal is re-enabled.") +
-								admissionDisabledUpdateCondition(),
+								admissionDisabledUpdateCondition(state.status),
 						},
 					],
 					structuredContent: { goal: state },
@@ -2125,7 +2148,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 							"consecutive Goal turns. Automatic continuation has stopped. Report to the user what is " +
 							"blocking the work and what would unblock it; /goal resume restarts it with a fresh blocked audit" +
 							(admission.enabled ? "." : " once pi-goal is re-enabled.") +
-							admissionDisabledUpdateCondition(),
+							admissionDisabledUpdateCondition(state.status),
 					},
 				],
 				structuredContent: { goal: state },
@@ -2148,7 +2171,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				"Re-verify against the current state, take the next available safe action, and report again only if " +
 				"the same blocker persists. Never report a blocker because the work is hard, slow, uncertain, or " +
 				"incomplete." +
-				admissionDisabledUpdateCondition(),
+				admissionDisabledUpdateCondition(state.status),
 			state,
 		);
 	}

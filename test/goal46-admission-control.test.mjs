@@ -566,6 +566,16 @@ test("an in-flight run still reports its terminal update while disabled", async 
 		const completion = await second.waitForToolResult("update_goal", 1);
 		assert.equal(completion.isError, false, "a terminal update from in-flight work still works while disabled");
 		assert.equal(structuredGoal(completion.result).status, "complete");
+		// The result carries the disabled condition, and it must not imply that
+		// re-enabling makes `/goal resume` work: a complete Goal is terminal for its
+		// identity, so replacing it is a new Goal.
+		assert.match(toolText(completion.result), /pi-goal is disabled \(goal\.enabled is false\)/);
+		assert.match(toolText(completion.result), /a complete Goal is terminal either way/);
+		assert.match(toolText(completion.result), /not a resume/);
+		assert.ok(
+			!/no \/goal resume/.test(toolText(completion.result)),
+			`the completion promises a resume it can never have: ${toolText(completion.result)}`,
+		);
 		await second.waitForSettled(1);
 
 		const entries = readSessionEntries(sessionFile);
@@ -595,8 +605,11 @@ test("an in-flight provider usage-limit stop still lands while disabled", async 
 		// The terminal stop is a lifecycle write, not admission: it still lands.
 		const limited = await context.session.notifyAfter(mark, (r) => r.message.includes("is now usage_limited"));
 		assert.match(limited.message, /insufficient_quota/);
-		// The usage-limit stop keeps its own text; it is not an "admission is off" case.
-		assert.match(limited.message, /\/goal resume restarts it/);
+		// The stop keeps its own text, but it names the admission condition instead of
+		// promising a resume the disabled extension refuses.
+		assert.match(limited.message, /\/goal resume restarts it once the limit is resolved/);
+		assert.match(limited.message, /so that resume is refused until the setting is re-enabled/);
+		assert.match(limited.message, /never continues on its own/);
 
 		const entries = readSessionEntries(context.sessionFile);
 		assert.equal(lastGoalSnapshot(entries).data.goal.status, "usage_limited", "the stop is durable");

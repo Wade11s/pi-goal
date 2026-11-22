@@ -145,6 +145,10 @@ was disabled can still complete a Goal, report a blocker, or pause it, and every
 successful result carries the disabled condition in its text — including a blocker
 report below the audit threshold, which otherwise reads as a Goal that stays
 active — so the model does not read the Goal as one that will keep continuing.
+The condition follows the status the update leaves: a paused or blocked result
+names the refused `/goal resume` that re-enabling makes available again, while a
+completion says the Goal is terminal either way so that replacing it is a new
+`/goal <objective>` and not a resume.
 
 `blocked` is the blocker contract. The model calls it with
 `{ action: "blocked", blocker: "…" }` — plus `blocker_id` on every later report of
