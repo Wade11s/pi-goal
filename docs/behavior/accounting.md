@@ -4,7 +4,7 @@ How Goal-owned token usage and active elapsed time are counted, when they become
 durable, and why replay and the live path converge.
 
 [← README](../README.md) · See also [budgets](budgets.md) ·
-[persistence](persistence.md)
+[persistence](persistence.md) · [subagent usage](../subagent-usage.md)
 
 Token usage and active elapsed time are durable Goal state, recovered from the
 session after a restart, a resume, a reload, or tree navigation.
