@@ -234,6 +234,30 @@ pi-goal admits no new Goal work, so nothing unattended starts.
 
 → [Goal lifecycle](docs/behavior/lifecycle.md)
 
+### Naming the session from the Objective
+
+```json
+{ "goal": { "sessionNameFromObjective": true } }
+```
+
+`goal.sessionNameFromObjective` (default `false`) is an opt-in convenience: after a
+successful creation, pi-goal may name an otherwise unnamed session from the
+Objective, so a Goal is easier to find later in a session list.
+
+- The name is the Objective's **first line**, whitespace-collapsed and capped at
+  **80 characters**. Attachment contents never contribute: only the Objective text
+  does.
+- **A name you provided is never overwritten.** If the session already has a name,
+  pi-goal leaves it alone.
+- **An Objective edit and a Replacement Goal never rename anything**, and a
+  creation that failed, was rolled back, or was cleared while it waited names
+  nothing.
+- The name is Pi's own session metadata, not Goal state: it is not part of the
+  Lifecycle, of accounting, or of the `pi-goal:updated` event stream, and it
+  survives a restart because Pi persists it.
+
+→ [Goal lifecycle](docs/behavior/lifecycle.md)
+
 ### Optional resume prompt
 
 ```json
@@ -293,6 +317,10 @@ sessions (`--no-session`) refuse to create a Goal at all.
   provider loop, so a run can overshoot before the gate stops further work. A
   tool already in flight when the budget is crossed still finishes and is
   charged.
+- Session naming is read from Pi's effective settings at session start, so a
+  changed `goal.sessionNameFromObjective` takes effect on the next session start
+  or reload. It names only a session that has no name yet and only on a creation,
+  so a session whose name came from an earlier Goal keeps that name.
 - `goal.enabled` is read from Pi's effective settings at session start, so a
   changed value takes effect on the next session start or reload rather than
   mid-session. While the extension is disabled, an active Goal accrues no new

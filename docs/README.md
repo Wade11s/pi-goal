@@ -22,7 +22,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 
 | Doc | Covers |
 | --- | --- |
-| [behavior/lifecycle.md](behavior/lifecycle.md) | Create, replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, and the `goal.enabled` admission control |
+| [behavior/lifecycle.md](behavior/lifecycle.md) | Create, replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Objective, and the `goal.enabled` admission control |
 | [behavior/budgets.md](behavior/budgets.md) | `--budget` and `--no-budget`, settings defaults and hard maximum, cumulative budget raises, budget exhaustion and the bounded wrap-up |
 | [behavior/continuation.md](behavior/continuation.md) | The `agent_before_settle` seam, one provider request per settlement, the evidence audit, and the no-progress contract |
 | [behavior/stopping.md](behavior/stopping.md) | The Blocker identity contract, blocked-audit thresholds, anti-loop bounds, and the usage-limit classification tiers |

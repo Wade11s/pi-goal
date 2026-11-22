@@ -31,6 +31,14 @@ snapshot before reporting success. Creating a Goal through the tool does not
 send a kickoff message: the model is already mid-run, and the continuation seam
 picks the Goal up at the next settlement.
 
+Because it refuses while any Goal exists, a successful `create_goal` is always a
+fresh creation, so it is also the tool-side path for the opt-in session name: with
+`goal.sessionNameFromObjective` enabled it names an otherwise unnamed session
+from the Objective, exactly like `/goal <objective>`. A refused, failed, or
+rolled-back creation reports no Goal and names nothing. The name is not part of
+the tool result and not part of any Goal-updated event — see
+[lifecycle](behavior/lifecycle.md#naming-the-session-from-the-objective).
+
 While `goal.enabled` is false the tool is refused before anything is validated:
 the result is an error carrying the unchanged current Goal (or `goal: null`), and
 the one-shot creation authority is left intact, so a corrected call can retry once

@@ -262,6 +262,48 @@ only durable state — so it stays available while disabled, and its notice says
 that no work was started. Re-enabling restores admission, and an active Goal
 continues only at Pi's normal settlement seam.
 
+## Naming the session from the Objective
+
+```json
+{ "goal": { "sessionNameFromObjective": true } }
+```
+
+`goal.sessionNameFromObjective` (Pi settings, default `false`) is an opt-in
+convenience: after a successful creation, pi-goal may name an otherwise unnamed
+session from the Objective, so a Goal is easier to find later in a session list.
+
+- The name is the Objective's **first line**, whitespace-collapsed and capped at
+  **80 characters**. Truncation is silent — no ellipsis — because a session name is
+  a label in a selector, and the Objective stays the authoritative text. Only the
+  Objective text contributes: attachment contents are supporting material with
+  their own trust boundary and never reach a name.
+- The name is written through Pi's own seam, so it is a `session_info` entry in the
+  session file. It is **host metadata, not Goal state**: it is never persisted in a
+  snapshot, never reconstructed from a branch, never part of a `pi-goal:updated`
+  event, and never counted in accounting. It survives a restart because Pi
+  persists it.
+- The write happens **after** the durable commit it describes and only while the
+  session has no name, so it is gated by exactly the checks that decide whether a
+  creation stands.
+
+What it never does:
+
+| Case | Behavior |
+| --- | --- |
+| The setting is absent or `false` (the default) | Nothing is read and nothing is written. A non-boolean value is reported once and ignored, which keeps sessions unnamed exactly as an unset value does. |
+| The session already has a name — whether the user typed it or an earlier Goal wrote it | Left alone. A name that exists is never overwritten. |
+| An Objective edit | Never renames. The edit changes the Goal in place, not the session. |
+| A Replacement Goal | Never renames. A replacement is a new Goal in a session that already has Goal history, so naming it would relabel a session the user may already recognize. |
+| A refused, failed, or rolled-back creation | Never names. The write sits after the durable commit, so a creation that did not stand leaves no name behind. |
+| A creation cleared while it waited for the current run | Never names. The command reports that the Goal was cleared instead of claiming success, and the naming goes with the success it never had. |
+
+A failure to write the name (a full disk, an unwritable session file) is reported
+as a warning and never as a creation failure: the Goal is already durable, and the
+name is metadata about the session. Both creation paths name the session —
+`/goal <objective>` for a fresh creation and `create_goal`, which refuses while
+any Goal exists and is therefore always a fresh one — and nothing else in the
+extension ever writes a session name.
+
 These commands are **usable while work is running** and never wait for the
 agent to become idle — an active Goal's own continuation loop keeps Pi busy
 almost continuously, so a lifecycle command that waited for idle could never

@@ -389,6 +389,26 @@ reproduce the user-visible surface by hand.
 7. Remove the setting (or set it to `false`) and restart: the paused Goal is
    restored with no dialog and only `/goal resume` restarts it.
 
+## 23. Optional: naming the session from the Objective
+
+`goal.sessionNameFromObjective` (default `false`) is a convenience, not a
+Lifecycle behavior. The deterministic coverage is
+`test/goal52-session-naming.test.mjs` (a real `pi --mode rpc` session per case);
+the steps below reproduce the user-visible surface by hand.
+
+1. Add `"goal": { "sessionNameFromObjective": true }` to Pi settings and restart Pi.
+2. `/goal <objective>` in a session with no name. Expect the session name (shown in
+   the session selector and the footer) to become the Objective's first line.
+3. Name the session yourself (`/name <name>` or `ctrl+r` to rename it in place),
+   then `/goal clear` and `/goal <another objective>`. Expect your name to survive:
+   pi-goal never overwrites a name that exists.
+4. With a named session, `/goal edit <new objective>`. Expect the name to be
+   unchanged while the Goal's objective and revision change.
+5. With a named session, `/goal <another objective>` and confirm the replacement.
+   Expect the name to be unchanged again.
+6. A long objective (over 80 characters) is named with exactly its first 80
+   characters, and a multi-line objective with only its first line.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -434,6 +454,13 @@ reproduce the user-visible surface by hand.
       and unchanged.
 - [ ] `active`, `complete`, `blocked`, `usage_limited`, and `budget_limited` Goals
       are never prompted for, and a disabled extension never offers the prompt.
+- [ ] With `goal.sessionNameFromObjective: true`, `/goal <objective>` names an
+      unnamed session from the Objective's first line (whitespace-collapsed, at
+      most 80 characters), and `create_goal` does the same.
+- [ ] With the setting absent or `false`, no session is ever named.
+- [ ] A session name the user provided is never overwritten, an Objective edit and
+      a Replacement Goal never rename it, and a failed or rolled-back creation
+      leaves the session unnamed.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with

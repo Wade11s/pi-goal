@@ -86,3 +86,12 @@ what it cannot preempt, and what is intentionally left to the user.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.
+- Session naming is opt-in and one-shot in effect: it names only a session that
+  has no name yet, and only on a creation. A session whose name came from an
+  earlier Goal keeps that name until the user renames it, and pi-goal never
+  removes a name — clearing a Goal does not clear the session name, because the
+  name describes the session's history rather than the Goal that is current.
+- `goal.sessionNameFromObjective` is read from Pi's effective settings at session
+  start, so a changed value takes effect on the next session start or reload,
+  never for a Goal that already exists. A non-boolean value is reported once and
+  ignored, which leaves sessions unnamed exactly as an unset value does.
