@@ -138,7 +138,10 @@ records. A hold gate can keep a child provably mid-turn so a test can observe
 the zero-usage snapshot a running child has already published. The helper also
 drives the released CLI for adoption and second-turn fixtures, supports nested
 children on the same private server, and can crash one child to exercise
-durable-recovery diagnostics.
+durable-recovery diagnostics. Every client it spawns is retained for the
+environment's lifetime, so teardown kills and reaps them — SIGTERM, then a
+bounded SIGKILL escalation — before the temp tree goes, and a call a throwing or
+timed-out test abandoned never outlives the socket it was using.
 
 `test/goal44-rex-recovery.test.mjs` extends that acceptance through restart and
 selected-parent-branch reconstruction, parallel and overlapping observations,
@@ -150,6 +153,13 @@ zero observed usage. The restart scenario also pins observation-time V1: work
 performed while paused is charged only by the post-resume observation. These
 tests assert public tool results and Goal records; direct run-directory access
 is limited to fixture administration and crash setup.
+
+Because the nested scenario's immediate child and its real grandchild share one
+provider, its responder identifies a request by the conversation that produced
+it — the last tool result, or the prompt when there is none — and holds the
+immediate child's `rex_wait` turn until the grandchild's request has been
+observed. Neither turn is scripted by global arrival index, so the aggregate
+holds whichever child reaches the provider first.
 
 The live scenarios need a `rex` CLI; without one they skip with a message,
 because what they certify is the real released provider, not a green tick.

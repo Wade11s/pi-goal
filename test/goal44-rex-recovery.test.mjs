@@ -91,6 +91,22 @@ async function navigateTo(session, entryId) {
 	await session.notifyAfter(mark, (record) => record.message.includes(`navigated to ${entryId}`));
 }
 
+/**
+ * Resolve once `predicate` holds, or throw after `timeoutMs`.
+ *
+ * A barrier inside a provider responder must fail the scenario it belongs to,
+ * not hang it: the deterministic provider cannot answer on the responder's
+ * behalf, so an unmet barrier has to surface as a bounded failure.
+ */
+async function waitUntil(predicate, description, timeoutMs = 30_000) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		if (predicate()) return;
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+}
+
 /** A second parent must neither observe nor adopt this owner's run. */
 async function assertForeignRunRejected(t, env, handle) {
 	const foreign = await PiRpcSession.start(env.sessionOptions());
@@ -433,24 +449,49 @@ test("adoption excludes pre-adoption work and enforces ownership and re-adoption
 test("nested delegation is charged only through the immediate child's aggregate", skipLive, async (t) => {
 	const env = await startRexAcceptanceEnv({ loadProviderGlobally: true });
 	t.after(() => env.stop());
-	env.provider.setResponder(({ index, body }) => {
-		if (index === 0) {
-			return {
-				toolCalls: [{
-					name: "rex_spawn",
-					args: { prompt: "grandchild work", name: "grandchild", provider: "rexdeterministic", model: "child-model", allowNested: true },
-				}],
-			};
-		}
-		if (index === 1) {
-			const toolMessage = [...body.messages].reverse().find((message) => message.role === "tool");
-			const handle = /Spawned Rex subagent ([0-9a-f]+)/.exec(JSON.stringify(toolMessage))?.[1];
-			assert.ok(handle, `immediate child received its grandchild handle: ${JSON.stringify(body.messages)}`);
+	// The immediate child and its real grandchild share one deterministic
+	// provider, so neither turn may be scripted by global arrival index: whichever
+	// child asks first is index 0, and an index-keyed responder hands that request
+	// the other child's script — which either fails the assertion inside the HTTP
+	// handler or silently swaps the two roles. Each request is instead identified
+	// by the conversation that produced it, and the immediate child's rex_wait
+	// turn is held until the grandchild's request has provably been observed. The
+	// aggregate below is therefore proven for either arrival order.
+	const GRANDCHILD_PROMPT = "grandchild work";
+	const served = { immediate: 0, grandchild: 0 };
+	env.provider.setResponder(async ({ body }) => {
+		const messages = Array.isArray(body?.messages) ? body.messages : [];
+		const transcript = JSON.stringify(messages);
+		// The transcript is cumulative, so a turn is identified by its *last* tool
+		// result: the spawn result is still present in every later turn, and keying
+		// on "a" spawn result would hand every one of them the rex_wait script.
+		const lastToolResult = [...messages].reverse().find((message) => message.role === "tool");
+		if (lastToolResult && /Spawned Rex subagent/.test(JSON.stringify(lastToolResult))) {
+			// The immediate child's second turn: the grandchild handle is in hand.
+			served.immediate += 1;
+			await waitUntil(() => served.grandchild > 0, "the grandchild's first provider request");
+			const handle = /Spawned Rex subagent ([0-9a-f]+)/.exec(JSON.stringify(lastToolResult))?.[1];
+			assert.ok(handle, `immediate child received its grandchild handle: ${transcript}`);
 			return { toolCalls: [{ name: "rex_wait", args: { handles: [handle], timeoutMs: 60_000 } }] };
 		}
-		if (index === 2) return { text: "GRANDCHILD_DONE" };
-		if (index === 3) return { text: "IMMEDIATE_CHILD_DONE" };
-		throw new Error(`unexpected nested child provider request ${index}`);
+		if (lastToolResult) {
+			// The immediate child's third turn: the rex_wait result is in hand.
+			served.immediate += 1;
+			return { text: "IMMEDIATE_CHILD_DONE" };
+		}
+		if (transcript.includes(GRANDCHILD_PROMPT)) {
+			// The grandchild's only turn.
+			served.grandchild += 1;
+			return { text: "GRANDCHILD_DONE" };
+		}
+		// The immediate child's first turn: spawn the real grandchild.
+		served.immediate += 1;
+		return {
+			toolCalls: [{
+				name: "rex_spawn",
+				args: { prompt: GRANDCHILD_PROMPT, name: "grandchild", provider: "rexdeterministic", model: "child-model", allowNested: true },
+			}],
+		};
 	});
 	const session = await PiRpcSession.start(env.sessionOptions());
 	t.after(async () => {
@@ -499,6 +540,10 @@ test("nested delegation is charged only through the immediate child's aggregate"
 	assert.equal(goal.usage.nestedTokens, 4 * CHILD_ACCOUNTED, "the grandchild occurs once inside the immediate aggregate");
 	assert.equal(goal.usage.totalTokens, 46 + 4 * CHILD_ACCOUNTED);
 	assert.equal(env.provider.requests.length, 4);
+	// Per-process counts, not arrival indices: the aggregate holds whichever
+	// child reached the provider first, and no responder threw while deciding.
+	assert.deepEqual(served, { immediate: 3, grandchild: 1 });
+	assert.equal(env.provider.responderErrors.length, 0, JSON.stringify(env.provider.responderErrors));
 	assertStepsConsumed(session, 8);
 	assertCleanRun(session);
 	assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));

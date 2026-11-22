@@ -90,6 +90,8 @@ export class ChildProviderServer {
 		this.hold = false;
 		/** Optional per-request response script used by nested-delegation acceptance. */
 		this.responder = undefined;
+		/** Failures a responder raised, surfaced instead of crashing the HTTP handler. */
+		this.responderErrors = [];
 		this.#startHoldGate();
 		this.server = createServer((request, response) => {
 			let body = "";
@@ -101,9 +103,13 @@ export class ChildProviderServer {
 					response.writeHead(404).end();
 					return;
 				}
-				const finish = () => {
+				// The responder may be async (nested acceptance holds a child until
+				// another one has been observed), and it may throw. Either way the
+				// outcome must reach the test as a failed response plus a recorded
+				// error, never as an exception escaping this HTTP handler.
+				const finish = async () => {
 					const index = requestIndex;
-					const answer = this.responder?.({ index, body: body ? JSON.parse(body) : {} }) ?? { text: "CHILD_DONE" };
+					const answer = (await this.responder?.({ index, body: body ? JSON.parse(body) : {} })) ?? { text: "CHILD_DONE" };
 					const delta = { role: "assistant" };
 					if (answer.text !== undefined) delta.content = answer.text;
 					if (answer.toolCalls) {
@@ -145,11 +151,15 @@ export class ChildProviderServer {
 					response.write("data: [DONE]\n\n");
 					response.end();
 				};
+				const run = () => finish().catch((error) => {
+					this.responderErrors.push(error);
+					response.writeHead(500, { "content-type": "text/plain" }).end(`responder failed: ${error instanceof Error ? error.message : String(error)}`);
+				});
 				if (this.hold) {
-					this.holdGate.then(finish);
+					this.holdGate.then(run);
 					return;
 				}
-				finish();
+				run();
 			});
 		});
 	}
@@ -162,6 +172,9 @@ export class ChildProviderServer {
 	/**
 	 * Script a response from the OpenAI request body and zero-based request index.
 	 * The default remains one fixed text response; nested acceptance uses tool calls.
+	 * The responder may be async, so a scenario can hold one child until another
+	 * one has provably arrived; a throw is recorded in {@link responderErrors}
+	 * and answered as a failed response.
 	 */
 	setResponder(responder) {
 		this.responder = responder;
@@ -252,6 +265,61 @@ export function stopServer(child, exited, graceMs = 5000) {
 		}, graceMs);
 		exited.then(settle);
 		signalGroup("SIGTERM");
+	});
+}
+
+/**
+ * Kill and reap every client process an acceptance environment spawned, bounded.
+ *
+ * `runProcess` retains each handle for the environment's lifetime, so a call the
+ * test abandons — a `wait` that outlives its `--for` deadline, a `send` that
+ * never returns, a reap loop that gives up — is still reachable here. SIGTERM
+ * first, then a bounded escalation to SIGKILL, then a bounded wait for the
+ * reaps: teardown never blocks on a client that refuses to die, and never
+ * leaves one running after the socket and the temp tree are gone.
+ *
+ * These are direct children of the test process, so they are signalled
+ * individually: the test process must never signal its own process group.
+ */
+export function stopClients(children, graceMs = 2000) {
+	const live = [...children].filter((child) => child.exitCode === null && child.signalCode === null);
+	if (live.length === 0) return Promise.resolve();
+	const reaped = Promise.all(
+		live.map(
+			(child) =>
+				new Promise((resolve) => {
+					const done = () => resolve();
+					child.once("exit", done);
+					child.once("error", done);
+					child.once("close", done);
+				}),
+		),
+	);
+	const signal = (signalName) => {
+		for (const child of live) {
+			try {
+				child.kill(signalName);
+			} catch {
+				// Already dead, or never started: the reap wait settles it anyway.
+			}
+		}
+	};
+	return new Promise((resolve) => {
+		let settled = false;
+		let escalation;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(escalation);
+			resolve();
+		};
+		escalation = setTimeout(() => {
+			// SIGKILL cannot be blocked; never wait past the grace period.
+			signal("SIGKILL");
+			settle();
+		}, graceMs);
+		reaped.then(settle);
+		signal("SIGTERM");
 	});
 }
 
@@ -380,12 +448,25 @@ export async function startRexAcceptanceEnv(options = {}) {
 		PATH: [...pathPrefix, process.env.PATH].filter(Boolean).join(":"),
 	};
 
+	// Every client this environment spawns — the released CLI and the `rex`
+	// client — is a direct child of the test process. Retaining the handles is
+	// what lets teardown kill and reap a client whose call was abandoned by a
+	// throwing test or a wait timeout, instead of leaking it past the socket and
+	// the temp tree it was talking to.
+	const clients = new Set();
 	const runProcess = async (executable, args, env = sessionEnv) => {
 		const child = spawn(executable, args, {
 			cwd: root,
 			env: Object.fromEntries(Object.entries({ ...process.env, ...env }).filter(([, value]) => value !== undefined)),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		clients.add(child);
+		// Forget a client the moment it is no longer running, so teardown only
+		// ever signals processes that are still alive. Registered before the
+		// await below so an already-exited client can never be signalled.
+		const forget = () => clients.delete(child);
+		child.once("exit", forget);
+		child.once("error", forget);
 		let stdout = "";
 		let stderr = "";
 		child.stdout.on("data", (chunk) => (stdout += chunk.toString("utf8")));
@@ -412,6 +493,18 @@ export async function startRexAcceptanceEnv(options = {}) {
 		records() {
 			const runsRoot = join(agentDir, "rex-subagents");
 			return existsSync(runsRoot) ? readdirSync(runsRoot).map((handle) => this.record(handle)) : [];
+		},
+		/** Pids of the client processes this environment has left running. */
+		clientPids() {
+			return [...clients].map((child) => child.pid).filter((pid) => Number.isInteger(pid));
+		},
+		/**
+		 * Run an arbitrary client in the isolated environment. Like the CLI and the
+		 * `rex` client, its handle is retained for the environment's lifetime, so
+		 * teardown reaps it too — which is what makes that contract testable.
+		 */
+		runProcess(executable, args, env = sessionEnv) {
+			return runProcess(executable, args, env);
 		},
 		/** Run the released CLI in the same isolated environment, never the user's Rex. */
 		async cli(args, { allowFailure = false } = {}) {
@@ -477,6 +570,10 @@ export async function startRexAcceptanceEnv(options = {}) {
 				provider.releaseChild();
 				await provider.close();
 			} finally {
+				// Reap this environment's own clients first: they are direct children of
+				// the test process, and a call a throwing or timed-out test abandoned can
+				// still be running against the socket we are about to remove.
+				await stopClients(clients);
 				// Kill the whole server process group (the child Pi is a descendant)
 				// with a bounded wait, then always remove the temp tree.
 				await stopServer(rex, exited);
