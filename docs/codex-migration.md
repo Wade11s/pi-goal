@@ -15,7 +15,7 @@ substitute for the per-capability table.
 | pi-goal | `integration/complete-codex-migration-42` base `63dac78`, plus #45 on `issue-45` (P0–P3 delivery; `main` stays at `13a341f` until the spec lands) |
 | pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43, #44, and the neutral #45 suite |
 | Pi API evidence | pi-goal's declared minimum, Pi 1.5.1; selected behavior also checked against the installed Pi 1.6.0 documentation and type definitions |
-| Verification on 2026-11-23 | Before #45: `npm test` passed 564/564. The #45 branch merged the integration tip (`107d2a9`): `npm run typecheck` passed and `npm test` passed 620/620, including all 14 neutral conformance cases (seven cases against each provider) with zero skips |
+| Verification on 2026-11-22 | Before #45: `npm test` passed 564/564. The #45 branch merged the integration tip (`107d2a9`): `npm run typecheck` passed and `npm test` passed 620/620, including all 14 neutral conformance cases (seven cases against each provider) with zero skips |
 
 The comparison covers the behavior in Codex `ext/goal`, its user-facing TUI
 integration, and the corresponding pi-goal behavior. Codex's Rust implementation
