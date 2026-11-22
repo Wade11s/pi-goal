@@ -144,6 +144,35 @@ test("the derived name is capped at 80 characters", () => {
 	assert.equal(deriveSessionName(`${"y".repeat(79)} tail`), "y".repeat(79));
 });
 
+test("the cap counts code points, so an emoji is never split in half", () => {
+	// 79 ASCII characters place the truncation point exactly on a surrogate pair, so
+	// a UTF-16 slice would keep the high surrogate and drop the low one: a lone
+	// surrogate persisted verbatim into the session file.
+	const name = deriveSessionName(`${'x'.repeat(79)}🚀 launch notes`);
+	assert.equal(name, `${'x'.repeat(79)}🚀`, "the whole emoji is kept");
+	assert.equal(Array.from(name).length, 80, `expected 80 code points, got ${Array.from(name).length}`);
+	assert.equal(Array.from(name).at(-1), "🚀", "the name must not end in a lone surrogate");
+	assert.ok(name.isWellFormed(), "a name stored in the session file must be well-formed UTF-16");
+
+	// An emoji just past the cap is dropped whole rather than half-kept.
+	const justOver = deriveSessionName(`${'x'.repeat(80)}🚀 launch notes`);
+	assert.equal(justOver, "x".repeat(80));
+	assert.ok(justOver.isWellFormed());
+});
+
+test("an astral-heavy objective keeps 80 code points, not 40", () => {
+	// Each rocket is two UTF-16 code units, so a code-unit cap would stop at 40 real
+	// characters and silently halve the width the limit promises.
+	const rockets = "🚀".repeat(100);
+	const name = deriveSessionName(`${rockets} launch notes`);
+	assert.equal(name, "🚀".repeat(80));
+	assert.equal(Array.from(name).length, 80, `expected 80 code points, got ${Array.from(name).length}`);
+	assert.equal(name.length, 160, "80 astral code points are 160 UTF-16 code units");
+	assert.ok(name.isWellFormed());
+	// 80 ASCII characters are still 80 code points, so both rules agree there.
+	assert.equal(deriveSessionName("x".repeat(200)), "x".repeat(80));
+});
+
 test("an Objective with no usable text yields no name", () => {
 	assert.equal(deriveSessionName(""), "");
 	assert.equal(deriveSessionName("   "), "");

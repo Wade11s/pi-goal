@@ -370,8 +370,8 @@ the steps below reproduce the user-visible surface by hand.
 1. Add `"goal": { "sessionNameFromObjective": true }` to Pi settings and restart Pi.
 2. `/goal <objective>` in a session with no name. Expect the session name (shown in
    the session selector and the footer) to become the Objective's first line.
-3. Name the session yourself (`/rename`, or the host's equivalent), then
-   `/goal clear` and `/goal <another objective>`. Expect your name to survive:
+3. Name the session yourself (`/name <name>` or `ctrl+r` to rename it in place),
+   then `/goal clear` and `/goal <another objective>`. Expect your name to survive:
    pi-goal never overwrites a name that exists.
 4. With a named session, `/goal edit <new objective>`. Expect the name to be
    unchanged while the Goal's objective and revision change.

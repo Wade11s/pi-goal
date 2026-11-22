@@ -105,7 +105,7 @@ export function parseSessionNamingSettings(settings: unknown): SessionNamingSett
 
 /**
  * Derive a session name from an Objective: its **first line**, whitespace-collapsed,
- * capped at {@link MAX_SESSION_NAME_LENGTH} characters.
+ * capped at {@link MAX_SESSION_NAME_LENGTH} code points.
  *
  * The first line is taken before anything is collapsed, so a multi-line Objective
  * contributes only its opening line and never a run-on of every line it has. The
@@ -113,14 +113,21 @@ export function parseSessionNamingSettings(settings: unknown): SessionNamingSett
  * selector, so a predictable width matters more than signalling that text was
  * dropped, and the Objective itself remains the authoritative text.
  *
+ * The cap counts *code points*, not UTF-16 code units, because a name is persisted
+ * verbatim into the session file: slicing code units could cut a surrogate pair in
+ * half and store a lone surrogate, and it would also hold astral-heavy text to half
+ * the intended width. `Array.from` iterates code points, so a truncation can never
+ * land inside a pair.
+ *
  * The input is the Objective alone. Attachment contents are not a parameter, so
  * they cannot reach a name.
  */
 export function deriveSessionName(objective: string): string {
 	const firstLine = objective.split(/\r\n|\r|\n/, 1)[0] ?? "";
 	const collapsed = firstLine.replace(/\s+/g, " ").trim();
-	return collapsed.length > MAX_SESSION_NAME_LENGTH
-		? collapsed.slice(0, MAX_SESSION_NAME_LENGTH).trimEnd()
+	const codePoints = Array.from(collapsed);
+	return codePoints.length > MAX_SESSION_NAME_LENGTH
+		? codePoints.slice(0, MAX_SESSION_NAME_LENGTH).join("").trimEnd()
 		: collapsed;
 }
 
