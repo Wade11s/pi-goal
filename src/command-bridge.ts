@@ -217,7 +217,13 @@ export function classifyGoalBridgeOutcome(input: GoalBridgeOutcomeInput): {
 	disposition: GoalBridgeDisposition;
 } {
 	if (input.action === "invalid") return { ok: false, disposition: "invalid" };
-	if (input.action === "status") return { ok: true, disposition: "reported" };
+	if (input.action === "status") {
+		// A status read has nothing to commit, so there is no durable proof to wait
+		// for — but a read that reported a problem did not answer either, and calling
+		// that "reported" would be a success claim the caller cannot afford.
+		const failed = input.diagnostics.some((diagnostic) => diagnostic.level !== "info");
+		return { ok: !failed, disposition: failed ? "refused" : "reported" };
+	}
 	if (input.transitions.length > 0) {
 		return input.committed ? { ok: true, disposition: "committed" } : { ok: false, disposition: "refused" };
 	}

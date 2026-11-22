@@ -217,6 +217,17 @@ test("the outcome classifier never claims success it cannot prove", () => {
 		ok: true,
 		disposition: "reported",
 	});
+	// ... but a status read that reported a problem did not answer, and saying
+	// "reported" would be a success claim without a commit behind it.
+	assert.deepEqual(
+		classifyGoalBridgeOutcome({
+			action: "status",
+			transitions: [],
+			diagnostics: [{ level: "error", text: "pi-goal error: the session file could not be read" }],
+			committed: false,
+		}),
+		{ ok: false, disposition: "refused" },
+	);
 
 	assert.deepEqual(classifyGoalBridgeOutcome({ action: "invalid", transitions: [], diagnostics: [], committed: false }), {
 		ok: false,
