@@ -53,6 +53,12 @@
  * Active elapsed time, so an active-but-disabled Goal is surfaced as exactly
  * that instead of being mistaken for a continuing one.
  *
+ * `goal.sessionNameFromObjective` (Pi settings, default false) is a separate opt-in
+ * convenience: after a successful *fresh* creation it may name an otherwise unnamed
+ * session from the Objective's first line. A session name is host metadata Pi already
+ * owns, not Goal state, so it never participates in the Lifecycle, in accounting, or in
+ * the event stream, and it never overwrites a name the user provided.
+ *
  * Usage is accounted durably from finalized Pi messages and reported nested
  * usage, with stable deduplication (see `accounting.ts`). A Goal with a token
  * budget transitions to `budget_limited` when its accounted usage reaches the
@@ -101,6 +107,12 @@ import {
 } from "./goal.ts";
 import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
 import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
+import {
+	applySessionNameFromObjective,
+	parseSessionNamingSettings,
+	sessionNameSurface,
+	type SessionNamingSettings,
+} from "./session-naming.ts";
 import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
@@ -577,6 +589,41 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let admission: AdmissionSettings = { enabled: true, problems: [] };
 
 	/**
+	 * Extension-level session-naming configuration
+	 * (`goal.sessionNameFromObjective`), read from Pi's effective settings at every
+	 * session start, exactly like the admission and budget settings, so a reload
+	 * picks up a changed configuration.
+	 *
+	 * The default is `false`: naming a session is a convenience the user has to ask
+	 * for, and pi-goal otherwise leaves Pi's own session metadata alone.
+	 */
+	let sessionNaming: SessionNamingSettings = { nameFromObjective: false, problems: [] };
+
+	/**
+	 * Name the session from a freshly created Goal's Objective, when the user opted in.
+	 *
+	 * Called only from the two creation paths, and only after their durable commit
+	 * succeeded: a refused, failed, or rolled-back creation never reaches it, so a
+	 * failed Goal can never leave a name behind. The write itself is best effort — a
+	 * host failure is reported as a warning, never as a creation failure, because the
+	 * Goal is already durable and the name is metadata about the session.
+	 *
+	 * The Objective is the only source. Attachment contents have their own trust
+	 * boundary and are never folded into a name (see `./session-naming.ts`).
+	 */
+	function nameSessionFromObjective(ctx: ExtensionContext, objective: string): void {
+		const outcome = applySessionNameFromObjective(sessionNameSurface(pi), objective, sessionNaming.nameFromObjective);
+		if (outcome.kind === "failed") {
+			notify(
+				ctx,
+				`Session not named: pi-goal could not name the session from the Objective (${outcome.reason}). ` +
+					"The Goal itself is unchanged; rename the session yourself if you want a name.",
+				"warning",
+			);
+		}
+	}
+
+	/**
 	 * The refusal for an admission request that `goal.enabled` currently forbids.
 	 *
 	 * One shared tail, because every refusal has to answer the same three
@@ -781,6 +828,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// never retroactively for work already in flight.
 		admission = parseAdmissionSettings(pi.getSettings());
 		for (const problem of admission.problems) notify(ctx, problem, "warning");
+		// Session naming is read from the same effective settings, at the same seam: a
+		// changed `goal.sessionNameFromObjective` takes effect on the next session start
+		// or reload, never retroactively for a Goal that already exists.
+		sessionNaming = parseSessionNamingSettings(pi.getSettings());
+		for (const problem of sessionNaming.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
 		// A hard crash can leave the superseded identity's in-flight tail on the branch
 		// with no freeze boundary after it. Reconstruction recovers that tail into
@@ -1822,6 +1874,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// but clearing the authority also prevents a replayed model request from
 			// being treated as fresh evidence.
 			clearCreationAuthority();
+			// The tool path is always a fresh creation — it refuses while any Goal
+			// exists — so a committed creation may name an unnamed session here too,
+			// exactly like the command's. The failure paths above returned before this
+			// point, so a rolled-back creation never names anything.
+			nameSessionFromObjective(ctx, goal.objective);
 			// No separate durability poll is needed here, unlike the /goal command whose
 			// kickoff is what creates the session file: a tool call implies a running
 			// session whose file already exists, and appendEntry writes synchronously
@@ -2834,6 +2891,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// durable bar every other transition uses. This announcement waits for the
 			// on-disk poll instead, because the user-facing message must not outlive a
 			// session file that never appeared.
+			//
+			// A *fresh* creation may also name the session, and only a fresh one: a
+			// replacement is a new Goal in a session that already has Goal history, so
+			// naming it would relabel a session the user may already recognize by its
+			// old name. Every failure path above returned before this point, so a
+			// refused, failed, or rolled-back creation never names anything.
+			if (!replacing) nameSessionFromObjective(ctx, goal.objective);
 			ctx.ui.notify(
 				replacing
 					? `Goal ${goal.id} created and activated, replacing ${previous!.id}. Initial work ${delivery === "started" ? "started" : "steered into the running work"}.`

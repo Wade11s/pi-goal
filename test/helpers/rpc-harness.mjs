@@ -364,6 +364,25 @@ export class PiRpcSession {
 		return this.sendSimple("get_state");
 	}
 
+	/**
+	 * Rename the session the way an interactive user or a host does (RPC
+	 * `set_session_name`).
+	 *
+	 * This is the *user-provided* name seam: pi-goal must never overwrite it, so a
+	 * naming test needs a way to produce a name that did not come from the extension.
+	 */
+	async setSessionName(name) {
+		const id = `req-${++nextRequestId}`;
+		const responsePromise = this.waitFor(
+			`response for set_session_name ${id}`,
+			(records) => records.find((r) => r.type === "response" && r.id === id),
+		);
+		this.writeCommand({ id, type: "set_session_name", name });
+		const response = await responsePromise;
+		if (!response.success) throw new Error(`set_session_name failed: ${response.error}`);
+		return response.data;
+	}
+
 	async getCommands() {
 		return this.sendSimple("get_commands");
 	}

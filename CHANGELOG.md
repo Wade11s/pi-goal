@@ -6,6 +6,15 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the opt-in `goal.sessionNameFromObjective` setting (default `false`): after a
+  successful *fresh* creation it names an otherwise unnamed session from the
+  Objective's first line — whitespace-collapsed, capped at 80 characters, and
+  attachment-agnostic. The name is written through Pi's own `session_info` seam, so
+  it is host metadata rather than Goal state: it is never persisted in a snapshot,
+  never reconstructed from a branch, never part of the `pi-goal:updated` stream, and
+  never counted in accounting. A name that already exists is never overwritten, an
+  Objective edit and a Replacement Goal never rename anything, and a refused, failed,
+  rolled-back, or cleared-while-waiting creation names nothing.
 - Emit a local `pi-goal:updated` event on Pi's shared extension event bus after
   every meaningful durable Goal transition (creation, replacement, objective
   edit, pause, resume, budget recovery, clear, blocked, usage-limited,

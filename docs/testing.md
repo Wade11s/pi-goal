@@ -85,6 +85,19 @@ alone. The narrow injected-fault seams — a failing append at the durable commi
 the in-memory budget stop versus its durable flush, audit bookkeeping — are
 unit-tested in `test/goal48-events-store.test.mjs` against a fake Pi API.
 
+Opt-in session naming (issue #52) is tested through the same RPC seam in
+`test/goal52-session-naming.test.mjs`: the live name comes from Pi's own
+`get_state` and the durable one from the `session_info` entries in the session
+file, while a name that must *not* be written is produced through Pi's
+`set_session_name` command — the user-provided name seam, so the test's own name
+is provably not the extension's. The pure rules (the setting's default and its
+malformed-value handling, the first-line/whitespace/80-character derivation, and
+the never-overwrite and write-failure outcomes) are unit-tested against
+`src/session-naming.ts` with a fake of the two Pi seams; the RPC tests then prove
+those rules through a real session, including the two failure paths a name must
+not survive — a durable write that fails and rolls the creation back, and a
+creation cleared while it waited for the current run.
+
 ### Rex provider acceptance
 
 `test/goal43-rex-acceptance.test.mjs` accepts the *released* pi-rex-subagent
@@ -146,3 +159,7 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] a run admitted against a replaced identity cannot complete, report a
       blocker against, or pause the Goal that replaced it, and the replaced
       identity keeps its own durable superseded record
+- [ ] with `goal.sessionNameFromObjective: true`, a creation names an unnamed
+      session from the Objective's first line; with the setting absent or false,
+      no session is named; a user-provided name, an Objective edit, a Replacement
+      Goal, and a failed or rolled-back creation never change it
