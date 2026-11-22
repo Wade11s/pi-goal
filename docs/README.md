@@ -7,7 +7,8 @@ procedure, and the historical evidence behind the V1 repair programme.
 ## Reading paths
 
 - **Using pi-goal** — [README](../README.md) → [lifecycle](behavior/lifecycle.md)
-  → [attachments](behavior/attachments.md) → [budgets](behavior/budgets.md). Read [limitations](limitations.md) for the
+  → [attachments](behavior/attachments.md) → [budgets](behavior/budgets.md) →
+  [history](behavior/history.md). Read [limitations](limitations.md) for the
   honest edges.
 - **Changing behavior** — [ADR-0001](adr/0001-conservative-stopping.md) →
   [continuation](behavior/continuation.md) → [stopping](behavior/stopping.md) →
@@ -23,7 +24,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | Doc | Covers |
 | --- | --- |
 | [behavior/lifecycle.md](behavior/lifecycle.md) | Create, replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Objective, the opt-in progress-plan tool, and the `goal.enabled` admission control |
-| [behavior/attachments.md](behavior/attachments.md) | `--file`/`--image` Objective attachments: limits, the immutable artifact store, the trust boundary, restore verification, and V1 retention |
+| [behavior/attachments.md](behavior/attachments.md) | `--file`/`--image`/`--remote-image` Objective attachments: fetch security, limits, the immutable artifact store, the trust boundary, restore verification, and V1 retention |
 | [behavior/budgets.md](behavior/budgets.md) | `--budget` and `--no-budget`, settings defaults and hard maximum, cumulative budget raises, budget exhaustion and the bounded wrap-up |
 | [behavior/continuation.md](behavior/continuation.md) | The `agent_before_settle` seam, one provider request per settlement, the evidence audit, and the no-progress contract |
 | [behavior/stopping.md](behavior/stopping.md) | The Blocker identity contract, blocked-audit thresholds, anti-loop bounds, and the usage-limit classification tiers |
@@ -32,6 +33,8 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | [behavior/events.md](behavior/events.md) | The local `pi-goal:updated` event stream: payload, transition kinds, durable-before-announced ordering, no-flood rules, and listener-failure isolation |
 | [behavior/metrics.md](behavior/metrics.md) | The privacy-safe `pi-goal:metrics` projection, its allowlist, the local consumer seam, and the on-demand hosted companion's consent, redaction, retry, and credential rules |
 | [behavior/companion.md](behavior/companion.md) | The optional Codex-shaped Goal RPC companion and the generic `pi-goal:command-bridge` seam it is built on: install, protocol, creation authority, durability proof, and the intentional difference from Codex's private app-server methods |
+
+| [behavior/history.md](behavior/history.md) | The non-authoritative durable audit history: `/goal history`, what is recorded, the documented crash gap, and malformed-entry handling |
 
 ## Reference
 

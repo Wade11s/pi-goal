@@ -786,12 +786,13 @@ test("every supported image type attaches; SVG and unknown media types are refus
 		session,
 	);
 	try {
-		// A remote URL is refused as a non-local path without fetching it (#50).
+		// A URL passed to --image is refused as a non-local path without fetching
+		// it; remote images use the explicit --remote-image option (#50).
 		const remoteRefusal = await session.prompt(`/goal --image https://example.invalid/never-fetch.png ${OBJECTIVE}`);
 		assert.equal(remoteRefusal.data.disposition, "handled");
 		assert.match(
-			(await session.waitForNotify((r) => r.message.includes("accepts a local file path, not the URL"))).message,
-			/accepts a local file path, not the URL/,
+			(await session.waitForNotify((r) => r.message.includes("accepts a local file path, not a URL"))).message,
+			/Use --remote-image <https URL>/,
 		);
 		// SVG is refused by extension and by policy.
 		const svgRefusal = await session.prompt(`/goal --image ${svg} ${OBJECTIVE}`);

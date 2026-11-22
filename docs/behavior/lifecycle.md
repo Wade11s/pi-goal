@@ -24,17 +24,18 @@ is durable before it is announced.
   subcommand whenever it is the first word — objectives that merely begin with
   one of the other words (for example "clear the lint errors") are accepted.
 
-Explicit local text and image attachments use the same creation path:
+Explicit local text/images and remote images use the same creation path:
 
 ```
-/goal --file spec.md --image screenshot.png Ship the attached requirements
+/goal --file spec.md --image screenshot.png --remote-image https://example.com/diagram.png Ship the attached requirements
 ```
 
-The repeatable leading options materialize and validate every artifact before
-the snapshot commits. Disabled admission refuses the command before a
-replacement dialog or materialization; plain Objective arguments stay text.
-See [Objective attachments](attachments.md) for types, limits, trust framing,
-and failure atomicity.
+The repeatable leading options validate and materialize every artifact before
+the snapshot commits; a remote image is fetched once through the HTTPS-only,
+public-destination, bounded-read policy. Disabled admission refuses the command
+before a replacement dialog, any fetch, or any materialization; plain Objective
+arguments stay text. See [Objective attachments](attachments.md) for types,
+limits, fetch security, trust framing, and failure atomicity.
 
 ## Replace a Goal
 
@@ -79,9 +80,9 @@ own budget exhaustion is recorded on its own record only, and it never continues
 or earns a wrap-up.
 
 A replacement may select a fresh attachment manifest with leading
-`--file`/`--image` options. Both identities' committed artifacts remain in the
-extension-owned store, because an older selected branch may still reference
-them; V1 performs no destructive automatic garbage collection.
+`--file`/`--image`/`--remote-image` options. Both identities' committed artifacts
+remain in the extension-owned store, because an older selected branch may still
+reference them; V1 performs no destructive automatic garbage collection.
 
 ## Edit the objective
 
@@ -92,9 +93,9 @@ them; V1 performs no destructive automatic garbage collection.
 Changes the objective **in place**: the Goal keeps its identity, creation time,
 and revision history (the edit is the next revision), so no usage history is
 erased. Its immutable attachment manifest is retained verbatim and re-stated
-when an active Goal's edit admits work. `/goal edit --file …` and
-`/goal edit --image …` are refused with guidance: changing attachments requires
-a Replacement Goal. If the Goal is active and a run is in flight, the new objective is
+when an active Goal's edit admits work. `/goal edit --file …`,
+`/goal edit --image …`, and `/goal edit --remote-image …` are refused with
+guidance: changing attachments requires a Replacement Goal. If the Goal is active and a run is in flight, the new objective is
 delivered into that run through Pi's steering mechanism (after the current
 turn's tool calls, before the next model request), so the live work is
 redirected safely instead of being interrupted; if the session is idle, editing
@@ -158,6 +159,27 @@ the extension, is what stops the clock, while a Goal that has already stopped
 says its clock is already stopped and that the refused Resume would be what
 restarts it after re-enabling. The per-status resume hints follow the same rule,
 so a disabled report never promises that `/goal resume` starts work.
+
+## Inspect the Goal history
+
+```
+/goal history
+```
+
+Renders the branch-local timeline of committed transitions: each record's
+identity, revision, previous and current Lifecycle statuses, timestamp, usage
+summary, Active elapsed time, and attachment manifest hashes when the Goal has
+attachments. The command is **read-only** — it reads the selected branch's
+`goal-history` entries and prints them — and the timeline it prints is
+**non-authoritative**: the durable `goal-state` snapshots and tombstones remain
+the only lifecycle authority, nothing reconstructs from history, and no command,
+tool, or option mutates a Goal from a history record.
+
+`history` is a subcommand only when it is the whole argument, exactly like
+`pause` and `clear`, so `/goal history of the release pipeline` is still an
+objective. See [Goal audit history](history.md) for what is recorded, what is
+deliberately not, the documented crash gap between a lifecycle commit and its
+history append, and how a malformed entry is surfaced.
 
 ## Status indicator
 

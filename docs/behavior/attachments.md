@@ -1,7 +1,8 @@
 # Objective attachments
 
-Explicit local text files and images attached to a Goal: how they are selected,
-materialized, framed, verified, and retained.
+Explicit local text files, local images, and fetched remote images attached to
+a Goal: how they are selected, fetched, materialized, framed, verified, and
+retained.
 
 [← README](../../README.md) · See also [lifecycle](lifecycle.md) ·
 [persistence](persistence.md) · [events](events.md) · [tools](../tools.md)
@@ -12,8 +13,9 @@ The Objective is the user's finish line, stored verbatim under a strict length
 policy (3–2000 characters). Long supporting material — a specification, a
 transcript, a screenshot — does not belong inside that policy, and weakening the
 policy to admit it would weaken the Objective for everyone. Attachments are the
-separate, explicit channel: the user names the files at creation or Replacement
-Goal time, the Objective stays verbatim, and the extension owns everything else.
+separate, explicit channel: the user names the files or the HTTPS image URL at
+creation or Replacement Goal time, the Objective stays verbatim, and the
+extension owns everything else.
 
 This explicit flow is also the supported alternative to Codex's *composer
 drafts* — pending pastes and image drafts that a host assembles before sending.
@@ -26,16 +28,17 @@ attachments use.
 ## Selecting attachments
 
 ```
-/goal --file spec.md --image shot.png Ship the release with the attached material
+/goal --file spec.md --image shot.png --remote-image https://example.com/diagram.png Ship the release
 ```
 
 - `--file <path>` selects a local **text file**; `--image <path>` selects a
-  local **image**. Both are *leading* options, repeatable, mixable with the
+  local **image**; `--remote-image <https-url>` selects a **remote image** to
+  fetch once. All three are *leading* options, repeatable, mixable with the
   budget flags, and usable in the `--flag=value` spelling. Everything after the
   leading options is the Objective, so an Objective that merely contains the
   word `--file` after its first plain word is never truncated — only a genuine
-  leading flag is consumed. V1 option values are whitespace-free paths; paths
-  containing spaces are not representable by this parser.
+  leading flag is consumed. Local option values are whitespace-free paths;
+  paths containing spaces are not representable by this parser.
 - Attachment selection exists at **creation** and **Replacement Goal** time. A
   replacement confirmation is asked first exactly as for a text-only
   replacement; a declined dialog changes nothing.
@@ -55,15 +58,55 @@ attachments use.
   such parameters, and nothing is attached.
 - **Objective edit retains the manifest.** `/goal edit <objective>` keeps the
   immutable attachment manifest verbatim; an edit that starts with
-  `--file`/`--image` is refused with guidance, because changing attachments
-  requires a Replacement Goal. Editing also re-states the attachments in the
-  edit message (unchanged, as data).
+  `--file`/`--image`/`--remote-image` is refused with guidance, because changing
+  attachments requires a Replacement Goal. Editing also re-states the
+  attachments in the edit message (unchanged, as data).
 - **Disabled admission is enforced first.** While `goal.enabled` is false, an
   attachment-bearing creation or replacement is refused before the replacement
   dialog and before any byte is materialized.
-- Remote image URLs are **not** supported in V1: `--image https://…` is refused
-  up front. Remote fetching (HTTPS-only, fetched once, never refetched) is the
-  scope of issue #50.
+- **Remote images are explicit.** `--image https://…` is refused: use
+  `--remote-image <https-url>` so the user unambiguously selected a fetch.
+  Remote fetching is never inferred from plain text, a model call, or a composer
+  draft, and `create_goal` stays text-only.
+
+## Remote fetching
+
+A remote image is fetched once, at creation or Replacement Goal time, into the
+same immutable store as a local image. Every later Continuation reads the stored
+bytes and never contacts the source URL again.
+
+- **HTTPS only.** HTTP, FTP, and every other scheme are refused before a
+  connection. URL credentials (`user:password@`) are refused outright rather
+  than stripped, and the request sends no `Authorization`, `Cookie`, or
+  `Referer` header.
+- **One 15-second deadline** covers DNS resolution, every redirect, and the body
+  read. A stalled response or a stalled body is torn down at the deadline.
+- **At most three redirects**, each target revalidated exactly like the original
+  URL: HTTPS, no credentials, and a public destination. A redirect downgrade, a
+  credential-bearing target, a missing `Location`, or a target resolving to a
+  forbidden address is refused before that target is contacted.
+- **Public destinations only.** Loopback, link-local, private, unique-local,
+  IPv4-mapped private, IPv4-translatable (SIIT), well-known and local-use
+  NAT64, 6to4, Teredo, segment-routing, multicast, and other reserved or
+  documentation ranges are refused. The check runs on IP literals, on **every**
+  DNS result (not just a preferred one), and on every redirect target. The
+  validated addresses are then pinned into the connection's lookup, so a DNS
+  answer that changes between resolution and connection cannot redirect the
+  socket. The resolver's answer itself is trusted as the resolver gave it; TLS
+  certificate validation still checks the URL hostname independently.
+- **Bounded reads.** `Content-Length` over the remaining limit is refused before
+  the body is read, and a streaming body is destroyed as soon as it exceeds the
+  limit. The body is never buffered without bound; redirect bodies have a
+  separate small bound.
+- **Bytes, not the URL, decide the media type.** The fetched bytes go through the
+  same PNG/JPEG/GIF/WebP magic-byte sniffing as a local image. SVG and unknown
+  content are refused even when the URL ends in `.png` or the server labels it
+  `image/png`; a `.jpg` URL serving PNG bytes is stored as PNG.
+- **Nothing is persisted from the source.** The durable manifest records the
+  content hash, media type, byte size, and a display label derived from the URL
+  basename. The URL, its query string, and its credentials are not stored in a
+  snapshot, an event, or a metric. The source URL is not required by a later
+  Continuation.
 
 ## Limits and supported types
 
@@ -77,9 +120,10 @@ attachments use.
 | Maximum per image | 10 MiB |
 | Maximum total materialized content | 25 MiB |
 
-Sniffing — not the file extension — decides the image media type, so a renamed
-file cannot smuggle an unsupported format in. A duplicate `--file`/`--image`
-label is refused rather than silently deduplicated in the manifest.
+Sniffing — not the file extension or a remote `Content-Type` — decides the
+image media type, so a renamed file or a mislabelled response cannot smuggle an
+unsupported format in. A duplicate `--file`/`--image`/`--remote-image` label is
+refused rather than silently deduplicated in the manifest.
 
 ## Materialization and the artifact store
 
@@ -101,24 +145,28 @@ into an immutable, extension-owned store keyed by Goal identity:
   Goal that shares content with another Goal write nothing new.
 - The durable manifest — the `attachments` array on every `goal-state`
   snapshot — records each attachment's **content hash, media type, byte size,
-  and display label**. Source paths are not required for later Continuations:
-  every kickoff and Continuation re-references the manifest and re-reads the
-  store.
+  and display label**. Local source paths and remote source URLs are not
+  required for later Continuations: every kickoff and Continuation
+  re-references the manifest and re-reads the store.
 - Source validation happens before any byte is written, and the whole request
   is refused on the first problem. A write failure can leave a partially written
   directory, so any refused materialization or pre-commit snapshot failure
   retracts only the uncommitted store directory of the Goal that never
   committed.
-- Each source is read once through a descriptor opened with `O_NOFOLLOW` and a
-  non-blocking flag. Its size is checked on the opened descriptor before any
-  content-sized allocation, no more than the applicable limit plus one byte is
-  read, and a final descriptor/path check refuses a file that grew, shrank, or
+- Each local source is read once through a descriptor opened with `O_NOFOLLOW`
+  and a non-blocking flag. Its size is checked on the opened descriptor before
+  any content-sized allocation, no more than the applicable limit plus one byte
+  is read, and a final descriptor/path check refuses a file that grew, shrank, or
   was replaced during the read. A stable oversized file is refused from its
   descriptor size without being buffered.
+- Each remote source is fetched once through the bounded policy above, then its
+  bytes take exactly the local materialization path. The fetch is capped by both
+  the 10 MiB per-image limit and the remaining 25 MiB total, so a remote body
+  cannot push the Goal over the cumulative limit.
 
-**Failure atomicity**: a failed validation, materialization, or snapshot write
-leaves the previous Goal untouched (nothing appended, its artifacts intact),
-starts no kickoff, and emits no success event. A partially materialized
+**Failure atomicity**: a failed fetch, validation, materialization, or snapshot
+write leaves the previous Goal untouched (nothing appended, its artifacts
+intact), starts no kickoff, and emits no success event. A partially materialized
 request — some artifacts written, then a store write failure — retracts the
 whole uncommitted directory. Artifacts of a Goal whose snapshot *did* commit,
 including a replacement that was later retracted by its durability rollback,
@@ -215,4 +263,5 @@ a log line. See [events](events.md).
 
 Bare `/goal`, `get_goal`, and the structured tool payloads expose the manifest
 as metadata: an `Attachments:` line naming each label, media type, and size.
-The display label is the source file's basename; source paths are not kept.
+The display label is the local source file's basename, or the remote URL's
+basename after decoding; source paths and source URLs are not kept.

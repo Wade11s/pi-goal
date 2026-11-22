@@ -453,11 +453,32 @@ The durable artifacts live beside the session file:
    refused before materialization, no `pi-goal-store` entry is created, and the
    previous Goal is unchanged.
 
-SVG, unknown image bytes, empty/invalid UTF-8 text, remote URLs, more than eight
-attachments, and files over the documented limits are refused without a success
-event or kickoff. Plain Objective text mentioning `--file` remains plain text,
-and `create_goal` has no attachment parameters. This explicit flow—not inferred
+SVG, unknown image bytes, empty/invalid UTF-8 text, more than eight attachments,
+and files over the documented limits are refused without a success event or
+kickoff. Plain Objective text mentioning `--file` remains plain text, and
+`create_goal` has no attachment parameters. This explicit flow—not inferred
 composer drafts—is the V1 alternative to Codex pending pastes and image drafts.
+
+### Remote image variant
+
+Use a small image URL you control (the automated suite uses only a local HTTPS
+fixture; this manual check may use the network):
+
+```
+/goal --remote-image https://example.com/diagram.png Implement the attached diagram
+```
+
+1. Expect one fetch, then a kickoff and Continuation with the same image hash.
+   `/goal` lists the manifest label, media type, and size without the URL.
+2. Restart Pi and continue. Expect no second request to the URL and the same
+   hash; the source URL is not needed after creation.
+3. Retry with `--remote-image http://example.com/diagram.png`, a URL containing
+   `user:password@`, `https://127.0.0.1/...`, and an https URL for a hostname
+   that resolves to loopback. Expect each refusal before a Goal is written or a
+   fetch completes. A redirect to a private address, too many redirects, a
+   non-image response, and an oversized response are refused the same way.
+4. With `goal.enabled: false`, retry a remote-image creation. Expect the
+   disabled refusal before any request is attempted.
 
 ## 25. Optional: the structured progress plan (`goal.planTool`)
 
@@ -481,12 +502,46 @@ the user-visible surface by hand.
    in the tool list, no mention of it in any Continuation, and a refusal if the
    model calls it anyway.
 
+## 26. Optional: the Goal audit history
+
+After any of the transitions above, read the timeline:
+
+```
+/goal history
+```
+
+Expect one line per committed transition — identity, revision, previous and
+current Lifecycle status, timestamp, usage summary, Active elapsed time, and an
+`attachments:` line with manifest hashes when the Goal has attachments. The
+header names the timeline as non-authoritative.
+
+1. Restart the session and run `/goal history` again: the same records, because
+   they are durable session entries rather than runtime state.
+2. Run `/goal` before and after `/goal history`: nothing changes. The rendering
+   writes no `goal-state`, `goal-history`, or `goal-usage` entry and starts no
+   run, and no command mutates a Goal from a record.
+3. Pause, resume, edit, and clear, checking the timeline after each: every
+   committed transition gets exactly one record, and refusals (a second pause, a
+   second clear, a declined replacement) get none.
+4. For the malformed-entry check, stop Pi and truncate one `goal-history` line's
+   JSON payload in the session file (leave the entry's id, parent, and timestamp
+   intact). Restart: `/goal` reports the unchanged Goal, and `/goal history`
+   renders the readable records plus a notice that one entry could not be read.
+5. For the crash-gap check, stop Pi and delete one `goal-history` line, re-pointing
+   the following entry's `parentId` at the removed entry's parent. Restart: the
+   Goal is unchanged, the timeline simply has no record for that transition, and
+   the next transition appends normally.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
 - [ ] `--file`/`--image` attachments reach kickoff and Continuation with stable
       hashes, survive restart and replacement/clear retention, and fail closed
       with an explicit error when an artifact is missing or corrupt.
+- [ ] `--remote-image` fetches once over HTTPS, keeps the same hash across
+      Continuations and restarts, sends no credentials/cookies/referrer, and
+      refuses HTTP, credentials, non-public destinations, bad redirects, MIME
+      mismatches, and oversized bodies without a success event.
 - [ ] `/goal <objective>` creates an active Goal and starts work.
 - [ ] The status indicator and bare `/goal` report `active`.
 - [ ] An active Goal continues automatically after a turn.
@@ -544,6 +599,12 @@ the user-visible surface by hand.
       revision — only `update_goal` completes it.
 - [ ] With the setting absent or `false`, no `update_plan` tool is registered and
       no Continuation mentions it.
+- [ ] `/goal history` renders one record per committed transition (identity,
+      revision, previous/current status, timestamp, usage, active time, manifest
+      hashes), survives a restart, writes nothing, and mutates nothing.
+- [ ] A truncated `goal-history` entry is skipped and surfaced as a notice while
+      the Goal reconstructs unchanged, and a missing one leaves only the
+      documented diagnostic gap.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with

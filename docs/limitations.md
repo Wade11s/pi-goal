@@ -4,7 +4,7 @@ Known boundaries of the current model: what the extension does not understand,
 what it cannot preempt, and what is intentionally left to the user.
 
 [← README](../README.md) · See also [tools](tools.md) ·
-[attachments](behavior/attachments.md)
+[attachments](behavior/attachments.md) · [history](behavior/history.md)
 
 - `create_goal` (the model tool) refuses while **any** Goal exists, including a
   complete, blocked, or usage-limited one, because replacing and clearing are
@@ -29,14 +29,21 @@ what it cannot preempt, and what is intentionally left to the user.
   custom message, so a request whose exact words were never sent as text, or
   one that a newer message has replaced, is refused with `goal: null`. The user
   can always create a Goal directly with `/goal <objective>`.
-- V1 attachments are explicit **local** text files and PNG/JPEG/GIF/WebP images.
-  Remote URLs are refused rather than fetched (issue #50 owns remote fetching),
-  SVG and unknown image types are rejected, and paths containing whitespace are
-  not representable by the current leading-option parser. Pi exposes no Codex
+- V1 attachments are explicit **local** text files, local PNG/JPEG/GIF/WebP
+  images, or explicit **HTTPS** remote image URLs selected with
+  `--remote-image`. Remote fetching is one-shot at creation: a later change at
+  the source URL does not alter the Goal. The fetch refuses non-public
+  destinations — including redirect targets and every DNS result — and pins the
+  validated addresses into the connection, so DNS cannot change the destination
+  between resolution and fetch. It trusts the public origin and the resolver's
+  answer themselves, and it does not authenticate the image's contents beyond
+  the media-type sniff and size bounds. SVG and unknown image types are rejected
+  from the actual bytes, and local paths containing whitespace are not
+  representable by the current leading-option parser. Pi exposes no Codex
   composer pending-draft object, so pi-goal never infers attachments from plain
-  arguments; the explicit `/goal --file … --image …` flow is the supported
-  alternative. A model without image input depends on Pi's normal image handling
-  rather than pi-goal inventing a vision capability.
+  arguments; the explicit `/goal --file … --image … --remote-image …` flow is
+  the supported alternative. A model without image input depends on Pi's normal
+  image handling rather than pi-goal inventing a vision capability.
 - Committed attachment artifacts survive clear and replacement so historical
   branches remain reconstructable. **V1 has no destructive automatic garbage
   collection**: up to 25 MiB can remain for each historical Goal until the user
@@ -46,6 +53,13 @@ what it cannot preempt, and what is intentionally left to the user.
   but their attachments unverifiable; automatic Continuation then stops with an
   explicit error and no artifact-driven Lifecycle change until the original
   bytes are restored or the Goal is replaced.
+- `/goal history` reports the branch's `goal-history` records as they are. A
+  process that dies between a lifecycle commit and the history append leaves one
+  transition with no record: the timeline never invents a placeholder for it, and
+  the authoritative Goal — reconstructed from `goal-state` alone — is unaffected.
+  A record that is present but unreadable is skipped and counted rather than
+  trusted, so a hand-edited or truncated file produces a shorter timeline with a
+  notice, never a different Goal.
 - An edit preserves the Goal identity, creation time, origin, budget, attachment
   manifest, and usage history: only the objective changes and the revision
   advances. Changing attachments requires a Replacement Goal. Replacement of
