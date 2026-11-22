@@ -65,7 +65,9 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
 - A Goal with Objective attachments also persists their immutable manifest
   (`hash`, `mediaType`, `bytes`, `label`) in every snapshot. The bytes live in a
   content-addressed, Goal-keyed `pi-goal-store` beside the session file and are
-  materialized before the snapshot commits. Restore and branch navigation verify
+  materialized before the snapshot commits. Source paths and remote source URLs
+  are not persisted: the manifest is the complete durable identity of the
+  material. Restore and branch navigation verify
   those hashes: missing or corrupt artifacts surface an explicit error and
   suppress automatic Continuation without silently dropping the manifest or
   changing Lifecycle status. Clear and replacement retain committed artifacts

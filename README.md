@@ -18,7 +18,7 @@ extension APIs and does not patch Pi core.
 | `/goal edit [objective]` | Change the objective in place, keeping identity and history |
 | `/goal pause` · `/goal resume` · `/goal clear` | Stop admission, restart work, or remove the Goal |
 | `/goal --budget <n>` · `/goal --no-budget` | Bound unattended usage at creation |
-| `/goal --file <path>` · `/goal --image <path>` | Attach explicit local text files and images (repeatable leading options) |
+| `/goal --file <path>` · `/goal --image <path>` · `/goal --remote-image <url>` | Attach explicit local text files, local images, or fetch a remote image once (repeatable leading options) |
 | `/goal resume --budget <new-total>` | Raise a `budget_limited` Goal's cumulative ceiling |
 | `get_goal` | Structured Goal state for the model |
 | `create_goal` | Model-created Goal, only on an explicit user request |
@@ -105,15 +105,19 @@ uses Pi's host-provided packages (`peerDependencies` only).
   confirmation before replacing it; a declined, timed-out, or dismissed dialog
   keeps the current Goal untouched.
 
-Add explicit local supporting material without changing the Objective's length
+Add explicit supporting material without changing the Objective's length
 policy:
 
 ```sh
 /goal --file spec.md --image screenshot.png Ship the release using the attached requirements
+/goal --remote-image https://example.com/diagram.png Follow the attached diagram
 ```
 
-`--file` and `--image` are repeatable leading options. Plain arguments remain
-text, and model-driven `create_goal` remains text-only. See
+`--file`, `--image`, and `--remote-image <https URL>` are repeatable leading
+options. Remote images are fetched **once** at creation over HTTPS only, with no
+credentials, a 15-second deadline, at most three revalidated redirects, and
+loopback/link-local/private destinations refused. Plain arguments remain text,
+and model-driven `create_goal` remains text-only. See
 [Objective attachments](docs/behavior/attachments.md).
 
 With a UI, a compact indicator tracks the Goal:
@@ -220,18 +224,26 @@ continues automatically: only the user's `/goal resume` restarts it.
 
 ### Objective attachments
 
-Use repeatable leading `--file <path>` and `--image <path>` options at creation
-or Replacement Goal time. Text files must be non-empty UTF-8; PNG, JPEG, GIF,
-and WebP images are recognized by their bytes, while SVG and unknown types are
-refused. Limits are 8 attachments, 1 MiB per text file, 10 MiB per image, and
-25 MiB total.
+Use repeatable leading `--file <path>`, `--image <path>`, and
+`--remote-image <https-url>` options at creation or Replacement Goal time. Text
+files must be non-empty UTF-8; PNG, JPEG, GIF, and WebP images are recognized by
+their **bytes**, while SVG and unknown types are refused. Limits are 8
+attachments, 1 MiB per text file, 10 MiB per image, and 25 MiB total.
+
+A remote image is fetched once, before the snapshot commits, over HTTPS only.
+The fetch sends no credentials, cookies, or referrer, has a 15-second overall
+deadline, follows at most three revalidated redirects, and refuses loopback,
+link-local, and private-network destinations — including redirect targets and
+DNS results. The fetched bytes are validated and materialized exactly like a
+local image. The source URL is neither required later nor persisted; only the
+immutable manifest's hash, media type, byte size, and a display label derived
+from the URL basename remain.
 
 Before the Goal snapshot commits, pi-goal copies the bytes into an immutable,
-content-addressed `pi-goal-store/<goal-id>/` beside the session file. The durable
-manifest records only hash, media type, byte size, and display label. Text reaches
+content-addressed `pi-goal-store/<goal-id>/` beside the session file. Text reaches
 the model as encoded, delimited **untrusted data** under the Objective's nonce
 boundary; images use Pi's text/image content arrays. Every kickoff and
-Continuation loads the same manifest.
+Continuation loads the same manifest and never refetches a remote source.
 
 An Objective edit retains that manifest; changing attachments requires a
 Replacement Goal. Clear and replacement retain committed artifacts so historical
@@ -239,7 +251,7 @@ branches remain reconstructable: **V1 has no destructive automatic garbage
 collection**. Missing or corrupt restored artifacts produce an explicit error and
 suppress automatic Continuation without changing Lifecycle status. This explicit
 flow is the supported alternative to Codex composer drafts; Pi has no equivalent
-pending-draft object to infer. Remote URLs are not fetched (that is issue #50).
+pending-draft object to infer.
 
 → [Objective attachments](docs/behavior/attachments.md)
 
@@ -407,11 +419,16 @@ credentials.
   changed `goal.sessionNameFromObjective` takes effect on the next session start
   or reload. It names only a session that has no name yet and only on a creation,
   so a session whose name came from an earlier Goal keeps that name.
-- Attachments are explicit local files only: V1 does not fetch URLs or infer
-  Codex-style composer drafts. Committed artifacts are retained after clear and
-  replacement with no destructive automatic GC, so long-lived sessions can
-  accumulate up to 25 MiB per historical Goal. Attachment option values are
-  whitespace-free paths; use a path without spaces in V1.
+- Attachments are explicit local text/image files or explicit HTTPS remote
+  image URLs. pi-goal never infers URLs from plain arguments, model calls, or
+  Codex-style composer drafts. A remote image is fetched once; later changes at
+  the source URL do not alter the Goal. The fetch refuses non-public
+  destinations and pins the validated DNS result to the connection, so a DNS
+  change between resolution and fetch cannot redirect it; it does not otherwise
+  certify that a public origin is trustworthy. Committed artifacts are retained
+  after clear and replacement with no destructive automatic GC, so long-lived
+  sessions can accumulate up to 25 MiB per historical Goal. Local attachment
+  option values are whitespace-free paths; use a path without spaces in V1.
 - `goal.enabled` is read from Pi's effective settings at session start, so a
   changed value takes effect on the next session start or reload rather than
   mid-session. While the extension is disabled, an active Goal accrues no new
@@ -477,15 +494,16 @@ To verify the package installation and the interactive surface by hand, follow
 [docs/smoke-test.md](docs/smoke-test.md). The checklist covers installation,
 creation, automatic continuation, editing, pause/resume/clear, budget recovery,
 the status indicator, restart persistence, the clear tombstone, frozen active
-time, identity-scoped attribution of queued work, and local text/image
-attachments, including artifact retention and restore verification.
+time, identity-scoped attribution of queued work, and local plus remote-image
+attachments (fetch-once and stable hashes above all), including artifact
+retention and restore verification.
 
 ## Documentation
 
 | Doc | Contents |
 | --- | --- |
 | [Goal lifecycle](docs/behavior/lifecycle.md) | Create, replace, edit, inspect, pause, resume, clear, opt-in convenience UX, and the status indicator |
-| [Objective attachments](docs/behavior/attachments.md) | Explicit local text/images, immutable artifacts, trust framing, limits, restore verification, and V1 retention |
+| [Objective attachments](docs/behavior/attachments.md) | Explicit local text/images and HTTPS remote images, immutable artifacts, fetch security, trust framing, limits, restore verification, and V1 retention |
 | [Token budgets](docs/behavior/budgets.md) | `--budget`, settings defaults and hard maximum, raising the ceiling, budget exhaustion |
 | [Automatic continuation](docs/behavior/continuation.md) | The settlement seam and the no-progress contract |
 | [Stopping safely](docs/behavior/stopping.md) | Blocked audit, anti-loop bounds, usage-limit classification |

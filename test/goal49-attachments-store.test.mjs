@@ -111,7 +111,7 @@ test("attachment flag values are validated before anything is read", () => {
 	assert.deepEqual(validateAttachmentPath("text", "notes.md"), { ok: true, path: "notes.md" });
 	assert.equal(validateAttachmentPath("image", "https://example.com/cat.png").ok, false);
 	assert.match(validateAttachmentPath("image", "https://example.com/cat.png").error, /--image accepts a local file path/);
-	assert.match(validateAttachmentPath("image", "https://example.com/cat.png").error, /Remote image fetching is not supported/);
+	assert.match(validateAttachmentPath("image", "https://example.com/cat.png").error, /Use --remote-image <https URL>/);
 	assert.equal(validateAttachmentPath("text", "  ").ok, false);
 });
 

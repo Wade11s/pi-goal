@@ -453,11 +453,32 @@ The durable artifacts live beside the session file:
    refused before materialization, no `pi-goal-store` entry is created, and the
    previous Goal is unchanged.
 
-SVG, unknown image bytes, empty/invalid UTF-8 text, remote URLs, more than eight
-attachments, and files over the documented limits are refused without a success
-event or kickoff. Plain Objective text mentioning `--file` remains plain text,
-and `create_goal` has no attachment parameters. This explicit flow—not inferred
+SVG, unknown image bytes, empty/invalid UTF-8 text, more than eight attachments,
+and files over the documented limits are refused without a success event or
+kickoff. Plain Objective text mentioning `--file` remains plain text, and
+`create_goal` has no attachment parameters. This explicit flow—not inferred
 composer drafts—is the V1 alternative to Codex pending pastes and image drafts.
+
+### Remote image variant
+
+Use a small image URL you control (the automated suite uses only a local HTTPS
+fixture; this manual check may use the network):
+
+```
+/goal --remote-image https://example.com/diagram.png Implement the attached diagram
+```
+
+1. Expect one fetch, then a kickoff and Continuation with the same image hash.
+   `/goal` lists the manifest label, media type, and size without the URL.
+2. Restart Pi and continue. Expect no second request to the URL and the same
+   hash; the source URL is not needed after creation.
+3. Retry with `--remote-image http://example.com/diagram.png`, a URL containing
+   `user:password@`, `https://127.0.0.1/...`, and an https URL for a hostname
+   that resolves to loopback. Expect each refusal before a Goal is written or a
+   fetch completes. A redirect to a private address, too many redirects, a
+   non-image response, and an oversized response are refused the same way.
+4. With `goal.enabled: false`, retry a remote-image creation. Expect the
+   disabled refusal before any request is attempted.
 
 ## 25. Optional: the structured progress plan (`goal.planTool`)
 
@@ -487,6 +508,10 @@ the user-visible surface by hand.
 - [ ] `--file`/`--image` attachments reach kickoff and Continuation with stable
       hashes, survive restart and replacement/clear retention, and fail closed
       with an explicit error when an artifact is missing or corrupt.
+- [ ] `--remote-image` fetches once over HTTPS, keeps the same hash across
+      Continuations and restarts, sends no credentials/cookies/referrer, and
+      refuses HTTP, credentials, non-public destinations, bad redirects, MIME
+      mismatches, and oversized bodies without a success event.
 - [ ] `/goal <objective>` creates an active Goal and starts work.
 - [ ] The status indicator and bare `/goal` report `active`.
 - [ ] An active Goal continues automatically after a turn.

@@ -119,11 +119,12 @@ import {
 	attachmentStoreRoot,
 	discardUncommittedArtifacts,
 	loadAttachments,
-	materializeAttachments,
+	materializeAttachmentRequests,
 	validateAttachmentPath,
 	verifyAttachments,
 	type AttachmentRequest,
 } from "./attachments.ts";
+import { validateRemoteImageUrl, type RemoteImageFetchOptions } from "./remote-image.ts";
 import type { AttachmentContent, GoalMessageContent } from "./goal.ts";
 import {
 	applySessionNameFromObjective,
@@ -216,10 +217,12 @@ function dialogTimeoutMs(defaultMs: number): number {
  * creates an unbounded Goal even when an extension default is configured, which
  * is why it is a distinct request kind rather than "no request".
  *
- * `--file <path>` and `--image <path>` are repeatable leading options for local
- * text files and local images. Plain arguments remain text: an objective that
- * never starts with a flag is exactly what it always was, and composer drafts
- * are never inferred from it.
+ * `--file <path>`, `--image <path>`, and `--remote-image <url>` are repeatable
+ * leading options for local text files, local images, and explicit remote image
+ * URLs. Plain arguments remain text: an objective that never starts with a flag
+ * is exactly what it always was, and composer drafts are never inferred from it.
+ * Remote URLs are accepted only here, through the direct user command; the
+ * `create_goal` model tool stays text-only.
  */
 export type GoalBudgetRequest =
 	/** No flag given: use the extension default. */
@@ -309,7 +312,7 @@ function parseGoalArgs(raw: string): ParsedGoalArgs {
 	const attachments: AttachmentRequest[] = [];
 	const problems: string[] = [];
 	for (;;) {
-		const match = /^--(budget|no-budget|file|image)(?:=(\S+))?(?:\s+|$)/.exec(rest);
+		const match = /^--(budget|no-budget|file|image|remote-image)(?:=(\S+))?(?:\s+|$)/.exec(rest);
 		if (!match) break;
 		const flag = match[1]!;
 		const inline = match[2];
@@ -318,7 +321,7 @@ function parseGoalArgs(raw: string): ParsedGoalArgs {
 			budget = { kind: "none" };
 			continue;
 		}
-		if (flag === "file" || flag === "image") {
+		if (flag === "file" || flag === "image" || flag === "remote-image") {
 			let value: string;
 			if (inline !== undefined) {
 				value = inline;
@@ -326,12 +329,23 @@ function parseGoalArgs(raw: string): ParsedGoalArgs {
 				const next = /^(\S+)(?:\s+|$)/.exec(rest);
 				if (!next) {
 					problems.push(
-						`Goal not created: --${flag} needs a local file path (for example --${flag} ${flag === "image" ? "screenshot.png" : "notes.md"}).`,
-				);
+						flag === "remote-image"
+							? "Goal not created: --remote-image needs an HTTPS image URL (for example --remote-image https://example.com/screenshot.png)."
+							: `Goal not created: --${flag} needs a local file path (for example --${flag} ${flag === "image" ? "screenshot.png" : "notes.md"}).`,
+					);
 					break;
 				}
 				value = next[1]!;
 				rest = rest.slice(next[0].length);
+			}
+			if (flag === "remote-image") {
+				const validated = validateRemoteImageUrl(value);
+				if (!validated.ok) {
+					problems.push(validated.error);
+					break;
+				}
+				attachments.push({ kind: "remote-image", url: validated.url.href });
+				continue;
 			}
 			const kind = flag === "image" ? "image" : "text";
 			const validated = validateAttachmentPath(kind, value);
@@ -426,8 +440,8 @@ type GoalCommand =
  *
  * `edit` cannot change attachments: an Objective edit keeps the immutable
  * attachment manifest, and changing attachments requires a Replacement Goal,
- * so an edit whose objective starts with `--file`/`--image` is refused with that
- * guidance instead of silently becoming part of the objective.
+ * so an edit whose objective starts with `--file`/`--image`/`--remote-image` is
+ * refused with that guidance instead of silently becoming part of the objective.
  */
 function parseGoalCommand(args: string): GoalCommand {
 	const trimmed = args.trim();
@@ -456,13 +470,13 @@ function parseGoalCommand(args: string): GoalCommand {
 			// and for hosts without a dialog-capable UI.
 			return { kind: "edit-dialog" };
 		}
-		if (/^--(file|image)(?:=|\s|$)/.test(remainder)) {
+		if (/^--(file|image|remote-image)(?:=|\s|$)/.test(remainder)) {
 			return {
 				kind: "invalid",
 				message:
 					"Goal not edited: /goal edit changes only the objective and keeps the Goal's immutable attachment " +
-					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> ... <objective> " +
-					"(with replacement confirmation when the current Goal is unfinished).",
+					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
+					"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).",
 			};
 		}
 		return { kind: "edit", objective: remainder };
@@ -2813,6 +2827,32 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Deterministic-suite seams for the local remote-image TLS fixture.
+	 *
+	 * The production fetch refuses loopback and every private destination, so the
+	 * tests run a local HTTPS fixture and must opt that exact origin in. The
+	 * override is read only when the real-Pi test harness is driving this process
+	 * (`PI_GOAL_TEST_SCRIPT`), applies only to exact HTTPS origins, and shortens
+	 * the overall timeout only for the timeout scenario. Users never configure
+	 * remote fetching through these variables; see `docs/testing.md`.
+	 */
+	function remoteImageFetchOptions(): RemoteImageFetchOptions | undefined {
+		if (!process.env.PI_GOAL_TEST_SCRIPT) return undefined;
+		const origins = (process.env.PI_GOAL_TEST_REMOTE_IMAGE_ORIGINS ?? "")
+			.split(",")
+			.map((origin) => origin.trim())
+			.filter((origin) => origin !== "");
+		const rawTimeout = process.env.PI_GOAL_TEST_REMOTE_IMAGE_TIMEOUT_MS;
+		const timeout = rawTimeout === undefined ? Number.NaN : Number(rawTimeout);
+		const timeoutMs = Number.isSafeInteger(timeout) && timeout > 0 ? timeout : undefined;
+		if (origins.length === 0 && timeoutMs === undefined) return undefined;
+		return {
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+			...(origins.length === 0 ? {} : { testOnly: { allowedOrigins: origins } }),
+		};
+	}
+
 	/** The refusal for work whose attachments cannot be verified. */
 	function attachmentIntegrityError(goal: GoalRecord, problems: readonly string[]): string {
 		return (
@@ -3420,8 +3460,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						throw new Error("the session file could not be resolved for the attachment store");
 					}
 					uncommittedAttachmentRoot = root;
-					const materialized = materializeAttachments(root, goal.id, parsed.attachments, {
+					const materialized = await materializeAttachmentRequests(root, goal.id, parsed.attachments, {
 						cwd: sessionWorkingDirectory(ctx),
+						remote: remoteImageFetchOptions(),
 					});
 					if (!materialized.ok) {
 						// Not a write failure of the Goal path: refuse with the validation
