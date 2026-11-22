@@ -1951,12 +1951,21 @@ export class GoalStore {
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
+		// The clear event reports the same usage projection `get_goal` publishes, so it
+		// has to be read here: `commitTombstone` writes a tombstone that carries no
+		// record at all, and then discards the ledger and resets the clock. Reading the
+		// live view first is what folds in the active-time tail that has accrued since
+		// the last snapshot or checkpoint — empty for a Goal that already stopped its
+		// clock, and the only thing that would otherwise be lost when clearing from
+		// `active`. Nothing is charged or stopped here, so accounting is unchanged.
+		const usage = this.getUsage();
 		const cleared = this.commitTombstone(pi);
 		if (cleared.ok) {
 			// The tombstone has no record of its own, so the event identifies the
 			// cleared Goal by the record it removed: its identity, its last revision,
-			// and the status it had. No new current Goal is invented by a clear.
-			this.emitTransition("cleared", current, Date.now());
+			// the status it had, and the usage it had at the clear. No new current Goal
+			// is invented by a clear.
+			this.emitTransition("cleared", { ...current, usage }, Date.now());
 		}
 		return cleared;
 	}
@@ -2061,10 +2070,12 @@ export class GoalStore {
 	 * Write a pending lifecycle transition if one is waiting, and report whether one
 	 * was: a transition supersedes a checkpoint, so a caller that wrote one is done.
 	 *
-	 * Also used on its own when a session is being *replaced* rather than exited (see
-	 * the `session_shutdown` handler). The transition is state that belongs to the
-	 * outgoing branch, so losing it would leave a Goal durably `active` with its
-	 * budget already exhausted; a bare accounting checkpoint, by contrast, is only an
+	 * The only caller is {@link flushAccounting}, which is how every post-persistence
+	 * boundary (`turn_end`, settlement, the wrap-up seam) reaches it — and how the last
+	 * boundary a session being *replaced* rather than exited still gets (the
+	 * `session_shutdown` handler) does. The transition is state that belongs to the
+	 * outgoing branch, so losing it would leave a Goal durably `active` with its budget
+	 * already exhausted; a bare accounting checkpoint, by contrast, is only an
 	 * optimization and would land in a session the user has navigated away from.
 	 *
 	 * This flush is the budget stop's *durable* moment — the in-memory transition

@@ -51,12 +51,12 @@ snapshot it follows can never disagree.
 | Kind | Produced by |
 | --- | --- |
 | `created` | `/goal <objective>` or an authorized `create_goal` committing a Goal into a free slot. |
-| `replaced` | `/goal <objective>` confirmed over an unfinished Goal: the event names the **replacement** identity; the replaced identity keeps its own durable superseded record and is never re-announced. |
+| `replaced` | `/goal <objective>` taking the session's Goal slot from an existing Goal — immediately when that Goal is already `complete`, otherwise once the user confirms the replacement. The event names the **replacement** identity; the replaced identity keeps its own durable superseded record and is never re-announced. |
 | `objective-edited` | `/goal edit` committing a new objective for the same identity. |
 | `paused` | `/goal pause`, or `update_goal action:"pause"` after pause corroboration. |
 | `resumed` | `/goal resume` restarting a paused, blocked, or usage-limited Goal. |
 | `budget-recovered` | `/goal resume --budget <new-total>` — the one resume that changes the cumulative ceiling. |
-| `cleared` | `/goal clear` committing the tombstone. Identifies the cleared Goal (identity, last revision, the status it had); no new current Goal is invented. |
+| `cleared` | `/goal clear` committing the tombstone. Identifies the cleared Goal (identity, last revision, the status it had, and the usage it had at the clear); no new current Goal is invented. |
 | `blocked` | The blocked audit reaching its threshold, or an extension-enforced conservative stop (activity-free / execution-unavailable bounds). |
 | `usage-limited` | A terminal provider failure classified as a usage limit. |
 | `budget-limited` | Accounted usage reaching the token budget — announced at the boundary that makes the stop durable (see below). |

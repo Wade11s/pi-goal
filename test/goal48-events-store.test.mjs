@@ -13,9 +13,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { GoalStore } from "../src/store.ts";
+import { CUSTOM_ENTRY_TYPE, toPublicState } from "../src/goal.ts";
+import { toGoalUpdatedEvent } from "../src/events.ts";
 
 /** A Pi `Usage` report. */
-function usage(input, output) {
+function usage(input, output, extra = {}) {
 	return {
 		input,
 		output,
@@ -23,6 +25,7 @@ function usage(input, output) {
 		cacheWrite: 0,
 		totalTokens: input + output,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		...extra,
 	};
 }
 
@@ -47,7 +50,7 @@ function observedStore() {
 	const events = [];
 	const store = new GoalStore({
 		onDurableTransition: (kind, goal, committedAt) => {
-			events.push({ kind, id: goal.id, revision: goal.revision, committedAt });
+			events.push({ kind, id: goal.id, revision: goal.revision, committedAt, goal });
 		},
 	});
 	return { store, events };
@@ -264,6 +267,59 @@ test("a clear announces the cleared record's identity, not a new current Goal", 
 	assert.equal(cleared.id, goal.id);
 	assert.equal(cleared.revision, paused.goal.revision, "the revision the Goal had when cleared");
 	assert.equal(store.get(), null, "no current Goal was invented");
+});
+
+/** The active-time tail that accrues between the last refresh and the clear. */
+const ACTIVE_TAIL_MS = 12_500;
+
+test("a clear from active carries the live usage projection get_goal reports", () => {
+	const pi = fakePi();
+	// Deterministic active time: the tracker samples the monotonic clock, so pinning it
+	// makes the tail that accrues between the last refresh and the clear exact instead
+	// of leaving the assertion to a wall-clock race.
+	let now = 4_000;
+	performance.now = () => now;
+	try {
+		const { store, events } = startedGoal(pi);
+		store.accountUsage("model:1", usage(400, 100, { cacheRead: 30, cacheWrite: 20 }), "model");
+
+		// `get_goal`'s projection, taken immediately before the clear. Reading it is the
+		// last refresh the store's record gets: no active time has accrued yet, which is
+		// also what the durable snapshot froze at the creation.
+		const record = store.get();
+		const before = toPublicState(record);
+		assert.equal(before.usage.activeSeconds, 0, "no active time had accrued at the last refresh");
+
+		// The Goal is still active, so its clock keeps running: this interval is real Goal
+		// work that only the live projection carries, and the clear must fold it in.
+		now += ACTIVE_TAIL_MS;
+		const atClear = toPublicState({
+			...record,
+			usage: { ...record.usage, activeMs: record.usage.activeMs + ACTIVE_TAIL_MS },
+		});
+
+		assert.equal(store.clear(pi).ok, true);
+		assert.deepEqual(kinds(events), ["created", "cleared"]);
+		const cleared = toGoalUpdatedEvent(events[1].kind, events[1].goal, events[1].committedAt);
+		assert.equal(cleared.goal.status, "active", "cleared while the Goal was still active");
+		assert.equal(cleared.goal.usage.activeSeconds, 12, "the active-time tail is folded in");
+		assert.deepEqual(
+			cleared.goal.usage,
+			atClear.usage,
+			"the clear event reports the projection get_goal would publish at the clear",
+		);
+
+		// The tail could only have come from the live read: the newest durable snapshot
+		// froze its usage at the creation, before any active time had accrued.
+		const snapshots = pi.entries.filter((e) => e.customType === CUSTOM_ENTRY_TYPE && e.data.goal);
+		assert.equal(snapshots.at(-1).data.goal.usage.activeMs, 0, "the snapshot predates the tail");
+		assert.ok(
+			pi.entries.some((e) => e.customType === CUSTOM_ENTRY_TYPE && e.data.goal === null),
+			"the clear still wrote its durable tombstone",
+		);
+	} finally {
+		delete performance.now;
+	}
 });
 
 test("rollback and restore are retractions, not transitions: neither announces", () => {
