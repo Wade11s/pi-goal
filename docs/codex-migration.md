@@ -12,10 +12,10 @@ substitute for the per-capability table.
 | Side | Baseline |
 | --- | --- |
 | Codex | [`openai/codex@ab541fb`](https://github.com/openai/codex/tree/ab541fb9908198d95e9420668bb03f94dfe6324e/codex-rs/ext/goal), the source revision named in [NOTICE.md](../NOTICE.md), plus the Goal TUI files under `codex-rs/tui/` at the same revision |
-| pi-goal | `integration/complete-codex-migration-42` at `6376718` (P0–P4 delivered; `main` stays at `13a341f` until the spec lands) |
+| pi-goal | `integration/complete-codex-migration-42` delivery tip promoted by PR #78 (P0–P4) |
 | pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43, #44, and the neutral #45 suite |
 | Pi API evidence | pi-goal's declared minimum, Pi 1.5.1; selected behavior also checked against the installed Pi 1.6.0 documentation and type definitions |
-| Verification on 2026-11-22 | At the P0–P4 tip `6376718`: `npm run typecheck` passed and `npm test` passed 707/707, including the 14 provider-neutral conformance cases (seven against each provider), the released-Rex acceptance suites, and the companion public-protocol tests, with zero skips |
+| Verification on 2026-11-22 | At the delivery tip promoted by PR #78: `npm run typecheck` passed and `npm test` passed 707/707, including the 14 provider-neutral conformance cases (seven against each provider), the released-Rex acceptance suites, and the companion public-protocol tests, with zero skips |
 
 The comparison covers the behavior in Codex `ext/goal`, its user-facing TUI
 integration, and the corresponding pi-goal behavior. Codex's Rust implementation
