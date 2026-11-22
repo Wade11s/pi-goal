@@ -102,6 +102,16 @@ import {
 import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
 import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
 import {
+	attachmentStoreRoot,
+	discardUncommittedArtifacts,
+	loadAttachments,
+	materializeAttachments,
+	validateAttachmentPath,
+	verifyAttachments,
+	type AttachmentRequest,
+} from "./attachments.ts";
+import type { AttachmentContent, GoalMessageContent } from "./goal.ts";
+import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
 	type AdmissionSettings,
@@ -133,13 +143,19 @@ const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
 const EDIT_TIMEOUT_MS = 120_000;
 
 /**
- * Parsed `/goal` arguments: the objective plus an optional budget request.
+ * Parsed `/goal` arguments: the objective, an optional budget request, and the
+ * explicit local attachment requests (issue #49).
  *
- * Budget flags are only recognized as a *leading* prefix (`/goal --budget 5000
- * <objective>`), so an objective that merely contains the word `--budget` is never
- * silently truncated. `--no-budget` creates an unbounded Goal even when an
- * extension default is configured, which is why it is a distinct request kind
- * rather than "no request".
+ * Budget and attachment flags are only recognized as a *leading* prefix
+ * (`/goal --budget 5000 --file spec.md <objective>`), so an objective that
+ * merely contains the word `--file` is never silently truncated. `--no-budget`
+ * creates an unbounded Goal even when an extension default is configured, which
+ * is why it is a distinct request kind rather than "no request".
+ *
+ * `--file <path>` and `--image <path>` are repeatable leading options for local
+ * text files and local images. Plain arguments remain text: an objective that
+ * never starts with a flag is exactly what it always was, and composer drafts
+ * are never inferred from it.
  */
 export type GoalBudgetRequest =
 	/** No flag given: use the extension default. */
@@ -148,6 +164,16 @@ export type GoalBudgetRequest =
 	| { kind: "none" }
 	/** `--budget <n>`: an explicit budget. */
 	| { kind: "value"; value: number };
+
+/** Parse problems that must refuse the command rather than guess an objective. */
+export interface ParsedGoalArgs {
+	objective: string;
+	budget: GoalBudgetRequest;
+	/** Explicit local attachment requests, in the order the user named them. */
+	attachments: AttachmentRequest[];
+	/** Flag errors that must refuse creation before materialization. */
+	problems: string[];
+}
 
 /**
  * Parsed `/goal resume` request.
@@ -213,17 +239,43 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 	return { kind: "value", value };
 }
 
-function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequest } {
+function parseGoalArgs(raw: string): ParsedGoalArgs {
 	let rest = raw.trim();
 	let budget: GoalBudgetRequest = { kind: "default" };
+	const attachments: AttachmentRequest[] = [];
+	const problems: string[] = [];
 	for (;;) {
-		const match = /^--(budget|no-budget)(?:=(\S+))?(?:\s+|$)/.exec(rest);
+		const match = /^--(budget|no-budget|file|image)(?:=(\S+))?(?:\s+|$)/.exec(rest);
 		if (!match) break;
 		const flag = match[1]!;
 		const inline = match[2];
 		rest = rest.slice(match[0].length);
 		if (flag === "no-budget") {
 			budget = { kind: "none" };
+			continue;
+		}
+		if (flag === "file" || flag === "image") {
+			let value: string;
+			if (inline !== undefined) {
+				value = inline;
+			} else {
+				const next = /^(\S+)(?:\s+|$)/.exec(rest);
+				if (!next) {
+					problems.push(
+						`Goal not created: --${flag} needs a local file path (for example --${flag} ${flag === "image" ? "screenshot.png" : "notes.md"}).`,
+				);
+					break;
+				}
+				value = next[1]!;
+				rest = rest.slice(next[0].length);
+			}
+			const kind = flag === "image" ? "image" : "text";
+			const validated = validateAttachmentPath(kind, value);
+			if (!validated.ok) {
+				problems.push(validated.error);
+				break;
+			}
+			attachments.push({ kind, path: validated.path });
 			continue;
 		}
 		if (inline !== undefined) {
@@ -235,7 +287,7 @@ function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequ
 		rest = rest.slice(value[0].length);
 		budget = { kind: "value", value: Number(value[1]) };
 	}
-	return { objective: rest.trim(), budget };
+	return { objective: rest.trim(), budget, attachments, problems };
 }
 
 /** How long creation waits for the snapshot to become durable on disk. */
@@ -307,6 +359,11 @@ type GoalCommand =
  * lint errors") stays a valid objective. `edit` is a subcommand whenever it is
  * the first word, because its remainder is the new objective; bare `/goal edit`
  * is a usage error rather than an objective literally named "edit".
+ *
+ * `edit` cannot change attachments: an Objective edit keeps the immutable
+ * attachment manifest, and changing attachments requires a Replacement Goal,
+ * so an edit whose objective starts with `--file`/`--image` is refused with that
+ * guidance instead of silently becoming part of the objective.
  */
 function parseGoalCommand(args: string): GoalCommand {
 	const trimmed = args.trim();
@@ -334,6 +391,15 @@ function parseGoalCommand(args: string): GoalCommand {
 			// current objective. The typed form stays available for headless modes
 			// and for hosts without a dialog-capable UI.
 			return { kind: "edit-dialog" };
+		}
+		if (/^--(file|image)(?:=|\s|$)/.test(remainder)) {
+			return {
+				kind: "invalid",
+				message:
+					"Goal not edited: /goal edit changes only the objective and keeps the Goal's immutable attachment " +
+					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> ... <objective> " +
+					"(with replacement confirmation when the current Goal is unfinished).",
+			};
 		}
 		return { kind: "edit", objective: remainder };
 	}
@@ -789,6 +855,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		store.closeSupersededAdmission(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
+		// Restore verifies the attachment manifest against the artifact store: a
+		// missing or corrupt artifact is surfaced here, explicitly, without changing
+		// the Goal's Lifecycle status — the continuation seam suppresses its request
+		// for as long as the verification fails.
+		surfaceAttachmentVerification(store.get(), ctx);
 		// Runtime-only counters must not survive into a new runtime; the durable
 		// blocked audit is reconstructed with the Goal.
 		safety.reset();
@@ -806,6 +877,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 		updateStatus(ctx);
 	});
+
+	/**
+	 * Surface the restore-time attachment verification without changing state.
+	 *
+	 * The notice is the explicit error the missing/corrupt-artifact contract
+	 * requires: it names the failing artifacts and the recovery path. The Goal
+	 * itself is untouched — its status is whatever the durable snapshot says —
+	 * and the continuation seam independently re-verifies before every request.
+	 */
+	function surfaceAttachmentVerification(goal: GoalRecord | null | undefined, ctx: ExtensionContext): void {
+		if (!goal) return;
+		const verification = verifyGoalArtifacts(goal, ctx);
+		if (!verification.ok) notifyAttachmentIntegrityFailure(goal, ctx, verification.problems);
+	}
 
 	/**
 	 * Surface actionable guidance when reconstruction failed closed on a malformed
@@ -938,6 +1023,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		store.closeSupersededAdmission(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
+		// The selected branch's Goal owns its own manifest; verify it like a restore.
+		surfaceAttachmentVerification(store.get(), ctx);
 		notifyBranchChange(ctx, before, after);
 		// The status line follows the selected branch too, and the accounting
 		// baseline is rebuilt with it.
@@ -1427,10 +1514,32 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 
 		// The Goal turn is over: evaluate it before deciding whether to continue.
+		// The conservative stops come first on purpose: they are decisions about the
+		// run itself (activity-free and execution-unavailable bounds), not about the
+		// attachments, so an artifact problem must never delay or mask one.
 		const stop = safety.evaluateRun(event.outcome);
 		closeGoalTurn(ctx);
 		if (stop) {
 			applySafetyStop(stop, ctx);
+			return;
+		}
+
+		// Artifact integrity gate: every kickoff and Continuation references the
+		// same manifest, so a Goal whose artifacts cannot be verified against it is
+		// never continued automatically. The suppression is explicit (the error names
+		// what is missing or corrupt and how to restore it), and nothing else moves:
+		// the attachments are not silently dropped, the Goal is not completed, and
+		// its Lifecycle status is untouched by an artifact problem.
+		const verification = verifyGoalArtifacts(goal, ctx);
+		if (!verification.ok) {
+			notifyAttachmentIntegrityFailure(goal, ctx, verification.problems);
+			return;
+		}
+		const contents = goal.attachments?.length
+			? loadGoalAttachments(goal, ctx)
+			: ({ ok: true, contents: [] } as const);
+		if (!contents.ok) {
+			notifyAttachmentIntegrityFailure(goal, ctx, contents.problems);
 			return;
 		}
 
@@ -1444,7 +1553,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				{
 					type: "custom_message",
 					customType: CUSTOM_MESSAGE_TYPE,
-					content: formatContinuationMessage(goal),
+					content: formatContinuationMessage(goal, contents.contents),
 					display: true,
 				},
 			],
@@ -2320,11 +2429,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * fire-and-forget: delivery failures surface as Pi extension errors, never as
 	 * a state lie ("steered" is reported only for the queueing itself).
 	 *
+	 * The message may carry image content blocks (a Goal whose manifest has
+	 * images): Pi accepts `TextContent | ImageContent` arrays here, normalizing
+	 * images exactly as it does for any user prompt.
+	 *
 	 * The admission segment is *not* opened here. It opens when the message is
 	 * delivered, in {@link applyDeliveredUserMessage}, because a steer reaches the
 	 * branch only after the work that was already in flight.
 	 */
-	function deliverWorkMessage(content: string, ctx: ExtensionCommandContext): "started" | "steered" {
+	function deliverWorkMessage(content: GoalMessageContent, ctx: ExtensionCommandContext): "started" | "steered" {
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(content);
 			return "started";
@@ -2344,6 +2457,77 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		ctx.ui.notify(`Goal not ${action}: ${failure.message ?? "the current Goal state does not allow it"}.`, "warning");
+	}
+
+	/**
+	 * The artifact store root for the current session, or null when the session
+	 * file cannot be resolved (a Goal can only exist in a persistent session, so
+	 * this is a defensive null rather than an expected state).
+	 */
+	function attachmentRoot(ctx: ExtensionContext): string | null {
+		try {
+			const file = ctx.sessionManager.getSessionFile();
+			return file ? attachmentStoreRoot(file) : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/** The refusal for work whose attachments cannot be verified. */
+	function attachmentIntegrityError(goal: GoalRecord, problems: readonly string[]): string {
+		return (
+			`pi-goal could not verify the attachments of Goal ${goal.id}: ${problems.join("; ")}. The Goal keeps its ` +
+			"Lifecycle status and its manifest — attachments are never silently dropped and the Goal is never completed " +
+			"for this reason — but no automatic continuation is requested while the artifacts cannot be verified. Restore " +
+			"the original bytes (content-addressed by their sha256) under the pi-goal-store directory beside the session " +
+			"file, or replace the Goal with a new one that re-attaches the files."
+		);
+	}
+
+	/**
+	 * Verify the current Goal's manifest against the artifact store.
+	 *
+	 * Runs on restore (session start and tree navigation) and before admitting
+	 * work that would re-send the attachments (a continuation, a resume, an
+	 * active-Goal edit): a missing or corrupt artifact suppresses the automatic
+	 * Continuation and surfaces this explicit error instead — the Goal is never
+	 * silently stripped of its attachments, completed, or moved to another
+	 * Lifecycle status because of an artifact problem.
+	 */
+	function verifyGoalArtifacts(goal: GoalRecord, ctx: ExtensionContext): { ok: true } | { ok: false; problems: string[] } {
+		const manifest = goal.attachments ?? [];
+		if (manifest.length === 0) return { ok: true };
+		const root = attachmentRoot(ctx);
+		if (!root) return { ok: false, problems: ["the session file could not be resolved"] };
+		return verifyAttachments(root, goal.id, manifest);
+	}
+
+	/** Surface a failed verification, naming the recovery path. */
+	function notifyAttachmentIntegrityFailure(goal: GoalRecord, ctx: ExtensionContext, problems: readonly string[]): void {
+		notify(ctx, attachmentIntegrityError(goal, problems), "error");
+	}
+
+	/**
+	 * Verify and load the current Goal's attachments for a work message.
+	 *
+	 * Verification comes first, so a work-admitting transition (resume, an
+	 * active-Goal edit) is refused with the explicit integrity error rather than
+	 * sending a message whose attachments silently disappeared.
+	 */
+	function loadGoalAttachments(
+		goal: GoalRecord,
+		ctx: ExtensionContext,
+	): { ok: true; contents: AttachmentContent[] } | { ok: false; problems: string[] } {
+		const manifest = goal.attachments ?? [];
+		if (manifest.length === 0) return { ok: true, contents: [] };
+		const verification = verifyGoalArtifacts(goal, ctx);
+		if (!verification.ok) return verification;
+		const root = attachmentRoot(ctx);
+		const loaded = root ? loadAttachments(root, goal.id, manifest) : undefined;
+		if (!loaded || !loaded.ok) {
+			return { ok: false, problems: [loaded?.error ?? "the session file could not be resolved"] };
+		}
+		return { ok: true, contents: loaded.contents };
 	}
 
 	function pauseGoal(ctx: ExtensionCommandContext): void {
@@ -2424,6 +2608,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			);
 			return;
 		}
+		// The resume message re-sends the Goal's attachments, so a Goal whose
+		// manifest cannot be reproduced from the store is not resumed into work
+		// that would silently miss its context: the resume is refused with the
+		// explicit integrity error instead.
+		if (goal.attachments?.length) {
+			const verification = verifyGoalArtifacts(goal, ctx);
+			if (!verification.ok) {
+				ctx.ui.notify(attachmentIntegrityError(goal, verification.problems), "error");
+				return;
+			}
+		}
 		// A stop the user is overruling is a user action, so every anti-loop counter
 		// and the in-memory audit chain start over with the resumed Goal. The durable
 		// audit itself is dropped by the store, so what resumes is the objective and
@@ -2448,9 +2643,21 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 		const updated = resumed.goal!;
 		const previousStatus = goal.status;
+		// The resume message restates the same manifest (verified above); a load
+		// failure here would be a mid-command artifact loss, which is reported as a
+		// work-start failure rather than silently dropping the attachments.
+		const loaded = loadGoalAttachments(updated, ctx);
+		if (!loaded.ok) {
+			ctx.ui.notify(
+				`${attachmentIntegrityError(updated, loaded.problems)} The Goal is resumed and durable; restart the work ` +
+					"with /goal resume once the artifacts are restored.",
+				"error",
+			);
+			return;
+		}
 		// Durable first, then restart work — busy-safely, so resuming while
 		// another run is in flight steers instead of waiting for idle.
-		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus), ctx);
+		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus, loaded.contents), ctx);
 		const restarted = resumeRestartNotice(previousStatus, updated.tokenBudget, store.getUsage().totalTokens);
 		ctx.ui.notify(
 			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
@@ -2565,6 +2772,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			refuseWorkAdmittingEdit(ctx, goal);
 			return;
 		}
+		// An edit keeps the immutable attachment manifest, and the edit message of
+		// an active Goal re-sends it, so the artifacts must verify before the edit
+		// steers new work. A stopped Goal's edit rewrites durable state only and is
+		// verified again when work is eventually resumed.
+		let contents: AttachmentContent[] = [];
+		if (goal.attachments?.length && goal.status === "active") {
+			const loaded = loadGoalAttachments(goal, ctx);
+			if (!loaded.ok) {
+				ctx.ui.notify(attachmentIntegrityError(goal, loaded.problems), "error");
+				return;
+			}
+			contents = loaded.contents;
+		}
 		const edited = store.editObjective(pi, validation.objective);
 		if (!edited.ok) {
 			notifyMutationFailure(ctx, "edited", edited);
@@ -2574,8 +2794,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const updated = edited.goal!;
 		if (updated.status === "active") {
 			// Redirect the active run through Pi's steering (or start work when
-			// idle, e.g. after an aborted run left the Goal dormant).
-			const delivery = deliverWorkMessage(formatEditMessage(updated), ctx);
+			// idle, e.g. after an aborted run left the Goal dormant). The manifest is
+			// immutable across the edit, so the same attachments ride along.
+			const delivery = deliverWorkMessage(formatEditMessage(updated, contents), ctx);
 			ctx.ui.notify(
 				`Goal ${updated.id} objective updated (revision ${updated.revision}); usage history is preserved. Work ${delivery === "started" ? "started" : "steered"} on the new objective.`,
 				"info",
@@ -2629,10 +2850,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(admissionDisabledRefusal("Goal not created:"), "warning");
 			return;
 		}
-		// Budget flags are a leading prefix of a create (`/goal --budget 5000 <objective>`),
+		// Budget and attachment flags are a leading prefix of a create (`/goal --budget 5000 --file spec.md <objective>`),
 		// so an objective that merely contains the word `--budget` is never truncated.
 		// `--no-budget` asks for an unbounded Goal even when a default is configured.
 		const parsed = parseGoalArgs(rawObjective);
+		for (const problem of parsed.problems) {
+			ctx.ui.notify(problem, "error");
+			return;
+		}
 		// `resolveGoalTokenBudget` owns the request kinds, so an explicit unbounded
 		// request is refused (never clamped) while a maximum is configured.
 		const budget = resolveGoalTokenBudget(
@@ -2715,7 +2940,33 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const goal = store.create(validation.objective, "command", { tokenBudget: budget.tokenBudget });
 			const sameRecord = (candidate: GoalRecord | null | undefined) =>
 				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
+			// Loaded attachment content for the kickoff message; filled by the
+			// materialization below and empty for a Goal without attachments.
+			let attachmentContents: AttachmentContent[] = [];
 			try {
+				// Materialize the requested attachments into the immutable,
+				// extension-owned store keyed by this Goal's identity *before* the
+				// snapshot is staged: validation and materialization failures refuse
+				// the whole creation here — the previous Goal (if any) is untouched,
+				// nothing was appended, and no success event was emitted. A refused
+				// materialization retracts only the uncommitted store directory; a
+				// Goal whose snapshot committed keeps its artifacts forever.
+				if (parsed.attachments.length > 0) {
+					const root = attachmentRoot(ctx);
+					if (!root) {
+						throw new Error("the session file could not be resolved for the attachment store");
+					}
+					const materialized = materializeAttachments(root, goal.id, parsed.attachments);
+					if (!materialized.ok) {
+						// Not a write failure of the Goal path: refuse with the validation
+						// error, retracting the uncommitted artifacts on the way out.
+						discardUncommittedArtifacts(root, goal.id);
+						ctx.ui.notify(materialized.error, "error");
+						return;
+					}
+					goal.attachments = materialized.attachments;
+					attachmentContents = materialized.contents;
+				}
 				// Replacement must preserve the superseded Goal's already-accounted
 				// totals as a durable historical record before the new identity takes
 				// over the session's Goal slot and resets the live ledger. If that
@@ -2758,7 +3009,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// in flight - waiting for idle would deadlock behind its
 				// continuation loop - so the kickoff is steered into the active
 				// run or starts immediately when idle.
-				delivery = deliverWorkMessage(formatKickoffMessage(goal), ctx);
+				delivery = deliverWorkMessage(formatKickoffMessage(goal, attachmentContents), ctx);
 			} else {
 				// There is no Goal continuation loop that could starve this wait
 				// (abort also settles a stuck run), and the seam above declines to
@@ -2793,7 +3044,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				pendingRunKind = "kickoff";
 				// The admission segment opens when the kickoff is delivered, in
 				// `applyDeliveredUserMessage`, like every other work message.
-				pi.sendUserMessage(formatKickoffMessage(goal));
+				pi.sendUserMessage(formatKickoffMessage(goal, attachmentContents));
 				delivery = "started";
 			}
 

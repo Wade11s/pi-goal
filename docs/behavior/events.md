@@ -40,6 +40,7 @@ One JSON object per event, versioned as a whole:
 | `goal.status` | The Lifecycle status as committed. A clear reports the status the Goal had when cleared. |
 | `goal.objective` | Metadata only: `{ length, origin }`. The verbatim objective stays in the durable snapshot and the delimited data block; the event is machine-consumed by any loaded extension, which makes it the same surface as a log line. |
 | `goal.tokenBudget` | The cumulative token ceiling, or `null` when unbounded. |
+| `goal.attachments` | The immutable attachment manifest's metadata — one `{ hash, mediaType, bytes, label }` entry per attachment, in manifest order, `[]` for a Goal without attachments. Never contents: attachment text and image bytes stay in the artifact store and the delimited data blocks, for the same privacy reason `goal.objective` is metadata only. |
 | `goal.usage` | The committed usage summary — the same projection `get_goal` reports: `totalTokens` (input + output + cache writes), the components, cached reads excluded as reuse, nested work counted once, and `activeSeconds`. |
 | `timestamp` | ISO timestamp of the committed transition — the snapshot's own `updatedAt` (the clear time for a tombstone, which carries no record). |
 
