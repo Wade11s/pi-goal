@@ -4,7 +4,7 @@ Where Goal state lives in the session, how reconstruction works across restart,
 reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
 
 [← README](../README.md) · See also [accounting](accounting.md) ·
-[lifecycle](lifecycle.md)
+[lifecycle](lifecycle.md) · [attachments](attachments.md)
 
 ## Persistence model
 
@@ -62,6 +62,15 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   with a durable tombstone snapshot. A failed **replacement** write leaves the
   existing Goal untouched in memory and on disk (no tombstone, no resurrection
   on restart), and `/goal <objective>` can simply be retried.
+- A Goal with Objective attachments also persists their immutable manifest
+  (`hash`, `mediaType`, `bytes`, `label`) in every snapshot. The bytes live in a
+  content-addressed, Goal-keyed `pi-goal-store` beside the session file and are
+  materialized before the snapshot commits. Restore and branch navigation verify
+  those hashes: missing or corrupt artifacts surface an explicit error and
+  suppress automatic Continuation without silently dropping the manifest or
+  changing Lifecycle status. Clear and replacement retain committed artifacts
+  for historical branches; V1 performs no destructive automatic garbage
+  collection. See [Objective attachments](attachments.md).
 - Usage accounting is durable too. Token totals are always recoverable from the
   session branch, and the accounted active time is checkpointed into separate
   `goal-usage` custom entries — kept apart from `goal-state` so the lifecycle log

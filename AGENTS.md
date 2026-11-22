@@ -14,7 +14,7 @@ Use the single-context layout: root `GLOSSARY.md` and `docs/adr/`. See `docs/age
 
 ### Orchestration
 
-For planning, issue delegation, implementation, PR review, and merges, follow `docs/agents/orchestration.md`.
+For planning, issue delegation, implementation, PR review, and merges, follow `docs/agents/orchestration.md`. Subagent model selection and review-subagent policy live in `docs/agents/subagents.md`; read it before every `rex-subagent` dispatch.
 
 ---
 ## Code review (open-code-review delegate mode)

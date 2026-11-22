@@ -15,7 +15,7 @@ substitute for the per-capability table.
 | pi-goal | `integration/complete-codex-migration-42` base `63dac78`, plus #45 on `issue-45` (P0–P3 delivery; `main` stays at `13a341f` until the spec lands) |
 | pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43, #44, and the neutral #45 suite |
 | Pi API evidence | pi-goal's declared minimum, Pi 1.5.1; selected behavior also checked against the installed Pi 1.6.0 documentation and type definitions |
-| Verification on 2026-11-22 | Before #45: `npm test` passed 564/564. After #45: `npm run typecheck` passed and `npm test` passed 576/576, including all 12 neutral conformance cases with zero skips |
+| Verification on 2026-11-23 | Before #45: `npm test` passed 564/564. The #45 branch merged the integration tip (`107d2a9`): `npm run typecheck` passed and `npm test` passed 620/620, including all 14 neutral conformance cases (seven cases against each provider) with zero skips |
 
 The comparison covers the behavior in Codex `ext/goal`, its user-facing TUI
 integration, and the corresponding pi-goal behavior. Codex's Rust implementation
@@ -78,12 +78,12 @@ Two corrections prevent an over-broad “complete” claim:
 | Budget recovery | External Goal updates can change the budget | `/goal resume --budget <new-total>` raises the cumulative ceiling with explicit headroom/maximum validation | Ported with a clearer user surface |
 | Token formula | `input - cached_input + output` | `input + output + cacheWrite`; cached reads excluded, reasoning not added twice | Intentional adapter-specific difference; see below |
 | In-process nested model usage | Descendant usage can be folded into root accounting | `toolResult.usage` is charged once by tool-call identity and replayed from the parent branch | Ported |
-| External descendant-process usage | Codex thread hierarchy reports descendant token usage to the root accounting state | Released Rex v0.2.0 reports each child's delta through Pi's standard parent `toolResult.usage`; #43/#44 accept Goal ownership and recovery, and #45 runs six neutral cases against both Rex and a deterministic fake | Ported through Pi's tool-result seam; [neutral V1 contract](subagent-usage.md), no registry or second ledger |
+| External descendant-process usage | Codex thread hierarchy reports descendant token usage to the root accounting state | Released Rex v0.2.0 reports each child's delta through Pi's standard parent `toolResult.usage`; #43/#44 accept Goal ownership and recovery, and #45 runs seven neutral cases against both Rex and a deterministic fake | Ported through Pi's tool-result seam; [neutral V1 contract](subagent-usage.md), no registry or second ledger |
 | Active elapsed time | Wall-clock deltas are persisted with Goal usage | Monotonic active clock, stopped in every non-active state and during downtime | Strengthened |
 | Persistence | `thread_goals` state DB records; fork flushes in-flight progress | `goal-state` / `goal-usage` entries on the selected session branch, tombstones, superseded records, and legacy cutover | Strengthened for Pi's tree model |
 | Ephemeral sessions | Ephemeral threads reject Goals | `--no-session` refuses Goal creation | Ported |
 | Stale model transitions | `expected_goal_id` guards persistent updates | Execution binding plus identity/revision checks reject transitions from pre-replacement or otherwise stale runs | Strengthened |
-| Automated evidence | Rust unit/integration tests | 564 real-Pi RPC and unit tests before #45, plus 12 provider-neutral conformance cases in #45 | Ported with host-level coverage |
+| Automated evidence | Rust unit/integration tests | 620 real-Pi RPC and unit tests across the integration tip and #45, including 14 provider-neutral conformance cases | Ported with host-level coverage |
 
 ## Per-capability comparison: host and UX integration
 
@@ -360,7 +360,7 @@ provides current evidence.
 Delivery order and current status:
 
 1. **P0-1 complete in #45:** the neutral snapshot contract and reusable suite use
-   `ToolResultMessage.usage`; six cases run against each provider. No generic
+   `ToolResultMessage.usage`; seven cases run against each provider. No generic
    asynchronous collector or durable external-usage ledger was added.
 2. **P0-2 complete in #43/#44:** released Rex v0.2.0 is the reference provider,
    with Goal accounting, budget, recovery, ownership, nesting, and final

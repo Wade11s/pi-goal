@@ -13,13 +13,25 @@
  *
  * No network access or credentials are required, which lets the RPC tests drive
  * real Pi sessions end to end.
+ *
+ * Two testing conveniences ride along:
+ *
+ * - the scripted model declares image input, so Goal attachment images reach the
+ *   provider as real image content blocks instead of being downgraded to
+ *   placeholders at the provider boundary (Pi replaces images with text
+ *   placeholders for text-only models);
+ * - when PI_GOAL_TEST_CAPTURE_DIR is set, every request's full message list is
+ *   dumped there as `request-<n>.json`, which is how tests assert on the exact
+ *   model context (encoded attachment data blocks, image blocks) a real Pi
+ *   session produced.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type JsonObject,
+	type Message,
 	type Model,
 	type SimpleStreamOptions,
 	type ToolCall,
@@ -89,16 +101,43 @@ export default function scriptedProviderExtension(pi: ExtensionAPI): void {
 				id: "stepfun-5-preview",
 				name: "StepFun 5 Preview (scripted)",
 				reasoning: false,
-				input: ["text"],
+				// Image input is declared so attachment tests exercise the real image
+				// path: a text-only model would have every image block downgraded to a
+				// placeholder before the provider sees it.
+				input: ["text", "image"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 128000,
 				maxTokens: 8192,
 			},
 		],
-		streamSimple(model, _context, options) {
-			return streamScriptedStep(model, _context, options, () => callCount++);
+		streamSimple(model, context, options) {
+			captureRequest(callCount, context.messages);
+			return streamScriptedStep(model, context, options, () => callCount++);
 		},
 	});
+}
+
+/**
+ * Dump one request's messages when PI_GOAL_TEST_CAPTURE_DIR is set.
+ *
+ * The capture is test-only evidence of the exact model context: which message
+ * carried the encoded attachment data blocks, which carried image blocks, and
+ * what text surrounded them. Writing is best effort; a capture failure never
+ * breaks the scenario under test.
+ */
+function captureRequest(index: number, messages: readonly Message[]): void {
+	const dir = process.env.PI_GOAL_TEST_CAPTURE_DIR;
+	if (!dir) return;
+	try {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			`${dir}/request-${index}.json`,
+			JSON.stringify(messages, null, "\t"),
+			"utf8",
+		);
+	} catch {
+		// Test-only convenience; never fail the run for it.
+	}
 }
 
 function streamScriptedStep(

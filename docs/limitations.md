@@ -3,7 +3,8 @@
 Known boundaries of the current model: what the extension does not understand,
 what it cannot preempt, and what is intentionally left to the user.
 
-[← README](../README.md) · See also [tools](tools.md)
+[← README](../README.md) · See also [tools](tools.md) ·
+[attachments](behavior/attachments.md)
 
 - `create_goal` (the model tool) refuses while **any** Goal exists, including a
   complete, blocked, or usage-limited one, because replacing and clearing are
@@ -28,8 +29,26 @@ what it cannot preempt, and what is intentionally left to the user.
   custom message, so a request whose exact words were never sent as text, or
   one that a newer message has replaced, is refused with `goal: null`. The user
   can always create a Goal directly with `/goal <objective>`.
-- An edit preserves the Goal identity, creation time, origin, budget, and usage
-  history: only the objective changes and the revision advances. Replacement of
+- V1 attachments are explicit **local** text files and PNG/JPEG/GIF/WebP images.
+  Remote URLs are refused rather than fetched (issue #50 owns remote fetching),
+  SVG and unknown image types are rejected, and paths containing whitespace are
+  not representable by the current leading-option parser. Pi exposes no Codex
+  composer pending-draft object, so pi-goal never infers attachments from plain
+  arguments; the explicit `/goal --file … --image …` flow is the supported
+  alternative. A model without image input depends on Pi's normal image handling
+  rather than pi-goal inventing a vision capability.
+- Committed attachment artifacts survive clear and replacement so historical
+  branches remain reconstructable. **V1 has no destructive automatic garbage
+  collection**: up to 25 MiB can remain for each historical Goal until the user
+  removes the session's `pi-goal-store` deliberately. Only artifacts from a
+  creation that never committed may be retracted automatically. Copying a
+  session file without its sibling artifact store leaves its Goals restorable
+  but their attachments unverifiable; automatic Continuation then stops with an
+  explicit error and no artifact-driven Lifecycle change until the original
+  bytes are restored or the Goal is replaced.
+- An edit preserves the Goal identity, creation time, origin, budget, attachment
+  manifest, and usage history: only the objective changes and the revision
+  advances. Changing attachments requires a Replacement Goal. Replacement of
   an unfinished Goal gives the session a fresh identity and fresh revisions, and
   preserves the replaced Goal's accounted history on its own superseded record
   rather than transferring any of it. Refining the finish line without replacing
@@ -64,6 +83,16 @@ what it cannot preempt, and what is intentionally left to the user.
   baseline under the 0.1.0 status-only rule, not exact Goal-owned attribution
   rebuilt under the repaired rules. Only work after the branch-local cutover is
   attributed under the repaired contract.
+- Pi nested tool usage (`toolResult.usage`) is counted, but model usage inside an
+  independent subprocess is not visible automatically. Each `pi-rex-subagent`
+  child is a separate Pi session, so its usage does not count toward the parent
+  Goal or its budget until a parent tool reports the child's delta as
+  `toolResult.usage`. The proposed bridge is specified in
+  [Subagent usage reporting](subagent-usage.md).
+- pi-goal emits Pi notifications and durable Goal entries, not Codex's
+  `ThreadGoalUpdated` protocol events, analytics events, or otel metrics. A local
+  integration could subscribe to a future `pi.events` event; hosted telemetry
+  would additionally require an explicit exporter and privacy policy.
 - Active time is durable to within one accounted second; an unclean exit loses
   at most that.
 - The activity-free and execution-unavailable counters are per session, not
@@ -100,3 +129,10 @@ what it cannot preempt, and what is intentionally left to the user.
   start, so a changed value takes effect on the next session start or reload,
   never for a Goal that already exists. A non-boolean value is reported once and
   ignored, which leaves sessions unnamed exactly as an unset value does.
+- Metrics are local and best-effort: `pi-goal:metrics` delivery has no queue,
+  retry, spool, acknowledgement, or replay. A consumer that needs completeness
+  must persist and verify records itself and treat gaps as possible. pi-goal
+  ships no hosted exporter, performs no network telemetry, accepts no analytics
+  endpoint or credential, and installs no exporter dependency; a companion
+  exporter is a separate install whose consent, redaction, retry, delivery
+  guarantee, and credentials are its own responsibility.

@@ -42,10 +42,14 @@ scripted test model provider (`test/extensions/scripted-provider.ts`, driven by
 `PI_GOAL_TEST_SCRIPT`, including hanging and delayed responses for
 interrupted-run and queueing tests), an optional second extension
 (`test/extensions/boundary-peer.ts`) for boundary-composition tests, and no
-network or model credentials. They assert public behavior end to end: RPC
-events, extension notifications, tool results, model context, persisted session
-entries, and survival across hard kills and restarts. Set `PI_BINARY` to run
-against a specific Pi binary; a missing binary fails fast instead of hanging.
+network or model credentials. The provider declares text and image input; when
+`PI_GOAL_TEST_CAPTURE_DIR` is set it also captures each request's complete model
+message list, allowing tests to assert the actual text/image content arrays the
+provider received rather than only durable session entries. Tests assert public
+behavior end to end: RPC events, extension notifications, tool results, model
+context, persisted session entries, artifact files, and survival across hard
+kills and restarts. Set `PI_BINARY` to run against a specific Pi binary; a
+missing binary fails fast instead of hanging.
 
 Accounting rules that are impractical to cover exhaustively through the RPC seam
 (the token formula, deduplication, the active-time boundaries, budget validation)
@@ -84,6 +88,41 @@ and listener-failure isolation from the session file and the RPC record stream
 alone. The narrow injected-fault seams — a failing append at the durable commit,
 the in-memory budget stop versus its durable flush, audit bookkeeping — are
 unit-tested in `test/goal48-events-store.test.mjs` against a fake Pi API.
+
+Operational metrics (issue #55) are tested at both seams. The pure projection,
+its pinned key set, the budget arithmetic (unbounded, within, exact exhaustion,
+overshoot), the allowlist treatment of hostile extra event fields, the
+publisher's sync-throw and rejected-promise isolation, and the default no-network
+shape (a stubbed `fetch`, a scan of the projection and wiring, and the
+package's dependency-free manifest) are unit-tested in
+`test/goal55-metrics-store.test.mjs`. The end-to-end seam is
+`test/extensions/metrics-peer.ts`: a second extension subscribes to the public
+`pi-goal:metrics` channel, records each projection as a `goal-metrics-log`
+entry paired with the process's fetch-attempt count, and can arm an injected
+consumer failure. `test/goal55-metrics.test.mjs` then proves that metrics mirror
+the committed `goal-state` snapshots, that no Objective, identity, path, or URL
+reaches them, that a throwing consumer cannot roll back a transition or turn
+its failure into a pi-goal durability problem, and that a full
+creation → completion → clear scenario makes zero fetch attempts. No hosted
+credential, host, or network service is involved.
+
+Objective attachments (issue #49) are covered by
+`test/goal49-attachments.test.mjs` through real Pi RPC sessions. Local fixtures
+exercise encoded hostile text and real PNG/JPEG/GIF/WebP image blocks in the
+provider's captured model context, stable hashes across Continuations, restart
+and clone reconstruction, Objective-edit retention, Replacement Goal isolation,
+clear/replacement artifact retention, validation and snapshot rollback,
+disabled admission before materialization, missing/corrupt restore suppression,
+and metadata-only Goal-updated events. Remote URLs are refused without network
+access; SVG and unknown types are rejected. The suite inspects the durable
+manifest and the sibling `pi-goal-store` directly, and every admitted run is
+sized and deliberately settled or aborted.
+
+`test/goal49-attachments-store.test.mjs` pins the cheaper fault matrix: magic
+byte sniffing, strict UTF-8, the 8-attachment / 1 MiB-text / 10 MiB-image /
+25 MiB-total limits, content-addressed read-only materialization and idempotence,
+uncommitted cleanup, missing/corrupt verification, malformed-manifest
+fail-closed reconstruction, Objective-edit retention, and metadata-only events.
 
 Opt-in session naming (issue #52) is tested through the same RPC seam in
 `test/goal52-session-naming.test.mjs`: the live name comes from Pi's own
@@ -213,6 +252,9 @@ To verify the package installation and the interactive surface by hand, follow
 
 - [ ] `pi install ./` and `pi list`
 - [ ] `/goal <objective>` creation and immediate work
+- [ ] `/goal --file <path> --image <path> <objective>` sends encoded untrusted
+      text and Pi image blocks, restarts with the same hashes, retains artifacts
+      after replacement/clear, and suppresses Continuation on integrity failure
 - [ ] automatic continuation at settlement
 - [ ] bare `/goal edit` interactive editing
 - [ ] `/goal pause`, `/goal resume`, and `/goal clear`

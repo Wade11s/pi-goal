@@ -18,6 +18,7 @@ extension APIs and does not patch Pi core.
 | `/goal edit [objective]` | Change the objective in place, keeping identity and history |
 | `/goal pause` · `/goal resume` · `/goal clear` | Stop admission, restart work, or remove the Goal |
 | `/goal --budget <n>` · `/goal --no-budget` | Bound unattended usage at creation |
+| `/goal --file <path>` · `/goal --image <path>` | Attach explicit local text files and images (repeatable leading options) |
 | `/goal resume --budget <new-total>` | Raise a `budget_limited` Goal's cumulative ceiling |
 | `get_goal` | Structured Goal state for the model |
 | `create_goal` | Model-created Goal, only on an explicit user request |
@@ -103,6 +104,17 @@ uses Pi's host-provided packages (`peerDependencies` only).
 - When an **unfinished** Goal already exists, `/goal <objective>` asks for
   confirmation before replacing it; a declined, timed-out, or dismissed dialog
   keeps the current Goal untouched.
+
+Add explicit local supporting material without changing the Objective's length
+policy:
+
+```sh
+/goal --file spec.md --image screenshot.png Ship the release using the attached requirements
+```
+
+`--file` and `--image` are repeatable leading options. Plain arguments remain
+text, and model-driven `create_goal` remains text-only. See
+[Objective attachments](docs/behavior/attachments.md).
 
 With a UI, a compact indicator tracks the Goal:
 
@@ -206,6 +218,31 @@ continues automatically: only the user's `/goal resume` restarts it.
 
 → [Token budgets and budget exhaustion](docs/behavior/budgets.md)
 
+### Objective attachments
+
+Use repeatable leading `--file <path>` and `--image <path>` options at creation
+or Replacement Goal time. Text files must be non-empty UTF-8; PNG, JPEG, GIF,
+and WebP images are recognized by their bytes, while SVG and unknown types are
+refused. Limits are 8 attachments, 1 MiB per text file, 10 MiB per image, and
+25 MiB total.
+
+Before the Goal snapshot commits, pi-goal copies the bytes into an immutable,
+content-addressed `pi-goal-store/<goal-id>/` beside the session file. The durable
+manifest records only hash, media type, byte size, and display label. Text reaches
+the model as encoded, delimited **untrusted data** under the Objective's nonce
+boundary; images use Pi's text/image content arrays. Every kickoff and
+Continuation loads the same manifest.
+
+An Objective edit retains that manifest; changing attachments requires a
+Replacement Goal. Clear and replacement retain committed artifacts so historical
+branches remain reconstructable: **V1 has no destructive automatic garbage
+collection**. Missing or corrupt restored artifacts produce an explicit error and
+suppress automatic Continuation without changing Lifecycle status. This explicit
+flow is the supported alternative to Codex composer drafts; Pi has no equivalent
+pending-draft object to infer. Remote URLs are not fetched (that is issue #50).
+
+→ [Objective attachments](docs/behavior/attachments.md)
+
 ### Disabling the extension
 
 ```json
@@ -300,9 +337,28 @@ objective; the *selected* branch alone decides it. The newest *current* entry
 controls the branch: a malformed or unrecognized one fails closed rather than
 falling back to an older snapshot that could resurrect a cleared or replaced
 Goal. Usage checkpoints live in separate `goal-usage` entries, and ephemeral
-sessions (`--no-session`) refuse to create a Goal at all.
+sessions (`--no-session`) refuse to create a Goal at all. Attachment bytes live
+outside those entries in the Goal-keyed artifact store beside the session file;
+copying a session elsewhere requires that store as well, and restore verifies
+every recorded hash.
 
 → [Persistence model and legacy cutover](docs/behavior/persistence.md)
+
+### Local events and metrics
+
+Other local extensions can react to committed Goal state without polling:
+pi-goal publishes a `pi-goal:updated` event after every meaningful durable
+transition, and a pre-redacted `pi-goal:metrics` projection for operational
+counters (transition kind, Lifecycle status, token totals, Active elapsed time,
+budget state, and extension version). The projection is an allowlist: Objective
+text, Blocker descriptions, attachment contents, file names, source URLs,
+session identifiers, and prompts are never part of a metric. pi-goal performs no
+network telemetry and installs no exporter dependency; a hosted exporter is a
+separately installed companion that owns its own consent, redaction, retry, and
+credentials.
+
+→ [Goal-updated events](docs/behavior/events.md) ·
+[Operational metrics and the exporter seam](docs/behavior/metrics.md)
 
 ## Limitations
 
@@ -321,6 +377,11 @@ sessions (`--no-session`) refuse to create a Goal at all.
   changed `goal.sessionNameFromObjective` takes effect on the next session start
   or reload. It names only a session that has no name yet and only on a creation,
   so a session whose name came from an earlier Goal keeps that name.
+- Attachments are explicit local files only: V1 does not fetch URLs or infer
+  Codex-style composer drafts. Committed artifacts are retained after clear and
+  replacement with no destructive automatic GC, so long-lived sessions can
+  accumulate up to 25 MiB per historical Goal. Attachment option values are
+  whitespace-free paths; use a path without spaces in V1.
 - `goal.enabled` is read from Pi's effective settings at session start, so a
   changed value takes effect on the next session start or reload rather than
   mid-session. While the extension is disabled, an active Goal accrues no new
@@ -339,6 +400,13 @@ sessions (`--no-session`) refuse to create a Goal at all.
   durable; a restart gives a malfunctioning loop up to three more empty turns.
   A third extension loaded after pi-goal can still request its own continuation
   at the same boundary.
+- Metrics are best-effort local bus delivery: there is no queue, retry, spool,
+  or acknowledgement, so a consumer that needs completeness must persist and
+  verify records itself. pi-goal ships no hosted exporter and accepts no
+  analytics endpoint or credential; a companion exporter is a separate install
+  with its own policy, and its delivery guarantees are its own, not pi-goal's.
+  No network telemetry happens by default — the only sink is the local
+  extension bus.
 
 → [All limitations](docs/limitations.md)
 
@@ -374,20 +442,26 @@ To verify the package installation and the interactive surface by hand, follow
 [docs/smoke-test.md](docs/smoke-test.md). The checklist covers installation,
 creation, automatic continuation, editing, pause/resume/clear, budget recovery,
 the status indicator, restart persistence, the clear tombstone, frozen active
-time, and identity-scoped attribution of queued work.
+time, identity-scoped attribution of queued work, and local text/image
+attachments, including artifact retention and restore verification.
 
 ## Documentation
 
 | Doc | Contents |
 | --- | --- |
-| [Goal lifecycle](docs/behavior/lifecycle.md) | Create, replace, edit, inspect, pause, resume, clear, and the status indicator |
+| [Goal lifecycle](docs/behavior/lifecycle.md) | Create, replace, edit, inspect, pause, resume, clear, opt-in convenience UX, and the status indicator |
+| [Objective attachments](docs/behavior/attachments.md) | Explicit local text/images, immutable artifacts, trust framing, limits, restore verification, and V1 retention |
 | [Token budgets](docs/behavior/budgets.md) | `--budget`, settings defaults and hard maximum, raising the ceiling, budget exhaustion |
 | [Automatic continuation](docs/behavior/continuation.md) | The settlement seam and the no-progress contract |
 | [Stopping safely](docs/behavior/stopping.md) | Blocked audit, anti-loop bounds, usage-limit classification |
 | [Usage accounting](docs/behavior/accounting.md) | Token formula, admission segments, active time, durability ordering |
 | [Persistence model](docs/behavior/persistence.md) | Snapshots, reconstruction, forks, and the 0.1.0 cutover |
+| [Goal-updated events](docs/behavior/events.md) | Committed local transitions and metadata-only attachment manifests |
+| [Metrics and the exporter seam](docs/behavior/metrics.md) | Privacy-safe `pi-goal:metrics`, what is never projected, local consumers, and the on-demand hosted companion |
 | [Model tools](docs/tools.md) | `get_goal`, `create_goal` (and creation authority), `update_goal`, trust boundary, structured responses |
 | [Limitations](docs/limitations.md) | Known boundaries of the current model |
+| [Codex migration status](docs/codex-migration.md) | Per-capability comparison and Pi-feasible follow-ups |
+| [Subagent usage reporting](docs/subagent-usage.md) | Proposed plugin-neutral provider contract for subagent token accounting |
 | [Testing](docs/testing.md) | The automated gate and the rules that keep it honest |
 | [Smoke test](docs/smoke-test.md) | Manual real-Pi procedure |
 | [ADR-0001](docs/adr/0001-conservative-stopping.md) | Conservative stopping is deterministic and extension-owned |

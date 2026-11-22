@@ -4,7 +4,7 @@
 the authority each transition requires, and the objective's trust boundary.
 
 [← README](../README.md) · See also [lifecycle](behavior/lifecycle.md) ·
-[stopping](behavior/stopping.md)
+[attachments](behavior/attachments.md) · [stopping](behavior/stopping.md)
 
 ## Model tool: `get_goal`
 
@@ -15,6 +15,9 @@ objective is absent or truncated in context.
 While `goal.enabled` is false the tool's text adds an `Admission disabled:` block:
 the Goal's Lifecycle status is untouched, no new Goal work is admitted, and
 inspection, pause, clear, and terminal updates from in-flight work still work.
+For a Goal with attachments, the text and structured state include the immutable
+manifest metadata (`hash`, `mediaType`, `bytes`, `label`), never attachment
+contents; the model receives those contents in the framed Goal work messages.
 With no Goal set, the text says the same thing about `/goal <objective>` and
 `create_goal`. The structured `{ goal }` payload is unchanged — admission is a
 host preference, not Goal state, so it is never persisted in a snapshot.
@@ -30,6 +33,13 @@ could not restore the Goal, refuses while this session already has a Goal
 snapshot before reporting success. Creating a Goal through the tool does not
 send a kickoff message: the model is already mid-run, and the continuation seam
 picks the Goal up at the next settlement.
+
+`create_goal` is deliberately **text-only**. It has no file, image, path, or URL
+parameters, and extra drifted fields do not gain attachment authority. Explicit
+local attachments can be selected only by the direct `/goal --file … --image …`
+command at creation or Replacement Goal time. The existing 3–2000 character
+Objective validation is unchanged; long supporting material belongs in a direct
+text attachment, not in a model-created Objective.
 
 Because it refuses while any Goal exists, a successful `create_goal` is always a
 fresh creation, so it is also the tool-side path for the opt-in session name: with
@@ -117,6 +127,12 @@ contains exactly one of each sentinel and each authoritative heading.
 The canonical objective is always available unframed through `get_goal` and in
 the structured tool results, and the record carries its `origin` (`command` for
 `/goal`, `tool` for `create_goal`).
+
+Text attachments use the same encoding and random-nonce boundary in separate
+`GOAL ATTACHMENT DATA` blocks; images travel as Pi image content blocks and are
+also identified as untrusted data by label and manifest hash. Neither kind can
+rewrite the extension-authored audit or completion instructions. See
+[Objective attachments](behavior/attachments.md#the-trust-boundary).
 
 ## Model tool: `update_goal`
 
@@ -264,13 +280,23 @@ unambiguous for programmatic callers:
       "activeSeconds": 312
     },
     "remainingTokens": 201790,
+    "attachments": [
+      {
+        "hash": "1b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d835670",
+        "mediaType": "text/plain",
+        "bytes": 12400,
+        "label": "spec.md"
+      }
+    ],
     "budgetExhausted": false
   }
 }
 ```
 
 `remainingTokens` is `null` when the Goal has no budget and floors at zero once
-the budget is reached; `budgetExhausted` is the explicit signal. The objective,
+the budget is reached; `budgetExhausted` is the explicit signal. `attachments`
+is `[]` without attachments and otherwise contains metadata only, in immutable
+manifest order. The objective,
 identity, origin, timestamps, and revision are part of the same payload.
 
 While a blocked audit is open, the same payload carries its **Blocker identity**
