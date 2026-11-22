@@ -4,6 +4,35 @@ Notable changes to pi-goal. Version headings match the `version` field in
 `package.json`; install a release with `pi install
 git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
+## [Unreleased]
+
+- Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
+  one confirmation at session start for a restored `paused` Goal. Accepting runs
+  the same durable `/goal resume` transition (same identity and history, fresh
+  Blocked audit); declining, dismissing, timing out, or having no interactive UI
+  leaves the Goal unchanged. It is never offered for any other Lifecycle status,
+  never makes print/JSON/headless startup wait, and is not offered at all while
+  `goal.enabled` is false. The contract is documented in
+  `docs/behavior/lifecycle.md`.
+- Add the opt-in `goal.sessionNameFromObjective` setting (default `false`): after a
+  successful *fresh* creation it names an otherwise unnamed session from the
+  Objective's first line — whitespace-collapsed, capped at 80 characters, and
+  attachment-agnostic. The name is written through Pi's own `session_info` seam, so
+  it is host metadata rather than Goal state: it is never persisted in a snapshot,
+  never reconstructed from a branch, never part of the `pi-goal:updated` stream, and
+  never counted in accounting. A name that already exists is never overwritten, an
+  Objective edit and a Replacement Goal never rename anything, and a refused, failed,
+  rolled-back, or cleared-while-waiting creation names nothing.
+- Emit a local `pi-goal:updated` event on Pi's shared extension event bus after
+  every meaningful durable Goal transition (creation, replacement, objective
+  edit, pause, resume, budget recovery, clear, blocked, usage-limited,
+  budget-limited, completion), carrying the committed identity, revision,
+  transition kind, status, objective metadata, usage summary, active time, and
+  timestamp. Refused, failed, and retracted transitions emit nothing; token
+  deltas and active-time ticks never emit. Listener failures are isolated by
+  the bus and never roll back committed state. The contract is documented in
+  `docs/behavior/events.md`.
+
 ## [0.1.1] - 2026-11-16
 
 - Add the docs map: the behavioral contract lives in `docs/behavior/`, the model

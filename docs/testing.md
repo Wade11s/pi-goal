@@ -74,6 +74,97 @@ issues can be read out of a structured tool result and passed back by the later
 turns — exactly what a real model does after calling `get_goal`, and race-free
 because no request after the gate is made until the gate file exists.
 
+The Goal-updated event stream (issue #48) is tested through
+`test/extensions/events-peer.ts`: a second extension subscribes to the public
+`pi-goal:updated` channel on Pi's shared extension event bus and records every
+event it receives as a durable `goal-events-log` session entry, so
+`test/goal48-events.test.mjs` can assert payload, ordering against the
+interleaved `goal-state` entries, transition coverage, refusal/rollback silence,
+and listener-failure isolation from the session file and the RPC record stream
+alone. The narrow injected-fault seams — a failing append at the durable commit,
+the in-memory budget stop versus its durable flush, audit bookkeeping — are
+unit-tested in `test/goal48-events-store.test.mjs` against a fake Pi API.
+
+Opt-in session naming (issue #52) is tested through the same RPC seam in
+`test/goal52-session-naming.test.mjs`: the live name comes from Pi's own
+`get_state` and the durable one from the `session_info` entries in the session
+file, while a name that must *not* be written is produced through Pi's
+`set_session_name` command — the user-provided name seam, so the test's own name
+is provably not the extension's. The pure rules (the setting's default and its
+malformed-value handling, the first-line/whitespace/80-character derivation, and
+the never-overwrite and write-failure outcomes) are unit-tested against
+`src/session-naming.ts` with a fake of the two Pi seams; the RPC tests then prove
+those rules through a real session, including the two failure paths a name must
+not survive — a durable write that fails and rolls the creation back, and a
+creation cleared while it waited for the current run.
+
+The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
+surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
+durable Lifecycle status, is stopped, and is reopened from a copy of its session
+file with `goal.resumePrompt` in its settings; the test then answers the dialog
+over the `confirm` extension-UI subprotocol with accept, decline, dismissal, or
+nothing at all, and asserts the durable snapshot, run/continuation counts, and
+notifications. `PI_GOAL_DIALOG_TIMEOUT_MS` shortens the dialog safety bound for
+the timeout case (see [Dialog timeouts](#dialog-timeouts)); the UI-less behavior
+of print and JSON modes is covered against the handler directly, with a fake Pi
+API, because those modes have no dialog to observe through the RPC harness.
+
+### Dialog timeouts
+
+Every interactive dialog pi-goal opens (a replacement confirmation, the
+interactive objective editor, the resume prompt) carries a `timeout` and a safe
+default answer, so an unattended host cannot make a command wait forever.
+`PI_GOAL_DIALOG_TIMEOUT_MS` overrides that bound with a positive integer number
+of milliseconds; it exists so the timeout branches are testable through the
+real-Pi harness without waiting the production interval out. An unset or invalid
+value leaves the production defaults untouched, so it changes nothing for users.
+
+### Rex provider acceptance
+
+`test/goal43-rex-acceptance.test.mjs` accepts the *released* pi-rex-subagent
+provider against the same RPC surface. The vendored release tree
+(`test/fixtures/rex-subagent-v0.2.0`, with its provenance record: tag, release
+commit, and tarball checksum) is loaded as a real extension next to pi-goal, so
+child work crosses exactly the seam the provider contract fixes: the persisted
+parent tool-result `usage` plus the accounting `details` cursors, produced by a
+real child Pi whose session events publish the usage snapshots.
+
+`test/helpers/rex-acceptance.mjs` builds the isolated environment per test: a
+foreground Rex server on a private Unix socket (`REX_SERVER`, so the user's own
+Rex app is never touched), a deterministic OpenAI-compatible child provider
+resolved through `models.json` in the shared agent directory (no credentials, no
+network), and that agent directory, which also isolates the provider's run
+records. A hold gate can keep a child provably mid-turn so a test can observe
+the zero-usage snapshot a running child has already published. The helper also
+drives the released CLI for adoption and second-turn fixtures, supports nested
+children on the same private server, and can crash one child to exercise
+durable-recovery diagnostics. Every client it spawns is retained for the
+environment's lifetime, so teardown kills and reaps them — SIGTERM, then a
+bounded SIGKILL escalation — before the temp tree goes, and a call a throwing or
+timed-out test abandoned never outlives the socket it was using.
+
+`test/goal44-rex-recovery.test.mjs` extends that acceptance through restart and
+selected-parent-branch reconstruction, parallel and overlapping observations,
+Replacement Goal ownership, adoption and nested delegation, and final
+stop/removal. The final-collection scenario checks all three persisted cursor
+outcomes: `final: true`, a durable non-final remainder marked
+`finalization: "unconfirmed"`, and terminal `snapshot: "missing"` recovery with
+zero observed usage. The restart scenario also pins observation-time V1: work
+performed while paused is charged only by the post-resume observation. These
+tests assert public tool results and Goal records; direct run-directory access
+is limited to fixture administration and crash setup.
+
+Because the nested scenario's immediate child and its real grandchild share one
+provider, its responder identifies a request by the conversation that produced
+it — the last tool result, or the prompt when there is none — and holds the
+immediate child's `rex_wait` turn until the grandchild's request has been
+observed. Neither turn is scripted by global arrival index, so the aggregate
+holds whichever child reaches the provider first.
+
+The live scenarios need a `rex` CLI; without one they skip with a message,
+because what they certify is the real released provider, not a green tick.
+pi-goal core stays Rex-free, which the suite's static isolation test pins.
+
 ## Interactive smoke test
 
 Deterministic RPC tests are the automated gate. The manual real-Pi procedure —
@@ -114,3 +205,7 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] a run admitted against a replaced identity cannot complete, report a
       blocker against, or pause the Goal that replaced it, and the replaced
       identity keeps its own durable superseded record
+- [ ] with `goal.sessionNameFromObjective: true`, a creation names an unnamed
+      session from the Objective's first line; with the setting absent or false,
+      no session is named; a user-provided name, an Objective edit, a Replacement
+      Goal, and a failed or rolled-back creation never change it

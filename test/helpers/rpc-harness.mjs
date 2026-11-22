@@ -21,6 +21,11 @@ import assert from "node:assert/strict";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 
+/** Drop undefined values: `spawn` refuses them, and a test may unset a variable. */
+function cleanEnv(env) {
+	return Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined));
+}
+
 export const PI_BINARY = process.env.PI_BINARY ?? "pi";
 export const PI_TIMEOUT_MS = Number(process.env.PI_GOAL_TEST_TIMEOUT_MS ?? 90_000);
 
@@ -28,7 +33,10 @@ let nextRequestId = 0;
 
 export class PiRpcSession {
 	constructor(options = {}) {
-		this.agentDir = mkdtempSync(join(tmpdir(), "pi-goal-agent-"));
+		// A caller-supplied agent dir (the Rex acceptance suite pre-writes models.json
+		// there so spawned Rex children resolve the deterministic provider) is the
+		// caller's to clean up; only a directory created here is removed on stop.
+		this.agentDir = options.agentDir ?? mkdtempSync(join(tmpdir(), "pi-goal-agent-"));
 		this.sessionDir = options.sessionDir ?? mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
 		this.cwd = options.cwd ?? mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 		this.scriptPath = options.scriptPath ?? join(this.cwd, "provider-script.json");
@@ -44,11 +52,17 @@ export class PiRpcSession {
 		// User-level settings written to <agent-dir>/settings.json before the spawn,
 		// for tests that need deterministic retry or compaction behavior.
 		this.settings = options.settings ?? undefined;
+		// Extra environment for the spawned Pi, applied over the harness defaults.
+		// The Rex acceptance suite uses it to point the released provider at an
+		// isolated Rex server and to strip this terminal's own Rex identity, so a
+		// test run from inside a Rex window cannot inherit it.
+		this.env = options.env ?? undefined;
 
 		// Only remove directories this session created; dirs passed in via options
-		// (shared cwd, shared session dir) outlive this instance and are the
-		// caller's responsibility.
-		this.ownedTempDirs = [this.agentDir];
+		// (shared cwd, shared session dir, caller agent dir) outlive this instance
+		// and are the caller's responsibility.
+		this.ownedTempDirs = [];
+		if (!options.agentDir) this.ownedTempDirs.push(this.agentDir);
 		if (!options.cwd) this.ownedTempDirs.push(this.cwd);
 		if (!options.sessionDir) this.ownedTempDirs.push(this.sessionDir);
 
@@ -90,11 +104,12 @@ export class PiRpcSession {
 
 		this.proc = spawn(PI_BINARY, args, {
 			cwd: this.cwd,
-			env: {
+			env: cleanEnv({
 				...process.env,
 				PI_CODING_AGENT_DIR: this.agentDir,
 				PI_GOAL_TEST_SCRIPT: this.scriptPath,
-			},
+				...(this.env ?? {}),
+			}),
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
@@ -304,6 +319,30 @@ export class PiRpcSession {
 	}
 
 	/**
+	 * Wait for a blocking extension confirm dialog and dismiss it.
+	 *
+	 * Dismissal is a different wire answer from an explicit "No": a host that
+	 * closes the dialog sends `cancelled: true`, which Pi maps to the dialog's
+	 * default answer without the user having decided anything. The extension
+	 * cannot observe the difference, so this is how a test pins dismissal as its
+	 * own path rather than reusing the decline answer.
+	 */
+	async dismissConfirm(matcher) {
+		const request = await this.waitFor("unanswered matching extension confirm dialog", (records) =>
+			records.find(
+				(r) =>
+					r.type === "extension_ui_request" &&
+					r.method === "confirm" &&
+					!this.answeredUiRequests.has(r.id) &&
+					matcher(r),
+			),
+		);
+		this.answeredUiRequests.add(request.id);
+		this.writeCommand({ type: "extension_ui_response", id: request.id, cancelled: true });
+		return request;
+	}
+
+	/**
 	 * Wait for a blocking extension editor dialog and answer it with `value`.
 	 *
 	 * Mirrors `respondToConfirm` for the `editor` method, which carries the
@@ -347,6 +386,25 @@ export class PiRpcSession {
 
 	async getState() {
 		return this.sendSimple("get_state");
+	}
+
+	/**
+	 * Rename the session the way an interactive user or a host does (RPC
+	 * `set_session_name`).
+	 *
+	 * This is the *user-provided* name seam: pi-goal must never overwrite it, so a
+	 * naming test needs a way to produce a name that did not come from the extension.
+	 */
+	async setSessionName(name) {
+		const id = `req-${++nextRequestId}`;
+		const responsePromise = this.waitFor(
+			`response for set_session_name ${id}`,
+			(records) => records.find((r) => r.type === "response" && r.id === id),
+		);
+		this.writeCommand({ id, type: "set_session_name", name });
+		const response = await responsePromise;
+		if (!response.success) throw new Error(`set_session_name failed: ${response.error}`);
+		return response.data;
 	}
 
 	async getCommands() {

@@ -392,6 +392,45 @@ export const getGoalOutputSchema = Type.Object({
 });
 
 /**
+ * The final-response usage instruction a *budgeted* Goal's completion publishes.
+ *
+ * Completion is terminal and the extension cannot ask for another provider turn
+ * just to produce a cost report, so the report travels inside the completing
+ * `update_goal` result: the model reads `instruction` and states the numbers in
+ * the final response it is already writing. The numeric fields are present so a
+ * programmatic caller never has to parse the instruction.
+ */
+export const goalCompletionReportSchema = Type.Object({
+	/** The instruction the final response must follow, verbatim. */
+	instruction: Type.String(),
+	/** Accounted Goal tokens at completion (input + output + cache writes). */
+	accountedTokens: Type.Integer(),
+	/** Active elapsed seconds at completion, in whole seconds. */
+	activeSeconds: Type.Integer(),
+	/** The Goal's Token budget. */
+	tokenBudget: Type.Integer(),
+	/** Tokens of remaining capacity, floored at zero. */
+	remainingTokens: Type.Integer(),
+	/**
+	 * The applicable accounting approximations, single-sourced into the
+	 * instruction so the model and a programmatic caller read the same caveats.
+	 */
+	accountingNotes: Type.Array(Type.String()),
+});
+export type GoalCompletionReport = Static<typeof goalCompletionReportSchema>;
+
+/**
+ * `update_goal`'s structured result: the same `{ goal }` payload every Goal tool
+ * returns, plus the completion usage report when a budgeted Goal completes.
+ * An unbudgeted completion carries no report, so it can never claim a budget or
+ * remaining capacity it does not have.
+ */
+export const updateGoalOutputSchema = Type.Object({
+	goal: Type.Union([Type.Null(), goalPublicStateSchema]),
+	completionReport: Type.Optional(goalCompletionReportSchema),
+});
+
+/**
  * Project the public, structured state from a record. One source of truth so the
  * /goal command output, get_goal, create_goal, and update_goal always agree.
  */
@@ -434,10 +473,52 @@ function formatSeconds(seconds: number): string {
 	return rest === 0 ? `${minutes}m` : `${minutes}m ${rest}s`;
 }
 
+/**
+ * Whether new Goal work may be admitted (`goal.enabled`).
+ *
+ * Passed to the renderers rather than stored on the Goal: admission is a host
+ * preference, not Goal state, so it must never appear in a snapshot or in the
+ * structured Goal record. Defaults to enabled so a caller that does not track
+ * the setting renders exactly what it did before.
+ */
+export interface AdmissionView {
+	admissionEnabled?: boolean;
+}
+
+/**
+ * The lines that tell the user the extension is disabled while a Goal exists.
+ *
+ * The point is that a disabled Goal is not a continuing one: nothing new will be
+ * admitted. Only an **active** Goal is still running its clock, though — its
+ * Lifecycle status is untouched and its Active elapsed time keeps accruing, so
+ * pausing the Goal (not disabling the extension) is what stops that clock. Every
+ * other status has already stopped the clock, and this block must not claim a
+ * stopped Goal is accruing or that a refused `/goal resume` will start it.
+ */
+function admissionDisabledLines(status: GoalPublicState["status"]): string[] {
+	const clock =
+		status === "active"
+			? "this Goal keeps its active status and keeps accruing active time, and /goal pause — not disabling the " +
+				"extension — is what stops that clock"
+			: `this Goal is already ${status}, so its active time has already stopped and nothing restarts it while the ` +
+				"extension stays disabled";
+	return [
+		"Admission disabled: goal.enabled is false, so pi-goal admits no new Goal work — no /goal <objective> or " +
+			"create_goal, no work-admitting /goal edit, no /goal resume, and no automatic continuation. " +
+			`Disabling the extension is an admission control, not a Lifecycle status and not a pause: ${clock}. ` +
+			"Inspection (/goal, get_goal), /goal pause, /goal clear, and terminal updates from work already in flight " +
+			"still work.",
+	];
+}
+
 /** Compact single-line rendering used in notifications and tool result text. */
-export function formatGoalSummary(state: GoalPublicState): string {
+export function formatGoalSummary(state: GoalPublicState, admission: AdmissionView = {}): string {
 	const budget = state.tokenBudget === null ? "none (unbounded)" : `${state.tokenBudget} tokens`;
 	const usage = state.usage;
+	// Every status hint that names a resume has to be admission-aware: a disabled
+	// extension refuses `/goal resume`, so a report may not promise it will start
+	// work. An enabled extension renders exactly what it always did.
+	const admissionOff = admission.admissionEnabled === false;
 	const lines = [
 		`Goal ${state.id} — ${state.status}`,
 		`Objective: ${state.objective}`,
@@ -452,24 +533,41 @@ export function formatGoalSummary(state: GoalPublicState): string {
 			`nested ${usage.nestedTokens} counted once)`,
 		`Active time: ${formatSeconds(usage.activeSeconds)}`,
 		...(state.status === "paused"
-			? ["Paused: no automatic Goal runs start until /goal resume; /goal edit still works."]
+			? [
+					admissionOff
+						? "Paused: no automatic Goal runs start, and /goal resume is refused while pi-goal is disabled; /goal edit still works."
+						: "Paused: no automatic Goal runs start until /goal resume; /goal edit still works.",
+				]
 			: []),
 		...(state.status === "blocked"
-			? ["Blocked: /goal resume restarts this Goal with a fresh blocked audit."]
+			? [
+					admissionOff
+						? "Blocked: /goal resume is refused while pi-goal is disabled; once re-enabled it restarts this Goal with a fresh blocked audit."
+						: "Blocked: /goal resume restarts this Goal with a fresh blocked audit.",
+				]
 			: []),
 		...(state.status === "usage_limited"
-			? ["Usage limited: /goal resume restarts this Goal once the limit is resolved."]
+			? [
+					admissionOff
+						? "Usage limited: /goal resume is refused while pi-goal is disabled; once re-enabled it restarts this Goal once the limit is resolved."
+						: "Usage limited: /goal resume restarts this Goal once the limit is resolved.",
+				]
 			: []),
 		...(state.status === "budget_limited"
 			? [
-					"Budget limited: /goal resume --budget <new-total> raises the cumulative ceiling and restarts this Goal; " +
-					"the configured default budget is never implicit resume authority.",
+					admissionOff
+						? "Budget limited: /goal resume --budget <new-total> is refused while pi-goal is disabled; once re-enabled it raises the cumulative ceiling and restarts this Goal, and the configured default budget is never implicit resume authority."
+						: "Budget limited: /goal resume --budget <new-total> raises the cumulative ceiling and restarts this Goal; " +
+							"the configured default budget is never implicit resume authority.",
 				]
 			: []),
 		state.tokenBudget === null
 			? "Remaining capacity: unlimited"
 			: `Remaining capacity: ${state.remainingTokens} tokens` +
 				(state.budgetExhausted ? " (budget exhausted)" : ""),
+		// Surfaced separately from the status line above, so an active-but-disabled
+		// Goal is never mistaken for one that keeps continuing on its own.
+		...(admissionOff ? admissionDisabledLines(state.status) : []),
 	];
 	if (state.blocker !== null) {
 		lines.push(`Blocker: ${state.blocker}`);
@@ -490,17 +588,63 @@ export function formatGoalSummary(state: GoalPublicState): string {
  * Deliberately short: the footer is a glance surface, and the full breakdown is
  * one `/goal` away.
  */
-export function formatGoalStatusLine(state: GoalPublicState): string {
+export function formatGoalStatusLine(state: GoalPublicState, admission: AdmissionView = {}): string {
 	const parts = [`${state.id}`, state.status, `${state.usage.totalTokens} tok`];
 	if (state.tokenBudget !== null) {
 		parts.push(state.budgetExhausted ? "budget exhausted" : `${state.remainingTokens} left`);
 	}
 	parts.push(formatSeconds(state.usage.activeSeconds));
+	// The one word that says this active Goal is not admitting anything new. Kept
+	// short: the footer is a glance surface and the full explanation is one /goal
+	// away.
+	if (admission.admissionEnabled === false) parts.push("admission off");
 	return parts.join(" · ");
 }
 
-export function formatNoGoal(): string {
-	return "No Goal is set in this session. Use /goal <objective> to create one.";
+/**
+ * Build the completion usage report for a finished Goal, or null when the Goal
+ * has no Token budget.
+ *
+ * Budgeted only, because the report's whole point is the cost of the work
+ * against its ceiling: an unbudgeted Goal has no budget and no remaining
+ * capacity to report, and inventing either would misstate what the user asked
+ * for. Everything comes from the completion snapshot the extension already
+ * built, so no extra provider request and no re-accounting is involved.
+ */
+export function buildCompletionReport(state: GoalPublicState): GoalCompletionReport | null {
+	if (state.tokenBudget === null) return null;
+	const accountedTokens = state.usage.totalTokens;
+	const remaining = state.remainingTokens ?? 0;
+	const activeSeconds = state.usage.activeSeconds;
+	const accountingNotes = [
+		"Accounted tokens are pi-goal's accounting approximation, not a provider invoice total: " +
+			"input + output + cache writes as Pi reports them, with cached reads excluded as prompt " +
+			"reuse, reasoning already inside output, and nested tool usage counted once.",
+		"Active elapsed time counts live-session time while the Goal was active, in whole seconds, " +
+			"and excludes non-active statuses and process downtime.",
+	];
+	const instruction =
+		"This budgeted Goal is complete. Your final response must report the cost and duration of the work: " +
+		`${accountedTokens} accounted tokens of the ${state.tokenBudget}-token Token budget, ` +
+		`${remaining} tokens of remaining capacity, and ${formatSeconds(activeSeconds)} of Active elapsed time. ` +
+		accountingNotes.join(" ");
+	return {
+		instruction,
+		accountedTokens,
+		activeSeconds,
+		tokenBudget: state.tokenBudget,
+		remainingTokens: remaining,
+		accountingNotes,
+	};
+}
+
+export function formatNoGoal(admissionEnabled = true): string {
+	const base = "No Goal is set in this session. Use /goal <objective> to create one.";
+	if (admissionEnabled) return base;
+	return (
+		`${base} pi-goal is disabled (goal.enabled is false), so /goal <objective> and create_goal are refused ` +
+		"until it is re-enabled; get_goal, /goal pause, and /goal clear are unaffected."
+	);
 }
 
 /** Compact single line for quoting an objective inside dialogs and errors. */

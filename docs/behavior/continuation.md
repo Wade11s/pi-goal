@@ -31,4 +31,11 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   replaced.
 - A run that was aborted or that ended in a provider error is a hard exit: Pi
   owns retries, so the Goal does not add a retry loop of its own. The Goal stays
-  active and continues on the next successful run.
+  active and continues on the next successful run — unless `goal.enabled` is
+  false, where the notice says so, because that next run settles at the
+  admission gate and continues nothing.
+- While `goal.enabled` is false, nothing is admitted at this boundary: no
+  continuation and no owed budget wrap-up. The Goal keeps its status and keeps
+  accruing active time, and a pending wrap-up is deferred rather than dropped —
+  re-enabling the setting delivers it at the next settlement. → [Disabling the
+  extension](lifecycle.md#disabling-the-extension-goalenabled)

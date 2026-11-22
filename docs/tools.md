@@ -12,6 +12,13 @@ The model can call `get_goal` at any time to retrieve the same structured state
 the command reports (or `goal: null` when no Goal is set). Use it whenever the
 objective is absent or truncated in context.
 
+While `goal.enabled` is false the tool's text adds an `Admission disabled:` block:
+the Goal's Lifecycle status is untouched, no new Goal work is admitted, and
+inspection, pause, clear, and terminal updates from in-flight work still work.
+With no Goal set, the text says the same thing about `/goal <objective>` and
+`create_goal`. The structured `{ goal }` payload is unchanged — admission is a
+host preference, not Goal state, so it is never persisted in a snapshot.
+
 ## Model tool: `create_goal`
 
 `create_goal` lets the model create a Goal, but only for an **explicit user or
@@ -23,6 +30,19 @@ could not restore the Goal, refuses while this session already has a Goal
 snapshot before reporting success. Creating a Goal through the tool does not
 send a kickoff message: the model is already mid-run, and the continuation seam
 picks the Goal up at the next settlement.
+
+Because it refuses while any Goal exists, a successful `create_goal` is always a
+fresh creation, so it is also the tool-side path for the opt-in session name: with
+`goal.sessionNameFromObjective` enabled it names an otherwise unnamed session
+from the Objective, exactly like `/goal <objective>`. A refused, failed, or
+rolled-back creation reports no Goal and names nothing. The name is not part of
+the tool result and not part of any Goal-updated event — see
+[lifecycle](behavior/lifecycle.md#naming-the-session-from-the-objective).
+
+While `goal.enabled` is false the tool is refused before anything is validated:
+the result is an error carrying the unchanged current Goal (or `goal: null`), and
+the one-shot creation authority is left intact, so a corrected call can retry once
+the setting is re-enabled.
 
 ### Creation authority
 
@@ -126,6 +146,17 @@ authorize its own pause) is refused, and the Goal keeps running. The model
 cannot resume, clear, replace, or budget-limit a Goal through the tool at all:
 those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
 <objective>`).
+
+None of the three actions is an admission decision, so all of them keep working
+while `goal.enabled` is false: a run that was already in flight when the extension
+was disabled can still complete a Goal, report a blocker, or pause it, and every
+successful result carries the disabled condition in its text — including a blocker
+report below the audit threshold, which otherwise reads as a Goal that stays
+active — so the model does not read the Goal as one that will keep continuing.
+The condition follows the status the update leaves: a paused or blocked result
+names the refused `/goal resume` that re-enabling makes available again, while a
+completion says the Goal is terminal either way so that replacing it is a new
+`/goal <objective>` and not a resume.
 
 `blocked` is the blocker contract. The model calls it with
 `{ action: "blocked", blocker: "…" }` — plus `blocker_id` on every later report of
@@ -247,3 +278,33 @@ While a blocked audit is open, the same payload carries its **Blocker identity**
 `get_goal`'s text repeats the identity so the model can pass it back verbatim in
 `update_goal`'s `blocker_id`. The human-facing status deliberately shows only the
 description and the count.
+
+### `update_goal`'s completion usage report
+
+A **budgeted** Goal's successful completion adds one field to that result, so the
+final response can state what the work cost without another provider request:
+
+```json
+{
+  "goal": { "id": "goal_1a2b3c4d", "status": "complete", "tokenBudget": 250000, "remainingTokens": 201790, "...": "..." },
+  "completionReport": {
+    "instruction": "This budgeted Goal is complete. Your final response must report the cost and duration of the work: 48210 accounted tokens of the 250000-token Token budget, 201790 tokens of remaining capacity, and 5m 12s of Active elapsed time. ...",
+    "accountedTokens": 48210,
+    "activeSeconds": 312,
+    "tokenBudget": 250000,
+    "remainingTokens": 201790,
+    "accountingNotes": ["..."]
+  }
+}
+```
+
+`instruction` is the exact wording the final response must follow, and it is also
+appended to the tool result's text content so the model acts on it. The numeric
+fields let a programmatic caller read the same facts without parsing prose. See
+[budgets](behavior/budgets.md#completion-usage-report) for the accounting
+approximations the notes carry.
+
+The report is present only on a successful **budgeted** completion. An
+unbudgeted Goal, a refusal, and every other `update_goal` action keep the plain
+`{ goal }` payload, so no result ever claims a budget or a remaining capacity
+the Goal does not have.

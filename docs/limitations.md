@@ -54,7 +54,12 @@ what it cannot preempt, and what is intentionally left to the user.
   reports `budgetExhausted: true` with `remaining: 0` in the meantime.
 - Token accounting is provider-neutral but not invoice-exact: it excludes cached
   reads and counts cache writes, and it does not reconcile against provider
-  billing. Pi's cache-warming `usage` entries are not counted.
+  billing. Pi's cache-warming `usage` entries are not counted. External child
+  usage uses observation-time ownership in V1: work performed while a Goal is
+  paused but first observed after resume can belong to the observing segment,
+  not the segment in which the child executed it. Strict lifecycle attribution
+  is not claimed, and work a crashed child never persisted to its session or a
+  durable usage snapshot cannot be recovered.
 - Migrated 0.1.0 Goals report **legacy reconstructed totals**: a one-time
   baseline under the 0.1.0 status-only rule, not exact Goal-owned attribution
   rebuilt under the repaired rules. Only work after the branch-local cutover is
@@ -76,6 +81,32 @@ what it cannot preempt, and what is intentionally left to the user.
   three more empty turns before it is stopped again; the blocked audit is durable
   and survives a restart, except that the prompt which resumes work after one is a
   user action and starts a fresh audit.
+- `goal.enabled` is read from Pi's effective settings at session start, so a
+  changed value takes effect on the next session start or reload, never
+  retroactively for work already in flight. A non-boolean value is reported once
+  and ignored, which keeps admission enabled exactly as an unset value does.
+- Disabling the extension is not a pause: an active-but-disabled Goal keeps
+  accruing Active elapsed time until the user pauses it, and no new Goal-owned
+  usage is admitted while it is disabled, because every run starts from a user
+  prompt that closes the admission segment. Work already queued when the
+  extension is disabled is delivered as ordinary work rather than dropped.
+- `goal.resumePrompt` (default `false`) is asked **once per session start** and
+  only for a restored `paused` Goal with a dialog-capable UI. Restarting again
+  asks again; there is no durable "already asked" marker. It never prompts for
+  `active`, `complete`, `blocked`, `usage_limited`, or `budget_limited` work, and
+  branch navigation does not ask even when it restores a paused Goal. The dialog
+  is bounded by its own safety timeout, so an unanswered prompt resolves to "no"
+  rather than waiting forever, and because `session_start` never awaits it a
+  headless RPC host is usable while the request is still pending.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.
+- Session naming is opt-in and one-shot in effect: it names only a session that
+  has no name yet, and only on a creation. A session whose name came from an
+  earlier Goal keeps that name until the user renames it, and pi-goal never
+  removes a name — clearing a Goal does not clear the session name, because the
+  name describes the session's history rather than the Goal that is current.
+- `goal.sessionNameFromObjective` is read from Pi's effective settings at session
+  start, so a changed value takes effect on the next session start or reload,
+  never for a Goal that already exists. A non-boolean value is reported once and
+  ignored, which leaves sessions unnamed exactly as an unset value does.

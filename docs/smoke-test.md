@@ -336,6 +336,79 @@ admitted against), and the new Goal to stay `active` at revision 0 with its own
 kickoff rather than being marked `complete` with no work. The replaced identity
 keeps its own durable superseded record.
 
+## 21. Optional: disabling the extension (`goal.enabled`)
+
+`goal.enabled` is an admission control, not a Lifecycle status. The deterministic
+coverage is `test/goal46-admission-control.test.mjs` (a real `pi --mode rpc`
+session per case, resumed with a different `settings.json`); the steps below
+reproduce the user-visible surface by hand.
+
+1. Create a Goal and let a continuation run (sections 3–5).
+2. Add `"goal": { "enabled": false }` to Pi settings and restart Pi on the same
+   session (`pi --continue`, or resume the session file).
+3. Run `/goal`. Expect the ordinary report plus an `Admission disabled:` block,
+   and a status line ending in `admission off`.
+4. Send an ordinary prompt. Expect the work to run and finish, and a
+   `... no continuation was requested at this settlement` notification. Bare
+   `/goal` twice a few seconds apart: `Active time` must still be increasing —
+   disabling the extension does not stop the clock.
+5. Try `/goal <objective>`, `/goal edit <objective>`, and `/goal resume`. Expect a
+   refusal naming what is refused and what still works; no replacement
+   confirmation dialog may open.
+6. `/goal pause`, then `/goal edit <objective>`: the edit of an already-stopped
+   Goal is allowed and says no work was started.
+7. Remove the setting (or set it to `true`) and restart on the same session. The
+   restored active Goal continues at the next settlement again.
+
+## 22. Optional: the paused-Goal resume prompt (`goal.resumePrompt`)
+
+`goal.resumePrompt` is convenience over `/goal resume`, not a replacement for it.
+The deterministic coverage is `test/goal51-resume-prompt.test.mjs` (a real `pi
+--mode rpc` session per case, reopened on a copied session file); the steps below
+reproduce the user-visible surface by hand.
+
+1. `/goal <objective>`, let one continuation run, then `/goal pause`.
+2. Add `"goal": { "resumePrompt": true }` to Pi settings and restart Pi on the
+   same session. Expect one `Resume the paused Goal?` confirmation after the
+   `Goal ... restored (paused)` notice. Do **not** answer it yet: `/goal` must
+   still respond and report `paused`, because startup never waits on the dialog.
+3. Answer **Yes**. Expect `Goal ... resumed (revision N)` and a fresh resume
+   kickoff; bare `/goal` reports `active`, and a subsequent model blocker report
+   starts a fresh audit rather than inheriting the pre-pause one.
+4. Repeat from step 1 and answer **No** (or dismiss the dialog, or leave it
+   unanswered until it times out). Expect `Resume prompt not confirmed
+   (declined, dismissed, or timed out)` and a Goal that is still `paused` with an
+   unchanged revision, no new run, and no new continuation.
+5. While a `blocked`, `usage_limited`, or `budget_limited` Goal is restored, no
+   prompt may appear; those recoveries stay explicit (`/goal resume`, or
+   `/goal resume --budget <new-total>` with valid new headroom).
+6. Set `"goal": { "enabled": false, "resumePrompt": true }` and restart on a
+   paused Goal. Expect no dialog, a notice that the prompt is enabled but
+   pi-goal is disabled, and `/goal resume` still refused; the Goal stays paused
+   either way.
+7. Remove the setting (or set it to `false`) and restart: the paused Goal is
+   restored with no dialog and only `/goal resume` restarts it.
+
+## 23. Optional: naming the session from the Objective
+
+`goal.sessionNameFromObjective` (default `false`) is a convenience, not a
+Lifecycle behavior. The deterministic coverage is
+`test/goal52-session-naming.test.mjs` (a real `pi --mode rpc` session per case);
+the steps below reproduce the user-visible surface by hand.
+
+1. Add `"goal": { "sessionNameFromObjective": true }` to Pi settings and restart Pi.
+2. `/goal <objective>` in a session with no name. Expect the session name (shown in
+   the session selector and the footer) to become the Objective's first line.
+3. Name the session yourself (`/name <name>` or `ctrl+r` to rename it in place),
+   then `/goal clear` and `/goal <another objective>`. Expect your name to survive:
+   pi-goal never overwrites a name that exists.
+4. With a named session, `/goal edit <new objective>`. Expect the name to be
+   unchanged while the Goal's objective and revision change.
+5. With a named session, `/goal <another objective>` and confirm the replacement.
+   Expect the name to be unchanged again.
+6. A long objective (over 80 characters) is named with exactly its first 80
+   characters, and a multi-line objective with only its first line.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -368,6 +441,26 @@ keeps its own durable superseded record.
 - [ ] A run admitted against a replaced identity cannot complete, report a
       blocker against, or pause the Goal that replaced it; the replaced identity
       keeps its own durable superseded record.
+- [ ] With `goal.enabled: false`, creation, replacement, `create_goal`, a
+      work-admitting edit, resume, and automatic continuation are all refused,
+      while inspection, pause, clear, and in-flight terminal updates still work.
+- [ ] An active-but-disabled Goal keeps its `active` status and keeps accruing
+      `Active time`; `/goal pause`, not disabling the extension, stops it.
+- [ ] Re-enabling `goal.enabled` restores admission, and the restored active Goal
+      continues only at the next settlement.
+- [ ] With `goal.resumePrompt: true`, a restored `paused` Goal is asked once;
+      accepting runs `/goal resume`'s durable transition (fresh Blocked audit),
+      while declining, dismissing, timing out, or having no UI leaves it paused
+      and unchanged.
+- [ ] `active`, `complete`, `blocked`, `usage_limited`, and `budget_limited` Goals
+      are never prompted for, and a disabled extension never offers the prompt.
+- [ ] With `goal.sessionNameFromObjective: true`, `/goal <objective>` names an
+      unnamed session from the Objective's first line (whitespace-collapsed, at
+      most 80 characters), and `create_goal` does the same.
+- [ ] With the setting absent or `false`, no session is ever named.
+- [ ] A session name the user provided is never overwritten, an Objective edit and
+      a Replacement Goal never rename it, and a failed or rolled-back creation
+      leaves the session unnamed.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with

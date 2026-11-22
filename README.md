@@ -132,11 +132,17 @@ occupied, so none of them wait for idle. Details:
 | Status | Meaning |
 | --- | --- |
 | `active` | Continues automatically; active time accrues. |
-| `paused` | The user stopped admission. In-flight work finishes, nothing continues, and the clock stops. `/goal resume` restarts. |
+| `paused` | The user stopped admission. In-flight work finishes, nothing continues, and the clock stops. `/goal resume` restarts it (an opt-in resume prompt may offer that at session start). |
 | `blocked` | Three consecutive Goal turns reported the same genuine blocker, or made no activity. `/goal resume` restarts with a fresh audit. |
 | `usage_limited` | The provider reported an exhausted plan or quota. `/goal resume` restarts. |
 | `budget_limited` | The token budget was reached. One bounded wrap-up is allowed, then no continuation. Raise the cumulative budget to resume. |
 | `complete` | Terminal for the Goal's identity. Replace it with `/goal <objective>`. |
+
+`goal.enabled` (Pi settings, default `true`) is an **Admission control**, not a
+status: while it is false, no new Goal work is admitted — no creation or
+replacement, no `create_goal`, no work-admitting objective edit, no resume, and no
+automatic continuation — and an active Goal keeps its `active` status and keeps
+accruing active time. → [Goal lifecycle](docs/behavior/lifecycle.md)
 
 ## How it behaves
 
@@ -192,8 +198,82 @@ continues automatically: only the user's `/goal resume` restarts it.
 - `/goal resume --budget <new-total>` raises the **cumulative** ceiling (not an
   increment). It must exceed the accounted total and stay within the configured
   maximum, and it earns one fresh wrap-up per exhaustion episode.
+- Completing a **budgeted** Goal returns a final-response usage report in the
+  `update_goal` result: accounted tokens, Active elapsed time, the Token budget,
+  remaining capacity, and the accounting approximations behind them. It is built
+  from the completion snapshot, so it costs no extra provider request. An
+  unbudgeted Goal's completion reports no budget and no remaining capacity.
 
 → [Token budgets and budget exhaustion](docs/behavior/budgets.md)
+
+### Disabling the extension
+
+```json
+{ "goal": { "enabled": false } }
+```
+
+`goal.enabled` (default `true`) is an admission control: while it is false,
+pi-goal admits no new Goal work, so nothing unattended starts.
+
+- **Refused:** `/goal <objective>` (creation and replacement), `create_goal`,
+  `/goal edit` of an *active* Goal (an edit there steers work into a running
+  Goal), `/goal resume`, and the automatic continuation or budget wrap-up the
+  settlement seam would otherwise request. A pending wrap-up is deferred, not
+  lost: it is delivered at the first settlement after re-enabling.
+- **Still available:** bare `/goal` and `get_goal`, `/goal pause`, `/goal clear`,
+  and every terminal update from work already in flight — including a
+  `budget_limited` transition and an `update_goal` completion. An in-flight
+  provider request is never aborted.
+- **Nothing is rewritten:** the Goal keeps its Lifecycle status and keeps
+  accruing active time. **Pausing the Goal, not disabling the extension, stops
+  that clock**, so the status report and the compact indicator both say
+  `admission off` while an active-but-disabled Goal is not mistaken for one that
+  keeps continuing.
+- A changed setting takes effect at the next session start or reload, exactly
+  like the budget settings; a non-boolean value is reported and ignored.
+
+→ [Goal lifecycle](docs/behavior/lifecycle.md)
+
+### Naming the session from the Objective
+
+```json
+{ "goal": { "sessionNameFromObjective": true } }
+```
+
+`goal.sessionNameFromObjective` (default `false`) is an opt-in convenience: after a
+successful creation, pi-goal may name an otherwise unnamed session from the
+Objective, so a Goal is easier to find later in a session list.
+
+- The name is the Objective's **first line**, whitespace-collapsed and capped at
+  **80 characters**. Attachment contents never contribute: only the Objective text
+  does.
+- **A name you provided is never overwritten.** If the session already has a name,
+  pi-goal leaves it alone.
+- **An Objective edit and a Replacement Goal never rename anything**, and a
+  creation that failed, was rolled back, or was cleared while it waited names
+  nothing.
+- The name is Pi's own session metadata, not Goal state: it is not part of the
+  Lifecycle, of accounting, or of the `pi-goal:updated` event stream, and it
+  survives a restart because Pi persists it.
+
+→ [Goal lifecycle](docs/behavior/lifecycle.md)
+
+### Optional resume prompt
+
+```json
+{ "goal": { "resumePrompt": true } }
+```
+
+`goal.resumePrompt` (default `false`) offers **one** confirmation dialog at
+session start when a restored Goal is `paused`: accepting runs the same durable
+transition as `/goal resume` (same identity and history, fresh Blocked audit),
+while declining, dismissing, timing out, or having no dialog-capable UI leaves
+the Goal paused and unchanged. Only `paused` is ever prompted for — `blocked`,
+`usage_limited`, and `budget_limited` recovery stays an explicit user decision —
+and the prompt is never awaited by startup, so print, JSON, and headless RPC
+flows never wait for it. While `goal.enabled` is false the prompt is not offered
+at all; the restore notice says so instead. →
+[Opt-in resume prompt](docs/behavior/lifecycle.md#opt-in-resume-prompt)
 
 ### Usage accounting
 
@@ -237,6 +317,20 @@ sessions (`--no-session`) refuse to create a Goal at all.
   provider loop, so a run can overshoot before the gate stops further work. A
   tool already in flight when the budget is crossed still finishes and is
   charged.
+- Session naming is read from Pi's effective settings at session start, so a
+  changed `goal.sessionNameFromObjective` takes effect on the next session start
+  or reload. It names only a session that has no name yet and only on a creation,
+  so a session whose name came from an earlier Goal keeps that name.
+- `goal.enabled` is read from Pi's effective settings at session start, so a
+  changed value takes effect on the next session start or reload rather than
+  mid-session. While the extension is disabled, an active Goal accrues no new
+  Goal-owned usage either, because every run starts from a user prompt that
+  closes the admission segment.
+- `goal.resumePrompt` is a convenience over the explicit `/goal resume`, never a
+  replacement for it: it is off by default, asks only once per session start and
+  only for a restored `paused` Goal, and every answer other than an explicit
+  "yes" — decline, dismissal, timeout, no UI — leaves the Goal untouched. It
+  never resumes `blocked`, `usage_limited`, or `budget_limited` work.
 - Accounting is provider-neutral but not invoice-exact: cached reads are
   excluded, cache writes counted, and provider billing is not reconciled.
   Migrated 0.1.0 Goals report **legacy reconstructed totals**, not exact

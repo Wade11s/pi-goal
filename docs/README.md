@@ -22,12 +22,13 @@ Every rule the extension enforces, and every reason it is shaped that way.
 
 | Doc | Covers |
 | --- | --- |
-| [behavior/lifecycle.md](behavior/lifecycle.md) | Create, replace, edit, inspect, the status indicator, and pause/resume/clear |
+| [behavior/lifecycle.md](behavior/lifecycle.md) | Create, replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Objective, and the `goal.enabled` admission control |
 | [behavior/budgets.md](behavior/budgets.md) | `--budget` and `--no-budget`, settings defaults and hard maximum, cumulative budget raises, budget exhaustion and the bounded wrap-up |
 | [behavior/continuation.md](behavior/continuation.md) | The `agent_before_settle` seam, one provider request per settlement, the evidence audit, and the no-progress contract |
 | [behavior/stopping.md](behavior/stopping.md) | The Blocker identity contract, blocked-audit thresholds, anti-loop bounds, and the usage-limit classification tiers |
 | [behavior/accounting.md](behavior/accounting.md) | The `input + output + cacheWrite` formula, deduplication, admission segments, active time, and durable-write ordering |
 | [behavior/persistence.md](behavior/persistence.md) | `goal-state` and `goal-usage` entries, reconstruction, forks, tombstones, superseded records, and the 0.1.0 cutover |
+| [behavior/events.md](behavior/events.md) | The local `pi-goal:updated` event stream: payload, transition kinds, durable-before-announced ordering, no-flood rules, and listener-failure isolation |
 
 ## Reference
 
