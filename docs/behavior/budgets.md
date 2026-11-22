@@ -118,3 +118,45 @@ objective, and an in-flight or completed wrap-up is never duplicated by an edit.
 
 Raising the budget or changing the objective is a user decision; a
 `budget_limited` Goal is resumed with `/goal resume --budget <new-total>`.
+
+## Completion usage report
+
+Completing a Goal with a Token budget also reports what it cost. The structured
+`update_goal` result of that one call carries a `completionReport` next to the
+usual `{ goal }` payload, and the model-visible result text repeats its
+`instruction`:
+
+```json
+{
+  "goal": { "id": "goal_1a2b3c4d", "status": "complete", "tokenBudget": 250000, "...": "..." },
+  "completionReport": {
+    "instruction": "This budgeted Goal is complete. Your final response must report the cost and duration of the work: 48210 accounted tokens of the 250000-token Token budget, 201790 tokens of remaining capacity, and 5m 12s of Active elapsed time. ...",
+    "accountedTokens": 48210,
+    "activeSeconds": 312,
+    "tokenBudget": 250000,
+    "remainingTokens": 201790,
+    "accountingNotes": ["Accounted tokens are pi-goal's accounting approximation, ...", "..."]
+  }
+}
+```
+
+- It is built from the completion snapshot the extension just wrote — the same
+  accounted tokens, Active elapsed time, Token budget, and remaining capacity
+  every other surface reports — so the reminder needs **no additional provider
+  request** and changes no completion or accounting behavior. The completing
+  run's own follow-up response is where the model states the report.
+- `remainingTokens` floors at zero, exactly like every other remaining-capacity
+  surface.
+- The approximations travel with the numbers, single-sourced into
+  `accountingNotes` and repeated in `instruction`: the accounted total is
+  `input + output + cacheWrite` under Pi's usage semantics (cached reads
+  excluded as reuse, reasoning already inside output, nested usage counted once),
+  and Active elapsed time counts live-session time in whole seconds, excluding
+  non-active statuses and process downtime. Nothing describes the total as
+  invoice-exact: it is pi-goal's accounting rule applied to what Pi reports, and
+  provider billing is not reconciled.
+- An **unbudgeted** Goal completes exactly as before: the result carries the
+  `{ goal }` payload and no `completionReport`, so it never claims a budget or a
+  remaining capacity it does not have.
+- A Goal completed by an automatic Continuation reports the same way; the report
+  is attached to whichever `update_goal` call completed it.
