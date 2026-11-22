@@ -23,7 +23,7 @@ pure function from one committed `pi-goal:updated` event to one
 - a metric exists only for a transition that committed — a refused, failed, or
   retracted transition emits no event, therefore produces no metric;
   `test/goal55-metrics-store.test.mjs` drives genuine refusals (ineligible,
-  stale) through the store and asserts the stream stays empty;
+  stale) through the store and asserts no further metric is published;
 - a metric can never disagree with the durable snapshot it describes, because
   both come from the same committed record;
 - metrics are never read from live store state, never polled, and never
