@@ -4,7 +4,7 @@ What Pi does on its own while a Goal is active, and the no-progress contract
 every continuation carries.
 
 [← README](../README.md) · See also [stopping](stopping.md) ·
-[accounting](accounting.md)
+[accounting](accounting.md) · [attachments](attachments.md)
 
 While a Goal is **active**, Pi continuing on its own is the normal case:
 
@@ -29,6 +29,14 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   is narration rather than Goal state. The section is emitted only when the tool
   is really registered, so the model is never told to call a tool that is not in
   its loadout. → [Optional progress plan](lifecycle.md#optional-progress-plan)
+- A Goal with attachments re-reads the same immutable manifest: text is framed
+  again as encoded, nonce-delimited untrusted data and images are included as Pi
+  image content blocks. Before requesting the Continuation, pi-goal performs one
+  authenticated load that enforces the manifest size and limits and verifies
+  every artifact hash on the exact bytes it returns. A missing or corrupt
+  artifact suppresses the request and surfaces an explicit integrity error
+  without silently dropping attachments, completing the Goal, or changing its
+  Lifecycle status.
 - The continuation requests exactly one further provider request per
   settlement. If queued work already causes that request, Pi satisfies the
   decision with it and makes no extra one.

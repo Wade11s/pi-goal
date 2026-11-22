@@ -19,6 +19,37 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   not registered at all and no Continuation mentions it; a name already owned by
   another extension is never replaced. The contract is documented in
   `docs/behavior/lifecycle.md` and `docs/tools.md`.
+- Add the privacy-safe `pi-goal:metrics` projection derived only from committed
+  Goal-updated events: transition kind, Lifecycle status, token totals, Active
+  elapsed time, budget state, extension version, and timestamp. The projection
+  is an allowlist built field by field, so Objective text, Blocker descriptions,
+  attachment contents, source file names, source URLs, session identifiers,
+  Goal identity, and raw prompts are absent by construction. pi-goal performs no
+  network export and installs no exporter dependency; the optional local
+  consumer seam is failure-isolated, and the on-demand hosted companion's
+  consent, redaction, retry, and credential ownership are documented in
+  `docs/behavior/metrics.md`.
+- Add explicit local Objective attachments through repeatable leading `/goal
+  --file <path>` and `--image <path>` options at creation and Replacement Goal
+  time. Materialize UTF-8 text and PNG/JPEG/GIF/WebP images into an immutable,
+  Goal-keyed artifact store before the snapshot commits; enforce 8 attachments,
+  1 MiB per text file, 10 MiB per image, and 25 MiB total. Text is encoded and
+  nonce-delimited as untrusted data, images use Pi content arrays, and every
+  kickoff and Continuation references the same durable hash/media-type/size/label
+  manifest. Objective edits retain that manifest, `create_goal` stays text-only,
+  disabled admission runs before materialization, and failed creation leaves the
+  previous Goal untouched without a success event. Missing or corrupt restored
+  artifacts suppress automatic Continuation with an explicit error and no
+  artifact-driven Lifecycle change. Clear and replacement retain committed
+  artifacts; V1 deliberately has no destructive automatic garbage collection.
+  This explicit flow is the supported alternative to Codex composer drafts.
+  Relative source paths resolve against the session working directory rather
+  than the launch directory; reads are bounded regular-file reads that refuse
+  symlinks and special files, and work messages render one authenticated load
+  instead of a separate verify and re-read. A resume loads its attachments
+  before committing the durable resume transition, so a failed load leaves the
+  Goal paused. Remote URL fetching remains separate follow-up work (#50). The
+  contract is documented in `docs/behavior/attachments.md`.
 - Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
   one confirmation at session start for a restored `paused` Goal. Accepting runs
   the same durable `/goal resume` transition (same identity and history, fresh

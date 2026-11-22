@@ -44,6 +44,7 @@ import {
 	isGoalCutover,
 	ownershipMarker,
 	type GoalCutover,
+	type GoalAttachment,
 	type GoalRecord,
 	type GoalSnapshot,
 	type GoalOrigin,
@@ -65,6 +66,13 @@ import {
 	type UsageSource,
 	zeroGoalUsage,
 } from "./accounting.ts";
+import {
+	ATTACHMENT_MEDIA_TYPES,
+	MAX_ATTACHMENTS,
+	MAX_IMAGE_ATTACHMENT_BYTES,
+	MAX_TEXT_ATTACHMENT_BYTES,
+	MAX_TOTAL_ATTACHMENT_BYTES,
+} from "./attachments.ts";
 import type { GoalTransitionKind } from "./events.ts";
 
 const GOAL_STATUS_SET = new Set<string>(GOAL_STATUSES);
@@ -2542,6 +2550,14 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 	}
 	if (record.tokenBudget !== undefined && typeof record.tokenBudget !== "number") return false;
 	if (record.wrapUpPending !== undefined && typeof record.wrapUpPending !== "boolean") return false;
+	// A malformed attachment manifest is not trusted either. Attachments are
+	// required context — the model works from them on every kickoff and
+	// Continuation — so a manifest that cannot be verified (a bad hash, an
+	// unsupported media type, a size above the enforced limit) must fail closed
+	// like any other unrecognized snapshot rather than being silently dropped:
+	// reconstructing the Goal without its attachments would be exactly the silent
+	// drop the missing/corrupt-artifact contract forbids.
+	if (record.attachments !== undefined && !isGoalAttachmentManifest(record.attachments)) return false;
 	return (
 		typeof record.id === "string" &&
 		record.id !== "" &&
@@ -2557,6 +2573,44 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 		Number.isInteger(record.revision) &&
 		record.revision >= 0
 	);
+}
+
+const ATTACHMENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+/** Structural validity of one manifest entry. */
+function isGoalAttachmentEntry(value: unknown): value is GoalAttachment {
+	if (typeof value !== "object" || value === null) return false;
+	const entry = value as Record<string, unknown>;
+	return (
+		typeof entry.hash === "string" &&
+		ATTACHMENT_HASH_PATTERN.test(entry.hash) &&
+		typeof entry.mediaType === "string" &&
+		ATTACHMENT_MEDIA_TYPES.has(entry.mediaType) &&
+		typeof entry.bytes === "number" &&
+		Number.isInteger(entry.bytes) &&
+		entry.bytes > 0 &&
+		typeof entry.label === "string" &&
+		entry.label.length > 0 &&
+		entry.label.length <= 255
+	);
+}
+
+/**
+ * Structural validity of an attachment manifest: at most the enforced count of
+ * entries, every entry well-formed, and every enforced size bound respected.
+ * Duplicate hashes are allowed — content-addressed artifacts are shared, not
+ * copied, and two manifest entries naming the same content are the same bytes.
+ */
+function isGoalAttachmentManifest(value: unknown): value is NonNullable<GoalRecord["attachments"]> {
+	if (!Array.isArray(value) || value.length > MAX_ATTACHMENTS) return false;
+	if (!value.every((entry) => isGoalAttachmentEntry(entry))) return false;
+	let total = 0;
+	for (const entry of value) {
+		total += entry.bytes;
+		if (entry.mediaType === "text/plain" && entry.bytes > MAX_TEXT_ATTACHMENT_BYTES) return false;
+		if (entry.mediaType !== "text/plain" && entry.bytes > MAX_IMAGE_ATTACHMENT_BYTES) return false;
+	}
+	return total <= MAX_TOTAL_ATTACHMENT_BYTES;
 }
 
 /**

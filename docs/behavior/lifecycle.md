@@ -3,8 +3,9 @@
 Create, replace, edit, inspect, pause, resume, and clear a Goal. Every transition
 is durable before it is announced.
 
-[← README](../README.md) · See also [budgets](budgets.md) ·
-[continuation](continuation.md) · [persistence](persistence.md) · [tools](../tools.md)
+[← README](../README.md) · See also [attachments](attachments.md) ·
+[budgets](budgets.md) · [continuation](continuation.md) ·
+[persistence](persistence.md) · [tools](../tools.md)
 
 ## Create a Goal
 
@@ -22,6 +23,18 @@ is durable before it is announced.
   subcommands only when they are the *entire* argument, and `edit` is a
   subcommand whenever it is the first word — objectives that merely begin with
   one of the other words (for example "clear the lint errors") are accepted.
+
+Explicit local text and image attachments use the same creation path:
+
+```
+/goal --file spec.md --image screenshot.png Ship the attached requirements
+```
+
+The repeatable leading options materialize and validate every artifact before
+the snapshot commits. Disabled admission refuses the command before a
+replacement dialog or materialization; plain Objective arguments stay text.
+See [Objective attachments](attachments.md) for types, limits, trust framing,
+and failure atomicity.
 
 ## Replace a Goal
 
@@ -65,6 +78,11 @@ replacement. The old identity's active-time clock stops at the replacement, its
 own budget exhaustion is recorded on its own record only, and it never continues
 or earns a wrap-up.
 
+A replacement may select a fresh attachment manifest with leading
+`--file`/`--image` options. Both identities' committed artifacts remain in the
+extension-owned store, because an older selected branch may still reference
+them; V1 performs no destructive automatic garbage collection.
+
 ## Edit the objective
 
 ```
@@ -73,7 +91,10 @@ or earns a wrap-up.
 
 Changes the objective **in place**: the Goal keeps its identity, creation time,
 and revision history (the edit is the next revision), so no usage history is
-erased. If the Goal is active and a run is in flight, the new objective is
+erased. Its immutable attachment manifest is retained verbatim and re-stated
+when an active Goal's edit admits work. `/goal edit --file …` and
+`/goal edit --image …` are refused with guidance: changing attachments requires
+a Replacement Goal. If the Goal is active and a run is in flight, the new objective is
 delivered into that run through Pi's steering mechanism (after the current
 turn's tool calls, before the next model request), so the live work is
 redirected safely instead of being interrupted; if the session is idle, editing
@@ -117,8 +138,12 @@ Token budget: 250000 tokens
 Token usage: 48210 tokens (input 31000, output 17000 including reasoning 4200, cache write 210;
             cached read 184300 excluded as reuse, nested 0 counted once)
 Active time: 5m 12s
+Attachments: 2 — spec.md (text/plain, 12.4 KB); screenshot.png (image/png, 84.1 KB)
 Remaining capacity: 201790 tokens
 ```
+
+The `Attachments:` line is present only for a Goal with attachments and exposes
+manifest metadata, never contents.
 
 When a session with a Goal starts, restores, or reloads, a `Goal ... restored
 (active)` notification confirms reconstruction. A restored **active** Goal while
@@ -181,12 +206,20 @@ and is reported as a persistence error).
   stop, and starts a **fresh** blocked audit: the next blocker report counts from
   one rather than inheriting the count the user just overruled. A **complete**
   Goal is terminal for its identity and is refused — replacing it is a new Goal.
+  Before a resume re-sends attachments, they are loaded and authenticated once:
+  the manifest size, per-file/total limits, and content hashes are checked on
+  the exact bytes the resume message will carry. That load happens **before**
+  the durable resume transition, so a missing or corrupt artifact refuses the
+  resume with an explicit integrity error and leaves the stopped Lifecycle
+  status, revision, and snapshot unchanged; `/goal resume` remains actionable
+  after the artifact is repaired or the Goal is replaced.
   The `--budget` option is valid only for a `budget_limited` Goal; it is refused
   for `active`, `paused`, `blocked`, `usage_limited`, and `complete`, whose
   existing lifecycle behavior is unchanged.
 - `/goal clear` removes the Goal from any status by writing a durable tombstone
   snapshot, so restarts and reloads cannot resurrect it, and the session returns
-  to ordinary prompt-by-prompt behavior.
+  to ordinary prompt-by-prompt behavior. Its committed attachment artifacts are
+  retained for historical branches; clear is not a destructive GC operation.
 
 ## Opt-in resume prompt
 
@@ -237,7 +270,7 @@ new Goal work:
 
 | Refused while disabled | Why |
 | --- | --- |
-| `/goal <objective>` — creation **and** replacement | Both open a new Goal identity and start work. The refusal comes before the replacement confirmation, so no dialog promises a replacement that will not happen. |
+| `/goal <objective>` — creation **and** replacement | Both open a new Goal identity and start work. The refusal comes before the replacement confirmation and before any attachment is materialized, so no dialog or artifact promises a replacement that will not happen. |
 | `create_goal` | Same admission, from the model side. The refusal reports `goal: null` (or the unchanged current Goal) and leaves the one-shot creation authority intact, so a corrected call can retry after re-enabling. |
 | `/goal edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. |
 | `/goal resume` | The resume message restarts the loop. |
