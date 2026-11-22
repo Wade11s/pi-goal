@@ -294,6 +294,8 @@ time, and identity-scoped attribution of queued work.
 | [Persistence model](docs/behavior/persistence.md) | Snapshots, reconstruction, forks, and the 0.1.0 cutover |
 | [Model tools](docs/tools.md) | `get_goal`, `create_goal` (and creation authority), `update_goal`, trust boundary, structured responses |
 | [Limitations](docs/limitations.md) | Known boundaries of the current model |
+| [Codex migration status](docs/codex-migration.md) | Per-capability comparison and Pi-feasible follow-ups |
+| [Subagent usage reporting](docs/subagent-usage.md) | Proposed plugin-neutral provider contract for subagent token accounting |
 | [Testing](docs/testing.md) | The automated gate and the rules that keep it honest |
 | [Smoke test](docs/smoke-test.md) | Manual real-Pi procedure |
 | [ADR-0001](docs/adr/0001-conservative-stopping.md) | Conservative stopping is deterministic and extension-owned |
