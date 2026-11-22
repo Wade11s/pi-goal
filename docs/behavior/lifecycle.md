@@ -188,6 +188,47 @@ and is reported as a persistence error).
   snapshot, so restarts and reloads cannot resurrect it, and the session returns
   to ordinary prompt-by-prompt behavior.
 
+## Opt-in resume prompt
+
+```json
+{ "goal": { "resumePrompt": true } }
+```
+
+`goal.resumePrompt` (Pi settings, default `false`) is convenience over the
+user-owned resume, never a replacement for it. When a session start restores a
+Goal whose Lifecycle status is `paused` and a dialog-capable UI exists, pi-goal
+asks **once** whether to resume it.
+
+- **Accept** runs the same durable transition as `/goal resume`: the same
+  identity, creation time, objective, and accounted history, one revision
+  advance, and a **fresh Blocked audit** (the audit that described the stop the
+  user just overruled is dropped). The resume kickoff then restarts work exactly as
+  the command would.
+- **Decline, dismissal, timeout, and no UI change nothing.** The answer is
+  revalidated against the exact record the dialog described, so a Goal that was
+  edited, resumed, replaced, or cleared while the dialog was open is not resumed
+  by a stale answer. The dialog is bounded, and its default answer is "no".
+- **Only `paused` is prompted for.** `active`, `complete`, `blocked`,
+  `usage_limited`, and `budget_limited` never prompt in V1: blocked and
+  usage-limited recovery is an explicit user decision with its own reasoning,
+  and budget-limited recovery still requires valid new headroom
+  (`/goal resume --budget <new-total>`).
+- **Nothing waits on the prompt.** Print and JSON modes have no dialog-capable
+  UI, so nothing is asked and the notice says the Goal stays paused. In TUI and
+  RPC mode the dialog is created without being awaited by the `session_start`
+  handler, so the session is usable while the request is still pending and a
+  headless RPC caller can ignore it entirely; the safety bound then resolves it
+  to "no".
+- **A disabled extension does not ask.** While `goal.enabled` is false the prompt
+  cannot admit the resume it would perform, so it is not offered at all: the
+  restore notice names the disabled condition and the two explicit ways forward
+  (re-enable and `/goal resume`, or leave the Goal paused).
+
+The prompt is read from Pi's effective settings at session start like the other
+settings, so changing it takes effect on the next session start or reload. An
+invalid value is reported once and leaves the prompt off — a configuration
+mistake can never opt a user into a question they did not enable.
+
 ## Disabling the extension (`goal.enabled`)
 
 `goal.enabled` (Pi settings, default `true`) is an **admission control**, not a
@@ -201,6 +242,7 @@ new Goal work:
 | `/goal edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. |
 | `/goal resume` | The resume message restarts the loop. |
 | The automatic Continuation, and an owed Budget wrap-up | Both are unattended Goal work. A pending wrap-up is **deferred, not lost**: it is delivered at the first settlement after re-enabling. |
+| The opt-in resume prompt (`goal.resumePrompt`) | The dialog would only offer a resume that admission refuses, so it is not opened; the restore notice says why. |
 
 What stays available: bare `/goal` and `get_goal` (which surface the disabled
 condition), `/goal pause`, `/goal clear`, and every terminal update from work
