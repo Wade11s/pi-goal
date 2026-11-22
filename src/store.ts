@@ -2071,9 +2071,9 @@ export class GoalStore {
 	 * was: a transition supersedes a checkpoint, so a caller that wrote one is done.
 	 *
 	 * The only caller is {@link flushAccounting}, which is how every post-persistence
-	 * boundary (`turn_end`, settlement, the wrap-up seam) reaches it — and how the last
-	 * boundary a session being *replaced* rather than exited still gets (the
-	 * `session_shutdown` handler) does. The transition is state that belongs to the
+	 * boundary (`turn_end`, settlement, the wrap-up seam) reaches it — and how the
+	 * `session_shutdown` handler, the last boundary a session being *replaced* rather
+	 * than exited still gets, does. The transition is state that belongs to the
 	 * outgoing branch, so losing it would leave a Goal durably `active` with its budget
 	 * already exhausted; a bare accounting checkpoint, by contrast, is only an
 	 * optimization and would land in a session the user has navigated away from.
