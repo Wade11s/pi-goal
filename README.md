@@ -344,6 +344,22 @@ every recorded hash.
 
 → [Persistence model and legacy cutover](docs/behavior/persistence.md)
 
+### Local events and metrics
+
+Other local extensions can react to committed Goal state without polling:
+pi-goal publishes a `pi-goal:updated` event after every meaningful durable
+transition, and a pre-redacted `pi-goal:metrics` projection for operational
+counters (transition kind, Lifecycle status, token totals, Active elapsed time,
+budget state, and extension version). The projection is an allowlist: Objective
+text, Blocker descriptions, attachment contents, file names, source URLs,
+session identifiers, and prompts are never part of a metric. pi-goal performs no
+network telemetry and installs no exporter dependency; a hosted exporter is a
+separately installed companion that owns its own consent, redaction, retry, and
+credentials.
+
+→ [Goal-updated events](docs/behavior/events.md) ·
+[Operational metrics and the exporter seam](docs/behavior/metrics.md)
+
 ## Limitations
 
 - `create_goal` refuses while **any** Goal exists; replacing, clearing, and
@@ -384,6 +400,13 @@ every recorded hash.
   durable; a restart gives a malfunctioning loop up to three more empty turns.
   A third extension loaded after pi-goal can still request its own continuation
   at the same boundary.
+- Metrics are best-effort local bus delivery: there is no queue, retry, spool,
+  or acknowledgement, so a consumer that needs completeness must persist and
+  verify records itself. pi-goal ships no hosted exporter and accepts no
+  analytics endpoint or credential; a companion exporter is a separate install
+  with its own policy, and its delivery guarantees are its own, not pi-goal's.
+  No network telemetry happens by default — the only sink is the local
+  extension bus.
 
 → [All limitations](docs/limitations.md)
 
@@ -434,6 +457,7 @@ attachments, including artifact retention and restore verification.
 | [Usage accounting](docs/behavior/accounting.md) | Token formula, admission segments, active time, durability ordering |
 | [Persistence model](docs/behavior/persistence.md) | Snapshots, reconstruction, forks, and the 0.1.0 cutover |
 | [Goal-updated events](docs/behavior/events.md) | Committed local transitions and metadata-only attachment manifests |
+| [Metrics and the exporter seam](docs/behavior/metrics.md) | Privacy-safe `pi-goal:metrics`, what is never projected, local consumers, and the on-demand hosted companion |
 | [Model tools](docs/tools.md) | `get_goal`, `create_goal` (and creation authority), `update_goal`, trust boundary, structured responses |
 | [Limitations](docs/limitations.md) | Known boundaries of the current model |
 | [Codex migration status](docs/codex-migration.md) | Per-capability comparison and Pi-feasible follow-ups |

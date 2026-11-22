@@ -3,8 +3,8 @@
 The local event contract for other Pi extensions: what pi-goal announces on the
 shared extension event bus, when, and what deliberately stays off the stream.
 
-[← README](../README.md) · Map: [docs/README.md](../README.md) ·
-Attachments: [behavior/attachments.md](attachments.md)
+[← README](../README.md) · Map: [docs/README.md](../README.md) · See also
+[metrics](metrics.md) · Attachments: [behavior/attachments.md](attachments.md)
 
 ## Why a local event stream
 

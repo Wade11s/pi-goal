@@ -129,3 +129,10 @@ what it cannot preempt, and what is intentionally left to the user.
   start, so a changed value takes effect on the next session start or reload,
   never for a Goal that already exists. A non-boolean value is reported once and
   ignored, which leaves sessions unnamed exactly as an unset value does.
+- Metrics are local and best-effort: `pi-goal:metrics` delivery has no queue,
+  retry, spool, acknowledgement, or replay. A consumer that needs completeness
+  must persist and verify records itself and treat gaps as possible. pi-goal
+  ships no hosted exporter, performs no network telemetry, accepts no analytics
+  endpoint or credential, and installs no exporter dependency; a companion
+  exporter is a separate install whose consent, redaction, retry, delivery
+  guarantee, and credentials are its own responsibility.

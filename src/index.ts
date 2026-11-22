@@ -107,6 +107,7 @@ import {
 } from "./goal.ts";
 import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
 import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
+import { GOAL_METRICS_CHANNEL, createGoalMetricsPublisher } from "./metrics.ts";
 import {
 	attachmentStoreRoot,
 	discardUncommittedArtifacts,
@@ -448,15 +449,31 @@ function parseGoalCommand(args: string): GoalCommand {
 }
 
 export default function goalExtension(pi: ExtensionAPI): void {
+	/**
+	 * The optional local metrics consumer seam: the same committed event, projected
+	 * to a privacy-safe record and published on its own channel for an operator or
+	 * an explicitly installed companion exporter. The sink is a local bus emit, so
+	 * the default does no network I/O; the publisher isolates a sink failure so it
+	 * can never touch the committed transition (see docs/behavior/metrics.md).
+	 */
+	const metrics = createGoalMetricsPublisher({
+		sink: (projected) => {
+			pi.events.emit(GOAL_METRICS_CHANNEL, projected);
+		},
+	});
+
 	const store = new GoalStore({
 		// The store owns every durable commit point, so it is what announces each
 		// committed transition to the local event stream — including creation and
 		// replacement, whose commit is the durable bar the event uses. The /goal
 		// command's separate on-disk durability poll stays a gate for the
 		// *user-facing* announcement only (see `emitGoalUpdated` and
-		// docs/behavior/events.md).
+		// docs/behavior/events.md). The metrics projection is derived from that same
+		// committed event, never from the live record.
 		onDurableTransition: (kind, goal, committedAt) => {
-			emitGoalUpdated(toGoalUpdatedEvent(kind, goal, committedAt));
+			const event = toGoalUpdatedEvent(kind, goal, committedAt);
+			emitGoalUpdated(event);
+			metrics.publish(event);
 		},
 	});
 	const safety = new GoalSafetyMonitor();
