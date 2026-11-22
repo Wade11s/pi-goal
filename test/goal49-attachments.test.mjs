@@ -525,9 +525,9 @@ test("a failed attachment validation leaves the previous Goal and its artifacts 
 		const root = attachmentStoreRoot(sessionFile);
 		const first = before[0].data.goal;
 
-		// Good file first, missing file second: partially materialized, then refused.
-		// The active Goal's replacement confirmation comes first, exactly as for a
-		// text-only replacement; the missing file then refuses the whole request.
+		// A good file followed by a missing file: source validation refuses the
+		// whole request before any new artifact is written. The active Goal's
+		// replacement confirmation comes first, exactly as for text-only replacement.
 		const good = join(dirs.workDir, "good.txt");
 		writeFileSync(good, "good bytes", "utf8");
 		const failedPromise = session.prompt(`/goal --file ${good} --image ${join(dirs.workDir, "missing.png")} Third objective`);
@@ -550,6 +550,54 @@ test("a failed attachment validation leaves the previous Goal and its artifacts 
 		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
+		await session.stop();
+		cleanupDirs(dirs);
+	}
+});
+
+test("a snapshot failure after materialization keeps the previous Goal, retracts uncommitted bytes, and emits no success event", async () => {
+	const dirs = sharedDirs();
+	const { spec } = writeStandardFixtures(dirs);
+	const session = await startSession(dirs);
+	script([{ text: "Kickoff.", usage: { input: 30, output: 8 } }, { hang: true }], session);
+	let sessionFile;
+	try {
+		await session.prompt(`/goal --file ${spec} ${OBJECTIVE}`);
+		await abortActiveLoop(session, 2);
+		sessionFile = await session.sessionFile();
+		const root = attachmentStoreRoot(sessionFile);
+		const before = readSessionEntries(sessionFile);
+		const first = goalSnapshots(before)[0].data.goal;
+		const snapshotCount = goalSnapshots(before).length;
+
+		// Materialization succeeds first, then the durable replacement append
+		// fails. The catch path must retract only the never-committed identity.
+		chmodSync(sessionFile, 0o444);
+		let failure;
+		try {
+			const failedPromise = session.prompt(`/goal --file ${spec} A replacement whose snapshot cannot commit`);
+			await session.respondToConfirm(() => true, true);
+			assert.equal((await failedPromise).data.disposition, "handled");
+			failure = await session.waitForNotify((r) =>
+				r.message.includes("writing the replacement to the session failed"),
+			);
+		} finally {
+			chmodSync(sessionFile, 0o644);
+		}
+		assert.match(failure.message, /The current Goal is unchanged/);
+
+		const after = readSessionEntries(sessionFile);
+		assert.equal(goalSnapshots(after).length, snapshotCount, "no new durable snapshot");
+		assert.equal(goalSnapshots(after).at(-1).data.goal.id, first.id);
+		assert.deepEqual(goalSnapshots(after).at(-1).data.goal.attachments, first.attachments);
+		assert.deepEqual(storedGoalIds(root), [first.id], "the uncommitted replacement artifacts were retracted");
+		assert.equal(runCount(session), 2, "no kickoff started for the failed replacement");
+		assert.deepEqual(eventLog(after).map((e) => e.data.kind), ["created"], "no replacement success event");
+
+		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		if (sessionFile) chmodSync(sessionFile, 0o644);
 		await session.stop();
 		cleanupDirs(dirs);
 	}

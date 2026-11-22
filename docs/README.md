@@ -7,7 +7,7 @@ procedure, and the historical evidence behind the V1 repair programme.
 ## Reading paths
 
 - **Using pi-goal** — [README](../README.md) → [lifecycle](behavior/lifecycle.md)
-  → [budgets](behavior/budgets.md). Read [limitations](limitations.md) for the
+  → [attachments](behavior/attachments.md) → [budgets](behavior/budgets.md). Read [limitations](limitations.md) for the
   honest edges.
 - **Changing behavior** — [ADR-0001](adr/0001-conservative-stopping.md) →
   [continuation](behavior/continuation.md) → [stopping](behavior/stopping.md) →

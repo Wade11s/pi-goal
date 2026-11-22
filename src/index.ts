@@ -3170,6 +3170,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// Loaded attachment content for the kickoff message; filled by the
 			// materialization below and empty for a Goal without attachments.
 			let attachmentContents: AttachmentContent[] = [];
+			// Retract artifacts only while no snapshot has committed them. Once the
+			// commit succeeds, clear/replacement/rollback retention applies.
+			let uncommittedAttachmentRoot: string | null = null;
 			try {
 				// Materialize the requested attachments into the immutable,
 				// extension-owned store keyed by this Goal's identity *before* the
@@ -3183,6 +3186,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					if (!root) {
 						throw new Error("the session file could not be resolved for the attachment store");
 					}
+					uncommittedAttachmentRoot = root;
 					const materialized = materializeAttachments(root, goal.id, parsed.attachments);
 					if (!materialized.ok) {
 						// Not a write failure of the Goal path: refuse with the validation
@@ -3206,8 +3210,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// revalidating it after the wait detects exactly that change.
 				store.stage(pi, goal);
 				store.commit(goal);
+				uncommittedAttachmentRoot = null;
 				updateStatus(ctx);
 			} catch (error) {
+				if (uncommittedAttachmentRoot) {
+					discardUncommittedArtifacts(uncommittedAttachmentRoot, goal.id);
+				}
 				if (replacing) {
 					// A failed *replacement* write must not erase the existing
 					// Goal: nothing was appended, so the previous record stays

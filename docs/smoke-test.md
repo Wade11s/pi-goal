@@ -409,9 +409,62 @@ the steps below reproduce the user-visible surface by hand.
 6. A long objective (over 80 characters) is named with exactly its first 80
    characters, and a multi-line objective with only its first line.
 
+## 22. Optional: local Objective attachments
+
+Choose a small UTF-8 text file and a local PNG, JPEG, GIF, or WebP image, then
+create a Goal with explicit leading options:
+
+```
+/goal --file ./requirements.txt --image ./screenshot.png Implement the attached requirements
+```
+
+Expect the ordinary creation confirmation and immediate work, with the model
+using both files. `/goal` adds an `Attachments:` metadata line (labels, media
+types, sizes), not file contents. The first work message contains the text as an
+encoded `GOAL ATTACHMENT DATA` block and the image as a Pi image content block;
+the next automatic Continuation names the same hashes and carries the same
+attachments.
+
+The durable artifacts live beside the session file:
+
+```
+<session-directory>/pi-goal-store/<goal-id>/<sha256>.<ext>
+```
+
+1. Run `/goal edit Refine the attached requirements without changing the files`.
+   The manifest and hashes stay unchanged. `/goal edit --file ./other.txt New
+   objective` is refused with Replacement Goal guidance.
+2. Replace the Goal with a different `--file`/`--image` selection and confirm.
+   The new identity gets its own manifest; the old identity's artifact directory
+   remains.
+3. Restart the session. The attachments verify and later Continuations use the
+   same hashes; the original source paths are not needed.
+4. `/goal clear` removes the current Goal but does **not** remove either Goal's
+   committed artifacts. V1 deliberately has no destructive automatic garbage
+   collection because an older selected branch may still need them.
+5. For the integrity check, create another attachment-bearing active Goal, stop
+   Pi, and temporarily move one content-addressed artifact aside. Restart and
+   send an ordinary prompt. Expect an explicit missing-artifact error and no
+   automatic Continuation; `/goal` keeps the same Lifecycle status and manifest.
+   Restore the original bytes to the exact content-addressed path before
+   resuming. Do not edit the artifact in place unless corruption behavior is
+   what you intend to test.
+6. With `goal.enabled: false`, retry an attachment-bearing creation. It is
+   refused before materialization, no `pi-goal-store` entry is created, and the
+   previous Goal is unchanged.
+
+SVG, unknown image bytes, empty/invalid UTF-8 text, remote URLs, more than eight
+attachments, and files over the documented limits are refused without a success
+event or kickoff. Plain Objective text mentioning `--file` remains plain text,
+and `create_goal` has no attachment parameters. This explicit flow—not inferred
+composer drafts—is the V1 alternative to Codex pending pastes and image drafts.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
+- [ ] `--file`/`--image` attachments reach kickoff and Continuation with stable
+      hashes, survive restart and replacement/clear retention, and fail closed
+      with an explicit error when an artifact is missing or corrupt.
 - [ ] `/goal <objective>` creates an active Goal and starts work.
 - [ ] The status indicator and bare `/goal` report `active`.
 - [ ] An active Goal continues automatically after a turn.

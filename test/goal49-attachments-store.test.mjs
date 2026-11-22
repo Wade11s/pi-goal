@@ -249,15 +249,17 @@ test("the enforced limits refuse count, per-file, and total sizes", () => {
 	}
 });
 
-test("a refused materialization retracts the partially written store directory", () => {
+test("uncommitted cleanup retracts a refused Goal's whole store directory", () => {
 	const { dir, root } = tempStore();
 	try {
 		const good = join(dir, "good.txt");
 		writeFileSync(good, "good bytes", "utf8");
+		const written = materializeAttachments(root, "goal_12345678", [textRequest(good)]);
+		assert.equal(written.ok, true);
 		const result = materializeAttachments(root, "goal_12345678", [textRequest(good), textRequest(join(dir, "missing.txt"))]);
 		assert.equal(result.ok, false, "the missing second file refuses the whole request");
-		// The first artifact had already landed; the caller's cleanup retracts the
-		// whole uncommitted directory.
+		// No snapshot references this identity, so the caller retracts the whole
+		// uncommitted directory, including bytes written before the refusal.
 		discardUncommittedArtifacts(root, "goal_12345678");
 		assert.deepEqual(storedGoalIds(root), []);
 	} finally {

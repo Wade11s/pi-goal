@@ -3,7 +3,8 @@
 The local event contract for other Pi extensions: what pi-goal announces on the
 shared extension event bus, when, and what deliberately stays off the stream.
 
-[← README](../README.md) · Map: [docs/README.md](../README.md)
+[← README](../README.md) · Map: [docs/README.md](../README.md) ·
+Attachments: [behavior/attachments.md](attachments.md)
 
 ## Why a local event stream
 
@@ -108,6 +109,9 @@ The stream describes lifecycle state, not accounting churn:
   freezes of a replaced identity's tail, the one-time legacy cutover, and the
   creation/replacement retractions (`rollback`/`restore`) are bookkeeping or
   history, not lifecycle transitions;
+- attachment text and image bytes never emit. `goal.attachments` is the
+  immutable metadata manifest only; contents stay in the artifact store and the
+  untrusted Goal work messages (see [attachments](attachments.md));
 - the opt-in session name (`goal.sessionNameFromObjective`) never emits. It is
   Pi's own session metadata rather than Goal state — see
   [lifecycle](lifecycle.md#naming-the-session-from-the-objective) — so a listener

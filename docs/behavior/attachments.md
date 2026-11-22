@@ -32,9 +32,10 @@ attachments use.
 - `--file <path>` selects a local **text file**; `--image <path>` selects a
   local **image**. Both are *leading* options, repeatable, mixable with the
   budget flags, and usable in the `--flag=value` spelling. Everything after the
-  leading options is the Objective, so an objective that merely contains the
-  word `--file` (or even starts a sentence with it) is never truncated — only a
-  genuine leading flag is consumed.
+  leading options is the Objective, so an Objective that merely contains the
+  word `--file` after its first plain word is never truncated — only a genuine
+  leading flag is consumed. V1 option values are whitespace-free paths; paths
+  containing spaces are not representable by this parser.
 - Attachment selection exists at **creation** and **Replacement Goal** time. A
   replacement confirmation is asked first exactly as for a text-only
   replacement; a declined dialog changes nothing.
@@ -95,15 +96,17 @@ into an immutable, extension-owned store keyed by Goal identity:
   and display label**. Source paths are not required for later Continuations:
   every kickoff and Continuation re-references the manifest and re-reads the
   store.
-- All validation happens before any byte is written, and the whole request is
-  refused on the first problem. A refused materialization retracts only the
-  uncommitted store directory of the Goal that never committed.
+- Source validation happens before any byte is written, and the whole request
+  is refused on the first problem. A write failure can leave a partially written
+  directory, so any refused materialization or pre-commit snapshot failure
+  retracts only the uncommitted store directory of the Goal that never
+  committed.
 
 **Failure atomicity**: a failed validation, materialization, or snapshot write
 leaves the previous Goal untouched (nothing appended, its artifacts intact),
 starts no kickoff, and emits no success event. A partially materialized
-request — some artifacts written, then a missing file — retracts the whole
-uncommitted directory. Artifacts of a Goal whose snapshot *did* commit,
+request — some artifacts written, then a store write failure — retracts the
+whole uncommitted directory. Artifacts of a Goal whose snapshot *did* commit,
 including a replacement that was later retracted by its durability rollback,
 are retained (below).
 

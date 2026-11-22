@@ -6,6 +6,22 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add explicit local Objective attachments through repeatable leading `/goal
+  --file <path>` and `--image <path>` options at creation and Replacement Goal
+  time. Materialize UTF-8 text and PNG/JPEG/GIF/WebP images into an immutable,
+  Goal-keyed artifact store before the snapshot commits; enforce 8 attachments,
+  1 MiB per text file, 10 MiB per image, and 25 MiB total. Text is encoded and
+  nonce-delimited as untrusted data, images use Pi content arrays, and every
+  kickoff and Continuation references the same durable hash/media-type/size/label
+  manifest. Objective edits retain that manifest, `create_goal` stays text-only,
+  disabled admission runs before materialization, and failed creation leaves the
+  previous Goal untouched without a success event. Missing or corrupt restored
+  artifacts suppress automatic Continuation with an explicit error and no
+  artifact-driven Lifecycle change. Clear and replacement retain committed
+  artifacts; V1 deliberately has no destructive automatic garbage collection.
+  This explicit flow is the supported alternative to Codex composer drafts.
+  Remote URL fetching remains separate follow-up work (#50). The contract is
+  documented in `docs/behavior/attachments.md`.
 - Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
   one confirmation at session start for a restored `paused` Goal. Accepting runs
   the same durable `/goal resume` transition (same identity and history, fresh

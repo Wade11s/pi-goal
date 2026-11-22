@@ -4,7 +4,7 @@ What Pi does on its own while a Goal is active, and the no-progress contract
 every continuation carries.
 
 [← README](../README.md) · See also [stopping](stopping.md) ·
-[accounting](accounting.md)
+[accounting](accounting.md) · [attachments](attachments.md)
 
 While a Goal is **active**, Pi continuing on its own is the normal case:
 
@@ -24,6 +24,12 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   blocked audit is open it restates that audit's Blocker identity, latest
   description, and count, and it states the three-consecutive-Goal-turn blocked
   audit the extension enforces.
+- A Goal with attachments re-reads the same immutable manifest: text is framed
+  again as encoded, nonce-delimited untrusted data and images are included as Pi
+  image content blocks. Before requesting the Continuation, pi-goal verifies
+  every artifact hash. A missing or corrupt artifact suppresses the request and
+  surfaces an explicit integrity error without silently dropping attachments,
+  completing the Goal, or changing its Lifecycle status.
 - The continuation requests exactly one further provider request per
   settlement. If queued work already causes that request, Pi satisfies the
   decision with it and makes no extra one.
