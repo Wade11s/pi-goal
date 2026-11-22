@@ -85,6 +85,40 @@ alone. The narrow injected-fault seams — a failing append at the durable commi
 the in-memory budget stop versus its durable flush, audit bookkeeping — are
 unit-tested in `test/goal48-events-store.test.mjs` against a fake Pi API.
 
+Opt-in session naming (issue #52) is tested through the same RPC seam in
+`test/goal52-session-naming.test.mjs`: the live name comes from Pi's own
+`get_state` and the durable one from the `session_info` entries in the session
+file, while a name that must *not* be written is produced through Pi's
+`set_session_name` command — the user-provided name seam, so the test's own name
+is provably not the extension's. The pure rules (the setting's default and its
+malformed-value handling, the first-line/whitespace/80-character derivation, and
+the never-overwrite and write-failure outcomes) are unit-tested against
+`src/session-naming.ts` with a fake of the two Pi seams; the RPC tests then prove
+those rules through a real session, including the two failure paths a name must
+not survive — a durable write that fails and rolls the creation back, and a
+creation cleared while it waited for the current run.
+
+The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
+surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
+durable Lifecycle status, is stopped, and is reopened from a copy of its session
+file with `goal.resumePrompt` in its settings; the test then answers the dialog
+over the `confirm` extension-UI subprotocol with accept, decline, dismissal, or
+nothing at all, and asserts the durable snapshot, run/continuation counts, and
+notifications. `PI_GOAL_DIALOG_TIMEOUT_MS` shortens the dialog safety bound for
+the timeout case (see [Dialog timeouts](#dialog-timeouts)); the UI-less behavior
+of print and JSON modes is covered against the handler directly, with a fake Pi
+API, because those modes have no dialog to observe through the RPC harness.
+
+### Dialog timeouts
+
+Every interactive dialog pi-goal opens (a replacement confirmation, the
+interactive objective editor, the resume prompt) carries a `timeout` and a safe
+default answer, so an unattended host cannot make a command wait forever.
+`PI_GOAL_DIALOG_TIMEOUT_MS` overrides that bound with a positive integer number
+of milliseconds; it exists so the timeout branches are testable through the
+real-Pi harness without waiting the production interval out. An unset or invalid
+value leaves the production defaults untouched, so it changes nothing for users.
+
 ### Rex provider acceptance
 
 `test/goal43-rex-acceptance.test.mjs` accepts the *released* pi-rex-subagent
@@ -161,3 +195,7 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] a run admitted against a replaced identity cannot complete, report a
       blocker against, or pause the Goal that replaced it, and the replaced
       identity keeps its own durable superseded record
+- [ ] with `goal.sessionNameFromObjective: true`, a creation names an unnamed
+      session from the Objective's first line; with the setting absent or false,
+      no session is named; a user-provided name, an Objective edit, a Replacement
+      Goal, and a failed or rolled-back creation never change it

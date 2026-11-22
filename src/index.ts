@@ -53,6 +53,12 @@
  * Active elapsed time, so an active-but-disabled Goal is surfaced as exactly
  * that instead of being mistaken for a continuing one.
  *
+ * `goal.sessionNameFromObjective` (Pi settings, default false) is a separate opt-in
+ * convenience: after a successful *fresh* creation it may name an otherwise unnamed
+ * session from the Objective's first line. A session name is host metadata Pi already
+ * owns, not Goal state, so it never participates in the Lifecycle, in accounting, or in
+ * the event stream, and it never overwrites a name the user provided.
+ *
  * Usage is accounted durably from finalized Pi messages and reported nested
  * usage, with stable deduplication (see `accounting.ts`). A Goal with a token
  * budget transitions to `budget_limited` when its accounted usage reaches the
@@ -102,12 +108,20 @@ import {
 import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
 import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
 import {
+	applySessionNameFromObjective,
+	parseSessionNamingSettings,
+	sessionNameSurface,
+	type SessionNamingSettings,
+} from "./session-naming.ts";
+import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
 	type AdmissionSettings,
 	type BudgetSettings,
+	type ResumePromptSettings,
 	parseAdmissionSettings,
 	parseBudgetSettings,
+	parseResumePromptSettings,
 	resolveGoalTokenBudget,
 } from "./accounting.ts";
 import {
@@ -131,6 +145,33 @@ const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
  * reported the cancellation.
  */
 const EDIT_TIMEOUT_MS = 120_000;
+
+/**
+ * Auto-decline the opt-in paused-Goal resume prompt after this long.
+ *
+ * The dialog's default answer is "No", so a user who is away, a host that never
+ * answers, and an RPC client that ignores the request all leave the paused Goal
+ * exactly as it was. The prompt is a convenience over the explicit, durable
+ * `/goal resume` transition, so letting it lapse is always safe.
+ */
+const RESUME_PROMPT_TIMEOUT_MS = 120_000;
+
+/**
+ * Bound one extension dialog, with an override for deterministic tests.
+ *
+ * Every interactive dialog pi-goal shows has a safe default answer, so it is
+ * always created with a `timeout` and Pi resolves the default when nobody
+ * answers. `PI_GOAL_DIALOG_TIMEOUT_MS` shortens those bounds so the timeout
+ * branches can be exercised through the real-Pi RPC harness without waiting the
+ * production interval out; an unset or invalid value leaves the defaults
+ * untouched.
+ */
+function dialogTimeoutMs(defaultMs: number): number {
+	const raw = process.env.PI_GOAL_DIALOG_TIMEOUT_MS;
+	if (raw === undefined || raw.trim() === "") return defaultMs;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value > 0 ? value : defaultMs;
+}
 
 /**
  * Parsed `/goal` arguments: the objective plus an optional budget request.
@@ -577,6 +618,53 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let admission: AdmissionSettings = { enabled: true, problems: [] };
 
 	/**
+	 * Extension-level session-naming configuration
+	 * (`goal.sessionNameFromObjective`), read from Pi's effective settings at every
+	 * session start, exactly like the admission and budget settings, so a reload
+	 * picks up a changed configuration.
+	 *
+	 * The default is `false`: naming a session is a convenience the user has to ask
+	 * for, and pi-goal otherwise leaves Pi's own session metadata alone.
+	 */
+	let sessionNaming: SessionNamingSettings = { nameFromObjective: false, problems: [] };
+
+	/**
+	 * Name the session from a freshly created Goal's Objective, when the user opted in.
+	 *
+	 * Called only from the two creation paths, and only after their durable commit
+	 * succeeded: a refused, failed, or rolled-back creation never reaches it, so a
+	 * failed Goal can never leave a name behind. The write itself is best effort — a
+	 * host failure is reported as a warning, never as a creation failure, because the
+	 * Goal is already durable and the name is metadata about the session.
+	 *
+	 * The Objective is the only source. Attachment contents have their own trust
+	 * boundary and are never folded into a name (see `./session-naming.ts`).
+	 */
+	function nameSessionFromObjective(ctx: ExtensionContext, objective: string): void {
+		const outcome = applySessionNameFromObjective(sessionNameSurface(pi), objective, sessionNaming.nameFromObjective);
+		if (outcome.kind === "failed") {
+			notify(
+				ctx,
+				`Session not named: pi-goal could not name the session from the Objective (${outcome.reason}). ` +
+					"The Goal itself is unchanged; rename the session yourself if you want a name.",
+				"warning",
+			);
+		}
+	}
+
+	/**
+	 * Extension-level convenience configuration (`goal.resumePrompt`), read from
+	 * Pi's effective settings at every session start like the other settings.
+	 *
+	 * Off by default. When on, a restored **paused** Goal may be offered one
+	 * confirmation dialog at session start; accepting runs the same durable user
+	 * resume as `/goal resume` (same identity, history, and a fresh Blocked audit),
+	 * while declining, dismissing, timing out, or having no UI leaves the Goal
+	 * exactly as it was.
+	 */
+	let resumePrompt: ResumePromptSettings = { enabled: false, problems: [] };
+
+	/**
 	 * The refusal for an admission request that `goal.enabled` currently forbids.
 	 *
 	 * One shared tail, because every refusal has to answer the same three
@@ -781,6 +869,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// never retroactively for work already in flight.
 		admission = parseAdmissionSettings(pi.getSettings());
 		for (const problem of admission.problems) notify(ctx, problem, "warning");
+		// Session naming is read from the same effective settings, at the same seam: a
+		// changed `goal.sessionNameFromObjective` takes effect on the next session start
+		// or reload, never retroactively for a Goal that already exists.
+		sessionNaming = parseSessionNamingSettings(pi.getSettings());
+		for (const problem of sessionNaming.problems) notify(ctx, problem, "warning");
+		// The opt-in resume prompt is read at the same seam, so a changed setting
+		// takes effect at the next session start and never mid-session.
+		resumePrompt = parseResumePromptSettings(pi.getSettings());
+		for (const problem of resumePrompt.problems) notify(ctx, problem, "warning");
 		store.reconstruct(ctx);
 		// A hard crash can leave the superseded identity's in-flight tail on the branch
 		// with no freeze boundary after it. Reconstruction recovers that tail into
@@ -805,6 +902,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notify(ctx, `Goal ${goal.id} restored (${goal.status}).${disabled}`, "info");
 		}
 		updateStatus(ctx);
+		// Asked after the restore notice and only for a restored `paused` Goal. The
+		// call is fire-and-forget by design: the dialog is created now, but
+		// `session_start` never waits for its answer, so no host — including a
+		// headless RPC client that ignores it — is ever blocked by the prompt.
+		offerResumePrompt(ctx);
 	});
 
 	/**
@@ -1822,6 +1924,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// but clearing the authority also prevents a replayed model request from
 			// being treated as fresh evidence.
 			clearCreationAuthority();
+			// The tool path is always a fresh creation — it refuses while any Goal
+			// exists — so a committed creation may name an unnamed session here too,
+			// exactly like the command's. The failure paths above returned before this
+			// point, so a rolled-back creation never names anything.
+			nameSessionFromObjective(ctx, goal.objective);
 			// No separate durability poll is needed here, unlike the /goal command whose
 			// kickoff is what creates the session file: a tool call implies a running
 			// session whose file already exists, and appendEntry writes synchronously
@@ -2324,7 +2431,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * delivered, in {@link applyDeliveredUserMessage}, because a steer reaches the
 	 * branch only after the work that was already in flight.
 	 */
-	function deliverWorkMessage(content: string, ctx: ExtensionCommandContext): "started" | "steered" {
+	function deliverWorkMessage(content: string, ctx: ExtensionContext): "started" | "steered" {
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(content);
 			return "started";
@@ -2334,7 +2441,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/** Report a failed durable transition uniformly (the previous state stands). */
-	function notifyMutationFailure(ctx: ExtensionCommandContext, action: string, failure: { reason: string; message?: string; error?: unknown }): void {
+	function notifyMutationFailure(ctx: ExtensionContext, action: string, failure: { reason: string; message?: string; error?: unknown }): void {
 		if (failure.reason === "persistence") {
 			ctx.ui.notify(
 				`Goal not ${action}: writing the Goal to the session failed (${describeError(failure.error)}). ` +
@@ -2379,7 +2486,127 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		);
 	}
 
-	function resumeGoal(ctx: ExtensionCommandContext, budget: ResumeBudgetRequest): void {
+	/**
+	 * Offer the opt-in paused-Goal resume prompt for a restored `paused` Goal.
+	 *
+	 * The prompt is convenience, never authority. It asks once per session start,
+	 * and every answer other than an explicit "yes" leaves the Goal untouched:
+	 * declining, dismissing, timing out, an unavailable UI, and a Goal that moved
+	 * while the dialog was open all change nothing. Acceptance is delegated to
+	 * {@link resumeGoal}, so it is literally `/goal resume`: the durable
+	 * `markResumed` transition, the same identity and history, and a fresh Blocked
+	 * audit. That is also why the prompt is never offered for any other status —
+	 * `blocked` and `usage_limited` recovery is a user decision with its own
+	 * reasoning, and `budget_limited` recovery needs valid new headroom.
+	 *
+	 * Nothing here blocks a headless path. Print and JSON modes have no
+	 * dialog-capable UI, so the prompt is never opened; RPC mode can answer it, and
+	 * the dialog is created without being awaited by the `session_start` handler,
+	 * so the session becomes usable while the request is still pending. A UI-less
+	 * caller is told what happened rather than left to guess why a paused Goal was
+	 * not resumed.
+	 */
+	function offerResumePrompt(ctx: ExtensionContext): void {
+		if (!resumePrompt.enabled) return;
+		const goal = store.get();
+		if (!goal || goal.status !== "paused") return;
+		// A disabled extension cannot admit the resume this prompt would perform, so
+		// it must not ask a question it will refuse. The clear outcome is a notice
+		// naming the disabled condition and the two explicit ways forward.
+		if (!admission.enabled) {
+			notify(
+				ctx,
+				`Goal ${goal.id} restored (paused). The resume prompt is enabled, but pi-goal is disabled (goal.enabled is ` +
+					"false), so no resume was offered and nothing was resumed: the Goal stays paused and no new Goal work is " +
+					"admitted. Re-enable goal.enabled and run /goal resume to restart it, or leave it paused.",
+				"warning",
+			);
+			return;
+		}
+		if (!ctx.hasUI) {
+			notify(
+				ctx,
+				`Goal ${goal.id} restored (paused). The resume prompt is enabled, but this Pi mode has no interactive UI to ` +
+					"ask it, so nothing was asked and the Goal stays paused. Use /goal resume to restart it.",
+				"info",
+			);
+			return;
+		}
+		// Deliberately not awaited: `session_start` must return so the host can start
+		// dispatching input, and an RPC host answers the dialog only after that.
+		void askResumePrompt(ctx, goal).catch((error) => {
+			notify(ctx, `pi-goal resume prompt error: ${describeError(error)}`, "error");
+		});
+	}
+
+	/**
+	 * Ask the one resume question and act on the answer, revalidating first.
+	 *
+	 * The dialog's timeout resolves to "no" in every mode, and the Goal is re-read
+	 * after the answer because a Goal can be edited, paused, resumed, replaced, or
+	 * cleared while a dialog is open: the answer only ever applies to the exact
+	 * record the dialog described.
+	 */
+	async function askResumePrompt(ctx: ExtensionContext, goal: GoalRecord): Promise<void> {
+		let confirmed: boolean;
+		try {
+			confirmed = await ctx.ui.confirm(
+				"Resume the paused Goal?",
+				`Goal ${goal.id} is paused: "${previewObjective(goal.objective)}". Resuming restarts work with the same ` +
+					"identity, history, and retained progress and starts a fresh blocked audit — the same durable transition " +
+					"as /goal resume. Declining, dismissing, or not answering leaves the Goal paused and changes nothing.",
+				{ timeout: dialogTimeoutMs(RESUME_PROMPT_TIMEOUT_MS) },
+			);
+		} catch (error) {
+			notify(
+				ctx,
+				`Goal ${goal.id} stays paused: the resume prompt could not be displayed (${describeError(error)}). ` +
+					"Use /goal resume to restart it.",
+				"warning",
+			);
+			return;
+		}
+		const current = store.get();
+		if (!current || current.id !== goal.id || current.revision !== goal.revision) {
+			notify(
+				ctx,
+				`Resume prompt closed without resuming: the Goal changed while the prompt was open` +
+					(current ? ` (now ${current.status}, revision ${current.revision})` : " (no Goal is set anymore)") +
+					", so the prompt no longer described the current state. The current Goal state stands; use /goal resume " +
+					"to restart the Goal you want.",
+				"warning",
+			);
+			return;
+		}
+		if (!confirmed) {
+			// Decline, dismissal, and timeout all resolve to "no" in Pi's dialog API, so
+			// the notice names every one of them rather than inventing a distinction the
+			// extension cannot observe.
+			notify(
+				ctx,
+				`Resume prompt not confirmed (declined, dismissed, or timed out): Goal ${current.id} stays paused and ` +
+					"nothing changed. Use /goal resume to restart it.",
+				"info",
+			);
+			return;
+		}
+		if (!admission.enabled) {
+			notify(ctx, admissionDisabledRefusal("Goal not resumed from the resume prompt:"), "warning");
+			return;
+		}
+		if (current.status !== "paused") {
+			notify(
+				ctx,
+				`Goal ${current.id} is ${current.status}; the resume prompt only resumes a paused Goal, so nothing was ` +
+					"resumed.",
+				"warning",
+			);
+			return;
+		}
+		resumeGoal(ctx, { kind: "none" });
+	}
+
+	function resumeGoal(ctx: ExtensionContext, budget: ResumeBudgetRequest): void {
 		const goal = store.get();
 		if (!goal) {
 			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
@@ -2536,7 +2763,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 		const edited = await withDialogTimeout(
 			ctx.ui.editor("Edit Goal objective", goal.objective),
-			EDIT_TIMEOUT_MS,
+			dialogTimeoutMs(EDIT_TIMEOUT_MS),
 			undefined,
 		);
 		if (edited === undefined) {
@@ -2616,7 +2843,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			"Replace the current Goal?",
 			`The current ${existing.status} Goal "${previewObjective(existing.objective)}" would be discarded ` +
 				"(a new Goal replaces it, with a fresh identity and no retained usage history). Replace it?",
-			{ timeout: REPLACE_CONFIRM_TIMEOUT_MS },
+			{ timeout: dialogTimeoutMs(REPLACE_CONFIRM_TIMEOUT_MS) },
 		);
 	}
 
@@ -2834,6 +3061,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// durable bar every other transition uses. This announcement waits for the
 			// on-disk poll instead, because the user-facing message must not outlive a
 			// session file that never appeared.
+			//
+			// A *fresh* creation may also name the session, and only a fresh one: a
+			// replacement is a new Goal in a session that already has Goal history, so
+			// naming it would relabel a session the user may already recognize by its
+			// old name. Every failure path above returned before this point, so a
+			// refused, failed, or rolled-back creation never names anything.
+			if (!replacing) nameSessionFromObjective(ctx, goal.objective);
 			ctx.ui.notify(
 				replacing
 					? `Goal ${goal.id} created and activated, replacing ${previous!.id}. Initial work ${delivery === "started" ? "started" : "steered into the running work"}.`
