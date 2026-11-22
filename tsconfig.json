@@ -13,5 +13,5 @@
 		"noUncheckedIndexedAccess": true,
 		"forceConsistentCasingInFileNames": true
 	},
-	"include": ["src/**/*.ts", "test/extensions/**/*.ts"]
+	"include": ["src/**/*.ts", "companion/**/*.ts", "test/extensions/**/*.ts"]
 }

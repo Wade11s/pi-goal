@@ -322,6 +322,43 @@ available, a live scenario dispatches through the released provider's
 `rex_spawn` and inspects the run record's `launchArgs`, so the documented
 profile is proven to reach the child Pi as real launch arguments.
 
+### Goal RPC companion and the command bridge
+
+`test/goal56-command-bridge.test.mjs` covers the bridge with a fake Pi API, which
+is the only way to reach three narrow cases deterministically: the whole outcome
+classifier truth table, strict request validation, and a creation that commits in
+memory, announces its transition on the event stream, and then fails its on-disk
+durability poll. That last one is the point of the seam: the bridge must answer
+`refused` for the retracted creation even though the event stream already
+announced it, and the test asserts the answer and the empty `goal-state` bytes.
+The same file pins the busy guard (a second bridged command while a confirmation
+dialog is open), the declined-replacement no-op, the no-session guard, the
+session-control guard (a bridged context throws for `abort`, `shutdown`,
+`compact`, `newSession`, `fork`, `navigateTree`, `switchSession`, and `reload`,
+and the test asserts the underlying session was never touched), the once-only
+reply contract (a reply callback that throws is not called a second time), and
+the companion's structural optionality: protocol constants agree with core, the
+package declares no pi-goal dependency, imports nothing from `src/`, registers no
+model tool, and never names a durable Goal entry.
+
+`test/goal56-goal-rpc-companion.test.mjs` drives the companion's public protocol
+against a real `pi --mode rpc` subprocess: one `/goal-rpc <json>` extension
+command in, one `goal-rpc-response` entry (published as `entry_appended`) out. It
+covers get/set/clear round-trips (including `origin: "command"`, so a bridged
+`set` is provably the user path and not `create_goal`), replacement confirmation
+declined and accepted with the superseded history record, the stale-run binding
+refusal that survives a replacement, disabled admission, invalid budgets (both
+pi-goal's whole-number rule and the companion's own envelope checks), declared
+model authority, and a companion-only session with no pi-goal installed, which
+answers `unavailable` instead of crashing. It also pins the objective guard that
+keeps a `set` from smuggling a lifecycle command — `clear`, `pause`, `history`,
+`resume`, `edit`, `resume --budget …`, and a leading option token are all
+`invalid-request` while an ordinary objective that merely starts with one of those
+words is still created — and the strict request envelope (`version: 1` required,
+unknown top-level fields refused). Every refusal asserts the structured error
+code **and** that the raw `goal-state` bytes are unchanged, so "nothing happened"
+is proved rather than assumed.
+
 ## Interactive smoke test
 
 Deterministic RPC tests are the automated gate. The manual real-Pi procedure —

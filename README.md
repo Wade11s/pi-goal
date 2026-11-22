@@ -403,6 +403,24 @@ credentials.
 → [Goal-updated events](docs/behavior/events.md) ·
 [Operational metrics and the exporter seam](docs/behavior/metrics.md)
 
+### Host adapters: the optional Goal RPC companion
+
+A host that needs Codex-shaped Goal `get`/`set`/`clear` methods can install the
+companion package in [`companion/goal-rpc`](companion/goal-rpc). It maps each
+method onto the *user* command surface through pi-goal's generic in-process
+command bridge, so replacement confirmation, `goal.enabled` admission, Token-budget
+and attachment validation, and durable-before-announced ordering stay in one place.
+Every answer is a structured outcome: `ok` is true only after a durable commit, and
+a refused, declined, disabled, unauthorized, or rolled-back call returns a named
+error with the Goal byte-identical. It is not Codex's private app-server protocol
+and is not wire-compatible with it.
+
+The companion is independently installable (`pi install
+./companion/goal-rpc`) and never a runtime dependency of pi-goal: without pi-goal
+it answers `unavailable` instead of failing.
+
+→ [Companion and command bridge](docs/behavior/companion.md)
+
 ### Goal audit history
 
 Every committed transition is also appended to the session branch as a
@@ -539,6 +557,7 @@ retention and restore verification.
 | [Persistence model](docs/behavior/persistence.md) | Snapshots, reconstruction, forks, and the 0.1.0 cutover |
 | [Goal-updated events](docs/behavior/events.md) | Committed local transitions and metadata-only attachment manifests |
 | [Metrics and the exporter seam](docs/behavior/metrics.md) | Privacy-safe `pi-goal:metrics`, what is never projected, local consumers, and the on-demand hosted companion |
+| [Goal RPC companion](docs/behavior/companion.md) | The optional Codex-shaped `get`/`set`/`clear` companion, the `pi-goal:command-bridge` seam, and the intentional app-server difference |
 | [Model tools](docs/tools.md) | `get_goal`, `create_goal` (and creation authority), `update_goal`, trust boundary, structured responses |
 | [Limitations](docs/limitations.md) | Known boundaries of the current model |
 | [Codex migration status](docs/codex-migration.md) | Per-capability comparison and Pi-feasible follow-ups |

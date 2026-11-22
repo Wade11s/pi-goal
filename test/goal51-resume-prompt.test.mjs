@@ -577,6 +577,14 @@ function uiLessSessionStart(mode) {
 		sendUserMessage() {
 			throw new Error("a UI-less session start must not start Goal work");
 		},
+		// The optional Goal command bridge registers a listener at load; the shared
+		// event bus is part of the real Pi API this fake stands in for.
+		events: {
+			on() {
+				return () => {};
+			},
+			emit() {},
+		},
 	};
 	const ctx = {
 		ui: {

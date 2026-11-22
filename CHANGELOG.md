@@ -6,6 +6,38 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+- Add the optional Codex-shaped Goal RPC companion
+  (`companion/goal-rpc`): independently installable, no dependency on pi-goal,
+  removable without affecting pi-goal. It maps `thread/goal/get`,
+  `thread/goal/set`, and `thread/goal/clear` onto the *user* command surface
+  through the new generic in-process bridge (`pi-goal:command-bridge`), so
+  replacement confirmation, `goal.enabled` admission, Token-budget and attachment
+  validation, the execution binding, and durable-before-announced ordering all
+  stay in one lifecycle: no snapshot, tombstone, or usage checkpoint is read or
+  written by the adapter. Each call answers with one `goal-rpc-response` session
+  entry whose `ok` is true only for a durable commit (a transition of the kind
+  that answers the requested action, still the current Goal identity, and on
+  disk) — a creation that committed and then failed its on-disk durability poll
+  is reported as `refused` — and whose `error.code` names the refused, declined,
+  invalid, unauthorized, or unavailable outcome, never a claimed success.
+  Mutating methods require an asserted `authority: "external-user"`; `model` is
+  refused and pointed at `create_goal`, and the companion registers no
+  model-callable tool, so model-driven creation keeps pi-goal's creation
+  authority. The bridge and companion are documented in
+  `docs/behavior/companion.md`, including the honest difference from Codex's
+  private in-tree app-server methods (Codex-shaped names, not a wire-compatible
+  protocol). Deterministic coverage: `test/goal56-command-bridge.test.mjs` and
+  `test/goal56-goal-rpc-companion.test.mjs`. The companion refuses a `set`
+  objective that pi-goal's command surface would read as anything other than a
+  create (the subcommands `pause`/`clear`/`history`/`edit`/`resume`, anything led
+  by `edit` or `resume --budget`, and any leading option token) before rendering
+  command text, so a host `set` can never clear, pause, resume, or edit the
+  current Goal; its request envelope requires `version: 1` and refuses unknown
+  top-level fields. The bridge's session-control guard covers the whole surface Pi
+  offers a command handler (`newSession`, `fork`, `navigateTree`, `switchSession`,
+  `reload`, `abort`, `shutdown`, `compact`), and a bridged request is answered
+  exactly once even when the caller's reply callback throws.
+
 - Add the non-authoritative durable Goal audit history: every committed transition
   covered by `pi-goal:updated` is appended to the session branch as a `goal-history`
   entry and rendered read-only by `/goal history`. Each record carries the
