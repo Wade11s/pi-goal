@@ -113,16 +113,47 @@ provider's captured model context, stable hashes across Continuations, restart
 and clone reconstruction, Objective-edit retention, Replacement Goal isolation,
 clear/replacement artifact retention, validation and snapshot rollback,
 disabled admission before materialization, missing/corrupt restore suppression,
-and metadata-only Goal-updated events. Remote URLs are refused without network
-access; SVG and unknown types are rejected. The suite inspects the durable
-manifest and the sibling `pi-goal-store` directly, and every admitted run is
-sized and deliberately settled or aborted.
+and metadata-only Goal-updated events. A URL passed to `--image` is refused
+without network access, while `--remote-image` is covered separately below; SVG
+and unknown types are rejected. The suite inspects the durable manifest and the
+sibling `pi-goal-store` directly, and every admitted run is sized and
+deliberately settled or aborted.
 
 `test/goal49-attachments-store.test.mjs` pins the cheaper fault matrix: magic
 byte sniffing, strict UTF-8, the 8-attachment / 1 MiB-text / 10 MiB-image /
 25 MiB-total limits, content-addressed read-only materialization and idempotence,
 uncommitted cleanup, missing/corrupt verification, malformed-manifest
 fail-closed reconstruction, Objective-edit retention, and metadata-only events.
+
+Remote-image fetching (issue #50) is tested at the same two seams. The local TLS
+fixture (`test/helpers/remote-image-fixture.mjs`, certificate and key under
+`test/fixtures/tls/`) serves every redirect, timeout, MIME, size, and hostile
+target case; it binds an ephemeral loopback port and no test resolves or
+connects to a public destination. The spawned Pi trusts the fixture CA through
+`NODE_EXTRA_CA_CERTS`, and the extension's test-only
+`PI_GOAL_TEST_REMOTE_IMAGE_ORIGINS` seam opts in exactly that HTTPS origin, which
+production correctly refuses as loopback. `PI_GOAL_TEST_REMOTE_IMAGE_TIMEOUT_MS`
+shortens the 15-second production deadline for the timeout cases, and
+`PI_GOAL_TEST_REMOTE_IMAGE_DNS` supplies a JSON host-name-to-addresses map that
+replaces the host resolver entirely: a name the stub does not list does not
+resolve, so no test depends on `/etc/hosts`, a local resolver, or the public
+internet, and mixed public/private answers can be pinned deterministically. Both
+variables are read only when the real-Pi harness sets `PI_GOAL_TEST_SCRIPT`,
+and neither changes production defaults. `test/goal50-remote-images.test.mjs`
+proves fetch-once and hash stability across Continuations, restart, and a cloned
+selected branch; it also covers redirect revalidation, credentials, HTTP,
+loopback/private/link-local/DNS refusals, actual-byte MIME validation, the
+per-image and total bounds, disabled admission before any request, and rollback
+with no success event. It also holds a fetch open to prove that a `/goal clear`,
+an edit, or a `create_goal` tool call during the network wait wins over the
+stale command, which cancels with a warning, retracts its uncommitted artifacts,
+and emits no success event. `test/goal50-remote-images-store.test.mjs` pins URL
+shape and label derivation, the IPv4/IPv6 destination policy (including mapped,
+IPv4-translatable, well-known and local-use NAT64, 6to4, Teredo, reserved, and
+public controls), literal/DNS/redirect forms of a private IPv4 embedded in a
+translation prefix, bounded declared and streamed bodies, stalled responses, and
+mixing a fetched image with local sources in one manifest. The source URL never
+appears in the durable manifest, events, or metrics; tests assert that directly.
 
 Opt-in session naming (issue #52) is tested through the same RPC seam in
 `test/goal52-session-naming.test.mjs`: the live name comes from Pi's own
@@ -318,6 +349,9 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] `/goal --file <path> --image <path> <objective>` sends encoded untrusted
       text and Pi image blocks, restarts with the same hashes, retains artifacts
       after replacement/clear, and suppresses Continuation on integrity failure
+- [ ] `/goal --remote-image <https URL> <objective>` fetches once over HTTPS,
+      keeps the same hash across restart and cloned branches, refuses
+      non-public destinations and unsafe redirects, and never fetches again
 - [ ] automatic continuation at settlement
 - [ ] bare `/goal edit` interactive editing
 - [ ] `/goal pause`, `/goal resume`, and `/goal clear`

@@ -93,7 +93,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Full Goal summary | TUI history summary | Bare `/goal` and structured `get_goal` | Ported |
 | Interactive objective editor | Prefilled edit prompt | `ctx.ui.editor()` with TUI/RPC support and a headless fallback | Ported |
 | Resume prompt after reopening a stopped Goal | TUI can offer “Resume paused goal?” | Opt-in `goal.resumePrompt` (default false) offers one confirmation for a restored paused Goal; accepting reuses the durable user resume | Ported, conservatively opt-in |
-| Rich objective materialization | Oversized text, pasted text, local images, and remote image URLs can become attachment files | Explicit local text-file and image options materialize an immutable per-Goal manifest; Objective stays verbatim (#49, in review). Remote image URLs are #50 | Partial; local text/images in review, remote fetch pending |
+| Rich objective materialization | Oversized text, pasted text, local images, and remote image URLs can become attachment files | Explicit local text-file and image options plus `--remote-image` fetch materialize one immutable per-Goal manifest; Objective stays verbatim (#49, #50) | Ported for explicit local/remote attachments; composer drafts remain intentionally unsupported |
 | Objective length | 1–4000 characters | 3–2000 characters | Intentional local validation choice |
 | Thread preview from objective | Empty thread preview is filled from the objective | Opt-in `goal.sessionNameFromObjective` (default false) names only an unnamed session | Ported, never overwriting a user name |
 | Enable/disable setting | `GoalExtensionConfig.enabled` can be changed by the host | `goal.enabled` (default true) gates admission only: no status rewrite, no clock stop | Ported |

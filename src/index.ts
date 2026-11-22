@@ -127,11 +127,12 @@ import {
 	attachmentStoreRoot,
 	discardUncommittedArtifacts,
 	loadAttachments,
-	materializeAttachments,
+	materializeAttachmentRequests,
 	validateAttachmentPath,
 	verifyAttachments,
 	type AttachmentRequest,
 } from "./attachments.ts";
+import { validateRemoteImageUrl, type RemoteImageFetchOptions } from "./remote-image.ts";
 import type { AttachmentContent, GoalMessageContent } from "./goal.ts";
 import {
 	applySessionNameFromObjective,
@@ -224,10 +225,12 @@ function dialogTimeoutMs(defaultMs: number): number {
  * creates an unbounded Goal even when an extension default is configured, which
  * is why it is a distinct request kind rather than "no request".
  *
- * `--file <path>` and `--image <path>` are repeatable leading options for local
- * text files and local images. Plain arguments remain text: an objective that
- * never starts with a flag is exactly what it always was, and composer drafts
- * are never inferred from it.
+ * `--file <path>`, `--image <path>`, and `--remote-image <url>` are repeatable
+ * leading options for local text files, local images, and explicit remote image
+ * URLs. Plain arguments remain text: an objective that never starts with a flag
+ * is exactly what it always was, and composer drafts are never inferred from it.
+ * Remote URLs are accepted only here, through the direct user command; the
+ * `create_goal` model tool stays text-only.
  */
 export type GoalBudgetRequest =
 	/** No flag given: use the extension default. */
@@ -317,7 +320,7 @@ function parseGoalArgs(raw: string): ParsedGoalArgs {
 	const attachments: AttachmentRequest[] = [];
 	const problems: string[] = [];
 	for (;;) {
-		const match = /^--(budget|no-budget|file|image)(?:=(\S+))?(?:\s+|$)/.exec(rest);
+		const match = /^--(budget|no-budget|file|image|remote-image)(?:=(\S+))?(?:\s+|$)/.exec(rest);
 		if (!match) break;
 		const flag = match[1]!;
 		const inline = match[2];
@@ -326,7 +329,7 @@ function parseGoalArgs(raw: string): ParsedGoalArgs {
 			budget = { kind: "none" };
 			continue;
 		}
-		if (flag === "file" || flag === "image") {
+		if (flag === "file" || flag === "image" || flag === "remote-image") {
 			let value: string;
 			if (inline !== undefined) {
 				value = inline;
@@ -334,12 +337,23 @@ function parseGoalArgs(raw: string): ParsedGoalArgs {
 				const next = /^(\S+)(?:\s+|$)/.exec(rest);
 				if (!next) {
 					problems.push(
-						`Goal not created: --${flag} needs a local file path (for example --${flag} ${flag === "image" ? "screenshot.png" : "notes.md"}).`,
-				);
+						flag === "remote-image"
+							? "Goal not created: --remote-image needs an HTTPS image URL (for example --remote-image https://example.com/screenshot.png)."
+							: `Goal not created: --${flag} needs a local file path (for example --${flag} ${flag === "image" ? "screenshot.png" : "notes.md"}).`,
+					);
 					break;
 				}
 				value = next[1]!;
 				rest = rest.slice(next[0].length);
+			}
+			if (flag === "remote-image") {
+				const validated = validateRemoteImageUrl(value);
+				if (!validated.ok) {
+					problems.push(validated.error);
+					break;
+				}
+				attachments.push({ kind: "remote-image", url: validated.url.href });
+				continue;
 			}
 			const kind = flag === "image" ? "image" : "text";
 			const validated = validateAttachmentPath(kind, value);
@@ -435,8 +449,8 @@ type GoalCommand =
  *
  * `edit` cannot change attachments: an Objective edit keeps the immutable
  * attachment manifest, and changing attachments requires a Replacement Goal,
- * so an edit whose objective starts with `--file`/`--image` is refused with that
- * guidance instead of silently becoming part of the objective.
+ * so an edit whose objective starts with `--file`/`--image`/`--remote-image` is
+ * refused with that guidance instead of silently becoming part of the objective.
  *
  * `history` joins `pause` and `clear` as a whole-argument subcommand, for the same
  * reason and with the same trade-off: `/goal history` renders the branch-local
@@ -472,13 +486,13 @@ function parseGoalCommand(args: string): GoalCommand {
 			// and for hosts without a dialog-capable UI.
 			return { kind: "edit-dialog" };
 		}
-		if (/^--(file|image)(?:=|\s|$)/.test(remainder)) {
+		if (/^--(file|image|remote-image)(?:=|\s|$)/.test(remainder)) {
 			return {
 				kind: "invalid",
 				message:
 					"Goal not edited: /goal edit changes only the objective and keeps the Goal's immutable attachment " +
-					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> ... <objective> " +
-					"(with replacement confirmation when the current Goal is unfinished).",
+					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
+					"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).",
 			};
 		}
 		return { kind: "edit", objective: remainder };
@@ -2863,6 +2877,67 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Deterministic-suite seams for the local remote-image TLS fixture.
+	 *
+	 * The production fetch refuses loopback and every private destination, so the
+	 * tests run a local HTTPS fixture and must opt that exact origin in. The
+	 * override is read only when the real-Pi test harness is driving this process
+	 * (`PI_GOAL_TEST_SCRIPT`), applies only to exact HTTPS origins, and shortens
+	 * the overall timeout only for the timeout scenario. A third seam supplies a
+	 * fixed host-name-to-addresses map so no test consults the host's resolver.
+	 * Users never configure remote fetching through these variables; see
+	 * `docs/testing.md`.
+	 */
+	function remoteImageFetchOptions(): RemoteImageFetchOptions | undefined {
+		if (!process.env.PI_GOAL_TEST_SCRIPT) return undefined;
+		const origins = (process.env.PI_GOAL_TEST_REMOTE_IMAGE_ORIGINS ?? "")
+			.split(",")
+			.map((origin) => origin.trim())
+			.filter((origin) => origin !== "");
+		const rawTimeout = process.env.PI_GOAL_TEST_REMOTE_IMAGE_TIMEOUT_MS;
+		const timeout = rawTimeout === undefined ? Number.NaN : Number(rawTimeout);
+		const timeoutMs = Number.isSafeInteger(timeout) && timeout > 0 ? timeout : undefined;
+		const resolver = testRemoteImageResolver(process.env.PI_GOAL_TEST_REMOTE_IMAGE_DNS);
+		if (origins.length === 0 && timeoutMs === undefined && resolver === undefined) return undefined;
+		const testOnly = {
+			...(origins.length === 0 ? {} : { allowedOrigins: origins }),
+			...(resolver === undefined ? {} : { resolver }),
+		};
+		return {
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+			...(Object.keys(testOnly).length === 0 ? {} : { testOnly }),
+		};
+	}
+
+	/**
+	 * Parse the deterministic DNS fixture for the real-Pi suite.
+	 *
+	 * The value is a JSON object of host name to a fixed address list. A malformed
+	 * value becomes an empty, still-authoritative stub: every host name then fails
+	 * to resolve instead of silently falling back to the host's resolver, so a
+	 * typo can never make a test reach `/etc/hosts`, a local resolver, or the
+	 * public internet.
+	 */
+	function testRemoteImageResolver(
+		raw: string | undefined,
+	): Record<string, readonly string[]> | undefined {
+		if (raw === undefined || raw.trim() === "") return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			return {};
+		}
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+		const resolver: Record<string, readonly string[]> = {};
+		for (const [name, addresses] of Object.entries(parsed)) {
+			if (!Array.isArray(addresses) || addresses.some((address) => typeof address !== "string")) return {};
+			resolver[name.toLowerCase()] = addresses as string[];
+		}
+		return resolver;
+	}
+
 	/** The refusal for work whose attachments cannot be verified. */
 	function attachmentIntegrityError(goal: GoalRecord, problems: readonly string[]): string {
 		return (
@@ -3470,8 +3545,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						throw new Error("the session file could not be resolved for the attachment store");
 					}
 					uncommittedAttachmentRoot = root;
-					const materialized = materializeAttachments(root, goal.id, parsed.attachments, {
+					const materialized = await materializeAttachmentRequests(root, goal.id, parsed.attachments, {
 						cwd: sessionWorkingDirectory(ctx),
+						remote: remoteImageFetchOptions(),
 					});
 					if (!materialized.ok) {
 						// Not a write failure of the Goal path: refuse with the validation
@@ -3482,6 +3558,40 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					}
 					goal.attachments = materialized.attachments;
 					attachmentContents = materialized.contents;
+				}
+				// The remote fetch is a real network await, and the create lock
+				// excludes only other create/replace commands: a /goal clear, an
+				// edit, a lifecycle command, or a create_goal tool call can run
+				// while DNS and the body read are pending. Revalidate the exact
+				// record this command captured — null included, for a fresh
+				// creation — immediately after materialization and before any
+				// durable transition (the superseded freeze, the stage, and the
+				// commit). On a mismatch the current Goal stays untouched, the
+				// never-committed artifacts are retracted, and no success event
+				// is emitted.
+				const captured = previous ?? null;
+				const afterMaterialization = store.get();
+				const unchanged =
+					captured === null
+						? afterMaterialization == null
+						: afterMaterialization != null &&
+							afterMaterialization.id === captured.id &&
+							afterMaterialization.revision === captured.revision;
+				if (!unchanged) {
+					if (uncommittedAttachmentRoot) {
+						discardUncommittedArtifacts(uncommittedAttachmentRoot, goal.id);
+					}
+					ctx.ui.notify(
+						"Goal not created: the Goal changed while the remote image was being fetched" +
+							(afterMaterialization
+								? ` (now ${afterMaterialization.status}, revision ${afterMaterialization.revision})`
+								: " (no Goal is set anymore)") +
+							", so this command no longer described the current state. Nothing was replaced and the " +
+							"fetched artifact was retracted; the current Goal is unchanged. Run /goal again to create " +
+							"it against the current state.",
+						"warning",
+					);
+					return;
 				}
 				// Replacement must preserve the superseded Goal's already-accounted
 				// totals as a durable historical record before the new identity takes

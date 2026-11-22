@@ -1,13 +1,16 @@
 /**
  * Objective attachments: validation, materialization, and verification of the
- * immutable extension-owned artifact store (issue #49).
+ * immutable extension-owned artifact store (issues #49 and #50).
  *
- * A direct user command (`/goal --file <path> --image <path> ... <objective>`)
- * may attach explicit local text files and local images to a Goal. The
- * Objective itself stays verbatim with its existing length policy; long or
- * binary supporting material becomes a separate attachment instead of being
- * folded into the Objective. `create_goal` stays text-only, so unquoted files
- * and images never gain Goal creation authority.
+ * A direct user command (`/goal --file <path> --image <path>
+ * --remote-image <https-url> ... <objective>`) may attach explicit local text
+ * files, local images, and remote images fetched once, to a Goal. The Objective
+ * itself stays verbatim with its existing length policy; long or binary
+ * supporting material becomes a separate attachment instead of being folded
+ * into the Objective. `create_goal` stays text-only, so unquoted files and
+ * images never gain Goal creation authority. A remote URL is fetched once into
+ * the same store and its URL is never persisted; see `./remote-image.ts` for the
+ * HTTPS-only, public-destination, redirect, deadline, and bounded-read policy.
  *
  * Artifacts are materialized into a store **keyed by Goal identity** — one
  * directory per Goal under a `pi-goal-store` directory that lives beside the
@@ -21,8 +24,9 @@
  *
  * The durable manifest — the `attachments` array on the Goal snapshot — records
  * each attachment's content hash, media type, byte size, and display label.
- * Source paths are not required for later Continuations: every kickoff and
- * Continuation re-references the same manifest and re-reads the store.
+ * Source paths and remote source URLs are not required for later Continuations:
+ * every kickoff and Continuation re-references the same manifest and re-reads
+ * the store.
  *
  * On restore (and before admitting work that would re-send the attachments),
  * the manifest and the artifact hashes are verified. Missing or corrupt
@@ -46,6 +50,11 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { AttachmentContent, GoalAttachment } from "./goal.ts";
+import {
+	fetchRemoteImage,
+	validateRemoteImageUrl,
+	type RemoteImageFetchOptions,
+} from "./remote-image.ts";
 
 /** At most this many attachments per Goal (text and images together). */
 export const MAX_ATTACHMENTS = 8;
@@ -82,15 +91,24 @@ export const ATTACHMENT_STORE_DIR = "pi-goal-store";
 /**
  * One explicit attachment request parsed from the leading `/goal` options.
  *
- * `kind` is what the user asked for — a text file (`--file`) or a local image
- * (`--image`) — and decides which limit and which validation apply. The path is
- * resolved relative to the session's working directory, exactly as the user
- * typed it.
+ * `kind` is what the user asked for — a text file (`--file`), a local image
+ * (`--image`), or an explicit remote image URL (`--remote-image`) — and decides
+ * which limit and which validation apply. Local paths resolve relative to the
+ * session's working directory, exactly as the user typed them. A remote URL is
+ * fetched once at creation time and never persisted.
  */
-export interface AttachmentRequest {
+export interface LocalAttachmentRequest {
 	kind: "text" | "image";
 	path: string;
 }
+
+/** One explicit remote-image URL request (`--remote-image <url>`). */
+export interface RemoteImageAttachmentRequest {
+	kind: "remote-image";
+	url: string;
+}
+
+export type AttachmentRequest = LocalAttachmentRequest | RemoteImageAttachmentRequest;
 
 /** Outcome of validating and materializing a request list. */
 export type MaterializeResult =
@@ -135,6 +153,8 @@ export interface MaterializeOptions {
 	cwd?: string;
 	/** Test-only observation hooks threaded to the bounded reader. */
 	readHooks?: AttachmentReadHooks;
+	/** Remote fetch policy; production uses the defaults. */
+	remote?: RemoteImageFetchOptions;
 }
 
 /**
@@ -288,11 +308,12 @@ export function readAttachmentBytes(
 }
 
 /**
- * Validate one raw flag value before anything is read.
+ * Validate one raw local flag value before anything is read.
  *
- * Remote image URLs are deliberately unsupported in V1 (issue #50 owns remote
- * fetching), so an `--image https://…` request is refused up front rather than
- * being read as a local path. Empty values are refused for both kinds.
+ * A URL passed to `--image` is refused up front rather than being read as a
+ * local path; remote images have their own explicit `--remote-image` option so
+ * a remote fetch is never inferred from a local-looking flag. Empty values are
+ * refused for both kinds.
  */
 export function validateAttachmentPath(kind: "text" | "image", raw: string): { ok: true; path: string } | { ok: false; error: string } {
 	const path = raw.trim();
@@ -304,8 +325,8 @@ export function validateAttachmentPath(kind: "text" | "image", raw: string): { o
 		return {
 			ok: false,
 			error:
-				`Goal not created: ${flag} accepts a local file path, not the URL ${JSON.stringify(path)}. ` +
-				"Remote image fetching is not supported yet.",
+				`Goal not created: ${flag} accepts a local file path, not a URL. ` +
+				"Use --remote-image <https URL> to fetch a remote image explicitly.",
 		};
 	}
 	return { ok: true, path };
@@ -359,7 +380,7 @@ function decodeStrictUtf8(bytes: Uint8Array): string | null {
 }
 
 function sourceReadError(
-	request: AttachmentRequest,
+	request: LocalAttachmentRequest,
 	label: string,
 	path: string,
 	maxBytes: number,
@@ -392,28 +413,25 @@ function sourceReadError(
 	}
 }
 
+interface PreparedAttachment {
+	kind: "text" | "image";
+	mediaType: string;
+	bytes: Uint8Array;
+	hash: string;
+	label: string;
+	size: number;
+}
+
 /**
- * Validate and materialize every request into the Goal's store directory.
+ * Preflight every request without touching the network or the filesystem.
  *
- * All validation happens before any byte is written; the first problem refuses
- * the whole request, so a partially materialized Goal never commits. Sizes are
- * the *materialized* bytes (text is stored as its UTF-8 bytes, decoded once for
- * rendering), and the limits are per text file, per image, and cumulative.
- *
- * Content-addressed writes are idempotent: an artifact that already exists with
- * the manifest hash is adopted (its bytes are identical by construction), and
- * one that exists with different bytes is a hash collision or tampering and is
- * refused. New artifacts are written read-only, which is the store's
- * immutability gesture at the filesystem level; verification, not the mode
- * bits, is the actual integrity guarantee.
+ * Count, per-kind duplicate labels, local SVG names, and remote URL syntax are
+ * all refused here, before a replacement confirmation can lead anywhere and
+ * before any byte is read or fetched. Media-type validation still happens on
+ * the actual bytes later; this is the cheap structural pass.
  */
-export function materializeAttachments(
-	storeRoot: string,
-	goalId: string,
-	requests: readonly AttachmentRequest[],
-	options: MaterializeOptions = {},
-): MaterializeResult {
-	if (requests.length === 0) return { ok: true, attachments: [], contents: [] };
+function preflightRequests(requests: readonly AttachmentRequest[]): { ok: true } | { ok: false; error: string } {
+	if (requests.length === 0) return { ok: true };
 	if (requests.length > MAX_ATTACHMENTS) {
 		return {
 			ok: false,
@@ -422,75 +440,120 @@ export function materializeAttachments(
 				`(${requests.length} were requested).`,
 		};
 	}
-	const cwd = options.cwd ?? process.cwd();
 	const labelSeen = new Set<string>();
-	const prepared: Array<{ request: AttachmentRequest; mediaType: string; bytes: Uint8Array; hash: string; label: string; size: number }> = [];
-	let total = 0;
 	for (const request of requests) {
-		const label = basename(request.path) || request.path;
-		const sourcePath = isAbsolute(request.path) ? request.path : resolve(cwd, request.path);
-		if (labelSeen.has(`${request.kind}:${label}`)) {
-			return {
-				ok: false,
-				error: `Goal not created: ${request.kind === "image" ? "--image" : "--file"} names ${JSON.stringify(label)} more than once.`,
-			};
-		}
-		labelSeen.add(`${request.kind}:${label}`);
-		const maxBytes = request.kind === "image" ? MAX_IMAGE_ATTACHMENT_BYTES : MAX_TEXT_ATTACHMENT_BYTES;
-		if (request.kind === "image" && isSvgPath(request.path)) {
-			return {
-				ok: false,
-				error:
-					`Goal not created: the attachment ${JSON.stringify(label)} is an SVG. SVG is not a supported image ` +
-					"attachment (its markup is executable in some hosts); use PNG, JPEG, GIF, or WebP.",
-			};
-		}
-		const read = readAttachmentBytes(sourcePath, maxBytes, options.readHooks);
-		if (!read.ok) {
-			return { ok: false, error: sourceReadError(request, label, request.path, maxBytes, read.failure) };
-		}
-		const bytes = read.bytes;
-		if (bytes.length === 0) {
-			return { ok: false, error: `Goal not created: the attachment ${JSON.stringify(label)} is empty.` };
-		}
-		let mediaType: string;
-		if (request.kind === "image") {
-			const sniffed = sniffImageMediaType(bytes);
-			if (sniffed === null) {
-				return {
-					ok: false,
-					error:
-						`Goal not created: the attachment ${JSON.stringify(label)} is not a recognized image. Supported image ` +
-						"types are PNG, JPEG, GIF, and WebP; SVG and unknown media types are rejected.",
-				};
-			}
-			mediaType = sniffed;
+		let label: string;
+		let category: string;
+		let flag: string;
+		if (request.kind === "remote-image") {
+			const validated = validateRemoteImageUrl(request.url);
+			if (!validated.ok) return { ok: false, error: validated.error };
+			label = validated.label;
+			category = "image";
+			flag = "--remote-image";
 		} else {
-			if (decodeStrictUtf8(bytes) === null) {
+			label = basename(request.path) || request.path;
+			category = request.kind;
+			flag = request.kind === "image" ? "--image" : "--file";
+			if (request.kind === "image" && isSvgPath(request.path)) {
 				return {
 					ok: false,
 					error:
-						`Goal not created: the attachment ${JSON.stringify(label)} is not valid UTF-8 text. Text ` +
-						"attachments must be decodable text files.",
+						`Goal not created: the attachment ${JSON.stringify(label)} is an SVG. SVG is not a supported image ` +
+						"attachment (its markup is executable in some hosts); use PNG, JPEG, GIF, or WebP.",
 				};
 			}
-			mediaType = TEXT_ATTACHMENT_MEDIA_TYPE;
 		}
-		total += bytes.length;
-		if (total > MAX_TOTAL_ATTACHMENT_BYTES) {
+		if (labelSeen.has(`${category}:${label}`)) {
+			return {
+				ok: false,
+				error: `Goal not created: ${flag} names ${JSON.stringify(label)} more than once.`,
+			};
+		}
+		labelSeen.add(`${category}:${label}`);
+	}
+	return { ok: true };
+}
+
+/**
+ * Validate one source's already-read bytes and build its prepared manifest
+ * entry. The media type is decided by the bytes, never by the URL or path
+ * extension.
+ */
+function prepareBytes(
+	kind: "text" | "image",
+	bytes: Uint8Array,
+	label: string,
+): { ok: true; prepared: PreparedAttachment } | { ok: false; error: string } {
+	if (bytes.length === 0) {
+		return { ok: false, error: `Goal not created: the attachment ${JSON.stringify(label)} is empty.` };
+	}
+	let mediaType: string;
+	if (kind === "image") {
+		const sniffed = sniffImageMediaType(bytes);
+		if (sniffed === null) {
 			return {
 				ok: false,
 				error:
-					`Goal not created: the attachments materialize to ${formatBytes(total)}, above the ` +
-					`${formatBytes(MAX_TOTAL_ATTACHMENT_BYTES)} total limit.`,
+					`Goal not created: the attachment ${JSON.stringify(label)} is not a recognized image. Supported image ` +
+					"types are PNG, JPEG, GIF, and WebP; SVG and unknown media types are rejected.",
 			};
 		}
-		prepared.push({ request, mediaType, bytes, hash: sha256(bytes), label, size: bytes.length });
+		mediaType = sniffed;
+	} else {
+		if (decodeStrictUtf8(bytes) === null) {
+			return {
+				ok: false,
+				error:
+					`Goal not created: the attachment ${JSON.stringify(label)} is not valid UTF-8 text. Text ` +
+					"attachments must be decodable text files.",
+			};
+		}
+		mediaType = TEXT_ATTACHMENT_MEDIA_TYPE;
 	}
+	return {
+		ok: true,
+		prepared: { kind, mediaType, bytes, hash: sha256(bytes), label, size: bytes.length },
+	};
+}
 
-	// Everything validated: write the store directory and its content-addressed
-	// artifacts. A write failure after some artifacts landed is cleaned up by the
-	// caller through `discardUncommittedArtifacts` (no snapshot referenced them).
+/** Validate and read one local request into a prepared entry. */
+function prepareLocalRequest(
+	request: LocalAttachmentRequest,
+	cwd: string,
+	readHooks: AttachmentReadHooks | undefined,
+): { ok: true; prepared: PreparedAttachment } | { ok: false; error: string } {
+	const label = basename(request.path) || request.path;
+	const sourcePath = isAbsolute(request.path) ? request.path : resolve(cwd, request.path);
+	const maxBytes = request.kind === "image" ? MAX_IMAGE_ATTACHMENT_BYTES : MAX_TEXT_ATTACHMENT_BYTES;
+	const read = readAttachmentBytes(sourcePath, maxBytes, readHooks);
+	if (!read.ok) {
+		return { ok: false, error: sourceReadError(request, label, request.path, maxBytes, read.failure) };
+	}
+	return prepareBytes(request.kind, read.bytes, label);
+}
+
+function totalLimitError(total: number): string {
+	return (
+		`Goal not created: the attachments materialize to ${formatBytes(total)}, above the ` +
+		`${formatBytes(MAX_TOTAL_ATTACHMENT_BYTES)} total limit.`
+	);
+}
+
+/**
+ * Write every prepared source into the Goal-keyed content-addressed store and
+ * build the manifest and renderable contents.
+ *
+ * Called only after every source validated, so a validation or fetch failure
+ * never writes a partial Goal. A write failure after some artifacts landed is
+ * cleaned up by the caller through `discardUncommittedArtifacts` (no snapshot
+ * referenced them).
+ */
+function materializePrepared(
+	storeRoot: string,
+	goalId: string,
+	prepared: readonly PreparedAttachment[],
+): MaterializeResult {
 	try {
 		mkdirSync(goalStoreDir(storeRoot, goalId), { recursive: true });
 		const attachments: GoalAttachment[] = [];
@@ -521,7 +584,7 @@ export function materializeAttachments(
 			};
 			attachments.push(meta);
 			contents.push(
-				item.request.kind === "image"
+				item.kind === "image"
 					? { meta, kind: "image", data: Buffer.from(item.bytes).toString("base64") }
 					: { meta, kind: "text", text: decodeStrictUtf8(item.bytes)! },
 			);
@@ -533,6 +596,89 @@ export function materializeAttachments(
 			error: `Goal not created: the attachment store could not be written (${describe(error)}).`,
 		};
 	}
+}
+
+/**
+ * Validate and materialize explicit local requests into the Goal's store.
+ *
+ * All validation happens before any byte is written; the first problem refuses
+ * the whole request, so a partially materialized Goal never commits. Sizes are
+ * the *materialized* bytes (text is stored as its UTF-8 bytes, decoded once for
+ * rendering), and the limits are per text file, per image, and cumulative.
+ *
+ * Content-addressed writes are idempotent: an artifact that already exists with
+ * the manifest hash is adopted (its bytes are identical by construction), and
+ * one that exists with different bytes is a hash collision or tampering and is
+ * refused. New artifacts are written read-only, which is the store's
+ * immutability gesture at the filesystem level; verification, not the mode
+ * bits, is the actual integrity guarantee.
+ */
+export function materializeAttachments(
+	storeRoot: string,
+	goalId: string,
+	requests: readonly LocalAttachmentRequest[],
+	options: MaterializeOptions = {},
+): MaterializeResult {
+	if (requests.length === 0) return { ok: true, attachments: [], contents: [] };
+	const preflight = preflightRequests(requests);
+	if (!preflight.ok) return { ok: false, error: preflight.error };
+	const cwd = options.cwd ?? process.cwd();
+	const prepared: PreparedAttachment[] = [];
+	let total = 0;
+	for (const request of requests) {
+		const result = prepareLocalRequest(request, cwd, options.readHooks);
+		if (!result.ok) return { ok: false, error: result.error };
+		total += result.prepared.size;
+		if (total > MAX_TOTAL_ATTACHMENT_BYTES) return { ok: false, error: totalLimitError(total) };
+		prepared.push(result.prepared);
+	}
+	return materializePrepared(storeRoot, goalId, prepared);
+}
+
+/**
+ * Validate, fetch, and materialize every request — local text, local image, and
+ * explicit remote image URLs — into one immutable manifest and store directory.
+ *
+ * Remote images are fetched here, once, before any Goal snapshot commits. Each
+ * fetch is bounded both by the per-image limit and by the remaining total, so a
+ * remote body can never push the Goal past the cumulative limit. A fetch or
+ * validation failure refuses the whole request and writes nothing.
+ */
+export async function materializeAttachmentRequests(
+	storeRoot: string,
+	goalId: string,
+	requests: readonly AttachmentRequest[],
+	options: MaterializeOptions = {},
+): Promise<MaterializeResult> {
+	if (requests.length === 0) return { ok: true, attachments: [], contents: [] };
+	const preflight = preflightRequests(requests);
+	if (!preflight.ok) return { ok: false, error: preflight.error };
+	const cwd = options.cwd ?? process.cwd();
+	const prepared: PreparedAttachment[] = [];
+	let total = 0;
+	for (const request of requests) {
+		if (request.kind === "remote-image") {
+			const remaining = MAX_TOTAL_ATTACHMENT_BYTES - total;
+			if (remaining <= 0) return { ok: false, error: totalLimitError(total) };
+			const fetched = await fetchRemoteImage(request.url, {
+				...options.remote,
+				maxBytes: Math.min(MAX_IMAGE_ATTACHMENT_BYTES, remaining),
+			});
+			if (!fetched.ok) return { ok: false, error: fetched.error };
+			const result = prepareBytes("image", fetched.bytes, fetched.label);
+			if (!result.ok) return { ok: false, error: result.error };
+			total += result.prepared.size;
+			if (total > MAX_TOTAL_ATTACHMENT_BYTES) return { ok: false, error: totalLimitError(total) };
+			prepared.push(result.prepared);
+			continue;
+		}
+		const result = prepareLocalRequest(request, cwd, options.readHooks);
+		if (!result.ok) return { ok: false, error: result.error };
+		total += result.prepared.size;
+		if (total > MAX_TOTAL_ATTACHMENT_BYTES) return { ok: false, error: totalLimitError(total) };
+		prepared.push(result.prepared);
+	}
+	return materializePrepared(storeRoot, goalId, prepared);
 }
 
 function describe(error: unknown): string {

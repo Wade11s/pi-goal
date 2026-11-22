@@ -33,6 +33,25 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   Goal-tool calls to Pi's `Tool <name> not found` refusal without a Goal write;
   a live scenario inspects the released provider's child launch arguments. An
   upstream Rex review preset remains a separate enhancement request.
+- Add explicit remote-image Objective attachments through the repeatable leading
+  `/goal --remote-image <https-url>` option at creation and Replacement Goal
+  time. The image is fetched **once**, before the snapshot commits, over HTTPS
+  only, with no credentials, cookies, or referrer, a 15-second overall deadline,
+  at most three revalidated redirects, and refusal of loopback, link-local,
+  private, and other non-public destinations — including every redirect target
+  and every DNS result. The validated addresses are pinned into the connection
+  so a DNS answer that changes between resolution and fetch cannot redirect it.
+  The response is read through a hard byte bound, and the actual bytes (not the
+  URL extension or `Content-Type`) decide PNG/JPEG/GIF/WebP; SVG and unknown
+  content are refused, and the existing 10 MiB per-image and 25 MiB total limits
+  apply to fetched bytes. The fetched content becomes the same immutable
+  Goal-keyed artifact as a local image, with hash/media type/byte size/label in
+  the durable manifest; the source URL is never persisted or needed by a later
+  Continuation. A failed fetch, validation, materialization, or snapshot leaves
+  the previous Goal untouched and emits no success event, and disabled admission
+  refuses the command before any request. `create_goal` stays text-only. The
+  contract is documented in `docs/behavior/attachments.md`; the automated suite
+  uses only a local TLS fixture and never the public network.
 - Add the opt-in structured progress-plan tool (`goal.planTool`, default `false`),
   registered as the `update_plan` model tool. It takes one ordered list of steps,
   each `pending`, `in_progress`, or `completed`, with at most one `in_progress`,
@@ -75,8 +94,8 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   symlinks and special files, and work messages render one authenticated load
   instead of a separate verify and re-read. A resume loads its attachments
   before committing the durable resume transition, so a failed load leaves the
-  Goal paused. Remote URL fetching remains separate follow-up work (#50). The
-  contract is documented in `docs/behavior/attachments.md`.
+  Goal paused. Explicit remote images are the separate `--remote-image` flow
+  documented in the entry above and in `docs/behavior/attachments.md`.
 - Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
   one confirmation at session start for a restored `paused` Goal. Accepting runs
   the same durable `/goal resume` transition (same identity and history, fresh

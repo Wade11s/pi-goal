@@ -37,10 +37,12 @@ picks the Goal up at the next settlement.
 
 `create_goal` is deliberately **text-only**. It has no file, image, path, or URL
 parameters, and extra drifted fields do not gain attachment authority. Explicit
-local attachments can be selected only by the direct `/goal --file … --image …`
-command at creation or Replacement Goal time. The existing 3–2000 character
-Objective validation is unchanged; long supporting material belongs in a direct
-text attachment, not in a model-created Objective.
+local and remote attachments can be selected only by the direct
+`/goal --file … --image … --remote-image …` command at creation or Replacement
+Goal time. Remote URLs are fetched only there, once, so a model cannot turn a
+quoted prompt or an unquoted URL into network material. The existing 3–2000
+character Objective validation is unchanged; long supporting material belongs in
+a direct text attachment, not in a model-created Objective.
 
 Because it refuses while any Goal exists, a successful `create_goal` is always a
 fresh creation, so it is also the tool-side path for the opt-in session name: with
