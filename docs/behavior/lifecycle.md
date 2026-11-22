@@ -206,9 +206,13 @@ and is reported as a persistence error).
   stop, and starts a **fresh** blocked audit: the next blocker report counts from
   one rather than inheriting the count the user just overruled. A **complete**
   Goal is terminal for its identity and is refused — replacing it is a new Goal.
-  Before a resume re-sends attachments, their hashes are verified. A missing or
-  corrupt artifact refuses the resume with an explicit integrity error, leaving
-  the stopped Lifecycle status unchanged.
+  Before a resume re-sends attachments, they are loaded and authenticated once:
+  the manifest size, per-file/total limits, and content hashes are checked on
+  the exact bytes the resume message will carry. That load happens **before**
+  the durable resume transition, so a missing or corrupt artifact refuses the
+  resume with an explicit integrity error and leaves the stopped Lifecycle
+  status, revision, and snapshot unchanged; `/goal resume` remains actionable
+  after the artifact is repaired or the Goal is replaced.
   The `--budget` option is valid only for a `budget_limited` Goal; it is refused
   for `active`, `paused`, `blocked`, `usage_limited`, and `complete`, whose
   existing lifecycle behavior is unchanged.

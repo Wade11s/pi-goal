@@ -1628,15 +1628,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 		// Artifact integrity gate: every kickoff and Continuation references the
 		// same manifest, so a Goal whose artifacts cannot be verified against it is
-		// never continued automatically. The suppression is explicit (the error names
-		// what is missing or corrupt and how to restore it), and nothing else moves:
-		// the attachments are not silently dropped, the Goal is not completed, and
-		// its Lifecycle status is untouched by an artifact problem.
-		const verification = verifyGoalArtifacts(goal, ctx);
-		if (!verification.ok) {
-			notifyAttachmentIntegrityFailure(goal, ctx, verification.problems);
-			return;
-		}
+		// never continued automatically. The authenticated load reads each artifact
+		// once and returns exactly the bytes it verified; the suppression is explicit
+		// (the error names what is missing or corrupt and how to restore it), and
+		// nothing else moves: the attachments are not silently dropped, the Goal is
+		// not completed, and its Lifecycle status is untouched by an artifact problem.
 		const contents = goal.attachments?.length
 			? loadGoalAttachments(goal, ctx)
 			: ({ ok: true, contents: [] } as const);
@@ -2614,12 +2610,23 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		notify(ctx, attachmentIntegrityError(goal, problems), "error");
 	}
 
+	/** The session working directory relative attachment sources resolve against. */
+	function sessionWorkingDirectory(ctx: ExtensionContext): string {
+		try {
+			return ctx.sessionManager.getCwd();
+		} catch {
+			return ctx.cwd;
+		}
+	}
+
 	/**
-	 * Verify and load the current Goal's attachments for a work message.
+	 * Load and authenticate the current Goal's attachments in one read path.
 	 *
-	 * Verification comes first, so a work-admitting transition (resume, an
-	 * active-Goal edit) is refused with the explicit integrity error rather than
-	 * sending a message whose attachments silently disappeared.
+	 * The loader verifies the manifest's recorded size, the per-file and total
+	 * limits, and the content hash on the exact bytes it returns. A work-admitting
+	 * transition (resume, an active-Goal edit, a continuation) therefore renders
+	 * those verified bytes and never re-reads a path that could have changed after
+	 * a separate verification.
 	 */
 	function loadGoalAttachments(
 		goal: GoalRecord,
@@ -2627,13 +2634,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	): { ok: true; contents: AttachmentContent[] } | { ok: false; problems: string[] } {
 		const manifest = goal.attachments ?? [];
 		if (manifest.length === 0) return { ok: true, contents: [] };
-		const verification = verifyGoalArtifacts(goal, ctx);
-		if (!verification.ok) return verification;
 		const root = attachmentRoot(ctx);
-		const loaded = root ? loadAttachments(root, goal.id, manifest) : undefined;
-		if (!loaded || !loaded.ok) {
-			return { ok: false, problems: [loaded?.error ?? "the session file could not be resolved"] };
-		}
+		if (!root) return { ok: false, problems: ["the session file could not be resolved"] };
+		const loaded = loadAttachments(root, goal.id, manifest);
+		if (!loaded.ok) return { ok: false, problems: [loaded.error] };
 		return { ok: true, contents: loaded.contents };
 	}
 
@@ -2835,16 +2839,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			);
 			return;
 		}
-		// The resume message re-sends the Goal's attachments, so a Goal whose
-		// manifest cannot be reproduced from the store is not resumed into work
-		// that would silently miss its context: the resume is refused with the
-		// explicit integrity error instead.
+		// The resume message re-sends the Goal's attachments, so load and
+		// authenticate them *before* the durable resume transition. If the load
+		// fails, the Goal stays paused with an actionable integrity error instead of
+		// becoming active and then failing to start work (which would make the
+		// suggested `/goal resume` a no-op).
+		let contents: AttachmentContent[] = [];
 		if (goal.attachments?.length) {
-			const verification = verifyGoalArtifacts(goal, ctx);
-			if (!verification.ok) {
-				ctx.ui.notify(attachmentIntegrityError(goal, verification.problems), "error");
+			const loaded = loadGoalAttachments(goal, ctx);
+			if (!loaded.ok) {
+				notifyAttachmentIntegrityFailure(goal, ctx, loaded.problems);
 				return;
 			}
+			contents = loaded.contents;
 		}
 		// A stop the user is overruling is a user action, so every anti-loop counter
 		// and the in-memory audit chain start over with the resumed Goal. The durable
@@ -2870,21 +2877,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 		const updated = resumed.goal!;
 		const previousStatus = goal.status;
-		// The resume message restates the same manifest (verified above); a load
-		// failure here would be a mid-command artifact loss, which is reported as a
-		// work-start failure rather than silently dropping the attachments.
-		const loaded = loadGoalAttachments(updated, ctx);
-		if (!loaded.ok) {
-			ctx.ui.notify(
-				`${attachmentIntegrityError(updated, loaded.problems)} The Goal is resumed and durable; restart the work ` +
-					"with /goal resume once the artifacts are restored.",
-				"error",
-			);
-			return;
-		}
 		// Durable first, then restart work — busy-safely, so resuming while
-		// another run is in flight steers instead of waiting for idle.
-		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus, loaded.contents), ctx);
+		// another run is in flight steers instead of waiting for idle. The message
+		// renders the bytes authenticated before the transition; it never re-reads.
+		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus, contents), ctx);
 		const restarted = resumeRestartNotice(previousStatus, updated.tokenBudget, store.getUsage().totalTokens);
 		ctx.ui.notify(
 			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
@@ -3187,7 +3183,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						throw new Error("the session file could not be resolved for the attachment store");
 					}
 					uncommittedAttachmentRoot = root;
-					const materialized = materializeAttachments(root, goal.id, parsed.attachments);
+					const materialized = materializeAttachments(root, goal.id, parsed.attachments, {
+						cwd: sessionWorkingDirectory(ctx),
+					});
 					if (!materialized.ok) {
 						// Not a write failure of the Goal path: refuse with the validation
 						// error, retracting the uncommitted artifacts on the way out.

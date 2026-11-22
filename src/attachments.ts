@@ -32,14 +32,19 @@
  */
 import { createHash } from "node:crypto";
 import {
+	closeSync,
+	constants,
+	fstatSync,
+	lstatSync,
 	mkdirSync,
-	readFileSync,
+	openSync,
+	readSync,
 	readdirSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { AttachmentContent, GoalAttachment } from "./goal.ts";
 
 /** At most this many attachments per Goal (text and images together). */
@@ -100,6 +105,38 @@ export type LoadResult =
 	| { ok: true; contents: AttachmentContent[] }
 	| { ok: false; error: string };
 
+/** Why a bounded attachment read refused the path or the bytes it opened. */
+export type AttachmentReadFailure =
+	| { kind: "missing" }
+	| { kind: "symlink" }
+	| { kind: "not-regular" }
+	| { kind: "too-large"; size: number }
+	| { kind: "changed" }
+	| { kind: "unreadable"; error: unknown };
+
+/** Outcome of one bounded, regular-file-only attachment read. */
+export type AttachmentBytesResult =
+	| { ok: true; bytes: Uint8Array }
+	| { ok: false; failure: AttachmentReadFailure };
+
+/**
+ * Deterministic seams for the read-race regression tests. Production callers
+ * never pass hooks; they exist so a test can grow, replace, or swap the path
+ * after the initial inspection without relying on scheduling luck.
+ */
+export interface AttachmentReadHooks {
+	beforeOpen?(): void;
+	afterOpen?(): void;
+}
+
+/** Options for materializing attachment sources. */
+export interface MaterializeOptions {
+	/** Session working directory for relative source paths. */
+	cwd?: string;
+	/** Test-only observation hooks threaded to the bounded reader. */
+	readHooks?: AttachmentReadHooks;
+}
+
 /**
  * The artifact store root for a session: a `pi-goal-store` directory beside the
  * session file.
@@ -149,6 +186,105 @@ function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
 	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function errorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * Read one attachment source through a bounded, regular-file-only descriptor.
+ *
+ * Symlinks are rejected explicitly (both by `lstat` and by `O_NOFOLLOW` on the
+ * open, which also closes the inspect/open race). `O_NONBLOCK` means a FIFO or
+ * other special file can never block the command before `fstat` rejects it, and
+ * a file is rejected from its opened descriptor size before any content-sized
+ * allocation. The read itself tops out at `maxBytes + 1`, so even a file that
+ * grows or is replaced mid-read cannot be buffered without bound. A final
+ * `fstat` (inode, size, mtime) and a path identity check refuse inconsistent
+ * bytes rather than returning a half-observed file.
+ *
+ * The optional hooks are deterministic test seams; production never passes them.
+ */
+export function readAttachmentBytes(
+	path: string,
+	maxBytes: number,
+	hooks?: AttachmentReadHooks,
+): AttachmentBytesResult {
+	let fd: number | undefined;
+	try {
+		let link;
+		try {
+			link = lstatSync(path, { bigint: true });
+		} catch (error) {
+			const code = errorCode(error);
+			return {
+				ok: false,
+				failure: code === "ENOENT" || code === "ENOTDIR" ? { kind: "missing" } : { kind: "unreadable", error },
+			};
+		}
+		if (link.isSymbolicLink()) return { ok: false, failure: { kind: "symlink" } };
+		if (!link.isFile()) return { ok: false, failure: { kind: "not-regular" } };
+		hooks?.beforeOpen?.();
+
+		const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+		try {
+			fd = openSync(path, flags);
+		} catch (error) {
+			const code = errorCode(error);
+			if (code === "ELOOP") return { ok: false, failure: { kind: "symlink" } };
+			if (code === "ENOENT" || code === "ENOTDIR") return { ok: false, failure: { kind: "missing" } };
+			return { ok: false, failure: { kind: "unreadable", error } };
+		}
+
+		const before = fstatSync(fd, { bigint: true });
+		if (!before.isFile()) return { ok: false, failure: { kind: "not-regular" } };
+		if (before.size > BigInt(maxBytes)) {
+			return { ok: false, failure: { kind: "too-large", size: Number(before.size) } };
+		}
+		hooks?.afterOpen?.();
+
+		const buffer = Buffer.allocUnsafe(maxBytes + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const read = readSync(fd, buffer, length, buffer.length - length, length);
+			if (read === 0) break;
+			length += read;
+		}
+
+		const after = fstatSync(fd, { bigint: true });
+		if (
+			after.ino !== before.ino ||
+			after.dev !== before.dev ||
+			after.size !== before.size ||
+			after.mtimeNs !== before.mtimeNs
+		) {
+			return { ok: false, failure: { kind: "changed" } };
+		}
+		let pathAfter;
+		try {
+			pathAfter = lstatSync(path, { bigint: true });
+		} catch {
+			return { ok: false, failure: { kind: "changed" } };
+		}
+		if (pathAfter.isSymbolicLink() || pathAfter.dev !== before.dev || pathAfter.ino !== before.ino) {
+			return { ok: false, failure: { kind: "changed" } };
+		}
+		if (length > maxBytes) return { ok: false, failure: { kind: "too-large", size: length } };
+		return { ok: true, bytes: buffer.subarray(0, length) };
+	} catch (error) {
+		return { ok: false, failure: { kind: "unreadable", error } };
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				// The descriptor is already unusable; no cleanup can improve that.
+			}
+		}
+	}
 }
 
 /**
@@ -222,6 +358,40 @@ function decodeStrictUtf8(bytes: Uint8Array): string | null {
 	}
 }
 
+function sourceReadError(
+	request: AttachmentRequest,
+	label: string,
+	path: string,
+	maxBytes: number,
+	failure: AttachmentReadFailure,
+): string {
+	const kind = request.kind === "image" ? "image" : "text file";
+	const maxDescription = request.kind === "image" ? "local image" : "text file";
+	switch (failure.kind) {
+		case "missing":
+			return `Goal not created: the ${kind} ${JSON.stringify(path)} does not exist or cannot be accessed.`;
+		case "symlink":
+			return (
+				`Goal not created: the attachment ${JSON.stringify(label)} is a symbolic link. Symbolic links are not ` +
+				"accepted as attachment sources; name the file itself."
+			);
+		case "not-regular":
+			return `Goal not created: ${JSON.stringify(path)} is not a regular file.`;
+		case "too-large":
+			return (
+				`Goal not created: the attachment ${JSON.stringify(label)} is ${formatBytes(failure.size)}, above the ` +
+				`${formatBytes(maxBytes)} limit for a ${maxDescription}.`
+			);
+		case "changed":
+			return (
+				`Goal not created: the attachment ${JSON.stringify(label)} changed while it was being read; ` +
+				"nothing was materialized. Try again with a stable file."
+			);
+		case "unreadable":
+			return `Goal not created: the attachment ${JSON.stringify(label)} could not be read (${describe(failure.error)}).`;
+	}
+}
+
 /**
  * Validate and materialize every request into the Goal's store directory.
  *
@@ -241,6 +411,7 @@ export function materializeAttachments(
 	storeRoot: string,
 	goalId: string,
 	requests: readonly AttachmentRequest[],
+	options: MaterializeOptions = {},
 ): MaterializeResult {
 	if (requests.length === 0) return { ok: true, attachments: [], contents: [] };
 	if (requests.length > MAX_ATTACHMENTS) {
@@ -251,11 +422,13 @@ export function materializeAttachments(
 				`(${requests.length} were requested).`,
 		};
 	}
+	const cwd = options.cwd ?? process.cwd();
 	const labelSeen = new Set<string>();
 	const prepared: Array<{ request: AttachmentRequest; mediaType: string; bytes: Uint8Array; hash: string; label: string; size: number }> = [];
 	let total = 0;
 	for (const request of requests) {
 		const label = basename(request.path) || request.path;
+		const sourcePath = isAbsolute(request.path) ? request.path : resolve(cwd, request.path);
 		if (labelSeen.has(`${request.kind}:${label}`)) {
 			return {
 				ok: false,
@@ -263,30 +436,7 @@ export function materializeAttachments(
 			};
 		}
 		labelSeen.add(`${request.kind}:${label}`);
-		let stat;
-		try {
-			stat = statSync(request.path);
-		} catch {
-			return {
-				ok: false,
-				error: `Goal not created: the ${request.kind === "image" ? "image" : "text file"} ${JSON.stringify(request.path)} does not exist or cannot be accessed.`,
-			};
-		}
-		if (!stat.isFile()) {
-			return {
-				ok: false,
-				error: `Goal not created: ${JSON.stringify(request.path)} is not a regular file.`,
-			};
-		}
 		const maxBytes = request.kind === "image" ? MAX_IMAGE_ATTACHMENT_BYTES : MAX_TEXT_ATTACHMENT_BYTES;
-		if (stat.size > maxBytes) {
-			return {
-				ok: false,
-				error:
-					`Goal not created: the attachment ${JSON.stringify(label)} is ${formatBytes(stat.size)}, above the ` +
-					`${formatBytes(maxBytes)} limit for a ${request.kind === "image" ? "local image" : "text file"}.`,
-			};
-		}
 		if (request.kind === "image" && isSvgPath(request.path)) {
 			return {
 				ok: false,
@@ -295,27 +445,13 @@ export function materializeAttachments(
 					"attachment (its markup is executable in some hosts); use PNG, JPEG, GIF, or WebP.",
 			};
 		}
-		let bytes: Uint8Array;
-		try {
-			bytes = readFileSync(request.path);
-		} catch (error) {
-			return {
-				ok: false,
-				error: `Goal not created: the attachment ${JSON.stringify(label)} could not be read (${describe(error)}).`,
-			};
+		const read = readAttachmentBytes(sourcePath, maxBytes, options.readHooks);
+		if (!read.ok) {
+			return { ok: false, error: sourceReadError(request, label, request.path, maxBytes, read.failure) };
 		}
+		const bytes = read.bytes;
 		if (bytes.length === 0) {
 			return { ok: false, error: `Goal not created: the attachment ${JSON.stringify(label)} is empty.` };
-		}
-		// Enforce the limit on the bytes actually materialized, not only on the
-		// earlier stat: a local file can grow between those two reads.
-		if (bytes.length > maxBytes) {
-			return {
-				ok: false,
-				error:
-					`Goal not created: the attachment ${JSON.stringify(label)} is ${formatBytes(bytes.length)}, above the ` +
-					`${formatBytes(maxBytes)} limit for a ${request.kind === "image" ? "local image" : "text file"}.`,
-			};
 		}
 		let mediaType: string;
 		if (request.kind === "image") {
@@ -365,8 +501,8 @@ export function materializeAttachments(
 				`${item.hash}${extensionFor(item.mediaType)}`,
 			);
 			if (existsStrict(artifact)) {
-				const existing = readFileSync(artifact);
-				if (sha256(existing) !== item.hash) {
+				const existing = readAttachmentBytes(artifact, item.size);
+				if (!existing.ok || sha256(existing.bytes) !== item.hash) {
 					return {
 						ok: false,
 						error:
@@ -412,9 +548,125 @@ function existsStrict(path: string): boolean {
 	}
 }
 
+const ATTACHMENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+function attachmentByteLimit(mediaType: string): number | null {
+	if (mediaType === TEXT_ATTACHMENT_MEDIA_TYPE) return MAX_TEXT_ATTACHMENT_BYTES;
+	if ((IMAGE_ATTACHMENT_MEDIA_TYPES as readonly string[]).includes(mediaType)) return MAX_IMAGE_ATTACHMENT_BYTES;
+	return null;
+}
+
+function attachmentKind(mediaType: string): string {
+	return mediaType === TEXT_ATTACHMENT_MEDIA_TYPE ? "text file" : "image";
+}
+
+/** Structural checks applied before any artifact byte is read. */
+function manifestReadProblem(manifest: readonly GoalAttachment[]): string | null {
+	if (manifest.length > MAX_ATTACHMENTS) {
+		return (
+			`the attachment manifest names ${manifest.length} entries, above the ${MAX_ATTACHMENTS}-attachment ` +
+			"limit"
+		);
+	}
+	for (const attachment of manifest) {
+		if (!ATTACHMENT_HASH_PATTERN.test(attachment.hash)) {
+			return `the attachment ${JSON.stringify(attachment.label)} has an invalid content hash`;
+		}
+		const limit = attachmentByteLimit(attachment.mediaType);
+		if (limit === null) {
+			return `the attachment ${JSON.stringify(attachment.label)} has the unsupported media type ${JSON.stringify(attachment.mediaType)}`;
+		}
+		if (!Number.isInteger(attachment.bytes) || attachment.bytes <= 0) {
+			return `the attachment ${JSON.stringify(attachment.label)} has an invalid recorded byte size`;
+		}
+		if (attachment.bytes > limit) {
+			return (
+				`the attachment ${JSON.stringify(attachment.label)} records ${formatBytes(attachment.bytes)}, above the ` +
+				`${formatBytes(limit)} limit for a ${attachmentKind(attachment.mediaType)}`
+			);
+		}
+	}
+	return null;
+}
+
+function artifactReadProblem(
+	attachment: GoalAttachment,
+	failure: AttachmentReadFailure,
+	perFileLimit: number,
+): string {
+	const label = JSON.stringify(attachment.label);
+	switch (failure.kind) {
+		case "missing":
+			return (
+				`the ${attachmentKind(attachment.mediaType)} ${label} (sha256 ${attachment.hash.slice(0, 12)}…) ` +
+				"is missing from the attachment store"
+			);
+		case "symlink":
+			return `the attachment ${label} is a symbolic link, not a regular immutable artifact`;
+		case "not-regular":
+			return `the attachment ${label} is not a regular file`;
+		case "too-large":
+			if (failure.size > perFileLimit) {
+				return (
+					`the attachment ${label} is ${formatBytes(failure.size)}, above the ` +
+					`${formatBytes(perFileLimit)} limit for a ${attachmentKind(attachment.mediaType)}`
+				);
+			}
+			return (
+				`the attachments are above the ${formatBytes(MAX_TOTAL_ATTACHMENT_BYTES)} total limit at ${label}`
+			);
+		case "changed":
+			return `the attachment ${label} changed while it was being read; refusing the inconsistent bytes`;
+		case "unreadable":
+			return `the attachment ${label} could not be read from the store (${describe(failure.error)})`;
+	}
+}
+
 /**
- * Verify a committed manifest against the store: every artifact must exist and
- * hash to the manifest's content hash.
+ * Read, bound, size-check, and hash-check one artifact exactly once.
+ *
+ * The returned bytes are the authenticated bytes: callers must render these,
+ * never re-open the path. `remainingTotal` is the actual-byte budget left for
+ * this Goal, so the read itself cannot climb past the cumulative limit even
+ * when a hand-edited manifest understates a file's size.
+ */
+function authenticateAttachment(
+	storeRoot: string,
+	goalId: string,
+	attachment: GoalAttachment,
+	remainingTotal: number,
+): { ok: true; bytes: Uint8Array } | { ok: false; problems: string[]; bytes?: Uint8Array } {
+	const perFileLimit = attachmentByteLimit(attachment.mediaType)!;
+	const allowed = Math.min(perFileLimit, remainingTotal);
+	const read = readAttachmentBytes(artifactPath(storeRoot, goalId, attachment), allowed);
+	if (!read.ok) {
+		return { ok: false, problems: [artifactReadProblem(attachment, read.failure, perFileLimit)] };
+	}
+	const bytes = read.bytes;
+	const details: string[] = [];
+	if (bytes.length !== attachment.bytes) {
+		details.push(
+			`its content is ${formatBytes(bytes.length)} but the manifest records ${formatBytes(attachment.bytes)}`,
+		);
+	}
+	const actual = sha256(bytes);
+	if (actual !== attachment.hash) {
+		details.push(
+			`its content hashes to ${actual.slice(0, 12)}… but the manifest records ${attachment.hash.slice(0, 12)}…`,
+		);
+	}
+	if (details.length === 0) return { ok: true, bytes };
+	return {
+		ok: false,
+		problems: [`the attachment ${JSON.stringify(attachment.label)} is corrupt: ${details.join("; ")}`],
+		bytes,
+	};
+}
+
+/**
+ * Verify a committed manifest against the store: every artifact must exist,
+ * be a bounded regular file, fit its manifest size and the enforced per-file
+ * and total limits, and hash to the manifest's content hash.
  *
  * Returns one problem string per failing attachment so the surfaced error can
  * name exactly what is missing or corrupt and how to restore it (copy the
@@ -426,39 +678,34 @@ export function verifyAttachments(
 	manifest: readonly GoalAttachment[],
 ): VerifyResult {
 	if (manifest.length === 0) return { ok: true };
+	const structural = manifestReadProblem(manifest);
+	if (structural !== null) return { ok: false, problems: [structural] };
 	const problems: string[] = [];
+	let remainingTotal = MAX_TOTAL_ATTACHMENT_BYTES;
 	for (const attachment of manifest) {
-		const artifact = artifactPath(storeRoot, goalId, attachment);
-		let bytes: Uint8Array;
-		try {
-			bytes = readFileSync(artifact);
-		} catch {
-			problems.push(
-				`the ${attachment.mediaType === TEXT_ATTACHMENT_MEDIA_TYPE ? "text file" : "image"} ${JSON.stringify(attachment.label)} ` +
-					`(sha256 ${attachment.hash.slice(0, 12)}…) is missing from the attachment store`,
-			);
+		const result = authenticateAttachment(storeRoot, goalId, attachment, remainingTotal);
+		if (result.ok) {
+			remainingTotal -= result.bytes.length;
 			continue;
 		}
-		const actual = sha256(bytes);
-		if (actual !== attachment.hash) {
-			problems.push(
-				`the attachment ${JSON.stringify(attachment.label)} is corrupt: its content hashes to ${actual.slice(0, 12)}… ` +
-					`but the manifest records ${attachment.hash.slice(0, 12)}…`,
-			);
-		}
+		problems.push(...result.problems);
+		if (result.bytes) remainingTotal -= result.bytes.length;
 	}
 	return problems.length === 0 ? { ok: true } : { ok: false, problems };
 }
 
 /**
- * Load committed artifacts for message rendering.
+ * Load committed artifacts for message rendering through the one authenticated
+ * read path.
  *
- * Text is decoded (it was validated UTF-8 at materialization; a decode failure
- * here means the artifact changed on disk and is reported as an error rather
- * than silently dropped). Images are read as base64 for Pi's image content
- * blocks. Callers that must not admit work on unverifiable artifacts verify
- * first (`verifyAttachments`); this loader reports the same failure class for
- * the read path.
+ * Each artifact is opened and read once, under the same symlink/special-file,
+ * bounded-read, and stable-descriptor rules as materialization. The manifest's
+ * recorded size, the per-file limit, the cumulative limit, and the recorded
+ * hash are all enforced on those exact bytes. Text is then decoded, and images
+ * are rendered as base64 for Pi image content blocks. A caller that gets
+ * `ok: true` must use `contents`; it must never re-read the artifact path,
+ * because a later read could observe different bytes than the ones verified
+ * here.
  */
 export function loadAttachments(
 	storeRoot: string,
@@ -466,20 +713,16 @@ export function loadAttachments(
 	manifest: readonly GoalAttachment[],
 ): LoadResult {
 	if (manifest.length === 0) return { ok: true, contents: [] };
+	const structural = manifestReadProblem(manifest);
+	if (structural !== null) return { ok: false, error: structural };
 	const contents: AttachmentContent[] = [];
+	let remainingTotal = MAX_TOTAL_ATTACHMENT_BYTES;
 	for (const meta of manifest) {
-		const artifact = artifactPath(storeRoot, goalId, meta);
-		let bytes: Uint8Array;
-		try {
-			bytes = readFileSync(artifact);
-		} catch (error) {
-			return {
-				ok: false,
-				error: `the attachment ${JSON.stringify(meta.label)} could not be read from the store (${describe(error)})`,
-			};
-		}
+		const result = authenticateAttachment(storeRoot, goalId, meta, remainingTotal);
+		if (!result.ok) return { ok: false, error: result.problems.join("; ") };
+		remainingTotal -= result.bytes.length;
 		if (meta.mediaType === TEXT_ATTACHMENT_MEDIA_TYPE) {
-			const text = decodeStrictUtf8(bytes);
+			const text = decodeStrictUtf8(result.bytes);
 			if (text === null) {
 				return {
 					ok: false,
@@ -488,7 +731,7 @@ export function loadAttachments(
 			}
 			contents.push({ meta, kind: "text", text });
 		} else {
-			contents.push({ meta, kind: "image", data: Buffer.from(bytes).toString("base64") });
+			contents.push({ meta, kind: "image", data: Buffer.from(result.bytes).toString("base64") });
 		}
 	}
 	return { ok: true, contents };

@@ -26,10 +26,12 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   audit the extension enforces.
 - A Goal with attachments re-reads the same immutable manifest: text is framed
   again as encoded, nonce-delimited untrusted data and images are included as Pi
-  image content blocks. Before requesting the Continuation, pi-goal verifies
-  every artifact hash. A missing or corrupt artifact suppresses the request and
-  surfaces an explicit integrity error without silently dropping attachments,
-  completing the Goal, or changing its Lifecycle status.
+  image content blocks. Before requesting the Continuation, pi-goal performs one
+  authenticated load that enforces the manifest size and limits and verifies
+  every artifact hash on the exact bytes it returns. A missing or corrupt
+  artifact suppresses the request and surfaces an explicit integrity error
+  without silently dropping attachments, completing the Goal, or changing its
+  Lifecycle status.
 - The continuation requests exactly one further provider request per
   settlement. If queued work already causes that request, Pi satisfies the
   decision with it and makes no extra one.

@@ -39,6 +39,14 @@ attachments use.
 - Attachment selection exists at **creation** and **Replacement Goal** time. A
   replacement confirmation is asked first exactly as for a text-only
   replacement; a declined dialog changes nothing.
+- Relative paths resolve against the **session working directory** recorded in
+  the session header, not against the directory the Pi process happens to be
+  launched from. A session resumed from another directory therefore attaches
+  the same-named file beside the session, never a namesake in the launch
+  directory. Absolute paths are used unchanged.
+- Sources must be **regular files**. Symlinks are refused explicitly rather
+  than followed, and FIFOs, devices, and directories are refused without being
+  opened for content (a FIFO can never block the command).
 - **Plain arguments remain text.** `/goal Read the --file flag in the README`
   creates a Goal whose objective is that whole sentence, with no attachments.
 - **`create_goal` stays text-only.** Attachment-bearing creation is a direct
@@ -101,6 +109,12 @@ into an immutable, extension-owned store keyed by Goal identity:
   directory, so any refused materialization or pre-commit snapshot failure
   retracts only the uncommitted store directory of the Goal that never
   committed.
+- Each source is read once through a descriptor opened with `O_NOFOLLOW` and a
+  non-blocking flag. Its size is checked on the opened descriptor before any
+  content-sized allocation, no more than the applicable limit plus one byte is
+  read, and a final descriptor/path check refuses a file that grew, shrank, or
+  was replaced during the read. A stable oversized file is refused from its
+  descriptor size without being buffered.
 
 **Failure atomicity**: a failed validation, materialization, or snapshot write
 leaves the previous Goal untouched (nothing appended, its artifacts intact),
@@ -156,7 +170,18 @@ attachment sentinels, exactly as they exclude the Objective's data block.
 On restore (session start and tree navigation) — and again before admitting
 work that would re-send the attachments (a Continuation, a resume, an
 active-Goal edit) — the manifest is verified against the store: every artifact
-must exist and hash to its recorded sha256.
+must exist, be a regular bounded file, fit its recorded byte size and the
+per-file/total limits, and hash to its recorded sha256.
+
+Work-admitting paths use one **authenticated load**, not a separate verify and
+then a second read. The loader opens each artifact once under the same
+symlink/special-file and bounded-read rules as materialization, enforces the
+manifest size and limits on those bytes, verifies the hash on those bytes, and
+returns exactly those bytes for message construction. A file replaced after an
+earlier verification therefore cannot be sent while the message quotes the old
+hash. A resume loads and authenticates its attachments **before** the durable
+resume transition, so a load failure leaves the Goal paused instead of active
+with no work started.
 
 A **missing or corrupt** artifact:
 

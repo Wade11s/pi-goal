@@ -920,3 +920,174 @@ test("plain arguments remain text: an objective mentioning --file mid-sentence n
 		cleanupDirs(dirs);
 	}
 });
+
+test("relative attachment paths resolve against the session working directory, not the launch directory", async () => {
+	const dirs = sharedDirs();
+	const launchDir = mkdtempSync(join(tmpdir(), "pi-goal-attach-launch-"));
+	const SESSION_TEXT = "SESSION CWD RELATIVE ATTACHMENT";
+	const LAUNCH_TEXT = "LAUNCH DIRECTORY NAMESAKE ATTACHMENT";
+	writeFileSync(join(dirs.workDir, "relative.md"), SESSION_TEXT, "utf8");
+	writeFileSync(join(launchDir, "relative.md"), LAUNCH_TEXT, "utf8");
+	writeFileSync(join(dirs.workDir, "relative.png"), Buffer.from(PNG_B64, "base64"));
+	writeFileSync(join(launchDir, "relative.png"), Buffer.from(JPEG_B64, "base64"));
+
+	// A saved session is bound to the working directory in its header. The first
+	// process creates that session file from the session directory.
+	const first = await startSession(dirs);
+	script([{ text: "Session created.", usage: { input: 10, output: 2 } }], first);
+	let sessionFile;
+	try {
+		await first.prompt("create the session file");
+		await first.waitForSettled(1);
+		sessionFile = await first.sessionFile();
+		assertStepsConsumed(first, 1);
+	} finally {
+		await first.stop();
+	}
+
+	// Resume from a different launch directory. Pi does not chdir to the session
+	// cwd, so the relative paths must resolve against the session cwd, not here.
+	const second = await startSession(dirs, { sessionFile, cwd: launchDir });
+	script(
+		[
+			{ text: "Kickoff with the session-cwd files.", usage: { input: 40, output: 10 } },
+			{ text: "Continuing with the session-cwd files.", usage: { input: 20, output: 5 } },
+			{ hang: true },
+		],
+		second,
+	);
+	try {
+		await second.prompt(`/goal --file relative.md --image relative.png ${OBJECTIVE}`);
+		await abortActiveLoop(second, 3);
+		const entries = readSessionEntries(sessionFile);
+		const created = goalSnapshots(entries)[0].data.goal;
+		assert.deepEqual(
+			created.attachments.map((a) => [a.label, a.mediaType, a.bytes, a.hash]),
+			[
+				["relative.md", "text/plain", Buffer.byteLength(SESSION_TEXT, "utf8"), sha256(Buffer.from(SESSION_TEXT, "utf8"))],
+				["relative.png", "image/png", Buffer.from(PNG_B64, "base64").length, sha256(Buffer.from(PNG_B64, "base64"))],
+			],
+			"only the session-cwd namesakes were materialized",
+		);
+
+		const kickoff = kickoffEntry(entries);
+		const kickoffText = userMessageText(kickoff);
+		assert.ok(kickoffText.includes(SESSION_TEXT), "the kickoff carries the session-cwd text");
+		assert.ok(!kickoffText.includes(LAUNCH_TEXT), "the launch-directory namesake is not attached");
+		assert.deepEqual(
+			kickoff.content.filter((block) => block.type === "image").map((block) => [block.mimeType, block.data]),
+			[["image/png", PNG_B64]],
+			"the session-cwd image, not the launch-directory namesake, rides along",
+		);
+
+		const continuation = continuationEntries(entries).at(-1);
+		const continuationText = userMessageText(continuation);
+		assert.ok(continuationText.includes(SESSION_TEXT));
+		assert.ok(!continuationText.includes(LAUNCH_TEXT));
+		assert.equal(
+			continuation.content.filter((block) => block.type === "image").map((block) => block.data).join(","),
+			PNG_B64,
+		);
+
+		assertStepsConsumed(second, 3, [{ stopReason: "aborted" }]);
+		assert.equal(second.extensionErrors().length, 0, JSON.stringify(second.extensionErrors()));
+	} finally {
+		await second.stop();
+		rmSync(launchDir, { recursive: true, force: true });
+		cleanupDirs(dirs);
+	}
+});
+
+/**
+ * Rewrite every committed Goal snapshot's manifest entry for `label`.
+ *
+ * The resume-atomicity regression needs an artifact that passes hash
+ * verification and then fails the richer load (text decoding). Matching the
+ * manifest to the corrupt bytes is what makes the failure a load failure rather
+ * than an earlier verification failure.
+ */
+function rewriteGoalAttachmentManifest(sessionFile, label, hash, bytes) {
+	const entries = readSessionEntries(sessionFile);
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== "goal-state") continue;
+		const manifest = entry.data?.goal?.attachments;
+		if (!Array.isArray(manifest)) continue;
+		for (const attachment of manifest) {
+			if (attachment.label !== label) continue;
+			attachment.hash = hash;
+			attachment.bytes = bytes;
+		}
+	}
+	writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+}
+
+test("a resume whose artifact fails to load leaves the Goal paused and names a real recovery", async () => {
+	const dirs = sharedDirs();
+	const { spec } = writeStandardFixtures(dirs);
+	const first = await startSession(dirs);
+	script([{ text: "Kickoff.", usage: { input: 30, output: 8 } }, { hang: true }], first);
+	let sessionFile;
+	let pausedGoal;
+	try {
+		await first.prompt(`/goal --file ${spec} ${OBJECTIVE}`);
+		await abortActiveLoop(first, 2);
+		sessionFile = await first.sessionFile();
+		await first.prompt("/goal pause");
+		await first.waitForNotify((r) => r.message.includes("paused (revision"));
+		pausedGoal = goalSnapshots(readSessionEntries(sessionFile)).at(-1).data.goal;
+		assert.equal(pausedGoal.status, "paused");
+	} finally {
+		await first.stop();
+	}
+
+	// Corrupt the text artifact into invalid UTF-8. Its hash still matches the
+	// manifest, so hash verification passes; only the authenticated load fails.
+	const invalid = Buffer.from([0xff, 0xfe, 0x00, 0x01]);
+	const invalidHash = sha256(invalid);
+	const textArtifact = join(
+		attachmentStoreRoot(sessionFile),
+		pausedGoal.id,
+		`${invalidHash}.txt`,
+	);
+	writeFileSync(textArtifact, invalid, { mode: 0o444 });
+	rewriteGoalAttachmentManifest(sessionFile, pausedGoal.attachments[0].label, invalidHash, invalid.length);
+	const beforeEntries = readSessionEntries(sessionFile);
+	const beforeGoal = goalSnapshots(beforeEntries).at(-1).data.goal;
+
+	const second = await startSession(dirs, { sessionFile });
+	script([], second);
+	try {
+		await second.waitForNotify((r) => r.message.includes(`Goal ${beforeGoal.id} restored (paused)`));
+		const mark = second.records.length;
+		const runsBefore = runCount(second);
+		const continuationsBefore = continuationEntries(beforeEntries).length;
+		const snapshotsBefore = goalSnapshots(beforeEntries).length;
+
+		await second.prompt("/goal resume");
+		const failure = await second.notifyAfter(mark, (r) =>
+			r.message.includes("could not verify the attachments"),
+		);
+		assert.match(failure.message, /is no longer valid UTF-8/);
+		assert.match(failure.message, /Restore the original bytes/);
+		assert.match(failure.message, /replace the Goal/);
+		assert.doesNotMatch(
+			failure.message,
+			/restart the work with \/goal resume/,
+			"a failed resume must not claim the Goal was resumed or suggest a no-op retry",
+		);
+
+		const afterEntries = readSessionEntries(sessionFile);
+		const afterGoal = goalSnapshots(afterEntries).at(-1).data.goal;
+		assert.equal(afterGoal.status, "paused", "the failed load did not activate the Goal");
+		assert.equal(afterGoal.revision, beforeGoal.revision, "no durable resume transition was committed");
+		assert.deepEqual(afterGoal.attachments, beforeGoal.attachments);
+		assert.equal(goalSnapshots(afterEntries).length, snapshotsBefore, "no new snapshot was appended");
+		assert.equal(continuationEntries(afterEntries).length, continuationsBefore, "no work message was sent");
+		assert.equal(runCount(second), runsBefore, "no resumed run started");
+		assertStepsConsumed(second, 0);
+		assert.equal(second.extensionErrors().length, 0, JSON.stringify(second.extensionErrors()));
+	} finally {
+		await second.stop();
+		cleanupDirs(dirs);
+	}
+});

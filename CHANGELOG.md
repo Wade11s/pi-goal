@@ -20,8 +20,13 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   artifact-driven Lifecycle change. Clear and replacement retain committed
   artifacts; V1 deliberately has no destructive automatic garbage collection.
   This explicit flow is the supported alternative to Codex composer drafts.
-  Remote URL fetching remains separate follow-up work (#50). The contract is
-  documented in `docs/behavior/attachments.md`.
+  Relative source paths resolve against the session working directory rather
+  than the launch directory; reads are bounded regular-file reads that refuse
+  symlinks and special files, and work messages render one authenticated load
+  instead of a separate verify and re-read. A resume loads its attachments
+  before committing the durable resume transition, so a failed load leaves the
+  Goal paused. Remote URL fetching remains separate follow-up work (#50). The
+  contract is documented in `docs/behavior/attachments.md`.
 - Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
   one confirmation at session start for a restored `paused` Goal. Accepting runs
   the same durable `/goal resume` transition (same identity and history, fresh

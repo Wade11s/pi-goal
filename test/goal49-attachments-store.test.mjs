@@ -11,8 +11,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { GoalStore } from "../src/store.ts";
@@ -23,6 +24,9 @@ import {
 	discardUncommittedArtifacts,
 	goalStoreDir,
 	loadAttachments,
+	MAX_IMAGE_ATTACHMENT_BYTES,
+	MAX_TEXT_ATTACHMENT_BYTES,
+	MAX_TOTAL_ATTACHMENT_BYTES,
 	materializeAttachments,
 	sniffImageMediaType,
 	storedGoalIds,
@@ -393,4 +397,191 @@ test("an objective edit retains the immutable manifest in the committed snapshot
 	const snapshots = pi.entries.filter((entry) => entry.customType === CUSTOM_ENTRY_TYPE);
 	assert.deepEqual(snapshots.at(-1).data.goal.attachments, manifest, "the edit keeps the manifest verbatim");
 	assert.equal(snapshots.at(-1).data.goal.objective, "Second objective, same attachments");
+});
+
+test("materialization refuses a symlink source instead of following it", () => {
+	const { dir, root } = tempStore();
+	try {
+		const target = join(dir, "target.txt");
+		writeFileSync(target, "the symlink target", "utf8");
+		const link = join(dir, "link.txt");
+		symlinkSync(target, link);
+
+		const result = materializeAttachments(root, "goal_symlink1", [textRequest(link)]);
+		assert.equal(result.ok, false, "a symlink is not an accepted attachment source");
+		assert.match(result.error, /symbolic link/);
+		assert.deepEqual(storedGoalIds(root), [], "nothing was materialized");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a path swapped to a FIFO after inspection fails fast and cannot block the read", { timeout: 5000 }, (t) => {
+	const { dir, root } = tempStore();
+	try {
+		const source = join(dir, "source.txt");
+		writeFileSync(source, "regular bytes", "utf8");
+		const fifoProbe = spawnSync("mkfifo", [join(dir, "probe.fifo")], { stdio: "ignore" });
+		if (fifoProbe.error?.code === "ENOENT" || fifoProbe.status !== 0) {
+			t.skip("mkfifo is unavailable on this platform");
+			return;
+		}
+
+		let swapped = false;
+		const result = materializeAttachments(root, "goal_fifo0001", [textRequest(source)], {
+			readHooks: {
+				beforeOpen() {
+					if (swapped) return;
+					swapped = true;
+					rmSync(source);
+					const made = spawnSync("mkfifo", [source], { stdio: "ignore" });
+					assert.equal(made.status, 0, "the test FIFO was created");
+				},
+			},
+		});
+		assert.equal(swapped, true, "the deterministic swap ran");
+		assert.equal(result.ok, false, "a FIFO is not a regular file");
+		assert.match(result.error, /not a regular file/);
+		assert.deepEqual(storedGoalIds(root), [], "nothing was materialized");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("materialization detects a file that grows while it is being read", () => {
+	const { dir, root } = tempStore();
+	try {
+		const source = join(dir, "growing.txt");
+		writeFileSync(source, "initial bytes\n", "utf8");
+		const result = materializeAttachments(root, "goal_growth01", [textRequest(source)], {
+			readHooks: {
+				afterOpen() {
+					appendFileSync(source, Buffer.alloc(2048, 0x62));
+				},
+			},
+		});
+		assert.equal(result.ok, false, "the descriptor changed under the read");
+		assert.match(result.error, /changed while it was being read/);
+		assert.deepEqual(storedGoalIds(root), [], "nothing was materialized");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("materialization detects a path replaced while it is being read", () => {
+	const { dir, root } = tempStore();
+	try {
+		const source = join(dir, "replace-me.txt");
+		const replacement = join(dir, "replacement.txt");
+		writeFileSync(source, "original bytes", "utf8");
+		writeFileSync(replacement, "replacement bytes that are longer than the original", "utf8");
+		const result = materializeAttachments(root, "goal_replace1", [textRequest(source)], {
+			readHooks: {
+				afterOpen() {
+					renameSync(replacement, source);
+				},
+			},
+		});
+		assert.equal(result.ok, false, "the path no longer names the opened inode");
+		assert.match(result.error, /changed while it was being read/);
+		assert.deepEqual(storedGoalIds(root), [], "nothing was materialized");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("an oversized source is refused from its descriptor size without allocating its contents", () => {
+	const { dir, root } = tempStore();
+	try {
+		const sparse = join(dir, "oversized.txt");
+		writeFileSync(sparse, "", "utf8");
+		truncateSync(sparse, 64 * 1024 * 1024);
+		const before = process.memoryUsage().arrayBuffers;
+		const result = materializeAttachments(root, "goal_oversize", [textRequest(sparse)]);
+		const after = process.memoryUsage().arrayBuffers;
+		assert.equal(result.ok, false);
+		assert.match(result.error, /above the 1\.0 MB limit for a text file/);
+		assert.ok(after - before < 8 * 1024 * 1024, `the oversized file was not buffered (${after - before} bytes)`);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("loading authenticates the bytes it returns after a separate verification", () => {
+	const { dir, root } = tempStore();
+	try {
+		const TEXT = "the specification body";
+		const textPath = join(dir, "spec.md");
+		writeFileSync(textPath, TEXT, "utf8");
+		const goalId = "goal_swap0001";
+		const { attachments } = materializeAttachments(root, goalId, [textRequest(textPath)]);
+		assert.deepEqual(verifyAttachments(root, goalId, attachments), { ok: true });
+
+		const artifact = artifactPath(root, goalId, attachments[0]);
+		chmodSync(artifact, 0o644);
+		writeFileSync(artifact, TEXT.replace("body", "BODY"), "utf8");
+
+		const loaded = loadAttachments(root, goalId, attachments);
+		assert.equal(loaded.ok, false, "the bytes read after verification still have to match the hash");
+		assert.match(loaded.error, /"spec\.md" is corrupt/);
+		assert.match(loaded.error, /hashes to .* but the manifest records/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("loading rejects a hand-edited small manifest size for larger artifact bytes", () => {
+	const { dir, root } = tempStore();
+	try {
+		const goalId = "goal_smallbyt";
+		const actual = Buffer.alloc(900 * 1024, 0x61);
+		const manifest = [
+			{ hash: sha256(actual), mediaType: "text/plain", bytes: 5, label: "declared-small.txt" },
+		];
+		mkdirSync(goalStoreDir(root, goalId), { recursive: true });
+		writeFileSync(artifactPath(root, goalId, manifest[0]), actual);
+
+		const loaded = loadAttachments(root, goalId, manifest);
+		assert.equal(loaded.ok, false, "the manifest byte size is enforced on the loaded bytes");
+		assert.match(loaded.error, /"declared-small\.txt" is corrupt/);
+		assert.match(loaded.error, /5 B/);
+		assert.equal(verifyAttachments(root, goalId, manifest).ok, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("loading enforces per-file and total limits on artifact bytes", () => {
+	const { dir, root } = tempStore();
+	try {
+		const goalId = "goal_loadlim";
+		const oversizedText = Buffer.alloc(MAX_TEXT_ATTACHMENT_BYTES + 1, 0x61);
+		const oversizedManifest = [
+			{ hash: sha256(oversizedText), mediaType: "text/plain", bytes: 1, label: "oversized.txt" },
+		];
+		mkdirSync(goalStoreDir(root, goalId), { recursive: true });
+		writeFileSync(artifactPath(root, goalId, oversizedManifest[0]), oversizedText);
+		const perFile = loadAttachments(root, goalId, oversizedManifest);
+		assert.equal(perFile.ok, false);
+		assert.match(perFile.error, /above the 1\.0 MB limit for a text file/);
+
+		const imageBytes = Buffer.concat([
+			PNG_BYTES,
+			Buffer.alloc(MAX_IMAGE_ATTACHMENT_BYTES - 1024 * 1024 - PNG_BYTES.length, 0x00),
+		]);
+		const hash = sha256(imageBytes);
+		const totalManifest = ["a.png", "b.png", "c.png"].map((label) => ({
+			hash,
+			mediaType: "image/png",
+			bytes: imageBytes.length,
+			label,
+		}));
+		assert.ok(imageBytes.length * totalManifest.length > MAX_TOTAL_ATTACHMENT_BYTES);
+		writeFileSync(artifactPath(root, goalId, totalManifest[0]), imageBytes);
+		const total = loadAttachments(root, goalId, totalManifest);
+		assert.equal(total.ok, false, "three 9 MiB artifacts exceed the 25 MiB total");
+		assert.match(total.error, /above the 25\.0 MB total limit/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
