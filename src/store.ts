@@ -65,6 +65,7 @@ import {
 	type UsageSource,
 	zeroGoalUsage,
 } from "./accounting.ts";
+import type { GoalTransitionKind } from "./events.ts";
 
 const GOAL_STATUS_SET = new Set<string>(GOAL_STATUSES);
 
@@ -240,9 +241,27 @@ export interface CreateGoalOptions {
 	tokenBudget?: number;
 }
 
+/**
+ * The store's observer for committed Goal-updated events (issue #48).
+ *
+ * The store owns the durable commit points, so it is the only place that knows
+ * a transition has *become* durable — the moment an event may be announced. The
+ * callback receives the transition kind and the committed record (usage already
+ * folded exactly as the snapshot carries it), plus the commit's own time for a
+ * clear, which has no record to carry one. It is invoked after the append
+ * succeeded and never for a refused, failed, or rolled-back transition, and a
+ * throw from the callback can never affect the committed state underneath.
+ */
+export interface GoalStoreEvents {
+	onDurableTransition(kind: GoalTransitionKind, goal: GoalRecord, committedAt: number): void;
+}
+
 export class GoalStore {
 	/** undefined = not reconstructed yet; null = no Goal (or tombstone); record = present. */
 	private current: GoalRecord | null | undefined = undefined;
+
+	/** Optional observer invoked after a meaningful durable transition committed. */
+	private readonly events: GoalStoreEvents | undefined;
 
 	/** Token ledger with stable deduplication. */
 	private readonly ledger = new UsageLedger();
@@ -320,6 +339,27 @@ export class GoalStore {
 	 * it; reconstruction itself stays silent and fails closed.
 	 */
 	private lastNotice: string | null = null;
+
+	constructor(events?: GoalStoreEvents) {
+		this.events = events;
+	}
+
+	/**
+	 * Announce one committed transition to the event observer, if any.
+	 *
+	 * Called only after the durable append succeeded, so a refused, failed, or
+	 * rolled-back transition never reaches it. The try/catch is the listener's
+	 * side of the contract: an observer that throws cannot change, undo, or be
+	 * mistaken for a durability problem in the transition that already committed.
+	 */
+	private emitTransition(kind: GoalTransitionKind, goal: GoalRecord, committedAt: number = goal.updatedAt): void {
+		if (!this.events) return;
+		try {
+			this.events.onDurableTransition(kind, goal, committedAt);
+		} catch {
+			// The transition is already durable; the event surface is best effort.
+		}
+	}
 
 	/**
 	 * Rebuild state from the active branch. Called on session_start (startup,
@@ -1155,8 +1195,24 @@ export class GoalStore {
 		return frozen;
 	}
 
-	/** Make a staged Goal visible to /goal and get_goal. */
+	/**
+	 * Make a staged Goal visible to /goal and get_goal.
+	 *
+	 * This is also where a creation or Replacement Goal is announced on the event
+	 * stream: the staged snapshot's append already succeeded (it throws through on
+	 * failure), so the transition is committed at the same bar every other event
+	 * uses. The command's separate on-disk durability poll stays what it is — a
+	 * belt-and-braces gate for the *user-facing* announcement, which a fresh
+	 * session's not-yet-created file needs — because waiting for it would announce
+	 * the creation after the kickoff run's own transitions (the run can complete or
+	 * stop the Goal before the file appears), inverting the stream's order.
+	 */
 	commit(goal: GoalRecord): void {
+		// A commit that takes the slot from a different live identity is a
+		// Replacement Goal; anything else (no Goal, a cleared tombstone, or a same-id
+		// re-commit) is a creation. The replaced identity keeps its own durable
+		// superseded record, so the event names the replacement.
+		const replacing = this.current != null && this.current.id !== goal.id;
 		this.current = this.adopt(goal);
 		// A newly created Goal starts its accounting from zero, even when the
 		// session already burned tokens before it existed, and no transition of a
@@ -1180,6 +1236,7 @@ export class GoalStore {
 		}
 		this.legacyPending = false;
 		if (goal.status === "active") this.clock.start();
+		this.emitTransition(replacing ? "replaced" : "created", goal);
 	}
 
 	/**
@@ -1689,7 +1746,7 @@ export class GoalStore {
 		}
 		// Completion is terminal for accounting: the clock stops at the transition and
 		// the snapshot carries the folded value.
-		return this.stopAndPersist(
+		const result = this.stopAndPersist(
 			pi,
 			current,
 			true,
@@ -1704,6 +1761,8 @@ export class GoalStore {
 			}),
 			(record) => this.commitSnapshot(pi, record),
 		);
+		if (result.ok) this.emitTransition("completed", result.goal);
+		return result;
 	}
 
 	/**
@@ -1733,7 +1792,7 @@ export class GoalStore {
 				message: `only an active Goal can be paused (current status: ${current.status})`,
 			};
 		}
-		return this.stopAndPersist(
+		const result = this.stopAndPersist(
 			pi,
 			current,
 			true,
@@ -1745,6 +1804,8 @@ export class GoalStore {
 			}),
 			(record) => this.commitSnapshot(pi, record),
 		);
+		if (result.ok) this.emitTransition("paused", result.goal);
+		return result;
 	}
 
 	/**
@@ -1813,6 +1874,10 @@ export class GoalStore {
 			});
 			if (!result.ok) return result;
 			this.clock.start();
+			// The one resume path that changes the cumulative ceiling is its own
+			// transition kind, so a listener can tell an explicit Token budget
+			// recovery from an ordinary restart of a stopped Goal.
+			this.emitTransition("budget-recovered", result.goal);
 			return result;
 		}
 		if (raising) {
@@ -1844,6 +1909,7 @@ export class GoalStore {
 		});
 		if (!result.ok) return result;
 		this.clock.start();
+		this.emitTransition("resumed", result.goal);
 		return result;
 	}
 
@@ -1865,12 +1931,14 @@ export class GoalStore {
 				message: "a complete Goal is finished and cannot be edited; use /goal <objective> to set a new one",
 			};
 		}
-		return this.commitSnapshot(pi, {
+		const result = this.commitSnapshot(pi, {
 			...current,
 			objective,
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		});
+		if (result.ok) this.emitTransition("objective-edited", result.goal);
+		return result;
 	}
 
 	/**
@@ -1883,7 +1951,14 @@ export class GoalStore {
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
-		return this.commitTombstone(pi);
+		const cleared = this.commitTombstone(pi);
+		if (cleared.ok) {
+			// The tombstone has no record of its own, so the event identifies the
+			// cleared Goal by the record it removed: its identity, its last revision,
+			// and the status it had. No new current Goal is invented by a clear.
+			this.emitTransition("cleared", current, Date.now());
+		}
+		return cleared;
 	}
 
 	/**
@@ -1991,12 +2066,19 @@ export class GoalStore {
 	 * outgoing branch, so losing it would leave a Goal durably `active` with its
 	 * budget already exhausted; a bare accounting checkpoint, by contrast, is only an
 	 * optimization and would land in a session the user has navigated away from.
+	 *
+	 * This flush is the budget stop's *durable* moment — the in-memory transition
+	 * only armed it — so it is also where the stop is announced on the event stream.
+	 * The usage is re-read at the flush (see `transitionToPersist`), which is what
+	 * the event's summary reports.
 	 */
 	flushPendingTransition(pi: ExtensionAPI): boolean {
 		const pending = this.pendingTransition;
 		if (!pending) return false;
-		this.persistSnapshot(pi, this.transitionToPersist(pending));
+		const record = this.transitionToPersist(pending);
+		this.persistSnapshot(pi, record);
 		this.pendingTransition = undefined;
+		this.emitTransition("budget-limited", record);
 		return true;
 	}
 
@@ -2238,6 +2320,10 @@ export class GoalStore {
 			this.lastBlockerRevision = undefined;
 			return { ok: false, reason: "persistence", error: result.error };
 		}
+		// Only the threshold is a lifecycle transition. A below-threshold report is
+		// durable audit bookkeeping — the Goal keeps working and its status never
+		// changes — so it stays off the event stream.
+		if (thresholdMet) this.emitTransition("blocked", result.goal);
 		return { ok: true, goal: result.goal, turns, thresholdMet, repeat: false };
 	}
 
@@ -2278,6 +2364,7 @@ export class GoalStore {
 		// The stop ends the audit chain: whatever reports next starts a fresh one at one.
 		this.lastBlockerTurn = undefined;
 		this.lastBlockerRevision = undefined;
+		this.emitTransition(stop.status === "usage_limited" ? "usage-limited" : "blocked", result.goal);
 		return { ok: true, goal: result.goal };
 	}
 
