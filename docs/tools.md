@@ -141,9 +141,10 @@ those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
 
 None of the three actions is an admission decision, so all of them keep working
 while `goal.enabled` is false: a run that was already in flight when the extension
-was disabled can still complete a Goal, report a blocker, or pause it, and the
-result carries the disabled condition in its text so the model does not read the
-Goal as one that will keep continuing.
+was disabled can still complete a Goal, report a blocker, or pause it, and every
+successful result carries the disabled condition in its text — including a blocker
+report below the audit threshold, which otherwise reads as a Goal that stays
+active — so the model does not read the Goal as one that will keep continuing.
 
 `blocked` is the blocker contract. The model calls it with
 `{ action: "blocked", blocker: "…" }` — plus `blocker_id` on every later report of

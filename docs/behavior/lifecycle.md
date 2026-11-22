@@ -127,8 +127,12 @@ active time but admits no new Goal work, so an active-but-disabled Goal is never
 mistaken for a continuing one.
 
 Bare `/goal` also reports the disabled condition when `goal.enabled` is false —
-an `Admission disabled:` block naming what is refused, what still works, and the
-fact that pausing rather than disabling stops the clock.
+an `Admission disabled:` block naming what is refused and what still works. The
+block is status-aware: for an `active` Goal it adds that pausing, not disabling
+the extension, is what stops the clock, while a Goal that has already stopped
+says its clock is already stopped and that the refused Resume would be what
+restarts it after re-enabling. The per-status resume hints follow the same rule,
+so a disabled report never promises that `/goal resume` starts work.
 
 ## Status indicator
 
@@ -204,10 +208,11 @@ already in flight — a `budget_limited` transition, an `update_goal` completion
 blocker report. An in-flight provider request is never aborted, and work already
 queued is delivered as ordinary work rather than dropped.
 
-Nothing is rewritten: the Goal keeps its Lifecycle status, including `active`, and
-keeps accruing active time, because stopping that clock is a pause rather than a
-host preference. The status report and the compact indicator therefore carry the
-disabled condition separately (`Admission disabled: …` / `admission off`) so an
+Nothing is rewritten: the Goal keeps its Lifecycle status, including `active`. An
+`active` Goal keeps accruing active time, because stopping that clock is a pause
+rather than a host preference; a Goal that has already stopped keeps its stopped
+clock. The status report and the compact indicator therefore carry the disabled
+condition separately (`Admission disabled: …` / `admission off`) so an
 active-but-disabled Goal is never mistaken for one that keeps continuing.
 
 An edit of a Goal that is *already stopped* is not work-admitting — it changes

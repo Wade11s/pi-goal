@@ -89,15 +89,18 @@ function wrapUpEntries(entries) {
  * response so the Goal stays active. Its session file is copied into a
  * test-owned directory, so the follow-up processes resume the same branch while
  * the first process's temporary directories are already gone.
+ *
+ * `command` is the `/goal` invocation used to create it, so a scenario can give
+ * the restored Goal a token budget without duplicating this setup.
  */
-async function activeGoalSession(settings) {
+async function activeGoalSession(settings, command = `/goal ${OBJECTIVE}`) {
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-workdir-"));
 	const resumedDir = mkdtempSync(join(tmpdir(), "pi-goal-resumed-"));
 	const first = await PiRpcSession.start({ cwd: workDir });
 	script([{ text: "Kickoff answer." }, { text: "First continuation answer." }, { hang: true }], first);
 	let sessionFile;
 	try {
-		await first.prompt(`/goal ${OBJECTIVE}`);
+		await first.prompt(command);
 		await abortActiveLoop(first, 3);
 		sessionFile = await first.sessionFile();
 		copyFileSync(sessionFile, join(resumedDir, basename(sessionFile)));
@@ -195,6 +198,35 @@ test("the compact status line marks admission off without losing the status or u
 	assert.match(disabled, /400 tok/);
 	assert.match(disabled, /admission off/);
 	assert.ok(disabled.length <= 80, `the disabled line is not compact: ${disabled}`);
+});
+
+test("the disabled block is status-aware about the clock and about resume", () => {
+	// Only an active Goal is still running its clock; every other status already
+	// stopped it, so the block may not say it keeps accruing or that the refused
+	// /goal resume would restart work.
+	const active = formatGoalSummary(toPublicState(record({ usage: usage() })), { admissionEnabled: false });
+	assert.match(active, /keeps accruing active time/);
+	for (const status of ["paused", "complete", "blocked", "usage_limited", "budget_limited"]) {
+		const state = toPublicState(record({ status, usage: usage() }));
+		assert.ok(
+			!formatGoalSummary(state).includes("Admission disabled"),
+			`${status}: the enabled report never mentions the setting`,
+		);
+		const disabled = formatGoalSummary(state, { admissionEnabled: false });
+		assert.ok(
+			!disabled.includes("keeps accruing active time"),
+			`${status} must not claim a stopped clock is accruing: ${disabled}`,
+		);
+		assert.match(
+			disabled,
+			new RegExp(`this Goal is already ${status}, so its active time has already stopped`),
+		);
+		assert.match(disabled, /no \/goal resume/, `${status} must say resume is not admitted`);
+		if (status !== "complete") {
+			// Its status hint names a resume, so the hint has to say it is refused too.
+			assert.match(disabled, /is refused while pi-goal is disabled/, `${status}: ${disabled}`);
+		}
+	}
 });
 
 test("the no-Goal report explains the disabled extension instead of only naming the missing Goal", () => {
@@ -548,6 +580,160 @@ test("an in-flight run still reports its terminal update while disabled", async 
 		rmSync(resumedDir, { recursive: true, force: true });
 		rmSync(gateDir, { recursive: true, force: true });
 		rmSync(workDir, { recursive: true, force: true });
+	}
+});
+
+test("an in-flight provider usage-limit stop still lands while disabled", async () => {
+	// Retries are off so the failure reaches the settlement boundary as it is: with
+	// retries on, a retryable error would consume the next scripted step.
+	const context = await activeGoalSession({ goal: { enabled: false }, retry: { enabled: false } });
+	script([{ error: "insufficient_quota: current quota exhausted" }], context.session);
+	try {
+		const mark = context.session.records.length;
+		await context.session.prompt("Please keep working on the objective");
+		await context.session.waitForSettled(1);
+		// The terminal stop is a lifecycle write, not admission: it still lands.
+		const limited = await context.session.notifyAfter(mark, (r) => r.message.includes("is now usage_limited"));
+		assert.match(limited.message, /insufficient_quota/);
+		// The usage-limit stop keeps its own text; it is not an "admission is off" case.
+		assert.match(limited.message, /\/goal resume restarts it/);
+
+		const entries = readSessionEntries(context.sessionFile);
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "usage_limited", "the stop is durable");
+		assert.equal(continuationEntries(entries).length, 2, "and nothing was admitted after it");
+		assert.equal(runCount(context.session), 1, "the single in-flight run that reported the limit");
+		assertStepsConsumed(context.session, 1, [
+			{ stopReason: "error", errorMessage: "insufficient_quota: current quota exhausted" },
+		]);
+		assert.equal(context.session.extensionErrors().length, 0, JSON.stringify(context.session.extensionErrors()));
+	} finally {
+		await stopShared(context);
+	}
+});
+
+test("an in-flight update_goal pause still lands while disabled", async () => {
+	const context = await activeGoalSession({ goal: { enabled: false } });
+	script(
+		[
+			{ toolCalls: [{ name: "update_goal", args: { action: "pause", userRequest: "Please pause the goal" } }] },
+			{ text: "Paused as requested." },
+		],
+		context.session,
+	);
+	try {
+		await context.session.prompt("Please pause the goal");
+		const paused = await context.session.waitForToolResult("update_goal", 1);
+		assert.equal(paused.isError, false, "a pause from in-flight work still works while disabled");
+		assert.equal(structuredGoal(paused.result).status, "paused");
+		// The result carries the disabled condition, so the model cannot read the
+		// pause as a stop it may lift with a resume of its own.
+		assert.match(toolText(paused.result), /pi-goal is disabled \(goal\.enabled is false\)/);
+		assert.match(toolText(paused.result), /no new Goal work is admitted/);
+		await context.session.waitForSettled(1);
+
+		const entries = readSessionEntries(context.sessionFile);
+		assert.equal(lastGoalSnapshot(entries).data.goal.status, "paused", "the pause is durable");
+		assert.equal(continuationEntries(entries).length, 2, "nothing continued after the pause");
+		assert.equal(runCount(context.session), 1, "the single in-flight run that paused it");
+		assertStepsConsumed(context.session, 2);
+		assertCleanRun(context.session);
+		assert.equal(context.session.extensionErrors().length, 0, JSON.stringify(context.session.extensionErrors()));
+	} finally {
+		await stopShared(context);
+	}
+});
+
+test("an in-flight blocked report still lands while disabled", async () => {
+	const context = await activeGoalSession({ goal: { enabled: false } });
+	const BLOCKER = "the release token has not been issued yet";
+	script(
+		[
+			{ toolCalls: [{ name: "update_goal", args: { action: "blocked", blocker: BLOCKER } }] },
+			{ text: "Reported the blocker." },
+		],
+		context.session,
+	);
+	try {
+		// The blocker audit is a lifecycle write, not an admission decision, so the
+		// report from this in-flight run is still recorded: it opens the durable audit
+		// and publishes the identity the next report has to reuse.
+		//
+		// The threshold itself is not reachable here, and that is admission working as
+		// designed: every user prompt resets the audit, so the three consecutive
+		// reports have to come from Goal-owned turns, which a disabled extension never
+		// starts. What is reachable while disabled is the write, and it must land.
+		await context.session.prompt("Please report the blocker that is still preventing progress");
+		const report = await context.session.waitForToolResult("update_goal", 1);
+		const state = structuredGoal(report.result);
+		assert.equal(report.isError, true, "a lone report is recorded, not acted on");
+		assert.equal(state.status, "active", "the report does not stop the Goal by itself");
+		assert.match(state.blockerId, /^blocker_[0-9a-f]{8}$/, "the durable audit was opened");
+		assert.equal(state.blocker, BLOCKER);
+		assert.equal(state.blockedTurns, 1);
+		// The result carries the disabled condition, so "stays active" is not read as
+		// "keeps continuing".
+		assert.match(toolText(report.result), /pi-goal is disabled \(goal\.enabled is false\)/);
+		assert.match(toolText(report.result), /no new Goal work is admitted/);
+		await context.session.waitForSettled(1);
+
+		const entries = readSessionEntries(context.sessionFile);
+		const recorded = lastGoalSnapshot(entries).data.goal.blockedAudit;
+		assert.equal(recorded.blockerId, state.blockerId, "the audit is durable");
+		assert.equal(recorded.turns, 1);
+		assert.equal(lastGoalSnapshot(entries).data.goal.revision, 1, "the reported audit step is its own revision");
+		assert.equal(continuationEntries(entries).length, 2, "no turn was continued by admission");
+		assert.equal(runCount(context.session), 1, "the single in-flight run that reported it");
+		assertStepsConsumed(context.session, 2);
+		assertCleanRun(context.session);
+		assert.equal(context.session.extensionErrors().length, 0, JSON.stringify(context.session.extensionErrors()));
+	} finally {
+		await stopShared(context);
+	}
+});
+
+test("an in-flight budget crossing still stops the Goal while disabled", async () => {
+	// The Goal is created with a budget, so the restored Goal can cross it in flight.
+	const context = await activeGoalSession(
+		{ goal: { enabled: false } },
+		`/goal --budget 300 ${OBJECTIVE}`,
+	);
+	// A Goal-owned run can only be in flight while admission is off if it was admitted
+	// before the setting was disabled: the disabled runtime starts none of its own.
+	// Delivery is the seam that charges it (`applyDeliveredUserMessage` admits a work
+	// message that names the current Goal), so the test delivers the exact continuation
+	// header the extension writes for the restored Goal — the observable equivalent of
+	// a continuation already queued when the setting changed.
+	const restored = lastGoalSnapshot(readSessionEntries(context.sessionFile)).data.goal;
+	const workMessage = `[pi-goal] Continue Goal ${restored.id} (active, revision ${restored.revision}).`;
+	// The runs before the restart accounted well under 300 tokens; this single
+	// in-flight run adds 350 and crosses the ceiling mid-run.
+	script(
+		[{ text: "In-flight answer.", usage: { input: 250, output: 100 } }, { text: "Never requested." }],
+		context.session,
+	);
+	try {
+		const mark = context.session.records.length;
+		await context.session.prompt(workMessage);
+		const limited = await context.session.notifyAfter(mark, (r) => r.message.includes("reached its token budget"));
+		assert.match(limited.message, /is now budget_limited/);
+		// The wrap-up is unattended Goal work, so it is deferred rather than admitted.
+		assert.match(limited.message, /the one bounded wrap-up is deferred/);
+		const deferred = await context.session.notifyAfter(mark, (r) => /wrap-up stays pending/.test(r.message));
+		assert.match(deferred.message, /budget_limited with its one bounded wrap-up still owed/);
+		await context.session.waitForSettled(1);
+
+		const entries = readSessionEntries(context.sessionFile);
+		const stopped = lastGoalSnapshot(entries).data.goal;
+		assert.equal(stopped.status, "budget_limited", "the budget stop landed from in-flight work");
+		assert.equal(stopped.wrapUpPending, true, "and the one bounded wrap-up still owes delivery");
+		assert.equal(wrapUpEntries(entries).length, 0, "it was not delivered while disabled");
+		assert.equal(continuationEntries(entries).length, 2, "nothing was admitted after the stop");
+		assert.equal(runCount(context.session), 1, "the single in-flight Goal-owned run");
+		assertStepsConsumed(context.session, 1);
+		assertCleanRun(context.session);
+		assert.equal(context.session.extensionErrors().length, 0, JSON.stringify(context.session.extensionErrors()));
+	} finally {
+		await stopShared(context);
 	}
 });
 
