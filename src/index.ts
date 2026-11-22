@@ -62,6 +62,7 @@ import {
 	BLOCKED_AUDIT_THRESHOLD,
 	CUSTOM_MESSAGE_TYPE,
 	CUSTOM_WRAPUP_MESSAGE_TYPE,
+	buildCompletionReport,
 	corroborateGoalCreationRequest,
 	corroboratePauseRequest,
 	formatBudgetWrapUpMessage,
@@ -87,6 +88,7 @@ import {
 	type GoalStatus,
 	previewObjective,
 	toPublicState,
+	updateGoalOutputSchema,
 } from "./goal.ts";
 import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
 import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
@@ -1682,7 +1684,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				}),
 			),
 		}),
-		outputSchema: getGoalOutputSchema,
+		outputSchema: updateGoalOutputSchema,
 		promptSnippet:
 			"Mark the current Goal complete after an evidence audit, blocked after a persistent blocker, or paused at the user's explicit request",
 		promptGuidelines: [
@@ -1800,10 +1802,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				}
 				const state = toPublicState(completed.goal!);
 				updateStatus(ctx);
+				// A budgeted completion asks the final response to report its cost and
+				// duration. The numbers come from the completion snapshot above, so the
+				// reminder costs no extra provider turn and no extra accounting, and an
+				// unbudgeted Goal gets no report at all.
+				const completionReport = buildCompletionReport(state);
+				const payload = {
+					goal: state,
+					...(completionReport === null ? {} : { completionReport }),
+				};
 				return {
-					content: [{ type: "text", text: `Goal ${completed.goal!.id} marked complete.` }],
-					structuredContent: { goal: state },
-					details: { goal: state },
+					content: [
+						{
+							type: "text",
+							text:
+								`Goal ${completed.goal!.id} marked complete.` +
+								(completionReport === null ? "" : `\n\n${completionReport.instruction}`),
+						},
+					],
+					structuredContent: payload,
+					details: payload,
 				};
 			}
 			if (params?.action === "pause") {

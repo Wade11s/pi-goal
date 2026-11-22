@@ -247,3 +247,33 @@ While a blocked audit is open, the same payload carries its **Blocker identity**
 `get_goal`'s text repeats the identity so the model can pass it back verbatim in
 `update_goal`'s `blocker_id`. The human-facing status deliberately shows only the
 description and the count.
+
+### `update_goal`'s completion usage report
+
+A **budgeted** Goal's successful completion adds one field to that result, so the
+final response can state what the work cost without another provider request:
+
+```json
+{
+  "goal": { "id": "goal_1a2b3c4d", "status": "complete", "tokenBudget": 250000, "remainingTokens": 201790, "...": "..." },
+  "completionReport": {
+    "instruction": "This budgeted Goal is complete. Your final response must report the cost and duration of the work: 48210 accounted tokens of the 250000-token Token budget, 201790 tokens of remaining capacity, and 5m 12s of Active elapsed time. ...",
+    "accountedTokens": 48210,
+    "activeSeconds": 312,
+    "tokenBudget": 250000,
+    "remainingTokens": 201790,
+    "accountingNotes": ["..."]
+  }
+}
+```
+
+`instruction` is the exact wording the final response must follow, and it is also
+appended to the tool result's text content so the model acts on it. The numeric
+fields let a programmatic caller read the same facts without parsing prose. See
+[budgets](behavior/budgets.md#completion-usage-report) for the accounting
+approximations the notes carry.
+
+The report is present only on a successful **budgeted** completion. An
+unbudgeted Goal, a refusal, and every other `update_goal` action keep the plain
+`{ goal }` payload, so no result ever claims a budget or a remaining capacity
+the Goal does not have.
