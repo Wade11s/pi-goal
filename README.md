@@ -138,6 +138,12 @@ occupied, so none of them wait for idle. Details:
 | `budget_limited` | The token budget was reached. One bounded wrap-up is allowed, then no continuation. Raise the cumulative budget to resume. |
 | `complete` | Terminal for the Goal's identity. Replace it with `/goal <objective>`. |
 
+`goal.enabled` (Pi settings, default `true`) is an **Admission control**, not a
+status: while it is false, no new Goal work is admitted — no creation or
+replacement, no `create_goal`, no work-admitting objective edit, no resume, and no
+automatic continuation — and an active Goal keeps its `active` status and keeps
+accruing active time. → [Goal lifecycle](docs/behavior/lifecycle.md)
+
 ## How it behaves
 
 ### Automatic continuation
@@ -200,6 +206,34 @@ continues automatically: only the user's `/goal resume` restarts it.
 
 → [Token budgets and budget exhaustion](docs/behavior/budgets.md)
 
+### Disabling the extension
+
+```json
+{ "goal": { "enabled": false } }
+```
+
+`goal.enabled` (default `true`) is an admission control: while it is false,
+pi-goal admits no new Goal work, so nothing unattended starts.
+
+- **Refused:** `/goal <objective>` (creation and replacement), `create_goal`,
+  `/goal edit` of an *active* Goal (an edit there steers work into a running
+  Goal), `/goal resume`, and the automatic continuation or budget wrap-up the
+  settlement seam would otherwise request. A pending wrap-up is deferred, not
+  lost: it is delivered at the first settlement after re-enabling.
+- **Still available:** bare `/goal` and `get_goal`, `/goal pause`, `/goal clear`,
+  and every terminal update from work already in flight — including a
+  `budget_limited` transition and an `update_goal` completion. An in-flight
+  provider request is never aborted.
+- **Nothing is rewritten:** the Goal keeps its Lifecycle status and keeps
+  accruing active time. **Pausing the Goal, not disabling the extension, stops
+  that clock**, so the status report and the compact indicator both say
+  `admission off` while an active-but-disabled Goal is not mistaken for one that
+  keeps continuing.
+- A changed setting takes effect at the next session start or reload, exactly
+  like the budget settings; a non-boolean value is reported and ignored.
+
+→ [Goal lifecycle](docs/behavior/lifecycle.md)
+
 ### Usage accounting
 
 The accounted total is `input + output + cacheWrite`. Cached reads are prompt
@@ -242,6 +276,11 @@ sessions (`--no-session`) refuse to create a Goal at all.
   provider loop, so a run can overshoot before the gate stops further work. A
   tool already in flight when the budget is crossed still finishes and is
   charged.
+- `goal.enabled` is read from Pi's effective settings at session start, so a
+  changed value takes effect on the next session start or reload rather than
+  mid-session. While the extension is disabled, an active Goal accrues no new
+  Goal-owned usage either, because every run starts from a user prompt that
+  closes the admission segment.
 - Accounting is provider-neutral but not invoice-exact: cached reads are
   excluded, cache writes counted, and provider billing is not reconciled.
   Migrated 0.1.0 Goals report **legacy reconstructed totals**, not exact

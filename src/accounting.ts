@@ -347,6 +347,57 @@ export interface BudgetSettings {
 	problems: string[];
 }
 
+/**
+ * Extension-level admission configuration (`goal.enabled`).
+ *
+ * Admission is the gate every path that would start *new* Goal work passes
+ * through: `/goal <objective>` (creation and replacement), `create_goal`, an
+ * objective edit that would steer work into an active Goal, `/goal resume`, and
+ * the automatic continuation the settlement seam requests. It is deliberately
+ * not part of the durable Goal record: it is a host preference, so it never
+ * rewrites a Lifecycle status, never pauses Active elapsed time, and survives
+ * neither a snapshot nor a restart.
+ */
+export interface AdmissionSettings {
+	/** Whether new Goal work may be admitted. Defaults to true. */
+	enabled: boolean;
+	/** Human-readable configuration problems, reported once per session. */
+	problems: string[];
+}
+
+function readEnabledValue(value: unknown): boolean | undefined | "invalid" {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") return "invalid";
+	return value;
+}
+
+/**
+ * Read the `goal.enabled` admission control from Pi's effective settings.
+ *
+ * The default is `true`, so a session that never configured the setting admits
+ * Goal work exactly as before. A non-boolean value is dropped and reported
+ * rather than silently coerced: `"false"`, `0`, and `1` are configuration
+ * mistakes, and guessing at them would either disable the extension behind the
+ * user's back or keep admitting work the user believed they had switched off.
+ * An absent or invalid value therefore keeps the permissive default and says so,
+ * which is the same fail-loud-but-harmless shape the budget settings use.
+ */
+export function parseAdmissionSettings(settings: unknown): AdmissionSettings {
+	const goal = (settings && typeof settings === "object" ? (settings as Record<string, unknown>).goal : undefined) as
+		| Record<string, unknown>
+		| undefined;
+	const raw = readEnabledValue(goal?.enabled);
+	if (raw === "invalid") {
+		return {
+			enabled: true,
+			problems: [
+				"pi-goal: goal.enabled must be a boolean (true or false); ignoring it and admitting Goal work as usual.",
+			],
+		};
+	}
+	return { enabled: raw ?? true, problems: [] };
+}
+
 function readBudgetValue(value: unknown): number | undefined | "invalid" {
 	if (value === undefined || value === null) return undefined;
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < MIN_TOKEN_BUDGET) return "invalid";

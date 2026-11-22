@@ -12,6 +12,13 @@ The model can call `get_goal` at any time to retrieve the same structured state
 the command reports (or `goal: null` when no Goal is set). Use it whenever the
 objective is absent or truncated in context.
 
+While `goal.enabled` is false the tool's text adds an `Admission disabled:` block:
+the Goal's Lifecycle status is untouched, no new Goal work is admitted, and
+inspection, pause, clear, and terminal updates from in-flight work still work.
+With no Goal set, the text says the same thing about `/goal <objective>` and
+`create_goal`. The structured `{ goal }` payload is unchanged — admission is a
+host preference, not Goal state, so it is never persisted in a snapshot.
+
 ## Model tool: `create_goal`
 
 `create_goal` lets the model create a Goal, but only for an **explicit user or
@@ -23,6 +30,11 @@ could not restore the Goal, refuses while this session already has a Goal
 snapshot before reporting success. Creating a Goal through the tool does not
 send a kickoff message: the model is already mid-run, and the continuation seam
 picks the Goal up at the next settlement.
+
+While `goal.enabled` is false the tool is refused before anything is validated:
+the result is an error carrying the unchanged current Goal (or `goal: null`), and
+the one-shot creation authority is left intact, so a corrected call can retry once
+the setting is re-enabled.
 
 ### Creation authority
 
@@ -126,6 +138,17 @@ authorize its own pause) is refused, and the Goal keeps running. The model
 cannot resume, clear, replace, or budget-limit a Goal through the tool at all:
 those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
 <objective>`).
+
+None of the three actions is an admission decision, so all of them keep working
+while `goal.enabled` is false: a run that was already in flight when the extension
+was disabled can still complete a Goal, report a blocker, or pause it, and every
+successful result carries the disabled condition in its text — including a blocker
+report below the audit threshold, which otherwise reads as a Goal that stays
+active — so the model does not read the Goal as one that will keep continuing.
+The condition follows the status the update leaves: a paused or blocked result
+names the refused `/goal resume` that re-enabling makes available again, while a
+completion says the Goal is terminal either way so that replacing it is a new
+`/goal <objective>` and not a resume.
 
 `blocked` is the blocker contract. The model calls it with
 `{ action: "blocked", blocker: "…" }` — plus `blocker_id` on every later report of

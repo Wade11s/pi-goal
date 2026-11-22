@@ -52,7 +52,10 @@ to be over.
   malfunction, and it resets the counters.
 - A **terminal provider error** that is not a usage limit stops the continuation
   for that run and is surfaced as a warning, while the Goal stays active and
-  continues on the next successful run. Pi's own retries are untouched. A Goal
+  continues on the next successful run. Pi's own retries are untouched. While
+  `goal.enabled` is false that notice names the disabled condition instead: the
+  next settlement admits nothing, so promising the next successful run would
+  describe a continuation the gate refuses. A Goal
   that has already stopped (`blocked`, `usage_limited`, `budget_limited`,
   `paused`, `complete`) has no continuation to stop, so the same failure is
   reported against that status: it changes nothing, and it is never described as
@@ -107,6 +110,9 @@ to be over.
   | Bare account vocabulary | `Your billing address could not be verified; update your account details`, `Billing service temporarily unavailable; please retry later` |
 - Every stop is explained to the user through a notification and recorded on the
   Goal, so `get_goal` and bare `/goal` report the blocker and the audit count.
+  While `goal.enabled` is false the usage-limit notice names the admission
+  condition as well: the stop still lands, but the `/goal resume` it names is
+  refused until the setting is re-enabled.
 - **User actions reset the counters.** A prompt the user types (including one
   queued while the agent is busy) and an abort both restart the blocked audit and
   the anti-loop counters, and a replacement Goal starts from a fresh record.

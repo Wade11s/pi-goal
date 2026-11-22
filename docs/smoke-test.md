@@ -336,6 +336,30 @@ admitted against), and the new Goal to stay `active` at revision 0 with its own
 kickoff rather than being marked `complete` with no work. The replaced identity
 keeps its own durable superseded record.
 
+## 21. Optional: disabling the extension (`goal.enabled`)
+
+`goal.enabled` is an admission control, not a Lifecycle status. The deterministic
+coverage is `test/goal46-admission-control.test.mjs` (a real `pi --mode rpc`
+session per case, resumed with a different `settings.json`); the steps below
+reproduce the user-visible surface by hand.
+
+1. Create a Goal and let a continuation run (sections 3–5).
+2. Add `"goal": { "enabled": false }` to Pi settings and restart Pi on the same
+   session (`pi --continue`, or resume the session file).
+3. Run `/goal`. Expect the ordinary report plus an `Admission disabled:` block,
+   and a status line ending in `admission off`.
+4. Send an ordinary prompt. Expect the work to run and finish, and a
+   `... no continuation was requested at this settlement` notification. Bare
+   `/goal` twice a few seconds apart: `Active time` must still be increasing —
+   disabling the extension does not stop the clock.
+5. Try `/goal <objective>`, `/goal edit <objective>`, and `/goal resume`. Expect a
+   refusal naming what is refused and what still works; no replacement
+   confirmation dialog may open.
+6. `/goal pause`, then `/goal edit <objective>`: the edit of an already-stopped
+   Goal is allowed and says no work was started.
+7. Remove the setting (or set it to `true`) and restart on the same session. The
+   restored active Goal continues at the next settlement again.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
@@ -368,6 +392,13 @@ keeps its own durable superseded record.
 - [ ] A run admitted against a replaced identity cannot complete, report a
       blocker against, or pause the Goal that replaced it; the replaced identity
       keeps its own durable superseded record.
+- [ ] With `goal.enabled: false`, creation, replacement, `create_goal`, a
+      work-admitting edit, resume, and automatic continuation are all refused,
+      while inspection, pause, clear, and in-flight terminal updates still work.
+- [ ] An active-but-disabled Goal keeps its `active` status and keeps accruing
+      `Active time`; `/goal pause`, not disabling the extension, stops it.
+- [ ] Re-enabling `goal.enabled` restores admission, and the restored active Goal
+      continues only at the next settlement.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with

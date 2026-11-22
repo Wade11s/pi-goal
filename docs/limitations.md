@@ -66,6 +66,15 @@ what it cannot preempt, and what is intentionally left to the user.
   three more empty turns before it is stopped again; the blocked audit is durable
   and survives a restart, except that the prompt which resumes work after one is a
   user action and starts a fresh audit.
+- `goal.enabled` is read from Pi's effective settings at session start, so a
+  changed value takes effect on the next session start or reload, never
+  retroactively for work already in flight. A non-boolean value is reported once
+  and ignored, which keeps admission enabled exactly as an unset value does.
+- Disabling the extension is not a pause: an active-but-disabled Goal keeps
+  accruing Active elapsed time until the user pauses it, and no new Goal-owned
+  usage is admitted while it is disabled, because every run starts from a user
+  prompt that closes the admission segment. Work already queued when the
+  extension is disabled is delivered as ordinary work rather than dropped.
 - A third extension loaded after pi-goal can still request its own continuation
   at the same boundary (Pi's last-handler-wins rule). pi-goal declines to request
   one when it should not continue; it does not veto another extension's request.
