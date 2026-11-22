@@ -81,6 +81,25 @@ export interface GoalEventUsage {
 	activeSeconds: number;
 }
 
+/**
+ * Immutable attachment manifest metadata: what the Goal owns, never contents.
+ *
+ * The event is machine-consumed by any loaded extension, which makes it the same
+ * trust and privacy surface as a log line — so attachment contents, like
+ * objective text, stay out of it. The manifest entry (`hash`, `mediaType`,
+ * `bytes`, `label`) is exactly what the durable snapshot records.
+ */
+export interface GoalEventAttachment {
+	/** sha256 of the materialized bytes (lowercase hex). */
+	hash: string;
+	/** `text/plain`, `image/png`, `image/jpeg`, `image/gif`, or `image/webp`. */
+	mediaType: string;
+	/** Byte size of the materialized content. */
+	bytes: number;
+	/** Display label (the source file's basename). */
+	label: string;
+}
+
 /** The committed Goal identity and state the event describes. */
 export interface GoalUpdatedGoal {
 	id: string;
@@ -91,6 +110,8 @@ export interface GoalUpdatedGoal {
 	objective: GoalEventObjective;
 	/** The cumulative token ceiling, or null when the Goal is unbounded. */
 	tokenBudget: number | null;
+	/** The immutable attachment manifest's metadata, in manifest order; empty when the Goal has none. */
+	attachments: GoalEventAttachment[];
 	usage: GoalEventUsage;
 }
 
@@ -128,6 +149,7 @@ export function toGoalUpdatedEvent(
 				origin: goal.origin ?? "command",
 			},
 			tokenBudget: goal.tokenBudget ?? null,
+			attachments: (goal.attachments ?? []).map((attachment) => ({ ...attachment })),
 			usage: {
 				totalTokens: usage.totalTokens,
 				inputTokens: usage.inputTokens,
