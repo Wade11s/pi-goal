@@ -17,6 +17,19 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   Goal-tool calls to Pi's `Tool <name> not found` refusal without a Goal write;
   a live scenario inspects the released provider's child launch arguments. An
   upstream Rex review preset remains a separate enhancement request.
+- Add the opt-in structured progress-plan tool (`goal.planTool`, default `false`),
+  registered as the `update_plan` model tool. It takes one ordered list of steps,
+  each `pending`, `in_progress`, or `completed`, with at most one `in_progress`,
+  so verified progress and remaining work stay visible across Continuations. Its
+  record is the tool result's persisted `details` — the ordinary session-branch
+  tool result — so it survives a restart and is visible in the model's own context
+  with no second Goal record: no `goal-state` entry, no revision, and no
+  `pi-goal:updated` event. It never mutates a Lifecycle status, so a plan that
+  marks every step completed cannot complete or bypass the Completion audit, and
+  it is accounted like any other tool call. While the setting is off the tool is
+  not registered at all and no Continuation mentions it; a name already owned by
+  another extension is never replaced. The contract is documented in
+  `docs/behavior/lifecycle.md` and `docs/tools.md`.
 - Add the privacy-safe `pi-goal:metrics` projection derived only from committed
   Goal-updated events: transition kind, Lifecycle status, token totals, Active
   elapsed time, budget state, extension version, and timestamp. The projection

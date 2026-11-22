@@ -59,6 +59,13 @@
  * owns, not Goal state, so it never participates in the Lifecycle, in accounting, or in
  * the event stream, and it never overwrites a name the user provided.
  *
+ * `goal.planTool` (Pi settings, default false) is a third opt-in, and the only one that
+ * changes what is *registered*: while it is true the extension registers an
+ * `update_plan` model tool for a Goal's ordered progress steps. Its record is the tool
+ * result's persisted `details` — Pi's ordinary session-branch tool result — so it is
+ * durable without a second Goal record, and it never mutates a Lifecycle status or
+ * satisfies the Completion audit (see `./plan.ts`).
+ *
  * Usage is accounted durably from finalized Pi messages and reported nested
  * usage, with stable deduplication (see `accounting.ts`). A Goal with a token
  * budget transitions to `budget_limited` when its accounted usage reaches the
@@ -124,6 +131,21 @@ import {
 	sessionNameSurface,
 	type SessionNamingSettings,
 } from "./session-naming.ts";
+import {
+	PLAN_TOOL_NAME,
+	PLAN_TOOL_PROMPT_GUIDELINES,
+	PLAN_TOOL_PROMPT_SNIPPET,
+	formatPlanDisabledMessage,
+	formatPlanMessage,
+	formatPlanNoGoalMessage,
+	parsePlanToolSettings,
+	planOutputSchema,
+	planParametersSchema,
+	validatePlanArgument,
+	type PlanRecord,
+	type PlanToolArguments,
+	type PlanToolSettings,
+} from "./plan.ts";
 import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
@@ -748,6 +770,197 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let resumePrompt: ResumePromptSettings = { enabled: false, problems: [] };
 
 	/**
+	 * Extension-level plan-tool configuration (`goal.planTool`), read from Pi's
+	 * effective settings at every session start like the other settings.
+	 *
+	 * Off by default: a structured progress plan is a convenience for long Goals,
+	 * and an opt-out default would put another tool in every model's loadout. See
+	 * `./plan.ts` for why the plan is a persisted tool result rather than Goal
+	 * state.
+	 */
+	let planTool: PlanToolSettings = { enabled: false, problems: [] };
+
+	/**
+	 * Whether the plan tool is registered *and* survived registration in this
+	 * session. Only this flag gates the Continuation wording, so the model is never
+	 * told to call a tool that is not in its loadout.
+	 *
+	 * Registration happens at `session_start` rather than at extension load because
+	 * Pi's effective settings are not readable before the runtime is bound, and
+	 * registering late is a supported seam. Once registered a tool cannot be
+	 * unregistered, so a setting changed mid-session leaves the registration in
+	 * place; the tool then refuses its calls rather than silently recording plans
+	 * the user switched off, and the next session start reconciles the two.
+	 */
+	let planToolRegistered = false;
+
+	/**
+	 * Register the opt-in progress-plan tool, and record whether it really landed.
+	 *
+	 * "Registration succeeded" is checked rather than assumed, for two reasons that
+	 * both come from Pi's tool registry being keyed by name across all extensions:
+	 *
+	 * - another extension may already own `update_plan`. Registering anyway would
+	 *   silently replace its tool, which is the one thing this feature must not do
+	 *   to a host that happens to use the same conventional name;
+	 * - a registration can fail, and a Continuation that named a tool the model
+	 *   cannot call would waste a Goal turn and teach it to ignore the extension.
+	 *
+	 * Both checks resolve to "not registered" on anything unexpected, which is the
+	 * fail-closed direction: the tool is a convenience, so the safe outcome of not
+	 * knowing is not to promise it.
+	 */
+	function registerPlanTool(ctx: ExtensionContext): void {
+		if (planToolNameTaken()) {
+			planToolRegistered = false;
+			notify(
+				ctx,
+					`pi-goal did not register ${PLAN_TOOL_NAME}: another extension already provides a tool with that name, and ` +
+						"pi-goal will not replace it. No Continuation will mention the plan tool. Rename that extension's tool to " +
+						"use pi-goal's own, or set goal.planTool to false to stop pi-goal from offering one.",
+					"warning",
+			);
+			return;
+		}
+		try {
+			pi.registerTool({
+				name: PLAN_TOOL_NAME,
+				label: "Update Plan",
+				description:
+					"Record the current Goal's ordered progress plan, replacing any previous one: an ordered list of " +
+					"steps, each pending, in_progress, or completed, with at most one in_progress. Use it for a Goal with " +
+					"several steps so verified progress and remaining work are visible across turns. It is progress " +
+					"narration only: it never changes the Goal's Lifecycle status and can never mark the Goal complete.",
+				parameters: planParametersSchema,
+				outputSchema: planOutputSchema,
+				promptSnippet: PLAN_TOOL_PROMPT_SNIPPET,
+				promptGuidelines: [...PLAN_TOOL_PROMPT_GUIDELINES],
+				/**
+				 * Compatibility shim for the one spelling a model reliably drifts into:
+				 * naming the list `steps` instead of `plan`. Everything else is passed
+				 * through untouched, so a semantically invalid plan is refused by the
+				 * tool with an explanation rather than being reshaped here.
+				 */
+				prepareArguments: (args: unknown): PlanToolArguments => {
+					if (typeof args !== "object" || args === null) return { plan: [] };
+					const record = args as Record<string, unknown>;
+					if (record.plan !== undefined || record.steps === undefined) return record as PlanToolArguments;
+					return { ...record, plan: record.steps } as PlanToolArguments;
+				},
+				async execute(
+					_toolCallId: string,
+					params: PlanToolArguments,
+					_signal,
+					_onUpdate,
+					toolCtx: ExtensionToolContext,
+				) {
+					// The setting is read at session start, and a tool cannot be
+					// unregistered, so a value changed mid-session is refused here rather
+					// than recorded against a user who switched the tool off.
+					if (!planTool.enabled) {
+						return planToolError(formatPlanDisabledMessage());
+					}
+					// The plan is progress on a Goal. With no Goal there is nothing for it
+					// to describe and no Continuation that would ever show it, so the call
+					// is refused instead of writing an orphan record.
+					const goal = store.get();
+					if (!goal) {
+						return planToolError(formatPlanNoGoalMessage());
+					}
+					const validation = validatePlanArgument(params?.plan);
+					if (!validation.ok) {
+						return planToolError(validation.error);
+					}
+					const plan: PlanRecord = validation.plan;
+					// Nothing here touches the store: no snapshot, no revision, no event.
+					// The plan's durability is this tool result's own `details`, which Pi
+					// persists onto the session branch like any other tool result, and its
+					// usage is charged by the ordinary accounting path like any other tool
+					// call — there is no plan-specific branch in either.
+					return {
+						content: [{ type: "text", text: formatPlanMessage(plan) }],
+						structuredContent: { plan },
+						details: { plan },
+					};
+				},
+			});
+		} catch (error) {
+			planToolRegistered = false;
+			notify(
+				ctx,
+					`pi-goal could not register the ${PLAN_TOOL_NAME} tool (${describeError(error)}). The Goal itself is ` +
+					"unaffected; no Continuation will mention the tool.",
+				"warning",
+			);
+			return;
+		}
+		planToolRegistered = planToolSurvivedRegistration();
+		if (!planToolRegistered) {
+			notify(
+				ctx,
+					`pi-goal registered ${PLAN_TOOL_NAME}, but another extension's tool of the same name took its place, so ` +
+						"pi-goal will not tell the model to call it. Rename that extension's tool, or set goal.planTool to false " +
+						"to stop pi-goal from registering its own.",
+				"warning",
+			);
+		}
+	}
+
+	/**
+	 * Whether some *other* extension already owns the plan tool's name.
+	 *
+	 * `get_goal` is the control: it is registered unconditionally at extension load
+	 * and is pi-goal's own, so its source identifies this extension. A tool of the
+	 * same name from a different source is somebody else's, and registering over it
+	 * would be exactly the shadowing this feature must not do. Anything unexpected —
+	 * a host without these seams, a missing entry, a throw — resolves to "taken",
+	 * because declining to register costs a convenience while clobbering another
+	 * extension costs that extension its tool.
+	 */
+	function planToolNameTaken(): boolean {
+		try {
+			const tools = pi.getAllTools();
+			const ownSource = tools.find((tool) => tool.name === "get_goal")?.sourceInfo?.path;
+			if (ownSource === undefined) return true;
+			const existing = tools.find((tool) => tool.name === PLAN_TOOL_NAME);
+			return existing !== undefined && existing.sourceInfo?.path !== ownSource;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * Whether the `update_plan` declaration now in force is pi-goal's own.
+	 *
+	 * The belt to {@link planToolNameTaken}'s braces: a registration that was
+	 * allowed can still lose the name, and only the declaration actually in force
+	 * may be named in a Continuation.
+	 */
+	function planToolSurvivedRegistration(): boolean {
+		try {
+			const tools = pi.getAllTools();
+			const ownSource = tools.find((tool) => tool.name === "get_goal")?.sourceInfo?.path;
+			if (ownSource === undefined) return false;
+			const plan = tools.find((tool) => tool.name === PLAN_TOOL_NAME);
+			return plan?.sourceInfo?.path === ownSource;
+		} catch {
+			return false;
+		}
+	}
+
+	/** The uniform tool error for a refused plan call. No plan record is persisted. */
+	function planToolError(message: string) {
+		return {
+			content: [{ type: "text" as const, text: message }],
+			isError: true,
+			// An empty record on purpose: the durable plan is a *successful* tool
+			// result's `details.plan`, so a refusal must leave nothing for a reader of
+			// the branch to pick up in its place.
+			details: {},
+		};
+	}
+
+	/**
 	 * The refusal for an admission request that `goal.enabled` currently forbids.
 	 *
 	 * One shared tail, because every refusal has to answer the same three
@@ -961,6 +1174,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// takes effect at the next session start and never mid-session.
 		resumePrompt = parseResumePromptSettings(pi.getSettings());
 		for (const problem of resumePrompt.problems) notify(ctx, problem, "warning");
+		// The opt-in progress-plan tool is read at the same seam, and it is the only
+		// setting here that changes what is *registered*: a disabled session registers
+		// no plan tool at all, so nothing mentions it and nothing can call it.
+		planTool = parsePlanToolSettings(pi.getSettings());
+		for (const problem of planTool.problems) notify(ctx, problem, "warning");
+		if (planTool.enabled) registerPlanTool(ctx);
+		else planToolRegistered = false;
 		store.reconstruct(ctx);
 		// A hard crash can leave the superseded identity's in-flight tail on the branch
 		// with no freeze boundary after it. Reconstruction recovers that tail into
@@ -1668,7 +1888,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				{
 					type: "custom_message",
 					customType: CUSTOM_MESSAGE_TYPE,
-					content: formatContinuationMessage(goal, contents.contents),
+					content: formatContinuationMessage(goal, { planTool: planToolRegistered }, contents.contents),
 					display: true,
 				},
 			],

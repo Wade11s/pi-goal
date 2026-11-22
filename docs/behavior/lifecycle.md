@@ -337,6 +337,51 @@ name is metadata about the session. Both creation paths name the session —
 any Goal exists and is therefore always a fresh one — and nothing else in the
 extension ever writes a session name.
 
+## Optional progress plan
+
+```json
+{ "goal": { "planTool": true } }
+```
+
+`goal.planTool` (Pi settings, default `false`) registers an `update_plan` model
+tool: one ordered list of steps, each `pending`, `in_progress`, or `completed`,
+with **at most one** `in_progress`. It exists so a long Goal's verified progress
+and remaining work stay visible across Continuations instead of having to be
+reconstructed from the transcript every turn.
+
+- **Off by default, and off means absent.** While the setting is false no tool is
+  registered at all: it is not in the model's tool list, its guideline bullets are
+  not in the system prompt, no Continuation mentions it, and a model that calls it
+  anyway is refused by Pi before any extension runs. A non-boolean value is
+  reported once and ignored, exactly like the other settings.
+- **The plan is a persisted tool result, not Goal state.** The tool returns the
+  plan in its result `details`, which Pi already writes onto the session branch
+  as part of the tool-result message. There is no second Goal record: no
+  `goal-state` entry, no revision, no `pi-goal:updated` event, and nothing in the
+  Goal store. A restart therefore makes the plan visible again through the model's
+  own context, and a later plan simply becomes the newest record on the branch.
+- **It never mutates the Lifecycle.** A plan call cannot complete, pause, block,
+  or budget-limit a Goal, and a plan that marks every step `completed` leaves the
+  Goal exactly as active as it was. Completion stays with `update_goal` and the
+  evidence audit; both the tool's own result text and the Continuation say so.
+- **It is accounted like any other tool call.** There is no plan-specific branch
+  in accounting, so a plan turn's tokens are charged under the ordinary
+  `input + output + cacheWrite` rule and count against the Token budget like any
+  other Goal turn.
+- **It never takes another extension's tool.** If some other extension already
+  registered `update_plan`, pi-goal registers nothing, reports why, and no
+  Continuation names the tool — the behavior is the parity target, not the name.
+
+The tool is registered at session start, not at extension load, because Pi's
+effective settings are only readable once the runtime is bound. A setting changed
+mid-session therefore leaves the registration in place: the tool refuses its
+calls until the session is reloaded, rather than silently recording plans the user
+switched off.
+
+A refused plan — no Goal set, a second `in_progress` step, an empty or over-long
+step, an unknown status — persists no record at all, so the durable plan is only
+ever a *successful* tool result.
+
 These commands are **usable while work is running** and never wait for the
 agent to become idle — an active Goal's own continuation loop keeps Pi busy
 almost continuously, so a lifecycle command that waited for idle could never
