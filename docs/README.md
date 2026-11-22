@@ -7,7 +7,7 @@ procedure, and the historical evidence behind the V1 repair programme.
 ## Reading paths
 
 - **Using pi-goal** — [README](../README.md) → [lifecycle](behavior/lifecycle.md)
-  → [budgets](behavior/budgets.md). Read [limitations](limitations.md) for the
+  → [attachments](behavior/attachments.md) → [budgets](behavior/budgets.md). Read [limitations](limitations.md) for the
   honest edges.
 - **Changing behavior** — [ADR-0001](adr/0001-conservative-stopping.md) →
   [continuation](behavior/continuation.md) → [stopping](behavior/stopping.md) →
@@ -23,6 +23,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | Doc | Covers |
 | --- | --- |
 | [behavior/lifecycle.md](behavior/lifecycle.md) | Create, replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Objective, and the `goal.enabled` admission control |
+| [behavior/attachments.md](behavior/attachments.md) | `--file`/`--image` Objective attachments: limits, the immutable artifact store, the trust boundary, restore verification, and V1 retention |
 | [behavior/budgets.md](behavior/budgets.md) | `--budget` and `--no-budget`, settings defaults and hard maximum, cumulative budget raises, budget exhaustion and the bounded wrap-up |
 | [behavior/continuation.md](behavior/continuation.md) | The `agent_before_settle` seam, one provider request per settlement, the evidence audit, and the no-progress contract |
 | [behavior/stopping.md](behavior/stopping.md) | The Blocker identity contract, blocked-audit thresholds, anti-loop bounds, and the usage-limit classification tiers |
@@ -37,6 +38,8 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | --- | --- |
 | [tools.md](tools.md) | `get_goal`, `create_goal` and its creation authority, the objective's trust boundary, `update_goal` and its execution binding, structured tool responses |
 | [limitations.md](limitations.md) | What the extension does not understand, cannot preempt, or intentionally leaves to the user |
+| [codex-migration.md](codex-migration.md) | Per-capability Codex comparison and Pi-feasible follow-ups |
+| [subagent-usage.md](subagent-usage.md) | Proposed plugin-neutral usage provider contract, with Rex as one interchangeable provider |
 
 ## Testing and verification
 

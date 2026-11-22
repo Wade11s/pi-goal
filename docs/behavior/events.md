@@ -4,7 +4,7 @@ The local event contract for other Pi extensions: what pi-goal announces on the
 shared extension event bus, when, and what deliberately stays off the stream.
 
 [← README](../README.md) · Map: [docs/README.md](../README.md) · See also
-[metrics](metrics.md)
+[metrics](metrics.md) · Attachments: [behavior/attachments.md](attachments.md)
 
 ## Why a local event stream
 
@@ -41,6 +41,7 @@ One JSON object per event, versioned as a whole:
 | `goal.status` | The Lifecycle status as committed. A clear reports the status the Goal had when cleared. |
 | `goal.objective` | Metadata only: `{ length, origin }`. The verbatim objective stays in the durable snapshot and the delimited data block; the event is machine-consumed by any loaded extension, which makes it the same surface as a log line. |
 | `goal.tokenBudget` | The cumulative token ceiling, or `null` when unbounded. |
+| `goal.attachments` | The immutable attachment manifest's metadata — one `{ hash, mediaType, bytes, label }` entry per attachment, in manifest order, `[]` for a Goal without attachments. Never contents: attachment text and image bytes stay in the artifact store and the delimited data blocks, for the same privacy reason `goal.objective` is metadata only. |
 | `goal.usage` | The committed usage summary — the same projection `get_goal` reports: `totalTokens` (input + output + cache writes), the components, cached reads excluded as reuse, nested work counted once, and `activeSeconds`. |
 | `timestamp` | ISO timestamp of the committed transition — the snapshot's own `updatedAt` (the clear time for a tombstone, which carries no record). |
 
@@ -108,6 +109,9 @@ The stream describes lifecycle state, not accounting churn:
   freezes of a replaced identity's tail, the one-time legacy cutover, and the
   creation/replacement retractions (`rollback`/`restore`) are bookkeeping or
   history, not lifecycle transitions;
+- attachment text and image bytes never emit. `goal.attachments` is the
+  immutable metadata manifest only; contents stay in the artifact store and the
+  untrusted Goal work messages (see [attachments](attachments.md));
 - the opt-in session name (`goal.sessionNameFromObjective`) never emits. It is
   Pi's own session metadata rather than Goal state — see
   [lifecycle](lifecycle.md#naming-the-session-from-the-objective) — so a listener
