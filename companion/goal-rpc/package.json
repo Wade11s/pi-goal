@@ -1,0 +1,32 @@
+{
+	"name": "pi-goal-rpc-companion",
+	"version": "0.1.0",
+	"description": "Optional Codex-shaped Goal get/set/clear adapter for pi-goal, mapped onto pi-goal's user command surface through its in-process command bridge",
+	"type": "module",
+	"license": "MIT",
+	"private": true,
+	"author": "Wade11s",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Wade11s/pi-goal.git",
+		"directory": "companion/goal-rpc"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"goal",
+		"rpc",
+		"companion"
+	],
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

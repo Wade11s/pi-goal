@@ -44,6 +44,7 @@ import {
 	isGoalCutover,
 	ownershipMarker,
 	type GoalCutover,
+	type GoalAttachment,
 	type GoalRecord,
 	type GoalSnapshot,
 	type GoalOrigin,
@@ -65,6 +66,15 @@ import {
 	type UsageSource,
 	zeroGoalUsage,
 } from "./accounting.ts";
+import {
+	ATTACHMENT_MEDIA_TYPES,
+	MAX_ATTACHMENTS,
+	MAX_IMAGE_ATTACHMENT_BYTES,
+	MAX_TEXT_ATTACHMENT_BYTES,
+	MAX_TOTAL_ATTACHMENT_BYTES,
+} from "./attachments.ts";
+import type { GoalTransitionKind } from "./events.ts";
+import { readGoalHistory, type GoalHistoryView } from "./history.ts";
 
 const GOAL_STATUS_SET = new Set<string>(GOAL_STATUSES);
 
@@ -84,6 +94,21 @@ function goalId(): string {
  */
 function blockerId(): string {
 	return `blocker_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+}
+
+/**
+ * An in-memory lifecycle transition that is not durable yet, together with the
+ * record it was made *from*.
+ *
+ * `from` is what a derived observer such as the audit history needs in order to
+ * record the transition's previous Lifecycle status: the record the transition
+ * replaced is already overwritten in memory by the time the flush writes the
+ * snapshot, so the predecessor has to travel with the pending transition instead
+ * of being re-read afterwards.
+ */
+interface PendingTransition {
+	record: GoalRecord;
+	from: GoalRecord;
 }
 
 /** Payload persisted in `goal-usage` custom session entries. */
@@ -240,9 +265,32 @@ export interface CreateGoalOptions {
 	tokenBudget?: number;
 }
 
+/**
+ * The store's observer for committed Goal-updated events (issue #48).
+ *
+ * The store owns the durable commit points, so it is the only place that knows
+ * a transition has *become* durable — the moment an event may be announced. The
+ * callback receives the transition kind and the committed record (usage already
+ * folded exactly as the snapshot carries it), plus the commit's own time for a
+ * clear, which has no record to carry one. It is invoked after the append
+ * succeeded and never for a refused, failed, or rolled-back transition, and a
+ * throw from the callback can never affect the committed state underneath.
+ */
+export interface GoalStoreEvents {
+	onDurableTransition(
+		kind: GoalTransitionKind,
+		goal: GoalRecord,
+		committedAt: number,
+		previous: GoalRecord | null,
+	): void;
+}
+
 export class GoalStore {
 	/** undefined = not reconstructed yet; null = no Goal (or tombstone); record = present. */
 	private current: GoalRecord | null | undefined = undefined;
+
+	/** Optional observer invoked after a meaningful durable transition committed. */
+	private readonly events: GoalStoreEvents | undefined;
 
 	/** Token ledger with stable deduplication. */
 	private readonly ledger = new UsageLedger();
@@ -265,7 +313,7 @@ export class GoalStore {
 	 * visible, and each of those writes supersedes a transition still waiting here:
 	 * the newer snapshot carries the current status, revision, and totals.
 	 */
-	private pendingTransition: GoalRecord | undefined;
+	private pendingTransition: PendingTransition | undefined;
 
 	/**
 	 * The Goal turn of the last counted blocker report, and the revision that report
@@ -320,6 +368,32 @@ export class GoalStore {
 	 * it; reconstruction itself stays silent and fails closed.
 	 */
 	private lastNotice: string | null = null;
+
+	constructor(events?: GoalStoreEvents) {
+		this.events = events;
+	}
+
+	/**
+	 * Announce one committed transition to the event observer, if any.
+	 *
+	 * Called only after the durable append succeeded, so a refused, failed, or
+	 * rolled-back transition never reaches it. The try/catch is the listener's
+	 * side of the contract: an observer that throws cannot change, undo, or be
+	 * mistaken for a durability problem in the transition that already committed.
+	 */
+	private emitTransition(
+		kind: GoalTransitionKind,
+		goal: GoalRecord,
+		previous: GoalRecord | null,
+		committedAt: number = goal.updatedAt,
+	): void {
+		if (!this.events) return;
+		try {
+			this.events.onDurableTransition(kind, goal, committedAt, previous);
+		} catch {
+			// The transition is already durable; the event surface is best effort.
+		}
+	}
 
 	/**
 	 * Rebuild state from the active branch. Called on session_start (startup,
@@ -492,6 +566,31 @@ export class GoalStore {
 		}
 		if (this.current?.status === "active") this.clock.start();
 		return this.current;
+	}
+
+	/**
+	 * Read the branch's Goal history records, in append (commit) order.
+	 *
+	 * Deliberately *not* part of {@link reconstruct}: the timeline is derived
+	 * diagnostic data, so nothing in the reconstruction path may depend on it — a
+	 * missing, truncated, or malformed record changes what a reader sees and nothing
+	 * else. Reading it here rather than at the call site keeps "history is
+	 * branch-local" a property of the same branch scan reconstruction uses, so a
+	 * fork or a tree navigation shows the timeline that belongs to the selected
+	 * branch and never one from a branch the session left behind.
+	 *
+	 * Never throws: an unreadable branch yields a view flagged `unreadable` (empty
+	 * records, but distinguishable from a branch that was read and found empty), so the
+	 * renderer can say the history could not be read rather than claiming the branch
+	 * holds none.
+	 */
+	readHistory(ctx: ExtensionContext): GoalHistoryView {
+		try {
+			return readGoalHistory(ctx.sessionManager.getBranch());
+		} catch (error) {
+			console.error("[pi-goal] failed to read Goal history:", error);
+			return { records: [], malformed: 0, unreadable: true };
+		}
 	}
 
 	/**
@@ -1155,8 +1254,30 @@ export class GoalStore {
 		return frozen;
 	}
 
-	/** Make a staged Goal visible to /goal and get_goal. */
+	/**
+	 * Make a staged Goal visible to /goal and get_goal.
+	 *
+	 * This is also where a creation or Replacement Goal is announced on the event
+	 * stream: the staged snapshot's append already succeeded (it throws through on
+	 * failure), so the transition is committed at the same bar every other event
+	 * uses. The command's separate on-disk durability poll stays what it is — a
+	 * belt-and-braces gate for the *user-facing* announcement, which a fresh
+	 * session's not-yet-created file needs — because waiting for it would announce
+	 * the creation after the kickoff run's own transitions (the run can complete or
+	 * stop the Goal before the file appears), inverting the stream's order.
+	 */
 	commit(goal: GoalRecord): void {
+		// A commit that takes the slot from a different live identity is a
+		// Replacement Goal; anything else (no Goal, a cleared tombstone, or a same-id
+		// re-commit) is a creation. The replaced identity keeps its own durable
+		// superseded record, so the event names the replacement.
+		const replacing = this.current != null && this.current.id !== goal.id;
+		// The record this transition was made from: `null` for a creation into a free
+		// slot, and the replaced identity's record for a Replacement Goal. Captured
+		// before the adopt below, because the transition's *previous* Lifecycle status
+		// is what the derived audit history records and the adopted record no longer
+		// carries it.
+		const previous = this.current ?? null;
 		this.current = this.adopt(goal);
 		// A newly created Goal starts its accounting from zero, even when the
 		// session already burned tokens before it existed, and no transition of a
@@ -1180,6 +1301,7 @@ export class GoalStore {
 		}
 		this.legacyPending = false;
 		if (goal.status === "active") this.clock.start();
+		this.emitTransition(replacing ? "replaced" : "created", goal, previous);
 	}
 
 	/**
@@ -1689,7 +1811,7 @@ export class GoalStore {
 		}
 		// Completion is terminal for accounting: the clock stops at the transition and
 		// the snapshot carries the folded value.
-		return this.stopAndPersist(
+		const result = this.stopAndPersist(
 			pi,
 			current,
 			true,
@@ -1704,6 +1826,8 @@ export class GoalStore {
 			}),
 			(record) => this.commitSnapshot(pi, record),
 		);
+		if (result.ok) this.emitTransition("completed", result.goal, current);
+		return result;
 	}
 
 	/**
@@ -1733,7 +1857,7 @@ export class GoalStore {
 				message: `only an active Goal can be paused (current status: ${current.status})`,
 			};
 		}
-		return this.stopAndPersist(
+		const result = this.stopAndPersist(
 			pi,
 			current,
 			true,
@@ -1745,6 +1869,8 @@ export class GoalStore {
 			}),
 			(record) => this.commitSnapshot(pi, record),
 		);
+		if (result.ok) this.emitTransition("paused", result.goal, current);
+		return result;
 	}
 
 	/**
@@ -1813,6 +1939,10 @@ export class GoalStore {
 			});
 			if (!result.ok) return result;
 			this.clock.start();
+			// The one resume path that changes the cumulative ceiling is its own
+			// transition kind, so a listener can tell an explicit Token budget
+			// recovery from an ordinary restart of a stopped Goal.
+			this.emitTransition("budget-recovered", result.goal, current);
 			return result;
 		}
 		if (raising) {
@@ -1844,6 +1974,7 @@ export class GoalStore {
 		});
 		if (!result.ok) return result;
 		this.clock.start();
+		this.emitTransition("resumed", result.goal, current);
 		return result;
 	}
 
@@ -1865,12 +1996,14 @@ export class GoalStore {
 				message: "a complete Goal is finished and cannot be edited; use /goal <objective> to set a new one",
 			};
 		}
-		return this.commitSnapshot(pi, {
+		const result = this.commitSnapshot(pi, {
 			...current,
 			objective,
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
 		});
+		if (result.ok) this.emitTransition("objective-edited", result.goal, current);
+		return result;
 	}
 
 	/**
@@ -1883,7 +2016,23 @@ export class GoalStore {
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
-		return this.commitTombstone(pi);
+		// The clear event reports the same usage projection `get_goal` publishes, so it
+		// has to be read here: `commitTombstone` writes a tombstone that carries no
+		// record at all, and then discards the ledger and resets the clock. Reading the
+		// live view first is what folds in the active-time tail that has accrued since
+		// the last snapshot or checkpoint — empty for a Goal that already stopped its
+		// clock, and the only thing that would otherwise be lost when clearing from
+		// `active`. Nothing is charged or stopped here, so accounting is unchanged.
+		const usage = this.getUsage();
+		const cleared = this.commitTombstone(pi);
+		if (cleared.ok) {
+			// The tombstone has no record of its own, so the event identifies the
+			// cleared Goal by the record it removed: its identity, its last revision,
+			// the status it had, and the usage it had at the clear. No new current Goal
+			// is invented by a clear.
+			this.emitTransition("cleared", { ...current, usage }, current, Date.now());
+		}
+		return cleared;
 	}
 
 	/**
@@ -1919,7 +2068,10 @@ export class GoalStore {
 			wrapUpPending: true,
 		};
 		this.current = this.adopt(updated);
-		this.pendingTransition = updated;
+		// The transition keeps the record it was made from, so the flush that makes it
+		// durable can tell a derived observer what the Goal's previous Lifecycle status
+		// was: the record the stop replaced is already overwritten in memory.
+		this.pendingTransition = { record: updated, from: current };
 		this.clock.persisted(activeMs);
 		return { ok: true, goal: updated };
 	}
@@ -1986,17 +2138,26 @@ export class GoalStore {
 	 * Write a pending lifecycle transition if one is waiting, and report whether one
 	 * was: a transition supersedes a checkpoint, so a caller that wrote one is done.
 	 *
-	 * Also used on its own when a session is being *replaced* rather than exited (see
-	 * the `session_shutdown` handler). The transition is state that belongs to the
-	 * outgoing branch, so losing it would leave a Goal durably `active` with its
-	 * budget already exhausted; a bare accounting checkpoint, by contrast, is only an
+	 * The only caller is {@link flushAccounting}, which is how every post-persistence
+	 * boundary (`turn_end`, settlement, the wrap-up seam) reaches it — and how the
+	 * `session_shutdown` handler, the last boundary a session being *replaced* rather
+	 * than exited still gets, does. The transition is state that belongs to the
+	 * outgoing branch, so losing it would leave a Goal durably `active` with its budget
+	 * already exhausted; a bare accounting checkpoint, by contrast, is only an
 	 * optimization and would land in a session the user has navigated away from.
+	 *
+	 * This flush is the budget stop's *durable* moment — the in-memory transition
+	 * only armed it — so it is also where the stop is announced on the event stream.
+	 * The usage is re-read at the flush (see `transitionToPersist`), which is what
+	 * the event's summary reports.
 	 */
 	flushPendingTransition(pi: ExtensionAPI): boolean {
 		const pending = this.pendingTransition;
 		if (!pending) return false;
-		this.persistSnapshot(pi, this.transitionToPersist(pending));
+		const record = this.transitionToPersist(pending.record);
+		this.persistSnapshot(pi, record);
 		this.pendingTransition = undefined;
+		this.emitTransition("budget-limited", record, pending.from);
 		return true;
 	}
 
@@ -2238,6 +2399,10 @@ export class GoalStore {
 			this.lastBlockerRevision = undefined;
 			return { ok: false, reason: "persistence", error: result.error };
 		}
+		// Only the threshold is a lifecycle transition. A below-threshold report is
+		// durable audit bookkeeping — the Goal keeps working and its status never
+		// changes — so it stays off the event stream.
+		if (thresholdMet) this.emitTransition("blocked", result.goal, current);
 		return { ok: true, goal: result.goal, turns, thresholdMet, repeat: false };
 	}
 
@@ -2278,6 +2443,7 @@ export class GoalStore {
 		// The stop ends the audit chain: whatever reports next starts a fresh one at one.
 		this.lastBlockerTurn = undefined;
 		this.lastBlockerRevision = undefined;
+		this.emitTransition(stop.status === "usage_limited" ? "usage-limited" : "blocked", result.goal, current);
 		return { ok: true, goal: result.goal };
 	}
 
@@ -2444,6 +2610,14 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 	}
 	if (record.tokenBudget !== undefined && typeof record.tokenBudget !== "number") return false;
 	if (record.wrapUpPending !== undefined && typeof record.wrapUpPending !== "boolean") return false;
+	// A malformed attachment manifest is not trusted either. Attachments are
+	// required context — the model works from them on every kickoff and
+	// Continuation — so a manifest that cannot be verified (a bad hash, an
+	// unsupported media type, a size above the enforced limit) must fail closed
+	// like any other unrecognized snapshot rather than being silently dropped:
+	// reconstructing the Goal without its attachments would be exactly the silent
+	// drop the missing/corrupt-artifact contract forbids.
+	if (record.attachments !== undefined && !isGoalAttachmentManifest(record.attachments)) return false;
 	return (
 		typeof record.id === "string" &&
 		record.id !== "" &&
@@ -2459,6 +2633,44 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 		Number.isInteger(record.revision) &&
 		record.revision >= 0
 	);
+}
+
+const ATTACHMENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+/** Structural validity of one manifest entry. */
+function isGoalAttachmentEntry(value: unknown): value is GoalAttachment {
+	if (typeof value !== "object" || value === null) return false;
+	const entry = value as Record<string, unknown>;
+	return (
+		typeof entry.hash === "string" &&
+		ATTACHMENT_HASH_PATTERN.test(entry.hash) &&
+		typeof entry.mediaType === "string" &&
+		ATTACHMENT_MEDIA_TYPES.has(entry.mediaType) &&
+		typeof entry.bytes === "number" &&
+		Number.isInteger(entry.bytes) &&
+		entry.bytes > 0 &&
+		typeof entry.label === "string" &&
+		entry.label.length > 0 &&
+		entry.label.length <= 255
+	);
+}
+
+/**
+ * Structural validity of an attachment manifest: at most the enforced count of
+ * entries, every entry well-formed, and every enforced size bound respected.
+ * Duplicate hashes are allowed — content-addressed artifacts are shared, not
+ * copied, and two manifest entries naming the same content are the same bytes.
+ */
+function isGoalAttachmentManifest(value: unknown): value is NonNullable<GoalRecord["attachments"]> {
+	if (!Array.isArray(value) || value.length > MAX_ATTACHMENTS) return false;
+	if (!value.every((entry) => isGoalAttachmentEntry(entry))) return false;
+	let total = 0;
+	for (const entry of value) {
+		total += entry.bytes;
+		if (entry.mediaType === "text/plain" && entry.bytes > MAX_TEXT_ATTACHMENT_BYTES) return false;
+		if (entry.mediaType !== "text/plain" && entry.bytes > MAX_IMAGE_ATTACHMENT_BYTES) return false;
+	}
+	return total <= MAX_TOTAL_ATTACHMENT_BYTES;
 }
 
 /**

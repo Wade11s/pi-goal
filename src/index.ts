@@ -44,6 +44,35 @@
  * itself by completing the Goal, or by reporting the same genuine blocker for
  * three consecutive Goal turns. User actions reset every anti-loop counter.
  *
+ * `goal.enabled` (Pi settings, default true) is an admission control rather than
+ * a lifecycle state: while it is false the extension admits no *new* Goal work —
+ * no creation or replacement, no `create_goal`, no work-admitting objective edit,
+ * no resume, and no automatic continuation or budget wrap-up at the settlement
+ * seam — while inspection, pause, clear, and terminal updates from work already
+ * in flight keep working. It never rewrites a Lifecycle status and never stops
+ * Active elapsed time, so an active-but-disabled Goal is surfaced as exactly
+ * that instead of being mistaken for a continuing one.
+ *
+ * `goal.sessionNameFromObjective` (Pi settings, default false) is a separate opt-in
+ * convenience: after a successful *fresh* creation it may name an otherwise unnamed
+ * session from the Objective's first line. A session name is host metadata Pi already
+ * owns, not Goal state, so it never participates in the Lifecycle, in accounting, or in
+ * the event stream, and it never overwrites a name the user provided.
+ *
+ * `goal.planTool` (Pi settings, default false) is a third opt-in, and the only one that
+ * changes what is *registered*: while it is true the extension registers an
+ * `update_plan` model tool for a Goal's ordered progress steps. Its record is the tool
+ * result's persisted `details` — Pi's ordinary session-branch tool result — so it is
+ * durable without a second Goal record, and it never mutates a Lifecycle status or
+ * satisfies the Completion audit (see `./plan.ts`).
+ * Every committed transition is also appended to the session branch as a
+ * `goal-history` entry and rendered read-only by `/goal history` (see `history.ts`
+ * and `docs/behavior/history.md`). That timeline is derived diagnostic data, not
+ * a second lifecycle source of truth: it is written from the same
+ * committed-transition seam as the local event stream and projected from that
+ * stream's payload, nothing reconstructs from it, and no command or tool mutates
+ * a Goal from a record.
+ *
  * Usage is accounted durably from finalized Pi messages and reported nested
  * usage, with stable deduplication (see `accounting.ts`). A Goal with a token
  * budget transitions to `budget_limited` when its accounted usage reaches the
@@ -62,6 +91,7 @@ import {
 	BLOCKED_AUDIT_THRESHOLD,
 	CUSTOM_MESSAGE_TYPE,
 	CUSTOM_WRAPUP_MESSAGE_TYPE,
+	buildCompletionReport,
 	corroborateGoalCreationRequest,
 	corroboratePauseRequest,
 	formatBudgetWrapUpMessage,
@@ -87,13 +117,68 @@ import {
 	type GoalStatus,
 	previewObjective,
 	toPublicState,
+	updateGoalOutputSchema,
 } from "./goal.ts";
 import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
+import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
+import { GOAL_METRICS_CHANNEL, createGoalMetricsPublisher } from "./metrics.ts";
+import { formatGoalHistory, HISTORY_ENTRY_TYPE, toGoalHistoryRecord } from "./history.ts";
+import {
+	GOAL_COMMAND_BRIDGE,
+	GOAL_COMMAND_BRIDGE_VERSION,
+	classifyGoalBridgeOutcome,
+	committedKindsFor,
+	commandContextForBridge,
+	goalBridgeRefusal,
+	parseGoalCommandBridgeRequest,
+	recordingCommandContext,
+	type GoalBridgeAction,
+	type GoalBridgeDiagnostic,
+	type GoalBridgeTransition,
+	type GoalCommandBridgeRequest,
+	type GoalCommandBridgeResult,
+} from "./command-bridge.ts";
+import {
+	attachmentStoreRoot,
+	discardUncommittedArtifacts,
+	loadAttachments,
+	materializeAttachmentRequests,
+	validateAttachmentPath,
+	verifyAttachments,
+	type AttachmentRequest,
+} from "./attachments.ts";
+import { validateRemoteImageUrl, type RemoteImageFetchOptions } from "./remote-image.ts";
+import type { AttachmentContent, GoalMessageContent } from "./goal.ts";
+import {
+	applySessionNameFromObjective,
+	parseSessionNamingSettings,
+	sessionNameSurface,
+	type SessionNamingSettings,
+} from "./session-naming.ts";
+import {
+	PLAN_TOOL_NAME,
+	PLAN_TOOL_PROMPT_GUIDELINES,
+	PLAN_TOOL_PROMPT_SNIPPET,
+	formatPlanDisabledMessage,
+	formatPlanMessage,
+	formatPlanNoGoalMessage,
+	parsePlanToolSettings,
+	planOutputSchema,
+	planParametersSchema,
+	validatePlanArgument,
+	type PlanRecord,
+	type PlanToolArguments,
+	type PlanToolSettings,
+} from "./plan.ts";
 import {
 	ACCOUNTING_CHECKPOINT_MS,
 	MIN_TOKEN_BUDGET,
+	type AdmissionSettings,
 	type BudgetSettings,
+	type ResumePromptSettings,
+	parseAdmissionSettings,
 	parseBudgetSettings,
+	parseResumePromptSettings,
 	resolveGoalTokenBudget,
 } from "./accounting.ts";
 import {
@@ -119,13 +204,48 @@ const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
 const EDIT_TIMEOUT_MS = 120_000;
 
 /**
- * Parsed `/goal` arguments: the objective plus an optional budget request.
+ * Auto-decline the opt-in paused-Goal resume prompt after this long.
  *
- * Budget flags are only recognized as a *leading* prefix (`/goal --budget 5000
- * <objective>`), so an objective that merely contains the word `--budget` is never
- * silently truncated. `--no-budget` creates an unbounded Goal even when an
- * extension default is configured, which is why it is a distinct request kind
- * rather than "no request".
+ * The dialog's default answer is "No", so a user who is away, a host that never
+ * answers, and an RPC client that ignores the request all leave the paused Goal
+ * exactly as it was. The prompt is a convenience over the explicit, durable
+ * `/goal resume` transition, so letting it lapse is always safe.
+ */
+const RESUME_PROMPT_TIMEOUT_MS = 120_000;
+
+/**
+ * Bound one extension dialog, with an override for deterministic tests.
+ *
+ * Every interactive dialog pi-goal shows has a safe default answer, so it is
+ * always created with a `timeout` and Pi resolves the default when nobody
+ * answers. `PI_GOAL_DIALOG_TIMEOUT_MS` shortens those bounds so the timeout
+ * branches can be exercised through the real-Pi RPC harness without waiting the
+ * production interval out; an unset or invalid value leaves the defaults
+ * untouched.
+ */
+function dialogTimeoutMs(defaultMs: number): number {
+	const raw = process.env.PI_GOAL_DIALOG_TIMEOUT_MS;
+	if (raw === undefined || raw.trim() === "") return defaultMs;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value > 0 ? value : defaultMs;
+}
+
+/**
+ * Parsed `/goal` arguments: the objective, an optional budget request, and the
+ * explicit local attachment requests (issue #49).
+ *
+ * Budget and attachment flags are only recognized as a *leading* prefix
+ * (`/goal --budget 5000 --file spec.md <objective>`), so an objective that
+ * merely contains the word `--file` is never silently truncated. `--no-budget`
+ * creates an unbounded Goal even when an extension default is configured, which
+ * is why it is a distinct request kind rather than "no request".
+ *
+ * `--file <path>`, `--image <path>`, and `--remote-image <url>` are repeatable
+ * leading options for local text files, local images, and explicit remote image
+ * URLs. Plain arguments remain text: an objective that never starts with a flag
+ * is exactly what it always was, and composer drafts are never inferred from it.
+ * Remote URLs are accepted only here, through the direct user command; the
+ * `create_goal` model tool stays text-only.
  */
 export type GoalBudgetRequest =
 	/** No flag given: use the extension default. */
@@ -134,6 +254,16 @@ export type GoalBudgetRequest =
 	| { kind: "none" }
 	/** `--budget <n>`: an explicit budget. */
 	| { kind: "value"; value: number };
+
+/** Parse problems that must refuse the command rather than guess an objective. */
+export interface ParsedGoalArgs {
+	objective: string;
+	budget: GoalBudgetRequest;
+	/** Explicit local attachment requests, in the order the user named them. */
+	attachments: AttachmentRequest[];
+	/** Flag errors that must refuse creation before materialization. */
+	problems: string[];
+}
 
 /**
  * Parsed `/goal resume` request.
@@ -199,17 +329,54 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 	return { kind: "value", value };
 }
 
-function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequest } {
+function parseGoalArgs(raw: string): ParsedGoalArgs {
 	let rest = raw.trim();
 	let budget: GoalBudgetRequest = { kind: "default" };
+	const attachments: AttachmentRequest[] = [];
+	const problems: string[] = [];
 	for (;;) {
-		const match = /^--(budget|no-budget)(?:=(\S+))?(?:\s+|$)/.exec(rest);
+		const match = /^--(budget|no-budget|file|image|remote-image)(?:=(\S+))?(?:\s+|$)/.exec(rest);
 		if (!match) break;
 		const flag = match[1]!;
 		const inline = match[2];
 		rest = rest.slice(match[0].length);
 		if (flag === "no-budget") {
 			budget = { kind: "none" };
+			continue;
+		}
+		if (flag === "file" || flag === "image" || flag === "remote-image") {
+			let value: string;
+			if (inline !== undefined) {
+				value = inline;
+			} else {
+				const next = /^(\S+)(?:\s+|$)/.exec(rest);
+				if (!next) {
+					problems.push(
+						flag === "remote-image"
+							? "Goal not created: --remote-image needs an HTTPS image URL (for example --remote-image https://example.com/screenshot.png)."
+							: `Goal not created: --${flag} needs a local file path (for example --${flag} ${flag === "image" ? "screenshot.png" : "notes.md"}).`,
+					);
+					break;
+				}
+				value = next[1]!;
+				rest = rest.slice(next[0].length);
+			}
+			if (flag === "remote-image") {
+				const validated = validateRemoteImageUrl(value);
+				if (!validated.ok) {
+					problems.push(validated.error);
+					break;
+				}
+				attachments.push({ kind: "remote-image", url: validated.url.href });
+				continue;
+			}
+			const kind = flag === "image" ? "image" : "text";
+			const validated = validateAttachmentPath(kind, value);
+			if (!validated.ok) {
+				problems.push(validated.error);
+				break;
+			}
+			attachments.push({ kind, path: validated.path });
 			continue;
 		}
 		if (inline !== undefined) {
@@ -221,7 +388,7 @@ function parseGoalArgs(raw: string): { objective: string; budget: GoalBudgetRequ
 		rest = rest.slice(value[0].length);
 		budget = { kind: "value", value: Number(value[1]) };
 	}
-	return { objective: rest.trim(), budget };
+	return { objective: rest.trim(), budget, attachments, problems };
 }
 
 /** How long creation waits for the snapshot to become durable on disk. */
@@ -277,6 +444,7 @@ function describeError(error: unknown): string {
 /** What the /goal command was asked to do. */
 type GoalCommand =
 	| { kind: "status" }
+	| { kind: "history" }
 	| { kind: "create"; objective: string }
 	| { kind: "edit"; objective: string }
 	| { kind: "edit-dialog" }
@@ -293,6 +461,18 @@ type GoalCommand =
  * lint errors") stays a valid objective. `edit` is a subcommand whenever it is
  * the first word, because its remainder is the new objective; bare `/goal edit`
  * is a usage error rather than an objective literally named "edit".
+ *
+ * `edit` cannot change attachments: an Objective edit keeps the immutable
+ * attachment manifest, and changing attachments requires a Replacement Goal,
+ * so an edit whose objective starts with `--file`/`--image`/`--remote-image` is
+ * refused with that guidance instead of silently becoming part of the objective.
+ *
+ * `history` joins `pause` and `clear` as a whole-argument subcommand, for the same
+ * reason and with the same trade-off: `/goal history` renders the branch-local
+ * timeline, while an objective that merely *starts* with the word ("history of
+ * the release") stays an objective. The rendering is read-only — it can never
+ * change Goal state — which is what makes it safe to reach from the same command
+ * surface that creates Goals.
  */
 function parseGoalCommand(args: string): GoalCommand {
 	const trimmed = args.trim();
@@ -301,7 +481,7 @@ function parseGoalCommand(args: string): GoalCommand {
 	const first = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
 	const remainder = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex).trim();
 	const word = first.toLowerCase();
-	if (remainder === "" && (word === "pause" || word === "clear")) {
+	if (remainder === "" && (word === "pause" || word === "clear" || word === "history")) {
 		return { kind: word };
 	}
 	if (word === "resume") {
@@ -321,14 +501,132 @@ function parseGoalCommand(args: string): GoalCommand {
 			// and for hosts without a dialog-capable UI.
 			return { kind: "edit-dialog" };
 		}
+		if (/^--(file|image|remote-image)(?:=|\s|$)/.test(remainder)) {
+			return {
+				kind: "invalid",
+				message:
+					"Goal not edited: /goal edit changes only the objective and keeps the Goal's immutable attachment " +
+					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
+					"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).",
+			};
+		}
 		return { kind: "edit", objective: remainder };
 	}
 	return { kind: "create", objective: trimmed };
 }
 
 export default function goalExtension(pi: ExtensionAPI): void {
-	const store = new GoalStore();
+	/**
+	 * The optional local metrics consumer seam: the same committed event, projected
+	 * to a privacy-safe record and published on its own channel for an operator or
+	 * an explicitly installed companion exporter. The sink is a local bus emit, so
+	 * the default does no network I/O; the publisher isolates a sink failure so it
+	 * can never touch the committed transition (see docs/behavior/metrics.md).
+	 */
+	const metrics = createGoalMetricsPublisher({
+		sink: (projected) => {
+			pi.events.emit(GOAL_METRICS_CHANNEL, projected);
+		},
+	});
+
+	/**
+	 * Committed transitions observed while a bridged `/goal` command runs.
+	 *
+	 * Scoped by `bridgeInFlight`: a command that is not bridged never records
+	 * anything, and the sink is cleared before the reply is built so a later
+	 * transition cannot be attributed to a request that already finished.
+	 */
+	let bridgeTransitions: GoalBridgeTransition[] | null = null;
+
+	/**
+	 * One bridged command at a time.
+	 *
+	 * Serializing is what keeps attribution exact: the sink holds the transitions of
+	 * *the* command in flight, and a confirmation dialog can keep a command busy for
+	 * minutes. A second request is refused rather than queued, so a caller always
+	 * learns immediately that its request did not run.
+	 */
+	let bridgeInFlight = false;
+
+	/**
+	 * The most recent session context, captured at `session_start` (and refreshed on
+	 * input and tree navigation).
+	 *
+	 * Pi hands a context to event handlers but not to a bus listener, and a bridged
+	 * command needs one to read the session file, show dialogs, and wait for idle.
+	 * Pi's contexts are lazy handles onto the live runner, so the captured one stays
+	 * valid for the session it was captured in.
+	 */
+	let sessionContext: ExtensionContext | null = null;
+
+	const store = new GoalStore({
+		// The store owns every durable commit point, so it is what announces each
+		// committed transition to the local event stream — including creation and
+		// replacement, whose commit is the durable bar the event uses. The /goal
+		// command's separate on-disk durability poll stays a gate for the
+		// *user-facing* announcement only (see `emitGoalUpdated` and
+		// docs/behavior/events.md). Both derived surfaces ride the same committed
+		// event: the metrics projection is derived from it, never from the live
+		// record, and the audit history record is projected from it too, so neither
+		// can disagree with the stream or with the transition underneath.
+		onDurableTransition: (kind, goal, committedAt, previous) => {
+			const event = toGoalUpdatedEvent(kind, goal, committedAt);
+			// A bridged command records the durable transitions it caused, so its
+			// caller is answered from the commit rather than from a message (see
+			// `./command-bridge.ts`). Recording happens before the announcement and
+			// only here, so nothing that failed to commit can appear in the result.
+			if (bridgeTransitions !== null) bridgeTransitions.push({ kind, goal: toPublicState(goal) });
+			emitGoalUpdated(event);
+			metrics.publish(event);
+			appendGoalHistory(pi, event, previous);
+		},
+	});
 	const safety = new GoalSafetyMonitor();
+
+	/**
+	 * Publish one committed Goal-updated event on Pi's shared extension event bus.
+	 *
+	 * Emitted only after the durable write it describes, exactly like the UI
+	 * announcement: the transition is already committed when this runs, so the
+	 * event surface is best effort by construction. The bus isolates listeners
+	 * (a handler failure is caught and logged by the bus itself, never
+	 * propagated to the emitter), and this catch is the mirror image for a
+	 * failure of the emit call: it must never surface as — or be mistaken for —
+	 * a durability failure of the transition underneath.
+	 */
+	function emitGoalUpdated(event: GoalUpdatedEvent): void {
+		try {
+			pi.events.emit(GOAL_UPDATED_EVENT, event);
+		} catch {
+			// The transition is already durable; the event surface is best effort.
+		}
+	}
+
+	/**
+	 * Append one audit-history record for a transition that is already durable.
+	 *
+	 * The single write seam for the timeline, and it sits *inside* the store's
+	 * committed-transition observer: the `goal-state` snapshot or tombstone has
+	 * already been appended when this runs, so a history record can only ever
+	 * describe committed state, and a refused, failed, or retracted transition
+	 * never reaches it. The record is projected from the event payload rather than
+	 * from the Goal record, which is what keeps the timeline and the public event
+	 * stream from disagreeing about a transition.
+	 *
+	 * Best effort in the same sense the event is: an unwritable session file must
+	 * not be reported as a failed lifecycle transition, and a history append that
+	 * never landed leaves the documented diagnostic gap (a transition with no
+	 * record) instead of a wrong Goal. Nothing reads these entries back except the
+	 * read-only `/goal history` rendering — reconstruction reads `goal-state` alone
+	 * — so the failure mode is a shorter timeline, never a changed Goal.
+	 */
+	function appendGoalHistory(pi: ExtensionAPI, event: GoalUpdatedEvent, previous: GoalRecord | null): void {
+		try {
+			pi.appendEntry(HISTORY_ENTRY_TYPE, toGoalHistoryRecord(event, previous?.status ?? null));
+		} catch {
+			// The transition is already durable; history is derived diagnostic data.
+		}
+	}
 
 	/**
 	 * What started the next run, set by whoever starts it: the kickoff the /goal
@@ -520,6 +818,342 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
+	 * Extension-level admission configuration (`goal.enabled`), read from Pi's
+	 * effective settings at every session start, exactly like the budget settings,
+	 * so a reload picks up a changed configuration.
+	 *
+	 * Admission is a host preference rather than Goal state: nothing about it is
+	 * persisted, and a disabled extension never rewrites a Lifecycle status, never
+	 * pauses a Goal, and never stops the Active elapsed time clock. It only refuses
+	 * to admit *new* Goal work — creation, replacement, a work-admitting objective
+	 * edit, resume, and the automatic continuation (or budget wrap-up) the
+	 * settlement seam would otherwise request.
+	 */
+	let admission: AdmissionSettings = { enabled: true, problems: [] };
+
+	/**
+	 * Extension-level session-naming configuration
+	 * (`goal.sessionNameFromObjective`), read from Pi's effective settings at every
+	 * session start, exactly like the admission and budget settings, so a reload
+	 * picks up a changed configuration.
+	 *
+	 * The default is `false`: naming a session is a convenience the user has to ask
+	 * for, and pi-goal otherwise leaves Pi's own session metadata alone.
+	 */
+	let sessionNaming: SessionNamingSettings = { nameFromObjective: false, problems: [] };
+
+	/**
+	 * Name the session from a freshly created Goal's Objective, when the user opted in.
+	 *
+	 * Called only from the two creation paths, and only after their durable commit
+	 * succeeded: a refused, failed, or rolled-back creation never reaches it, so a
+	 * failed Goal can never leave a name behind. The write itself is best effort — a
+	 * host failure is reported as a warning, never as a creation failure, because the
+	 * Goal is already durable and the name is metadata about the session.
+	 *
+	 * The Objective is the only source. Attachment contents have their own trust
+	 * boundary and are never folded into a name (see `./session-naming.ts`).
+	 */
+	function nameSessionFromObjective(ctx: ExtensionContext, objective: string): void {
+		const outcome = applySessionNameFromObjective(sessionNameSurface(pi), objective, sessionNaming.nameFromObjective);
+		if (outcome.kind === "failed") {
+			notify(
+				ctx,
+				`Session not named: pi-goal could not name the session from the Objective (${outcome.reason}). ` +
+					"The Goal itself is unchanged; rename the session yourself if you want a name.",
+				"warning",
+			);
+		}
+	}
+
+	/**
+	 * Extension-level convenience configuration (`goal.resumePrompt`), read from
+	 * Pi's effective settings at every session start like the other settings.
+	 *
+	 * Off by default. When on, a restored **paused** Goal may be offered one
+	 * confirmation dialog at session start; accepting runs the same durable user
+	 * resume as `/goal resume` (same identity, history, and a fresh Blocked audit),
+	 * while declining, dismissing, timing out, or having no UI leaves the Goal
+	 * exactly as it was.
+	 */
+	let resumePrompt: ResumePromptSettings = { enabled: false, problems: [] };
+
+	/**
+	 * Extension-level plan-tool configuration (`goal.planTool`), read from Pi's
+	 * effective settings at every session start like the other settings.
+	 *
+	 * Off by default: a structured progress plan is a convenience for long Goals,
+	 * and an opt-out default would put another tool in every model's loadout. See
+	 * `./plan.ts` for why the plan is a persisted tool result rather than Goal
+	 * state.
+	 */
+	let planTool: PlanToolSettings = { enabled: false, problems: [] };
+
+	/**
+	 * Whether the plan tool is registered *and* survived registration in this
+	 * session. Only this flag gates the Continuation wording, so the model is never
+	 * told to call a tool that is not in its loadout.
+	 *
+	 * Registration happens at `session_start` rather than at extension load because
+	 * Pi's effective settings are not readable before the runtime is bound, and
+	 * registering late is a supported seam. Once registered a tool cannot be
+	 * unregistered, so a setting changed mid-session leaves the registration in
+	 * place; the tool then refuses its calls rather than silently recording plans
+	 * the user switched off, and the next session start reconciles the two.
+	 */
+	let planToolRegistered = false;
+
+	/**
+	 * Register the opt-in progress-plan tool, and record whether it really landed.
+	 *
+	 * "Registration succeeded" is checked rather than assumed, for two reasons that
+	 * both come from Pi's tool registry being keyed by name across all extensions:
+	 *
+	 * - another extension may already own `update_plan`. Registering anyway would
+	 *   silently replace its tool, which is the one thing this feature must not do
+	 *   to a host that happens to use the same conventional name;
+	 * - a registration can fail, and a Continuation that named a tool the model
+	 *   cannot call would waste a Goal turn and teach it to ignore the extension.
+	 *
+	 * Both checks resolve to "not registered" on anything unexpected, which is the
+	 * fail-closed direction: the tool is a convenience, so the safe outcome of not
+	 * knowing is not to promise it.
+	 */
+	function registerPlanTool(ctx: ExtensionContext): void {
+		if (planToolNameTaken()) {
+			planToolRegistered = false;
+			notify(
+				ctx,
+					`pi-goal did not register ${PLAN_TOOL_NAME}: another extension already provides a tool with that name, and ` +
+						"pi-goal will not replace it. No Continuation will mention the plan tool. Rename that extension's tool to " +
+						"use pi-goal's own, or set goal.planTool to false to stop pi-goal from offering one.",
+					"warning",
+			);
+			return;
+		}
+		try {
+			pi.registerTool({
+				name: PLAN_TOOL_NAME,
+				label: "Update Plan",
+				description:
+					"Record the current Goal's ordered progress plan, replacing any previous one: an ordered list of " +
+					"steps, each pending, in_progress, or completed, with at most one in_progress. Use it for a Goal with " +
+					"several steps so verified progress and remaining work are visible across turns. It is progress " +
+					"narration only: it never changes the Goal's Lifecycle status and can never mark the Goal complete.",
+				parameters: planParametersSchema,
+				outputSchema: planOutputSchema,
+				promptSnippet: PLAN_TOOL_PROMPT_SNIPPET,
+				promptGuidelines: [...PLAN_TOOL_PROMPT_GUIDELINES],
+				/**
+				 * Compatibility shim for the one spelling a model reliably drifts into:
+				 * naming the list `steps` instead of `plan`. Everything else is passed
+				 * through untouched, so a semantically invalid plan is refused by the
+				 * tool with an explanation rather than being reshaped here.
+				 */
+				prepareArguments: (args: unknown): PlanToolArguments => {
+					if (typeof args !== "object" || args === null) return { plan: [] };
+					const record = args as Record<string, unknown>;
+					if (record.plan !== undefined || record.steps === undefined) return record as PlanToolArguments;
+					return { ...record, plan: record.steps } as PlanToolArguments;
+				},
+				async execute(
+					_toolCallId: string,
+					params: PlanToolArguments,
+					_signal,
+					_onUpdate,
+					toolCtx: ExtensionToolContext,
+				) {
+					// The setting is read at session start, and a tool cannot be
+					// unregistered, so a value changed mid-session is refused here rather
+					// than recorded against a user who switched the tool off.
+					if (!planTool.enabled) {
+						return planToolError(formatPlanDisabledMessage());
+					}
+					// The plan is progress on a Goal. With no Goal there is nothing for it
+					// to describe and no Continuation that would ever show it, so the call
+					// is refused instead of writing an orphan record.
+					const goal = store.get();
+					if (!goal) {
+						return planToolError(formatPlanNoGoalMessage());
+					}
+					const validation = validatePlanArgument(params?.plan);
+					if (!validation.ok) {
+						return planToolError(validation.error);
+					}
+					const plan: PlanRecord = validation.plan;
+					// Nothing here touches the store: no snapshot, no revision, no event.
+					// The plan's durability is this tool result's own `details`, which Pi
+					// persists onto the session branch like any other tool result, and its
+					// usage is charged by the ordinary accounting path like any other tool
+					// call — there is no plan-specific branch in either.
+					return {
+						content: [{ type: "text", text: formatPlanMessage(plan) }],
+						structuredContent: { plan },
+						details: { plan },
+					};
+				},
+			});
+		} catch (error) {
+			planToolRegistered = false;
+			notify(
+				ctx,
+					`pi-goal could not register the ${PLAN_TOOL_NAME} tool (${describeError(error)}). The Goal itself is ` +
+					"unaffected; no Continuation will mention the tool.",
+				"warning",
+			);
+			return;
+		}
+		planToolRegistered = planToolSurvivedRegistration();
+		if (!planToolRegistered) {
+			notify(
+				ctx,
+					`pi-goal registered ${PLAN_TOOL_NAME}, but another extension's tool of the same name took its place, so ` +
+						"pi-goal will not tell the model to call it. Rename that extension's tool, or set goal.planTool to false " +
+						"to stop pi-goal from registering its own.",
+				"warning",
+			);
+		}
+	}
+
+	/**
+	 * Whether some *other* extension already owns the plan tool's name.
+	 *
+	 * `get_goal` is the control: it is registered unconditionally at extension load
+	 * and is pi-goal's own, so its source identifies this extension. A tool of the
+	 * same name from a different source is somebody else's, and registering over it
+	 * would be exactly the shadowing this feature must not do. Anything unexpected —
+	 * a host without these seams, a missing entry, a throw — resolves to "taken",
+	 * because declining to register costs a convenience while clobbering another
+	 * extension costs that extension its tool.
+	 */
+	function planToolNameTaken(): boolean {
+		try {
+			const tools = pi.getAllTools();
+			const ownSource = tools.find((tool) => tool.name === "get_goal")?.sourceInfo?.path;
+			if (ownSource === undefined) return true;
+			const existing = tools.find((tool) => tool.name === PLAN_TOOL_NAME);
+			return existing !== undefined && existing.sourceInfo?.path !== ownSource;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * Whether the `update_plan` declaration now in force is pi-goal's own.
+	 *
+	 * The belt to {@link planToolNameTaken}'s braces: a registration that was
+	 * allowed can still lose the name, and only the declaration actually in force
+	 * may be named in a Continuation.
+	 */
+	function planToolSurvivedRegistration(): boolean {
+		try {
+			const tools = pi.getAllTools();
+			const ownSource = tools.find((tool) => tool.name === "get_goal")?.sourceInfo?.path;
+			if (ownSource === undefined) return false;
+			const plan = tools.find((tool) => tool.name === PLAN_TOOL_NAME);
+			return plan?.sourceInfo?.path === ownSource;
+		} catch {
+			return false;
+		}
+	}
+
+	/** The uniform tool error for a refused plan call. No plan record is persisted. */
+	function planToolError(message: string) {
+		return {
+			content: [{ type: "text" as const, text: message }],
+			isError: true,
+			// An empty record on purpose: the durable plan is a *successful* tool
+			// result's `details.plan`, so a refusal must leave nothing for a reader of
+			// the branch to pick up in its place.
+			details: {},
+		};
+	}
+
+	/**
+	 * The refusal for an admission request that `goal.enabled` currently forbids.
+	 *
+	 * One shared tail, because every refusal has to answer the same three
+	 * questions: nothing about the existing Goal moved, which controls still work,
+	 * and what admits work again. Naming the permitted controls is the point — a
+	 * user who disabled the extension must still be able to inspect and stop a Goal
+	 * safely, and must not read the refusal as a lifecycle decision.
+	 */
+	function admissionDisabledRefusal(prefix: string): string {
+		return (
+			`${prefix} pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted. ` +
+			"Disabling the extension is an admission control, not a Lifecycle status and not a pause: no Goal was " +
+			"created, replaced, edited, resumed, or paused, and no work was started or aborted. Status inspection " +
+			"(/goal, get_goal), /goal pause, /goal clear, and terminal updates from work already in flight still work. " +
+			"Re-enable goal.enabled to admit Goal work again."
+		);
+	}
+
+	/**
+	 * The admission-disabled condition carried by every successful `update_goal`
+	 * result.
+	 *
+	 * `update_goal` is never an admission decision, so it keeps working while
+	 * disabled: that is exactly why its text has to say what is *not* happening.
+	 * Without it a below-threshold blocker result reads as a Goal that stays active
+	 * and therefore keeps continuing, and a terminal result hides that no
+	 * continuation was admitted either.
+	 *
+	 * The clause is status-aware, for the same reason the status report is: a
+	 * complete Goal is terminal for its identity — replacing it is a new
+	 * `/goal <objective>`, not a resume — so promising that re-enabling makes
+	 * `/goal resume` work would be false. A still-active Goal is not resumed either;
+	 * the continuation is what admission withholds from it.
+	 */
+	function admissionDisabledUpdateCondition(status: GoalPublicState["status"]): string {
+		if (admission.enabled) return "";
+		if (status === "complete") {
+			return (
+				" pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted — no automatic continuation " +
+				"— until it is re-enabled; a complete Goal is terminal either way, so replacing it is a new " +
+				"/goal <objective>, not a resume. This update is a lifecycle write from work already in flight and stands as " +
+				"written."
+			);
+		}
+		const resume = status === "active" ? "" : " and no /goal resume";
+		return (
+			" pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted — no automatic continuation" +
+			`${resume} — until it is re-enabled; this update is a lifecycle write from work already in flight and stands ` +
+			"as written."
+		);
+	}
+
+	/**
+	 * The uniform `{ goal }` tool error for a refused admission request.
+	 *
+	 * The shape matches every other create refusal: the unchanged current Goal, or
+	 * null when the session has none, so a caller never has to guess whether the
+	 * state moved.
+	 */
+	function admissionDisabledToolError(prefix: string) {
+		const current = store.get();
+		return goalToolError(admissionDisabledRefusal(prefix), current ? toPublicState(current) : null);
+	}
+
+	/**
+	 * Refuse an objective edit that would admit work, naming why that edit is the
+	 * one edit a disabled extension declines.
+	 *
+	 * An edit of an *active* Goal steers a new objective into the running work, so
+	 * it is new Goal work. The edit of a Goal that is already stopped changes only
+	 * durable state and stays available, which is why this refusal is scoped to the
+	 * active case rather than to every edit.
+	 */
+	function refuseWorkAdmittingEdit(ctx: ExtensionCommandContext, goal: GoalRecord): void {
+		ctx.ui.notify(
+			admissionDisabledRefusal(
+				"Goal not edited: the objective of an active Goal is work-admitting, because an edit steers a new " +
+					"objective into the running work.",
+			),
+			"warning",
+		);
+	}
+
+	/**
 	 * Extension-level budget configuration, read from Pi's effective settings at
 	 * every session start (so a reload picks up a changed configuration).
 	 */
@@ -570,7 +1204,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	function updateStatus(ctx: ExtensionContext): void {
 		const goal = store.get();
 		try {
-			ctx.ui.setStatus(STATUS_KEY, goal ? formatGoalStatusLine(toPublicState(goal)) : undefined);
+			ctx.ui.setStatus(
+				STATUS_KEY,
+				goal ? formatGoalStatusLine(toPublicState(goal), { admissionEnabled: admission.enabled }) : undefined,
+			);
 		} catch {
 			// Status is a convenience surface; never break a lifecycle event for it.
 		}
@@ -608,11 +1245,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const limited = store.markBudgetLimited();
 			if (limited.ok) {
 				budgetGateActive = true;
+				// The one bounded wrap-up is automatic work like a continuation, so a
+				// disabled extension defers it instead of delivering it. The flag is
+				// durable, so re-enabling the setting still delivers it exactly once.
+				const wrapUp = admission.enabled
+					? "No further Goal work runs; one wrap-up summary follows. "
+					: "No further Goal work runs; because pi-goal is disabled (goal.enabled is false) the one bounded " +
+							"wrap-up is deferred until the setting is re-enabled. ";
 				notify(
 					ctx,
 					`Goal ${limited.goal.id} reached its token budget of ${limited.goal.tokenBudget} tokens ` +
 						`(${store.getUsage().totalTokens} accounted) and is now budget_limited. ` +
-						"No further Goal work runs; one wrap-up summary follows. " +
+						wrapUp +
 						"Budget exhaustion is not completion.",
 					"warning",
 				);
@@ -622,9 +1266,34 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		// Captured for the optional command bridge (issue #56), which is invoked from
+		// an event-bus listener where Pi provides no context of its own. Pi contexts
+		// are lazy handles onto the live runner, so this stays valid for the session.
+		sessionContext = ctx;
 		clearCreationAuthority();
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
+		// Admission is read from the same effective settings, at the same seam: a
+		// changed `goal.enabled` takes effect on the next session start or reload,
+		// never retroactively for work already in flight.
+		admission = parseAdmissionSettings(pi.getSettings());
+		for (const problem of admission.problems) notify(ctx, problem, "warning");
+		// Session naming is read from the same effective settings, at the same seam: a
+		// changed `goal.sessionNameFromObjective` takes effect on the next session start
+		// or reload, never retroactively for a Goal that already exists.
+		sessionNaming = parseSessionNamingSettings(pi.getSettings());
+		for (const problem of sessionNaming.problems) notify(ctx, problem, "warning");
+		// The opt-in resume prompt is read at the same seam, so a changed setting
+		// takes effect at the next session start and never mid-session.
+		resumePrompt = parseResumePromptSettings(pi.getSettings());
+		for (const problem of resumePrompt.problems) notify(ctx, problem, "warning");
+		// The opt-in progress-plan tool is read at the same seam, and it is the only
+		// setting here that changes what is *registered*: a disabled session registers
+		// no plan tool at all, so nothing mentions it and nothing can call it.
+		planTool = parsePlanToolSettings(pi.getSettings());
+		for (const problem of planTool.problems) notify(ctx, problem, "warning");
+		if (planTool.enabled) registerPlanTool(ctx);
+		else planToolRegistered = false;
 		store.reconstruct(ctx);
 		// A hard crash can leave the superseded identity's in-flight tail on the branch
 		// with no freeze boundary after it. Reconstruction recovers that tail into
@@ -633,15 +1302,47 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		store.closeSupersededAdmission(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
+		// Restore verifies the attachment manifest against the artifact store: a
+		// missing or corrupt artifact is surfaced here, explicitly, without changing
+		// the Goal's Lifecycle status — the continuation seam suppresses its request
+		// for as long as the verification fails.
+		surfaceAttachmentVerification(store.get(), ctx);
 		// Runtime-only counters must not survive into a new runtime; the durable
 		// blocked audit is reconstructed with the Goal.
 		safety.reset();
 		const goal = store.get();
 		if (goal) {
-			notify(ctx, `Goal ${goal.id} restored (${goal.status}).`, "info");
+			// An active-but-disabled Goal is the case a user could mistake for a
+			// continuing one, so the restore notice names the disabled condition
+			// instead of leaving it to the status report.
+			const disabled =
+				!admission.enabled && goal.status === "active"
+					? " pi-goal is disabled (goal.enabled is false): this Goal keeps its active status and keeps accruing " +
+							"active time, but admits no new Goal work until the setting is re-enabled."
+					: "";
+			notify(ctx, `Goal ${goal.id} restored (${goal.status}).${disabled}`, "info");
 		}
 		updateStatus(ctx);
+		// Asked after the restore notice and only for a restored `paused` Goal. The
+		// call is fire-and-forget by design: the dialog is created now, but
+		// `session_start` never waits for its answer, so no host — including a
+		// headless RPC client that ignores it — is ever blocked by the prompt.
+		offerResumePrompt(ctx);
 	});
+
+	/**
+	 * Surface the restore-time attachment verification without changing state.
+	 *
+	 * The notice is the explicit error the missing/corrupt-artifact contract
+	 * requires: it names the failing artifacts and the recovery path. The Goal
+	 * itself is untouched — its status is whatever the durable snapshot says —
+	 * and the continuation seam independently re-verifies before every request.
+	 */
+	function surfaceAttachmentVerification(goal: GoalRecord | null | undefined, ctx: ExtensionContext): void {
+		if (!goal) return;
+		const verification = verifyGoalArtifacts(goal, ctx);
+		if (!verification.ok) notifyAttachmentIntegrityFailure(goal, ctx, verification.problems);
+	}
 
 	/**
 	 * Surface actionable guidance when reconstruction failed closed on a malformed
@@ -721,11 +1422,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (!before) {
-			ctx.ui.notify(
-				`Goal ${after.id} restored from the selected branch (${after.status}).` +
-					(after.status === "active"
+			// The restored Goal's continuation is admission, so the notice is
+			// admission-aware for the same reason `session_start`'s restore notice is:
+			// promising that an active Goal continues at the next settlement is false
+			// while `goal.enabled` is false.
+			const continuation =
+				after.status !== "active"
+					? ""
+					: admission.enabled
 						? " It continues at the next settlement once a run starts; navigation alone starts no run."
-						: ""),
+						: " pi-goal is disabled (goal.enabled is false), so it keeps its active status and keeps accruing " +
+							"active time but continues nowhere until the setting is re-enabled; navigation alone starts no run.";
+			ctx.ui.notify(
+				`Goal ${after.id} restored from the selected branch (${after.status}).` + continuation,
 				"info",
 			);
 			return;
@@ -756,6 +1465,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * instead of handing it a fresh binding it was never prepared against.
 	 */
 	pi.on("session_tree", (_event, ctx) => {
+		sessionContext = ctx;
 		clearCreationAuthority();
 		const before = store.get() ?? null;
 		const after = store.reconstruct(ctx);
@@ -766,6 +1476,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		store.closeSupersededAdmission(pi);
 		surfaceReconstructionNotice(ctx);
 		applyCutover(ctx);
+		// The selected branch's Goal owns its own manifest; verify it like a restore.
+		surfaceAttachmentVerification(store.get(), ctx);
 		notifyBranchChange(ctx, before, after);
 		// The status line follows the selected branch too, and the accounting
 		// baseline is rebuilt with it.
@@ -795,6 +1507,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * not fire `input`; creating a Goal already starts from a fresh record.
 	 */
 	pi.on("input", (event, ctx) => {
+		sessionContext = ctx;
 		pendingUserInputs.push({ text: event.text, source: event.source });
 		continuesGoalTurn = false;
 		// A prompt the user actually typed is never Goal-owned work, so the
@@ -1193,6 +1906,41 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// written before the wrap-up snapshot that follows it.
 		store.flushAccounting(pi);
 
+		/*
+		 * Admission control: while `goal.enabled` is false, this settlement admits
+		 * nothing new. Neither the one bounded budget wrap-up nor a continuation is
+		 * requested, because both are unattended Goal work.
+		 *
+		 * Nothing is dropped: the wrap-up flag is durable, so re-enabling the setting
+		 * delivers it at the next settlement, and the Goal itself is untouched. It keeps
+		 * its Lifecycle status — including `active` — and keeps accruing Active elapsed
+		 * time, because stopping that clock is a pause, not a host preference. A run
+		 * that is already in flight is never aborted here either; it finishes and
+		 * reports its own terminal update.
+		 */
+		if (!admission.enabled) {
+			const current = store.get();
+			if (current?.status === "active") {
+				notify(
+					ctx,
+					`Goal ${current.id} is active, but pi-goal is disabled (goal.enabled is false), so no continuation was ` +
+						"requested at this settlement. The Goal keeps its active status and keeps accruing active time; " +
+						"/goal pause, not disabling the extension, stops that clock. Re-enable goal.enabled to admit Goal work again.",
+					"warning",
+				);
+			} else if (store.isWrapUpPending()) {
+				notify(
+					ctx,
+					`Goal ${current?.id ?? ""} is budget_limited with its one bounded wrap-up still owed, but pi-goal is ` +
+						"disabled (goal.enabled is false), so it was not delivered. The wrap-up stays pending and is delivered at " +
+						"the first settlement after the setting is re-enabled.",
+					"warning",
+				);
+			}
+			closeGoalTurn(ctx);
+			return;
+		}
+
 		if (store.isWrapUpPending()) {
 			// Exactly one bounded wrap-up, then the Goal stops for good.
 			const delivered = store.consumeWrapUp(pi);
@@ -1220,10 +1968,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 
 		// The Goal turn is over: evaluate it before deciding whether to continue.
+		// The conservative stops come first on purpose: they are decisions about the
+		// run itself (activity-free and execution-unavailable bounds), not about the
+		// attachments, so an artifact problem must never delay or mask one.
 		const stop = safety.evaluateRun(event.outcome);
 		closeGoalTurn(ctx);
 		if (stop) {
 			applySafetyStop(stop, ctx);
+			return;
+		}
+
+		// Artifact integrity gate: every kickoff and Continuation references the
+		// same manifest, so a Goal whose artifacts cannot be verified against it is
+		// never continued automatically. The authenticated load reads each artifact
+		// once and returns exactly the bytes it verified; the suppression is explicit
+		// (the error names what is missing or corrupt and how to restore it), and
+		// nothing else moves: the attachments are not silently dropped, the Goal is
+		// not completed, and its Lifecycle status is untouched by an artifact problem.
+		const contents = goal.attachments?.length
+			? loadGoalAttachments(goal, ctx)
+			: ({ ok: true, contents: [] } as const);
+		if (!contents.ok) {
+			notifyAttachmentIntegrityFailure(goal, ctx, contents.problems);
 			return;
 		}
 
@@ -1237,7 +2003,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				{
 					type: "custom_message",
 					customType: CUSTOM_MESSAGE_TYPE,
-					content: formatContinuationMessage(goal),
+					content: formatContinuationMessage(goal, { planTool: planToolRegistered }, contents.contents),
 					display: true,
 				},
 			],
@@ -1375,7 +2141,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(
 					`Goal ${result.goal.id} is now usage_limited: the provider reported a usage limit ` +
 						`(${failure.evidence}). Automatic continuation has stopped; /goal resume restarts it once the ` +
-						"limit is resolved, because a usage-limited Goal never continues on its own.",
+						"limit is resolved" +
+						// The stop itself is a lifecycle write and still lands, but the resume it
+						// names is admission: saying it restarts the Goal without qualification
+						// would promise a command the disabled extension refuses.
+						(admission.enabled
+							? ", because a usage-limited Goal never continues on its own."
+							: ", but pi-goal is disabled (goal.enabled is false), so that resume is refused until the setting is " +
+								"re-enabled; a usage-limited Goal never continues on its own."),
 					"warning",
 				);
 				updateStatus(ctx);
@@ -1404,7 +2177,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 		ctx.ui.notify(
 			`Goal ${goal.id} is still active, but automatic continuation stopped for this run: the provider failed ` +
-				`and Pi is not retrying it (${failure.evidence}). The Goal continues on the next successful run.`,
+				`and Pi is not retrying it (${failure.evidence}). ` +
+				// The Goal itself is unchanged, but promising the next successful run
+				// continues it is false while `goal.enabled` is false: that run settles at
+				// the admission gate and admits nothing. Name the disabled condition the
+				// way the settlement suppression does instead.
+				(admission.enabled
+					? "The Goal continues on the next successful run."
+					: "pi-goal is disabled (goal.enabled is false), so no continuation is admitted either: the Goal keeps its " +
+							"active status and keeps accruing active time, and /goal pause, not disabling the extension, stops that " +
+							"clock. Re-enable goal.enabled to admit Goal work again."),
 			"warning",
 		);
 	}
@@ -1428,7 +2210,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const goal = store.get();
 			if (!goal) {
 				return {
-					content: [{ type: "text", text: formatNoGoal() }],
+					content: [{ type: "text", text: formatNoGoal(admission.enabled) }],
 					structuredContent: { goal: null },
 					details: { goal: null as GoalPublicState | null },
 				};
@@ -1444,7 +2226,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					: `\nBlocker identity: ${state.blockerId} (pass it back verbatim in update_goal's blocker_id for the ` +
 						"same condition; omit it for a genuinely different one)";
 			return {
-				content: [{ type: "text", text: `${formatGoalSummary(state)}${identity}` }],
+				content: [{ type: "text", text: `${formatGoalSummary(state, { admissionEnabled: admission.enabled })}${identity}` }],
 				structuredContent: { goal: state },
 				details: { goal: state },
 			};
@@ -1514,6 +2296,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			_onUpdate,
 			ctx,
 		) {
+			// Admission control first: a disabled extension refuses before it validates
+			// anything, and the refusal leaves the Goal (if any) and the one-shot
+			// creation authority untouched, so a corrected call can still retry after
+			// the setting is re-enabled.
+			if (!admission.enabled) {
+				return admissionDisabledToolError("Goal not created:");
+			}
 			const validation = validateObjective(String(params.objective ?? ""));
 			if (!validation.ok) {
 				return goalToolError(validation.error, null);
@@ -1592,12 +2381,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// but clearing the authority also prevents a replayed model request from
 			// being treated as fresh evidence.
 			clearCreationAuthority();
+			// The tool path is always a fresh creation — it refuses while any Goal
+			// exists — so a committed creation may name an unnamed session here too,
+			// exactly like the command's. The failure paths above returned before this
+			// point, so a rolled-back creation never names anything.
+			nameSessionFromObjective(ctx, goal.objective);
 			// No separate durability poll is needed here, unlike the /goal command whose
 			// kickoff is what creates the session file: a tool call implies a running
 			// session whose file already exists, and appendEntry writes synchronously
 			// and throws on failure. The existing-Goal guard, the stage, and the commit
 			// above also contain no await, so two create_goal calls issued in one
-			// assistant turn cannot both pass the guard.
+			// assistant turn cannot both pass the guard. The committed creation was
+			// announced on the event stream by the store's commit.
 			updateStatus(ctx);
 			const state = toPublicState(goal);
 			return {
@@ -1651,7 +2446,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				}),
 			),
 		}),
-		outputSchema: getGoalOutputSchema,
+		outputSchema: updateGoalOutputSchema,
 		promptSnippet:
 			"Mark the current Goal complete after an evidence audit, blocked after a persistent blocker, or paused at the user's explicit request",
 		promptGuidelines: [
@@ -1707,7 +2502,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		) {
 			const goal = store.get();
 			if (!goal) {
-				return goalToolError(formatNoGoal(), null);
+				return goalToolError(formatNoGoal(admission.enabled), null);
 			}
 			/**
 			 * Refuse a call whose decision was prepared against a different Goal
@@ -1769,10 +2564,27 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				}
 				const state = toPublicState(completed.goal!);
 				updateStatus(ctx);
+				// A budgeted completion asks the final response to report its cost and
+				// duration. The numbers come from the completion snapshot above, so the
+				// reminder costs no extra provider turn and no extra accounting, and an
+				// unbudgeted Goal gets no report at all.
+				const completionReport = buildCompletionReport(state);
+				const payload = {
+					goal: state,
+					...(completionReport === null ? {} : { completionReport }),
+				};
 				return {
-					content: [{ type: "text", text: `Goal ${completed.goal!.id} marked complete.` }],
-					structuredContent: { goal: state },
-					details: { goal: state },
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`Goal ${completed.goal!.id} marked complete.` +
+								(completionReport === null ? "" : `\n\n${completionReport.instruction}`) +
+								admissionDisabledUpdateCondition(state.status),
+						},
+					],
+					structuredContent: payload,
+					details: payload,
 				};
 			}
 			if (params?.action === "pause") {
@@ -1840,7 +2652,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 							text:
 								`Goal ${goal.id} paused at the user's explicit request (verified). ` +
 								"Report the pause and the current progress, then stop Goal work for this turn; " +
-								"the user restarts work with /goal resume.",
+								(admission.enabled
+									? "the user restarts work with /goal resume."
+									: "the user restarts work with /goal resume once pi-goal is re-enabled.") +
+								admissionDisabledUpdateCondition(state.status),
 						},
 					],
 					structuredContent: { goal: state },
@@ -1940,7 +2755,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						text:
 							`Goal ${result.goal.id} is blocked after the same blocker persisted for ${result.turns} ` +
 							"consecutive Goal turns. Automatic continuation has stopped. Report to the user what is " +
-							"blocking the work and what would unblock it; /goal resume restarts it with a fresh blocked audit.",
+							"blocking the work and what would unblock it; /goal resume restarts it with a fresh blocked audit" +
+							(admission.enabled ? "." : " once pi-goal is re-enabled.") +
+							admissionDisabledUpdateCondition(state.status),
 					},
 				],
 				structuredContent: { goal: state },
@@ -1962,54 +2779,237 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					: "") +
 				"Re-verify against the current state, take the next available safe action, and report again only if " +
 				"the same blocker persists. Never report a blocker because the work is hard, slow, uncertain, or " +
-				"incomplete.",
+				"incomplete." +
+				admissionDisabledUpdateCondition(state.status),
 			state,
 		);
 	}
 
+	/**
+	 * The `/goal` command, in one place.
+	 *
+	 * Both the registered user command and the in-process command bridge call this
+	 * function with the same argument text, so a bridged command *is* the command the
+	 * user sees: the same parsing, the same replacement confirmation dialog, the same
+	 * `goal.enabled` gate, the same Token-budget validation, and the same
+	 * durable-before-announced ordering. Nothing downstream can tell the difference,
+	 * which is the point — a second entry point that re-used the lifecycle helpers
+	 * instead would be a second lifecycle path.
+	 */
+	async function handleGoalCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		try {
+			const command = parseGoalCommand(args);
+			// A direct Goal lifecycle operation is a user decision that supersedes
+			// any model-held creation authority. A bare status read is not a
+			// lifecycle operation and leaves the authority alone, and neither is
+			// the read-only history rendering: both only report durable state.
+			if (command.kind !== "status" && command.kind !== "history" && command.kind !== "invalid") {
+				clearCreationAuthority();
+			}
+			switch (command.kind) {
+				case "status":
+					await reportStatus(ctx);
+					return;
+				case "history":
+					reportHistory(ctx);
+					return;
+				case "create":
+					await createOrReplaceGoal(command.objective, ctx);
+					return;
+				case "edit":
+					editGoal(command.objective, ctx);
+					return;
+				case "edit-dialog":
+					await editGoalInteractively(ctx);
+					return;
+				case "pause":
+					pauseGoal(ctx);
+					return;
+				case "resume":
+					resumeGoal(ctx, command.budget);
+					return;
+				case "clear":
+					clearGoal(ctx);
+					return;
+				case "invalid":
+					ctx.ui.notify(command.message, "error");
+					return;
+			}
+		} catch (error) {
+			ctx.ui.notify(`pi-goal error: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+	}
+
 	pi.registerCommand("goal", {
 		description:
-			"Create (/goal <objective>), inspect (bare /goal), edit (/goal edit <objective>), pause, resume " +
-			"(/goal resume, or /goal resume --budget <new-total> for a budget_limited Goal), or clear the session Goal",
-		handler: async (args, ctx) => {
+			"Create (/goal <objective>), inspect (bare /goal), read the Goal history (/goal history), edit " +
+			"(/goal edit <objective>), pause, resume (/goal resume, or /goal resume --budget <new-total> for a " +
+			"budget_limited Goal), or clear the session Goal",
+		handler: handleGoalCommand,
+	});
+
+	/**
+	 * The command family a parsed `/goal` command belongs to, for the bridge's
+	 * transition filter. `edit-dialog` is the interactive spelling of an objective
+	 * edit: over the bridge it opens the same editor and commits the same
+	 * `objective-edited` transition. `history` is another read-only rendering, so it
+	 * belongs to the same family as the bare status report: nothing to commit, and
+	 * the answer is the state the branch already holds.
+	 */
+	function bridgeActionFor(command: GoalCommand): GoalBridgeAction {
+		switch (command.kind) {
+			case "status":
+			case "history":
+				return "status";
+			case "create":
+				return "create";
+			case "edit":
+			case "edit-dialog":
+				return "edit";
+			case "pause":
+				return "pause";
+			case "resume":
+				return "resume";
+			case "clear":
+				return "clear";
+			case "invalid":
+				return "invalid";
+		}
+	}
+
+	/**
+	 * Answer one bridge request by running the same `/goal` command the user would.
+	 *
+	 * The result is built from three facts and no guesses: the durable transitions
+	 * the store announced during the command, the diagnostics the command reported
+	 * (recorded by wrapping its UI, not by parsing text), and the public state
+	 * afterwards. "Committed" additionally requires that the recorded transition is
+	 * the *current* Goal identity (or, for a clear, that no Goal is current) and
+	 * that its snapshot reached the session file — the same on-disk bar the
+	 * command's own success announcement waits for. A later legitimate transition
+	 * of the same Goal does not undo the commit, while a creation that committed in
+	 * memory and then failed its durability poll is reported as a refusal, never as
+	 * a success.
+	 */
+	async function handleBridgeRequest(
+		request: GoalCommandBridgeRequest,
+		reply: (result: GoalCommandBridgeResult) => void,
+	): Promise<void> {
+		const ctx = sessionContext;
+		const current = store.get();
+		const publicState = current ? toPublicState(current) : null;
+		if (ctx === null) {
+			reply(
+				goalBridgeRefusal({
+					id: request.id,
+					command: request.command,
+					message:
+						"Goal command not run: pi-goal has not started a session yet, so the /goal command surface is not " +
+						"available. Retry once the session has loaded.",
+					goal: publicState,
+					admissionEnabled: admission.enabled,
+				}),
+			);
+			return;
+		}
+		if (bridgeInFlight) {
+			reply(
+				goalBridgeRefusal({
+					id: request.id,
+					command: request.command,
+					message:
+						"Goal command not run: another bridged /goal command is still running (it may be waiting for a " +
+						"confirmation dialog). Retry after it finishes.",
+					goal: publicState,
+					admissionEnabled: admission.enabled,
+				}),
+			);
+			return;
+		}
+
+		const command = parseGoalCommand(request.command);
+		const action = bridgeActionFor(command);
+		const recorded: GoalBridgeTransition[] = [];
+		const diagnostics: GoalBridgeDiagnostic[] = [];
+		bridgeInFlight = true;
+		bridgeTransitions = recorded;
+		try {
+			await handleGoalCommand(request.command, recordingCommandContext(commandContextForBridge(ctx), diagnostics));
+		} catch (error) {
+			// The command handler reports its own failures as notifications; this is the
+			// last-resort mirror for a throw outside them, and it is a refusal, never a
+			// success.
+			diagnostics.push({ level: "error", text: `pi-goal error: ${describeError(error)}` });
+		} finally {
+			bridgeTransitions = null;
+			bridgeInFlight = false;
+		}
+
+		const transitions = recorded.filter((transition) => committedKindsFor(action).includes(transition.kind));
+		const last = transitions.at(-1);
+		const after = store.get() ?? null;
+		// "Landed" is identity plus durability, never the exact revision: a Goal that
+		// committed and then took another legitimate transition (a continuation that
+		// completed it while the reply was being built) still committed. A retracted
+		// creation or a replacement the durability poll restored fails here, because
+		// the current Goal is then null or a different identity.
+		const committed =
+			last !== undefined &&
+			(last.kind === "cleared"
+				? after === null
+				: after !== null && after.id === last.goal.id && store.isDurable(ctx, after.id));
+		const outcome = classifyGoalBridgeOutcome({ action, transitions, diagnostics, committed });
+		const result: GoalCommandBridgeResult = {
+			version: GOAL_COMMAND_BRIDGE_VERSION,
+			id: request.id,
+			command: request.command,
+			ok: outcome.ok,
+			disposition: outcome.disposition,
+			action,
+			goal: after ? toPublicState(after) : null,
+			admissionEnabled: admission.enabled,
+			transitions,
+			diagnostics,
+		};
+		reply(result);
+	}
+
+	// The optional companion seam (issue #56): an in-process request/response for
+	// extensions that need the user command surface with a structured outcome. The
+	// listener never throws into the bus and answers exactly once per request, so a
+	// companion cannot mistake a dropped reply for a committed Goal.
+	pi.events.on(GOAL_COMMAND_BRIDGE, (payload) => {
+		const parsed = parseGoalCommandBridgeRequest(payload);
+		// A malformed payload has no reply channel worth trusting: answering it would
+		// mean calling an unvalidated function from the bus.
+		if (!parsed.ok) return;
+		const request = parsed.request;
+		// "Called exactly once" includes the failure case: a reply callback that
+		// throws (a broken host channel) has already been *called*, so the last-resort
+		// refusal below must not call it a second time. Attempt-once is the honest
+		// reading of the contract — the caller's own timeout covers a lost answer.
+		let answered = false;
+		const reply = (result: GoalCommandBridgeResult): void => {
+			if (answered) return;
+			answered = true;
+			request.reply(result);
+		};
+		handleBridgeRequest(request, reply).catch((error: unknown) => {
 			try {
-				const command = parseGoalCommand(args);
-				// A direct Goal lifecycle operation is a user decision that supersedes
-				// any model-held creation authority. A bare status read is not a
-				// lifecycle operation and leaves the authority alone.
-				if (command.kind !== "status" && command.kind !== "invalid") {
-					clearCreationAuthority();
-				}
-				switch (command.kind) {
-					case "status":
-						await reportStatus(ctx);
-						return;
-					case "create":
-						await createOrReplaceGoal(command.objective, ctx);
-						return;
-					case "edit":
-						editGoal(command.objective, ctx);
-						return;
-					case "edit-dialog":
-						await editGoalInteractively(ctx);
-						return;
-					case "pause":
-						pauseGoal(ctx);
-						return;
-					case "resume":
-						resumeGoal(ctx, command.budget);
-						return;
-					case "clear":
-						clearGoal(ctx);
-						return;
-					case "invalid":
-						ctx.ui.notify(command.message, "error");
-						return;
-				}
-			} catch (error) {
-				ctx.ui.notify(`pi-goal error: ${error instanceof Error ? error.message : String(error)}`, "error");
+				const goal = store.get();
+				reply(
+					goalBridgeRefusal({
+						id: request.id,
+						command: request.command,
+						message: `pi-goal error: ${describeError(error)}`,
+						goal: goal ? toPublicState(goal) : null,
+						admissionEnabled: admission.enabled,
+					}),
+				);
+			} catch {
+				// Nothing left to report to: the caller's own timeout covers this case.
 			}
-		},
+		});
 	});
 
 	/**
@@ -2066,11 +3066,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * fire-and-forget: delivery failures surface as Pi extension errors, never as
 	 * a state lie ("steered" is reported only for the queueing itself).
 	 *
+	 * The message may carry image content blocks (a Goal whose manifest has
+	 * images): Pi accepts `TextContent | ImageContent` arrays here, normalizing
+	 * images exactly as it does for any user prompt.
+	 *
 	 * The admission segment is *not* opened here. It opens when the message is
 	 * delivered, in {@link applyDeliveredUserMessage}, because a steer reaches the
 	 * branch only after the work that was already in flight.
 	 */
-	function deliverWorkMessage(content: string, ctx: ExtensionCommandContext): "started" | "steered" {
+	function deliverWorkMessage(content: GoalMessageContent, ctx: ExtensionContext): "started" | "steered" {
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(content);
 			return "started";
@@ -2080,7 +3084,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/** Report a failed durable transition uniformly (the previous state stands). */
-	function notifyMutationFailure(ctx: ExtensionCommandContext, action: string, failure: { reason: string; message?: string; error?: unknown }): void {
+	function notifyMutationFailure(ctx: ExtensionContext, action: string, failure: { reason: string; message?: string; error?: unknown }): void {
 		if (failure.reason === "persistence") {
 			ctx.ui.notify(
 				`Goal not ${action}: writing the Goal to the session failed (${describeError(failure.error)}). ` +
@@ -2092,10 +3096,150 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		ctx.ui.notify(`Goal not ${action}: ${failure.message ?? "the current Goal state does not allow it"}.`, "warning");
 	}
 
+	/**
+	 * The artifact store root for the current session, or null when the session
+	 * file cannot be resolved (a Goal can only exist in a persistent session, so
+	 * this is a defensive null rather than an expected state).
+	 */
+	function attachmentRoot(ctx: ExtensionContext): string | null {
+		try {
+			const file = ctx.sessionManager.getSessionFile();
+			return file ? attachmentStoreRoot(file) : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Deterministic-suite seams for the local remote-image TLS fixture.
+	 *
+	 * The production fetch refuses loopback and every private destination, so the
+	 * tests run a local HTTPS fixture and must opt that exact origin in. The
+	 * override is read only when the real-Pi test harness is driving this process
+	 * (`PI_GOAL_TEST_SCRIPT`), applies only to exact HTTPS origins, and shortens
+	 * the overall timeout only for the timeout scenario. A third seam supplies a
+	 * fixed host-name-to-addresses map so no test consults the host's resolver.
+	 * Users never configure remote fetching through these variables; see
+	 * `docs/testing.md`.
+	 */
+	function remoteImageFetchOptions(): RemoteImageFetchOptions | undefined {
+		if (!process.env.PI_GOAL_TEST_SCRIPT) return undefined;
+		const origins = (process.env.PI_GOAL_TEST_REMOTE_IMAGE_ORIGINS ?? "")
+			.split(",")
+			.map((origin) => origin.trim())
+			.filter((origin) => origin !== "");
+		const rawTimeout = process.env.PI_GOAL_TEST_REMOTE_IMAGE_TIMEOUT_MS;
+		const timeout = rawTimeout === undefined ? Number.NaN : Number(rawTimeout);
+		const timeoutMs = Number.isSafeInteger(timeout) && timeout > 0 ? timeout : undefined;
+		const resolver = testRemoteImageResolver(process.env.PI_GOAL_TEST_REMOTE_IMAGE_DNS);
+		if (origins.length === 0 && timeoutMs === undefined && resolver === undefined) return undefined;
+		const testOnly = {
+			...(origins.length === 0 ? {} : { allowedOrigins: origins }),
+			...(resolver === undefined ? {} : { resolver }),
+		};
+		return {
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+			...(Object.keys(testOnly).length === 0 ? {} : { testOnly }),
+		};
+	}
+
+	/**
+	 * Parse the deterministic DNS fixture for the real-Pi suite.
+	 *
+	 * The value is a JSON object of host name to a fixed address list. A malformed
+	 * value becomes an empty, still-authoritative stub: every host name then fails
+	 * to resolve instead of silently falling back to the host's resolver, so a
+	 * typo can never make a test reach `/etc/hosts`, a local resolver, or the
+	 * public internet.
+	 */
+	function testRemoteImageResolver(
+		raw: string | undefined,
+	): Record<string, readonly string[]> | undefined {
+		if (raw === undefined || raw.trim() === "") return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			return {};
+		}
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+		const resolver: Record<string, readonly string[]> = {};
+		for (const [name, addresses] of Object.entries(parsed)) {
+			if (!Array.isArray(addresses) || addresses.some((address) => typeof address !== "string")) return {};
+			resolver[name.toLowerCase()] = addresses as string[];
+		}
+		return resolver;
+	}
+
+	/** The refusal for work whose attachments cannot be verified. */
+	function attachmentIntegrityError(goal: GoalRecord, problems: readonly string[]): string {
+		return (
+			`pi-goal could not verify the attachments of Goal ${goal.id}: ${problems.join("; ")}. The Goal keeps its ` +
+			"Lifecycle status and its manifest — attachments are never silently dropped and the Goal is never completed " +
+			"for this reason — but no automatic continuation is requested while the artifacts cannot be verified. Restore " +
+			"the original bytes (content-addressed by their sha256) under the pi-goal-store directory beside the session " +
+			"file, or replace the Goal with a new one that re-attaches the files."
+		);
+	}
+
+	/**
+	 * Verify the current Goal's manifest against the artifact store.
+	 *
+	 * Runs on restore (session start and tree navigation) and before admitting
+	 * work that would re-send the attachments (a continuation, a resume, an
+	 * active-Goal edit): a missing or corrupt artifact suppresses the automatic
+	 * Continuation and surfaces this explicit error instead — the Goal is never
+	 * silently stripped of its attachments, completed, or moved to another
+	 * Lifecycle status because of an artifact problem.
+	 */
+	function verifyGoalArtifacts(goal: GoalRecord, ctx: ExtensionContext): { ok: true } | { ok: false; problems: string[] } {
+		const manifest = goal.attachments ?? [];
+		if (manifest.length === 0) return { ok: true };
+		const root = attachmentRoot(ctx);
+		if (!root) return { ok: false, problems: ["the session file could not be resolved"] };
+		return verifyAttachments(root, goal.id, manifest);
+	}
+
+	/** Surface a failed verification, naming the recovery path. */
+	function notifyAttachmentIntegrityFailure(goal: GoalRecord, ctx: ExtensionContext, problems: readonly string[]): void {
+		notify(ctx, attachmentIntegrityError(goal, problems), "error");
+	}
+
+	/** The session working directory relative attachment sources resolve against. */
+	function sessionWorkingDirectory(ctx: ExtensionContext): string {
+		try {
+			return ctx.sessionManager.getCwd();
+		} catch {
+			return ctx.cwd;
+		}
+	}
+
+	/**
+	 * Load and authenticate the current Goal's attachments in one read path.
+	 *
+	 * The loader verifies the manifest's recorded size, the per-file and total
+	 * limits, and the content hash on the exact bytes it returns. A work-admitting
+	 * transition (resume, an active-Goal edit, a continuation) therefore renders
+	 * those verified bytes and never re-reads a path that could have changed after
+	 * a separate verification.
+	 */
+	function loadGoalAttachments(
+		goal: GoalRecord,
+		ctx: ExtensionContext,
+	): { ok: true; contents: AttachmentContent[] } | { ok: false; problems: string[] } {
+		const manifest = goal.attachments ?? [];
+		if (manifest.length === 0) return { ok: true, contents: [] };
+		const root = attachmentRoot(ctx);
+		if (!root) return { ok: false, problems: ["the session file could not be resolved"] };
+		const loaded = loadAttachments(root, goal.id, manifest);
+		if (!loaded.ok) return { ok: false, problems: [loaded.error] };
+		return { ok: true, contents: loaded.contents };
+	}
+
 	function pauseGoal(ctx: ExtensionCommandContext): void {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
 			return;
 		}
 		if (goal.status === "paused") {
@@ -2125,10 +3269,136 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		);
 	}
 
-	function resumeGoal(ctx: ExtensionCommandContext, budget: ResumeBudgetRequest): void {
+	/**
+	 * Offer the opt-in paused-Goal resume prompt for a restored `paused` Goal.
+	 *
+	 * The prompt is convenience, never authority. It asks once per session start,
+	 * and every answer other than an explicit "yes" leaves the Goal untouched:
+	 * declining, dismissing, timing out, an unavailable UI, and a Goal that moved
+	 * while the dialog was open all change nothing. Acceptance is delegated to
+	 * {@link resumeGoal}, so it is literally `/goal resume`: the durable
+	 * `markResumed` transition, the same identity and history, and a fresh Blocked
+	 * audit. That is also why the prompt is never offered for any other status —
+	 * `blocked` and `usage_limited` recovery is a user decision with its own
+	 * reasoning, and `budget_limited` recovery needs valid new headroom.
+	 *
+	 * Nothing here blocks a headless path. Print and JSON modes have no
+	 * dialog-capable UI, so the prompt is never opened; RPC mode can answer it, and
+	 * the dialog is created without being awaited by the `session_start` handler,
+	 * so the session becomes usable while the request is still pending. A UI-less
+	 * caller is told what happened rather than left to guess why a paused Goal was
+	 * not resumed.
+	 */
+	function offerResumePrompt(ctx: ExtensionContext): void {
+		if (!resumePrompt.enabled) return;
+		const goal = store.get();
+		if (!goal || goal.status !== "paused") return;
+		// A disabled extension cannot admit the resume this prompt would perform, so
+		// it must not ask a question it will refuse. The clear outcome is a notice
+		// naming the disabled condition and the two explicit ways forward.
+		if (!admission.enabled) {
+			notify(
+				ctx,
+				`Goal ${goal.id} restored (paused). The resume prompt is enabled, but pi-goal is disabled (goal.enabled is ` +
+					"false), so no resume was offered and nothing was resumed: the Goal stays paused and no new Goal work is " +
+					"admitted. Re-enable goal.enabled and run /goal resume to restart it, or leave it paused.",
+				"warning",
+			);
+			return;
+		}
+		if (!ctx.hasUI) {
+			notify(
+				ctx,
+				`Goal ${goal.id} restored (paused). The resume prompt is enabled, but this Pi mode has no interactive UI to ` +
+					"ask it, so nothing was asked and the Goal stays paused. Use /goal resume to restart it.",
+				"info",
+			);
+			return;
+		}
+		// Deliberately not awaited: `session_start` must return so the host can start
+		// dispatching input, and an RPC host answers the dialog only after that.
+		void askResumePrompt(ctx, goal).catch((error) => {
+			notify(ctx, `pi-goal resume prompt error: ${describeError(error)}`, "error");
+		});
+	}
+
+	/**
+	 * Ask the one resume question and act on the answer, revalidating first.
+	 *
+	 * The dialog's timeout resolves to "no" in every mode, and the Goal is re-read
+	 * after the answer because a Goal can be edited, paused, resumed, replaced, or
+	 * cleared while a dialog is open: the answer only ever applies to the exact
+	 * record the dialog described.
+	 */
+	async function askResumePrompt(ctx: ExtensionContext, goal: GoalRecord): Promise<void> {
+		let confirmed: boolean;
+		try {
+			confirmed = await ctx.ui.confirm(
+				"Resume the paused Goal?",
+				`Goal ${goal.id} is paused: "${previewObjective(goal.objective)}". Resuming restarts work with the same ` +
+					"identity, history, and retained progress and starts a fresh blocked audit — the same durable transition " +
+					"as /goal resume. Declining, dismissing, or not answering leaves the Goal paused and changes nothing.",
+				{ timeout: dialogTimeoutMs(RESUME_PROMPT_TIMEOUT_MS) },
+			);
+		} catch (error) {
+			notify(
+				ctx,
+				`Goal ${goal.id} stays paused: the resume prompt could not be displayed (${describeError(error)}). ` +
+					"Use /goal resume to restart it.",
+				"warning",
+			);
+			return;
+		}
+		const current = store.get();
+		if (!current || current.id !== goal.id || current.revision !== goal.revision) {
+			notify(
+				ctx,
+				`Resume prompt closed without resuming: the Goal changed while the prompt was open` +
+					(current ? ` (now ${current.status}, revision ${current.revision})` : " (no Goal is set anymore)") +
+					", so the prompt no longer described the current state. The current Goal state stands; use /goal resume " +
+					"to restart the Goal you want.",
+				"warning",
+			);
+			return;
+		}
+		if (!confirmed) {
+			// Decline, dismissal, and timeout all resolve to "no" in Pi's dialog API, so
+			// the notice names every one of them rather than inventing a distinction the
+			// extension cannot observe.
+			notify(
+				ctx,
+				`Resume prompt not confirmed (declined, dismissed, or timed out): Goal ${current.id} stays paused and ` +
+					"nothing changed. Use /goal resume to restart it.",
+				"info",
+			);
+			return;
+		}
+		if (!admission.enabled) {
+			notify(ctx, admissionDisabledRefusal("Goal not resumed from the resume prompt:"), "warning");
+			return;
+		}
+		if (current.status !== "paused") {
+			notify(
+				ctx,
+				`Goal ${current.id} is ${current.status}; the resume prompt only resumes a paused Goal, so nothing was ` +
+					"resumed.",
+				"warning",
+			);
+			return;
+		}
+		resumeGoal(ctx, { kind: "none" });
+	}
+
+	function resumeGoal(ctx: ExtensionContext, budget: ResumeBudgetRequest): void {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
+			return;
+		}
+		// A resume admits new Goal work — the resume message restarts the loop — so a
+		// disabled extension refuses it and the Goal keeps whatever status it has.
+		if (!admission.enabled) {
+			ctx.ui.notify(admissionDisabledRefusal("Goal not resumed:"), "warning");
 			return;
 		}
 		if (budget.kind === "value" && goal.status !== "budget_limited") {
@@ -2164,6 +3434,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			);
 			return;
 		}
+		// The resume message re-sends the Goal's attachments, so load and
+		// authenticate them *before* the durable resume transition. If the load
+		// fails, the Goal stays paused with an actionable integrity error instead of
+		// becoming active and then failing to start work (which would make the
+		// suggested `/goal resume` a no-op).
+		let contents: AttachmentContent[] = [];
+		if (goal.attachments?.length) {
+			const loaded = loadGoalAttachments(goal, ctx);
+			if (!loaded.ok) {
+				notifyAttachmentIntegrityFailure(goal, ctx, loaded.problems);
+				return;
+			}
+			contents = loaded.contents;
+		}
 		// A stop the user is overruling is a user action, so every anti-loop counter
 		// and the in-memory audit chain start over with the resumed Goal. The durable
 		// audit itself is dropped by the store, so what resumes is the objective and
@@ -2189,8 +3473,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const updated = resumed.goal!;
 		const previousStatus = goal.status;
 		// Durable first, then restart work — busy-safely, so resuming while
-		// another run is in flight steers instead of waiting for idle.
-		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus), ctx);
+		// another run is in flight steers instead of waiting for idle. The message
+		// renders the bytes authenticated before the transition; it never re-reads.
+		const delivery = deliverWorkMessage(formatResumeMessage(updated, previousStatus, contents), ctx);
 		const restarted = resumeRestartNotice(previousStatus, updated.tokenBudget, store.getUsage().totalTokens);
 		ctx.ui.notify(
 			`Goal ${updated.id} resumed (revision ${updated.revision}). ${restarted} Work ${delivery === "started" ? "restarted" : "steered into the running work"}.`,
@@ -2201,7 +3486,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	function clearGoal(ctx: ExtensionCommandContext): void {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
 			return;
 		}
 		const cleared = store.clear(pi);
@@ -2259,6 +3544,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify("There is no Goal to edit. Create one with /goal <objective> first.", "warning");
 			return;
 		}
+		// Refuse before opening the dialog: an edit of an active Goal is
+		// work-admitting, so a disabled extension must not invite the user to write a
+		// new objective it will then decline to deliver.
+		if (goal.status === "active" && !admission.enabled) {
+			refuseWorkAdmittingEdit(ctx, goal);
+			return;
+		}
 		if (!ctx.hasUI) {
 			ctx.ui.notify(
 				"Interactive objective editing needs a UI, which this Pi mode does not have. " +
@@ -2269,7 +3561,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 		const edited = await withDialogTimeout(
 			ctx.ui.editor("Edit Goal objective", goal.objective),
-			EDIT_TIMEOUT_MS,
+			dialogTimeoutMs(EDIT_TIMEOUT_MS),
 			undefined,
 		);
 		if (edited === undefined) {
@@ -2290,6 +3582,27 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify("There is no Goal to edit. Create one with /goal <objective> first.", "warning");
 			return;
 		}
+		// An edit of an *active* Goal is work-admitting: it steers a new objective
+		// into the running work, which is new Goal work. An edit of a Goal that is
+		// already stopped admits nothing — it only rewrites durable state — so it
+		// stays available while the extension is disabled.
+		if (goal.status === "active" && !admission.enabled) {
+			refuseWorkAdmittingEdit(ctx, goal);
+			return;
+		}
+		// An edit keeps the immutable attachment manifest, and the edit message of
+		// an active Goal re-sends it, so the artifacts must verify before the edit
+		// steers new work. A stopped Goal's edit rewrites durable state only and is
+		// verified again when work is eventually resumed.
+		let contents: AttachmentContent[] = [];
+		if (goal.attachments?.length && goal.status === "active") {
+			const loaded = loadGoalAttachments(goal, ctx);
+			if (!loaded.ok) {
+				ctx.ui.notify(attachmentIntegrityError(goal, loaded.problems), "error");
+				return;
+			}
+			contents = loaded.contents;
+		}
 		const edited = store.editObjective(pi, validation.objective);
 		if (!edited.ok) {
 			notifyMutationFailure(ctx, "edited", edited);
@@ -2299,19 +3612,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const updated = edited.goal!;
 		if (updated.status === "active") {
 			// Redirect the active run through Pi's steering (or start work when
-			// idle, e.g. after an aborted run left the Goal dormant).
-			const delivery = deliverWorkMessage(formatEditMessage(updated), ctx);
+			// idle, e.g. after an aborted run left the Goal dormant). The manifest is
+			// immutable across the edit, so the same attachments ride along.
+			const delivery = deliverWorkMessage(formatEditMessage(updated, contents), ctx);
 			ctx.ui.notify(
 				`Goal ${updated.id} objective updated (revision ${updated.revision}); usage history is preserved. Work ${delivery === "started" ? "started" : "steered"} on the new objective.`,
 				"info",
 			);
 			return;
 		}
+		// Nothing was started for a Goal that is already stopped, so the notice says
+		// what restarts it — and, while the extension is disabled, that nothing was
+		// started because admission is off rather than because the Goal moved.
+		const restart = admission.enabled
+			? updated.status === "budget_limited"
+				? "/goal resume --budget <new-total> restarts work with a higher cumulative ceiling."
+				: "/goal resume restarts work."
+			: "pi-goal is disabled (goal.enabled is false), so no work was started and /goal resume stays refused " +
+					"until it is re-enabled.";
 		ctx.ui.notify(
-			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ` +
-				(updated.status === "budget_limited"
-					? "/goal resume --budget <new-total> restarts work with a higher cumulative ceiling."
-					: "/goal resume restarts work."),
+			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ${restart}`,
 			"info",
 		);
 	}
@@ -2335,15 +3655,27 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			"Replace the current Goal?",
 			`The current ${existing.status} Goal "${previewObjective(existing.objective)}" would be discarded ` +
 				"(a new Goal replaces it, with a fresh identity and no retained usage history). Replace it?",
-			{ timeout: REPLACE_CONFIRM_TIMEOUT_MS },
+			{ timeout: dialogTimeoutMs(REPLACE_CONFIRM_TIMEOUT_MS) },
 		);
 	}
 
 	async function createOrReplaceGoal(rawObjective: string, ctx: ExtensionCommandContext): Promise<void> {
-		// Budget flags are a leading prefix of a create (`/goal --budget 5000 <objective>`),
+		// Admission control before anything else: a disabled extension refuses a
+		// creation *and* a replacement, and it refuses before the confirmation
+		// dialog — asking the user to confirm a replacement that cannot happen would
+		// be a lie about what the extension will do.
+		if (!admission.enabled) {
+			ctx.ui.notify(admissionDisabledRefusal("Goal not created:"), "warning");
+			return;
+		}
+		// Budget and attachment flags are a leading prefix of a create (`/goal --budget 5000 --file spec.md <objective>`),
 		// so an objective that merely contains the word `--budget` is never truncated.
 		// `--no-budget` asks for an unbounded Goal even when a default is configured.
 		const parsed = parseGoalArgs(rawObjective);
+		for (const problem of parsed.problems) {
+			ctx.ui.notify(problem, "error");
+			return;
+		}
 		// `resolveGoalTokenBudget` owns the request kinds, so an explicit unbounded
 		// request is refused (never clamped) while a maximum is configured.
 		const budget = resolveGoalTokenBudget(
@@ -2426,7 +3758,74 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const goal = store.create(validation.objective, "command", { tokenBudget: budget.tokenBudget });
 			const sameRecord = (candidate: GoalRecord | null | undefined) =>
 				candidate != null && candidate.id === goal.id && candidate.revision === goal.revision;
+			// Loaded attachment content for the kickoff message; filled by the
+			// materialization below and empty for a Goal without attachments.
+			let attachmentContents: AttachmentContent[] = [];
+			// Retract artifacts only while no snapshot has committed them. Once the
+			// commit succeeds, clear/replacement/rollback retention applies.
+			let uncommittedAttachmentRoot: string | null = null;
 			try {
+				// Materialize the requested attachments into the immutable,
+				// extension-owned store keyed by this Goal's identity *before* the
+				// snapshot is staged: validation and materialization failures refuse
+				// the whole creation here — the previous Goal (if any) is untouched,
+				// nothing was appended, and no success event was emitted. A refused
+				// materialization retracts only the uncommitted store directory; a
+				// Goal whose snapshot committed keeps its artifacts forever.
+				if (parsed.attachments.length > 0) {
+					const root = attachmentRoot(ctx);
+					if (!root) {
+						throw new Error("the session file could not be resolved for the attachment store");
+					}
+					uncommittedAttachmentRoot = root;
+					const materialized = await materializeAttachmentRequests(root, goal.id, parsed.attachments, {
+						cwd: sessionWorkingDirectory(ctx),
+						remote: remoteImageFetchOptions(),
+					});
+					if (!materialized.ok) {
+						// Not a write failure of the Goal path: refuse with the validation
+						// error, retracting the uncommitted artifacts on the way out.
+						discardUncommittedArtifacts(root, goal.id);
+						ctx.ui.notify(materialized.error, "error");
+						return;
+					}
+					goal.attachments = materialized.attachments;
+					attachmentContents = materialized.contents;
+				}
+				// The remote fetch is a real network await, and the create lock
+				// excludes only other create/replace commands: a /goal clear, an
+				// edit, a lifecycle command, or a create_goal tool call can run
+				// while DNS and the body read are pending. Revalidate the exact
+				// record this command captured — null included, for a fresh
+				// creation — immediately after materialization and before any
+				// durable transition (the superseded freeze, the stage, and the
+				// commit). On a mismatch the current Goal stays untouched, the
+				// never-committed artifacts are retracted, and no success event
+				// is emitted.
+				const captured = previous ?? null;
+				const afterMaterialization = store.get();
+				const unchanged =
+					captured === null
+						? afterMaterialization == null
+						: afterMaterialization != null &&
+							afterMaterialization.id === captured.id &&
+							afterMaterialization.revision === captured.revision;
+				if (!unchanged) {
+					if (uncommittedAttachmentRoot) {
+						discardUncommittedArtifacts(uncommittedAttachmentRoot, goal.id);
+					}
+					ctx.ui.notify(
+						"Goal not created: the Goal changed while the remote image was being fetched" +
+							(afterMaterialization
+								? ` (now ${afterMaterialization.status}, revision ${afterMaterialization.revision})`
+								: " (no Goal is set anymore)") +
+							", so this command no longer described the current state. Nothing was replaced and the " +
+							"fetched artifact was retracted; the current Goal is unchanged. Run /goal again to create " +
+							"it against the current state.",
+						"warning",
+					);
+					return;
+				}
 				// Replacement must preserve the superseded Goal's already-accounted
 				// totals as a durable historical record before the new identity takes
 				// over the session's Goal slot and resets the live ledger. If that
@@ -2439,8 +3838,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// revalidating it after the wait detects exactly that change.
 				store.stage(pi, goal);
 				store.commit(goal);
+				uncommittedAttachmentRoot = null;
 				updateStatus(ctx);
 			} catch (error) {
+				if (uncommittedAttachmentRoot) {
+					discardUncommittedArtifacts(uncommittedAttachmentRoot, goal.id);
+				}
 				if (replacing) {
 					// A failed *replacement* write must not erase the existing
 					// Goal: nothing was appended, so the previous record stays
@@ -2469,7 +3872,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// in flight - waiting for idle would deadlock behind its
 				// continuation loop - so the kickoff is steered into the active
 				// run or starts immediately when idle.
-				delivery = deliverWorkMessage(formatKickoffMessage(goal), ctx);
+				delivery = deliverWorkMessage(formatKickoffMessage(goal, attachmentContents), ctx);
 			} else {
 				// There is no Goal continuation loop that could starve this wait
 				// (abort also settles a stuck run), and the seam above declines to
@@ -2504,7 +3907,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				pendingRunKind = "kickoff";
 				// The admission segment opens when the kickoff is delivered, in
 				// `applyDeliveredUserMessage`, like every other work message.
-				pi.sendUserMessage(formatKickoffMessage(goal));
+				pi.sendUserMessage(formatKickoffMessage(goal, attachmentContents));
 				delivery = "started";
 			}
 
@@ -2540,6 +3943,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
+			// The creation (or replacement) was announced on the event stream by the
+			// store's commit, at the moment its snapshot's append succeeded — the same
+			// durable bar every other transition uses. This announcement waits for the
+			// on-disk poll instead, because the user-facing message must not outlive a
+			// session file that never appeared.
+			//
+			// A *fresh* creation may also name the session, and only a fresh one: a
+			// replacement is a new Goal in a session that already has Goal history, so
+			// naming it would relabel a session the user may already recognize by its
+			// old name. Every failure path above returned before this point, so a
+			// refused, failed, or rolled-back creation never names anything.
+			if (!replacing) nameSessionFromObjective(ctx, goal.objective);
 			ctx.ui.notify(
 				replacing
 					? `Goal ${goal.id} created and activated, replacing ${previous!.id}. Initial work ${delivery === "started" ? "started" : "steered into the running work"}.`
@@ -2570,9 +3985,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	async function reportStatus(ctx: ExtensionCommandContext): Promise<void> {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(), "info");
+			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
 			return;
 		}
-		ctx.ui.notify(formatGoalSummary(toPublicState(goal)), "info");
+		ctx.ui.notify(formatGoalSummary(toPublicState(goal), { admissionEnabled: admission.enabled }), "info");
+	}
+
+	/**
+	 * Render the branch-local Goal history.
+	 *
+	 * Read-only by construction: the handler reads the selected branch's history
+	 * entries and notifies a formatted timeline. There is no mutation here and no
+	 * mutation anywhere else that takes a history record as input — the timeline is
+	 * derived diagnostic data whose only purpose is to be read, so `/goal history`
+	 * can never become a second interface for changing Goal state.
+	 *
+	 * A branch with no history renders an explicit "no history" line rather than
+	 * silence, and unreadable entries are counted and surfaced as a notice instead
+	 * of being silently dropped: a timeline that quietly omits a record would
+	 * understate what the branch holds. Neither case touches the Goal — the notice
+	 * is a rendering diagnostic, and the authoritative Goal is unaffected.
+	 */
+	function reportHistory(ctx: ExtensionCommandContext): void {
+		ctx.ui.notify(formatGoalHistory(store.readHistory(ctx)), "info");
 	}
 }

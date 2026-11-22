@@ -336,9 +336,212 @@ admitted against), and the new Goal to stay `active` at revision 0 with its own
 kickoff rather than being marked `complete` with no work. The replaced identity
 keeps its own durable superseded record.
 
+## 21. Optional: disabling the extension (`goal.enabled`)
+
+`goal.enabled` is an admission control, not a Lifecycle status. The deterministic
+coverage is `test/goal46-admission-control.test.mjs` (a real `pi --mode rpc`
+session per case, resumed with a different `settings.json`); the steps below
+reproduce the user-visible surface by hand.
+
+1. Create a Goal and let a continuation run (sections 3–5).
+2. Add `"goal": { "enabled": false }` to Pi settings and restart Pi on the same
+   session (`pi --continue`, or resume the session file).
+3. Run `/goal`. Expect the ordinary report plus an `Admission disabled:` block,
+   and a status line ending in `admission off`.
+4. Send an ordinary prompt. Expect the work to run and finish, and a
+   `... no continuation was requested at this settlement` notification. Bare
+   `/goal` twice a few seconds apart: `Active time` must still be increasing —
+   disabling the extension does not stop the clock.
+5. Try `/goal <objective>`, `/goal edit <objective>`, and `/goal resume`. Expect a
+   refusal naming what is refused and what still works; no replacement
+   confirmation dialog may open.
+6. `/goal pause`, then `/goal edit <objective>`: the edit of an already-stopped
+   Goal is allowed and says no work was started.
+7. Remove the setting (or set it to `true`) and restart on the same session. The
+   restored active Goal continues at the next settlement again.
+
+## 22. Optional: the paused-Goal resume prompt (`goal.resumePrompt`)
+
+`goal.resumePrompt` is convenience over `/goal resume`, not a replacement for it.
+The deterministic coverage is `test/goal51-resume-prompt.test.mjs` (a real `pi
+--mode rpc` session per case, reopened on a copied session file); the steps below
+reproduce the user-visible surface by hand.
+
+1. `/goal <objective>`, let one continuation run, then `/goal pause`.
+2. Add `"goal": { "resumePrompt": true }` to Pi settings and restart Pi on the
+   same session. Expect one `Resume the paused Goal?` confirmation after the
+   `Goal ... restored (paused)` notice. Do **not** answer it yet: `/goal` must
+   still respond and report `paused`, because startup never waits on the dialog.
+3. Answer **Yes**. Expect `Goal ... resumed (revision N)` and a fresh resume
+   kickoff; bare `/goal` reports `active`, and a subsequent model blocker report
+   starts a fresh audit rather than inheriting the pre-pause one.
+4. Repeat from step 1 and answer **No** (or dismiss the dialog, or leave it
+   unanswered until it times out). Expect `Resume prompt not confirmed
+   (declined, dismissed, or timed out)` and a Goal that is still `paused` with an
+   unchanged revision, no new run, and no new continuation.
+5. While a `blocked`, `usage_limited`, or `budget_limited` Goal is restored, no
+   prompt may appear; those recoveries stay explicit (`/goal resume`, or
+   `/goal resume --budget <new-total>` with valid new headroom).
+6. Set `"goal": { "enabled": false, "resumePrompt": true }` and restart on a
+   paused Goal. Expect no dialog, a notice that the prompt is enabled but
+   pi-goal is disabled, and `/goal resume` still refused; the Goal stays paused
+   either way.
+7. Remove the setting (or set it to `false`) and restart: the paused Goal is
+   restored with no dialog and only `/goal resume` restarts it.
+
+## 23. Optional: naming the session from the Objective
+
+`goal.sessionNameFromObjective` (default `false`) is a convenience, not a
+Lifecycle behavior. The deterministic coverage is
+`test/goal52-session-naming.test.mjs` (a real `pi --mode rpc` session per case);
+the steps below reproduce the user-visible surface by hand.
+
+1. Add `"goal": { "sessionNameFromObjective": true }` to Pi settings and restart Pi.
+2. `/goal <objective>` in a session with no name. Expect the session name (shown in
+   the session selector and the footer) to become the Objective's first line.
+3. Name the session yourself (`/name <name>` or `ctrl+r` to rename it in place),
+   then `/goal clear` and `/goal <another objective>`. Expect your name to survive:
+   pi-goal never overwrites a name that exists.
+4. With a named session, `/goal edit <new objective>`. Expect the name to be
+   unchanged while the Goal's objective and revision change.
+5. With a named session, `/goal <another objective>` and confirm the replacement.
+   Expect the name to be unchanged again.
+6. A long objective (over 80 characters) is named with exactly its first 80
+   characters, and a multi-line objective with only its first line.
+
+## 24. Optional: local Objective attachments
+
+Choose a small UTF-8 text file and a local PNG, JPEG, GIF, or WebP image, then
+create a Goal with explicit leading options:
+
+```
+/goal --file ./requirements.txt --image ./screenshot.png Implement the attached requirements
+```
+
+Expect the ordinary creation confirmation and immediate work, with the model
+using both files. `/goal` adds an `Attachments:` metadata line (labels, media
+types, sizes), not file contents. The first work message contains the text as an
+encoded `GOAL ATTACHMENT DATA` block and the image as a Pi image content block;
+the next automatic Continuation names the same hashes and carries the same
+attachments.
+
+The durable artifacts live beside the session file:
+
+```
+<session-directory>/pi-goal-store/<goal-id>/<sha256>.<ext>
+```
+
+1. Run `/goal edit Refine the attached requirements without changing the files`.
+   The manifest and hashes stay unchanged. `/goal edit --file ./other.txt New
+   objective` is refused with Replacement Goal guidance.
+2. Replace the Goal with a different `--file`/`--image` selection and confirm.
+   The new identity gets its own manifest; the old identity's artifact directory
+   remains.
+3. Restart the session. The attachments verify and later Continuations use the
+   same hashes; the original source paths are not needed.
+4. `/goal clear` removes the current Goal but does **not** remove either Goal's
+   committed artifacts. V1 deliberately has no destructive automatic garbage
+   collection because an older selected branch may still need them.
+5. For the integrity check, create another attachment-bearing active Goal, stop
+   Pi, and temporarily move one content-addressed artifact aside. Restart and
+   send an ordinary prompt. Expect an explicit missing-artifact error and no
+   automatic Continuation; `/goal` keeps the same Lifecycle status and manifest.
+   Restore the original bytes to the exact content-addressed path before
+   resuming. Do not edit the artifact in place unless corruption behavior is
+   what you intend to test.
+6. With `goal.enabled: false`, retry an attachment-bearing creation. It is
+   refused before materialization, no `pi-goal-store` entry is created, and the
+   previous Goal is unchanged.
+
+SVG, unknown image bytes, empty/invalid UTF-8 text, more than eight attachments,
+and files over the documented limits are refused without a success event or
+kickoff. Plain Objective text mentioning `--file` remains plain text, and
+`create_goal` has no attachment parameters. This explicit flow—not inferred
+composer drafts—is the V1 alternative to Codex pending pastes and image drafts.
+
+### Remote image variant
+
+Use a small image URL you control (the automated suite uses only a local HTTPS
+fixture; this manual check may use the network):
+
+```
+/goal --remote-image https://example.com/diagram.png Implement the attached diagram
+```
+
+1. Expect one fetch, then a kickoff and Continuation with the same image hash.
+   `/goal` lists the manifest label, media type, and size without the URL.
+2. Restart Pi and continue. Expect no second request to the URL and the same
+   hash; the source URL is not needed after creation.
+3. Retry with `--remote-image http://example.com/diagram.png`, a URL containing
+   `user:password@`, `https://127.0.0.1/...`, and an https URL for a hostname
+   that resolves to loopback. Expect each refusal before a Goal is written or a
+   fetch completes. A redirect to a private address, too many redirects, a
+   non-image response, and an oversized response are refused the same way.
+4. With `goal.enabled: false`, retry a remote-image creation. Expect the
+   disabled refusal before any request is attempted.
+
+## 25. Optional: the structured progress plan (`goal.planTool`)
+
+`goal.planTool` (default `false`) registers an `update_plan` model tool. The
+deterministic coverage is `test/goal53-progress-plan.test.mjs` (a real `pi --mode
+rpc` session per case, driving real model tool calls); the steps below reproduce
+the user-visible surface by hand.
+
+1. Add `"goal": { "planTool": true }` to Pi settings and restart Pi.
+2. `/goal <objective>` and let one Continuation run. Ask the model to keep a plan.
+   Expect an `update_plan` call whose result restates the steps and their statuses,
+   and expect the tool to appear in the model's tool list.
+3. Ask for a plan with two steps marked in progress. Expect a refusal naming the
+   one-in-progress rule, with no plan recorded.
+4. Ask the model to mark every step completed. Expect the Goal to stay `active`
+   with an unchanged revision, and expect the next turn to keep working: only
+   `update_goal` with `complete` ends the Goal.
+5. Restart Pi on the same session. The plan is still part of the model's context,
+   and the tool is registered again.
+6. Remove the setting (or set it to `false`) and restart. Expect no `update_plan`
+   in the tool list, no mention of it in any Continuation, and a refusal if the
+   model calls it anyway.
+
+## 26. Optional: the Goal audit history
+
+After any of the transitions above, read the timeline:
+
+```
+/goal history
+```
+
+Expect one line per committed transition — identity, revision, previous and
+current Lifecycle status, timestamp, usage summary, Active elapsed time, and an
+`attachments:` line with manifest hashes when the Goal has attachments. The
+header names the timeline as non-authoritative.
+
+1. Restart the session and run `/goal history` again: the same records, because
+   they are durable session entries rather than runtime state.
+2. Run `/goal` before and after `/goal history`: nothing changes. The rendering
+   writes no `goal-state`, `goal-history`, or `goal-usage` entry and starts no
+   run, and no command mutates a Goal from a record.
+3. Pause, resume, edit, and clear, checking the timeline after each: every
+   committed transition gets exactly one record, and refusals (a second pause, a
+   second clear, a declined replacement) get none.
+4. For the malformed-entry check, stop Pi and truncate one `goal-history` line's
+   JSON payload in the session file (leave the entry's id, parent, and timestamp
+   intact). Restart: `/goal` reports the unchanged Goal, and `/goal history`
+   renders the readable records plus a notice that one entry could not be read.
+5. For the crash-gap check, stop Pi and delete one `goal-history` line, re-pointing
+   the following entry's `parentId` at the removed entry's parent. Restart: the
+   Goal is unchanged, the timeline simply has no record for that transition, and
+   the next transition appends normally.
+
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
+- [ ] `--file`/`--image` attachments reach kickoff and Continuation with stable
+      hashes, survive restart and replacement/clear retention, and fail closed
+      with an explicit error when an artifact is missing or corrupt.
+- [ ] `--remote-image` fetches once over HTTPS, keeps the same hash across
+      Continuations and restarts, sends no credentials/cookies/referrer, and
+      refuses HTTP, credentials, non-public destinations, bad redirects, MIME
+      mismatches, and oversized bodies without a success event.
 - [ ] `/goal <objective>` creates an active Goal and starts work.
 - [ ] The status indicator and bare `/goal` report `active`.
 - [ ] An active Goal continues automatically after a turn.
@@ -368,6 +571,40 @@ keeps its own durable superseded record.
 - [ ] A run admitted against a replaced identity cannot complete, report a
       blocker against, or pause the Goal that replaced it; the replaced identity
       keeps its own durable superseded record.
+- [ ] With `goal.enabled: false`, creation, replacement, `create_goal`, a
+      work-admitting edit, resume, and automatic continuation are all refused,
+      while inspection, pause, clear, and in-flight terminal updates still work.
+- [ ] An active-but-disabled Goal keeps its `active` status and keeps accruing
+      `Active time`; `/goal pause`, not disabling the extension, stops it.
+- [ ] Re-enabling `goal.enabled` restores admission, and the restored active Goal
+      continues only at the next settlement.
+- [ ] With `goal.resumePrompt: true`, a restored `paused` Goal is asked once;
+      accepting runs `/goal resume`'s durable transition (fresh Blocked audit),
+      while declining, dismissing, timing out, or having no UI leaves it paused
+      and unchanged.
+- [ ] `active`, `complete`, `blocked`, `usage_limited`, and `budget_limited` Goals
+      are never prompted for, and a disabled extension never offers the prompt.
+- [ ] With `goal.sessionNameFromObjective: true`, `/goal <objective>` names an
+      unnamed session from the Objective's first line (whitespace-collapsed, at
+      most 80 characters), and `create_goal` does the same.
+- [ ] With the setting absent or `false`, no session is ever named.
+- [ ] A session name the user provided is never overwritten, an Objective edit and
+      a Replacement Goal never rename it, and a failed or rolled-back creation
+      leaves the session unnamed.
+- [ ] With `goal.planTool: true`, an `update_plan` call records an ordered plan
+      with at most one in-progress step, and the plan is visible in the model's
+      context again after a restart.
+- [ ] A plan with two in-progress steps is refused and records nothing, and a plan
+      that marks every step completed leaves the Goal `active` with an unchanged
+      revision — only `update_goal` completes it.
+- [ ] With the setting absent or `false`, no `update_plan` tool is registered and
+      no Continuation mentions it.
+- [ ] `/goal history` renders one record per committed transition (identity,
+      revision, previous/current status, timestamp, usage, active time, manifest
+      hashes), survives a restart, writes nothing, and mutates nothing.
+- [ ] A truncated `goal-history` entry is skipped and surfaced as a notice while
+      the Goal reconstructs unchanged, and a missing one leaves only the
+      documented diagnostic gap.
 - [ ] `create_goal` succeeds only for a verbatim, affirmative, currently
       authoritative request, and refuses forged, stale, negated, hypothetical,
       question-shaped, non-explicit, and wrong-source quotations with

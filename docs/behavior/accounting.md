@@ -4,7 +4,7 @@ How Goal-owned token usage and active elapsed time are counted, when they become
 durable, and why replay and the live path converge.
 
 [← README](../README.md) · See also [budgets](budgets.md) ·
-[persistence](persistence.md)
+[persistence](persistence.md) · [subagent usage](../subagent-usage.md)
 
 Token usage and active elapsed time are durable Goal state, recovered from the
 session after a restart, a resume, a reload, or tree navigation.
@@ -50,6 +50,15 @@ is never adopted. `create_goal` leaves its creating run ordinary, and attributio
 starts at the first subsequent Continuation; pre-creation responses, creation
 controls, and unrelated same-batch tool results are excluded. Ordinary prompts
 are excluded in every lifecycle status.
+
+External child usage follows **observation-time ownership** in V1. A provider
+returns only the newly observed delta on the parent tool result, and that delta
+belongs to the admission segment that observes it. Consequently, child work
+performed while a Goal is paused but first observed after `/goal resume` can
+belong to the resumed segment; it is not retroactively attributed to the paused
+segment. The same boundary rule applies to durable replay: the persisted parent
+tool result, not the child's private snapshot, is the accounting record. Strict
+reconciliation at every pause/resume boundary is deliberately not claimed.
 
 Delivery is the seam at both ends because it is the entry the branch replay reads
 back. A steer queued during an in-flight response reaches the branch only *after*
@@ -100,6 +109,17 @@ wrap-up, and every later run of a `budget_limited` Goal. The branch replay after
 restart draws exactly the same line, so an unclean exit cannot reclassify
 post-completion work as Goal usage.
 
+The formula is the extension's accounting rule applied to what Pi reports, never
+an invoice: provider billing is not reconciled, cached reads are excluded, and a
+migrated 0.1.0 Goal carries legacy reconstructed totals rather than exact
+Goal-owned attribution. Observation-time ownership is an attribution
+approximation, not strict lifecycle attribution. A child crash can also leave
+work that never reached either its Pi session or a durable provider snapshot;
+that unrecorded work is unrecoverable, and terminal missing-snapshot recovery
+reports zero *observed* usage rather than claiming the child did no work. A
+budgeted Goal's completion says so explicitly next to the numbers it reports (see
+[completion usage report](budgets.md#completion-usage-report)).
+
 **Active time.** A monotonic clock (`performance.now()`, sampled exactly once per
 operation and clamped to the highest value seen) runs while a Goal is active in a
 live session. Every non-active status stops it — `paused`, `blocked`,
@@ -110,6 +130,13 @@ boundary neither loses nor double-counts time, and the accounted value is
 checkpointed durably at most once per accounted second of Goal activity, at every
 settlement, and at shutdown. Because the source is monotonic, a clock adjustment
 cannot make accounted time jump or shrink.
+
+Disabling the extension (`goal.enabled: false`) does **not** stop this clock: an
+active-but-disabled Goal keeps its `active` status, so idle-active time keeps
+accruing until the user pauses it. Pausing the Goal, not disabling the extension,
+is what stops Active elapsed time. For the same reason, no new Goal-owned usage
+is admitted while the extension is disabled: every run starts from a user prompt,
+and a user prompt closes the admission segment.
 
 Checkpoints are event-driven, not periodic: an *idle* active Goal accrues active
 time that only becomes durable at its next settlement or shutdown, so an unclean

@@ -4,7 +4,7 @@ What Pi does on its own while a Goal is active, and the no-progress contract
 every continuation carries.
 
 [← README](../README.md) · See also [stopping](stopping.md) ·
-[accounting](accounting.md)
+[accounting](accounting.md) · [attachments](attachments.md)
 
 While a Goal is **active**, Pi continuing on its own is the normal case:
 
@@ -24,6 +24,19 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   blocked audit is open it restates that audit's Blocker identity, latest
   description, and count, and it states the three-consecutive-Goal-turn blocked
   audit the extension enforces.
+- With `goal.planTool` enabled the same message adds a short *Progress plan*
+  section naming `update_plan`, its one-in-progress rule, and the fact that a plan
+  is narration rather than Goal state. The section is emitted only when the tool
+  is really registered, so the model is never told to call a tool that is not in
+  its loadout. → [Optional progress plan](lifecycle.md#optional-progress-plan)
+- A Goal with attachments re-reads the same immutable manifest: text is framed
+  again as encoded, nonce-delimited untrusted data and images are included as Pi
+  image content blocks. Before requesting the Continuation, pi-goal performs one
+  authenticated load that enforces the manifest size and limits and verifies
+  every artifact hash on the exact bytes it returns. A missing or corrupt
+  artifact suppresses the request and surfaces an explicit integrity error
+  without silently dropping attachments, completing the Goal, or changing its
+  Lifecycle status.
 - The continuation requests exactly one further provider request per
   settlement. If queued work already causes that request, Pi satisfies the
   decision with it and makes no extra one.
@@ -31,4 +44,11 @@ While a Goal is **active**, Pi continuing on its own is the normal case:
   replaced.
 - A run that was aborted or that ended in a provider error is a hard exit: Pi
   owns retries, so the Goal does not add a retry loop of its own. The Goal stays
-  active and continues on the next successful run.
+  active and continues on the next successful run — unless `goal.enabled` is
+  false, where the notice says so, because that next run settles at the
+  admission gate and continues nothing.
+- While `goal.enabled` is false, nothing is admitted at this boundary: no
+  continuation and no owed budget wrap-up. The Goal keeps its status and keeps
+  accruing active time, and a pending wrap-up is deferred rather than dropped —
+  re-enabling the setting delivers it at the next settlement. → [Disabling the
+  extension](lifecycle.md#disabling-the-extension-goalenabled)

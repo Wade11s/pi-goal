@@ -14,7 +14,7 @@ Use the single-context layout: root `GLOSSARY.md` and `docs/adr/`. See `docs/age
 
 ### Orchestration
 
-For planning, issue delegation, implementation, PR review, and merges, follow `docs/agents/orchestration.md`.
+For planning, issue delegation, implementation, PR review, and merges, follow `docs/agents/orchestration.md`. Subagent model selection and review-subagent policy live in `docs/agents/subagents.md`; read it before every `rex-subagent` dispatch.
 
 ---
 ## Code review (open-code-review delegate mode)
@@ -22,6 +22,7 @@ For planning, issue delegation, implementation, PR review, and merges, follow `d
 All code reviews must use the `open-code-review-delegate` skill: OCR only selects files and supplies rules; the reviewing agent performs the review itself using its own model.
 
 - When to review: before merging every PR, and whenever dispatching a review subagent.
+- Launch profile: launch every review subagent with the read-only review-child profile in `docs/agents/subagents.md` (`tools` = `read,bash,grep,find,ls`; `excludeTools` = `edit,write,get_goal,create_goal,update_goal`). It is a Rex launch argument set, not a Pi review-thread classification. The parent session keeps its Goal tools and Goal state; a review child has no Goal lifecycle controls — `get_goal`, `create_goal`, and `update_goal` are absent and out of scope, so a reviewer must not attempt lifecycle operations and instead reports that they are unavailable. A child that tries one anyway gets the intended `Tool <name> not found` refusal.
 - Instruction for review subagents: "Use the open-code-review-delegate skill to review `<base>..<head>`, following the skill's Step 1–6. Report issues only; do not modify code." The default base is `main`, and the default head is the current branch.
 - Required workflow:
   1. Run `ocr delegate preview --format json --from <base> --to <head>`; when requirement context is available (issue, acceptance criteria), add `-b "<summary>"`.

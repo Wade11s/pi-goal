@@ -1,16 +1,27 @@
 # Model tools
 
-`get_goal`, `create_goal`, and `update_goal`: the structured state they return,
-the authority each transition requires, and the objective's trust boundary.
+`get_goal`, `create_goal`, `update_goal`, and the opt-in `update_plan`: the
+structured state they return, the authority each transition requires, and the
+objective's trust boundary.
 
 [← README](../README.md) · See also [lifecycle](behavior/lifecycle.md) ·
-[stopping](behavior/stopping.md)
+[attachments](behavior/attachments.md) · [stopping](behavior/stopping.md)
 
 ## Model tool: `get_goal`
 
 The model can call `get_goal` at any time to retrieve the same structured state
 the command reports (or `goal: null` when no Goal is set). Use it whenever the
 objective is absent or truncated in context.
+
+While `goal.enabled` is false the tool's text adds an `Admission disabled:` block:
+the Goal's Lifecycle status is untouched, no new Goal work is admitted, and
+inspection, pause, clear, and terminal updates from in-flight work still work.
+For a Goal with attachments, the text and structured state include the immutable
+manifest metadata (`hash`, `mediaType`, `bytes`, `label`), never attachment
+contents; the model receives those contents in the framed Goal work messages.
+With no Goal set, the text says the same thing about `/goal <objective>` and
+`create_goal`. The structured `{ goal }` payload is unchanged — admission is a
+host preference, not Goal state, so it is never persisted in a snapshot.
 
 ## Model tool: `create_goal`
 
@@ -23,6 +34,28 @@ could not restore the Goal, refuses while this session already has a Goal
 snapshot before reporting success. Creating a Goal through the tool does not
 send a kickoff message: the model is already mid-run, and the continuation seam
 picks the Goal up at the next settlement.
+
+`create_goal` is deliberately **text-only**. It has no file, image, path, or URL
+parameters, and extra drifted fields do not gain attachment authority. Explicit
+local and remote attachments can be selected only by the direct
+`/goal --file … --image … --remote-image …` command at creation or Replacement
+Goal time. Remote URLs are fetched only there, once, so a model cannot turn a
+quoted prompt or an unquoted URL into network material. The existing 3–2000
+character Objective validation is unchanged; long supporting material belongs in
+a direct text attachment, not in a model-created Objective.
+
+Because it refuses while any Goal exists, a successful `create_goal` is always a
+fresh creation, so it is also the tool-side path for the opt-in session name: with
+`goal.sessionNameFromObjective` enabled it names an otherwise unnamed session
+from the Objective, exactly like `/goal <objective>`. A refused, failed, or
+rolled-back creation reports no Goal and names nothing. The name is not part of
+the tool result and not part of any Goal-updated event — see
+[lifecycle](behavior/lifecycle.md#naming-the-session-from-the-objective).
+
+While `goal.enabled` is false the tool is refused before anything is validated:
+the result is an error carrying the unchanged current Goal (or `goal: null`), and
+the one-shot creation authority is left intact, so a corrected call can retry once
+the setting is re-enabled.
 
 ### Creation authority
 
@@ -62,6 +95,63 @@ at execution time: snapshots retain `origin: "tool"` and gain no persisted
 quotation, source-message id, or reusable authorization marker. The direct
 `/goal <objective>` path is unchanged and needs no quotation.
 
+## Model tool: `update_plan`
+
+`update_plan` is the opt-in structured progress plan (`goal.planTool`, default
+`false`). It takes one argument — `plan`, an ordered array of `{ step, status }`
+where `status` is `pending`, `in_progress`, or `completed` — and replaces any
+previous plan wholesale. At most one step may be `in_progress`; a list of 1–20
+steps with step text of 1–200 characters is accepted, and anything else is
+refused with the rule that was broken.
+
+```json
+{
+  "plan": {
+    "steps": [
+      { "step": "Write the failing test", "status": "completed" },
+      { "step": "Implement the plan tool", "status": "in_progress" },
+      { "step": "Document the tool", "status": "pending" }
+    ],
+    "counts": { "total": 3, "completed": 1, "inProgress": 1, "pending": 1 }
+  }
+}
+```
+
+That object is the whole result: the tool returns it as both `structuredContent`
+and `details`, and Pi persists the tool result — including its `details` — on the
+session branch. So the plan's durability is the ordinary tool result, which
+survives a restart and is visible to the model in its own context, and there is
+no second Goal record: no `goal-state` entry, no revision, and no
+`pi-goal:updated` event. A later plan becomes the newest record on the branch and
+leaves the earlier one in place as history.
+
+What the tool deliberately does **not** do:
+
+- **It never mutates the Lifecycle.** Nothing in its execution path reaches the
+  Goal store, so a plan call cannot complete, pause, block, or budget-limit a
+  Goal. A plan that marks every step `completed` leaves the Goal active, and the
+  result text says so — a model that has just finished its own list is exactly
+  the one that might otherwise read it as a finished Goal.
+- **It cannot satisfy or bypass the Completion audit.** Completion remains
+  `update_goal` with `complete`, after every requirement of the objective is
+  verified by current-state evidence. A plan is narration about what the model
+  intends, never evidence that it happened.
+- **It performs no model work**, so it reports no usage of its own. Its turn is
+  charged by the ordinary accounting path like any other Goal turn, and it counts
+  as activity for the anti-loop counters like any other tool call.
+- **It never replaces another extension's tool.** If `update_plan` is already
+  registered by someone else, pi-goal registers nothing, reports why, and no
+  Continuation names the tool.
+
+Refusals — no Goal set, a second `in_progress` step, an empty or over-long step,
+an unknown status, a malformed argument — return an error result with **no**
+`details` payload, so the durable plan on a branch is only ever a successful tool
+result. A call in a session with no Goal is refused because there is no progress
+for a plan to describe and no Continuation that would ever show it.
+
+While the setting is off the tool does not exist: it is not declared to the model,
+and Pi refuses a call to it before any extension runs.
+
 ## The objective's trust boundary
 
 The objective is the one part of a Goal message the extension does not author. A
@@ -98,6 +188,12 @@ The canonical objective is always available unframed through `get_goal` and in
 the structured tool results, and the record carries its `origin` (`command` for
 `/goal`, `tool` for `create_goal`).
 
+Text attachments use the same encoding and random-nonce boundary in separate
+`GOAL ATTACHMENT DATA` blocks; images travel as Pi image content blocks and are
+also identified as untrusted data by label and manifest hash. Neither kind can
+rewrite the extension-authored audit or completion instructions. See
+[Objective attachments](behavior/attachments.md#the-trust-boundary).
+
 ## Model tool: `update_goal`
 
 `update_goal` supports three actions. `complete` is the completion contract: the
@@ -126,6 +222,17 @@ authorize its own pause) is refused, and the Goal keeps running. The model
 cannot resume, clear, replace, or budget-limit a Goal through the tool at all:
 those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
 <objective>`).
+
+None of the three actions is an admission decision, so all of them keep working
+while `goal.enabled` is false: a run that was already in flight when the extension
+was disabled can still complete a Goal, report a blocker, or pause it, and every
+successful result carries the disabled condition in its text — including a blocker
+report below the audit threshold, which otherwise reads as a Goal that stays
+active — so the model does not read the Goal as one that will keep continuing.
+The condition follows the status the update leaves: a paused or blocked result
+names the refused `/goal resume` that re-enabling makes available again, while a
+completion says the Goal is terminal either way so that replacing it is a new
+`/goal <objective>` and not a resume.
 
 `blocked` is the blocker contract. The model calls it with
 `{ action: "blocked", blocker: "…" }` — plus `blocker_id` on every later report of
@@ -211,7 +318,9 @@ opaque identity says nothing useful there and is not displayed.
 
 `get_goal`, `create_goal`, and `update_goal` all return the same structured
 `{ goal }` payload, so status, budgets, usage, and remaining capacity are
-unambiguous for programmatic callers:
+unambiguous for programmatic callers. The opt-in `update_plan` returns a
+`{ plan }` payload of its own (see above), which is deliberately *not* a Goal
+payload: nothing in it is Goal state.
 
 ```json
 {
@@ -233,13 +342,23 @@ unambiguous for programmatic callers:
       "activeSeconds": 312
     },
     "remainingTokens": 201790,
+    "attachments": [
+      {
+        "hash": "1b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d835670",
+        "mediaType": "text/plain",
+        "bytes": 12400,
+        "label": "spec.md"
+      }
+    ],
     "budgetExhausted": false
   }
 }
 ```
 
 `remainingTokens` is `null` when the Goal has no budget and floors at zero once
-the budget is reached; `budgetExhausted` is the explicit signal. The objective,
+the budget is reached; `budgetExhausted` is the explicit signal. `attachments`
+is `[]` without attachments and otherwise contains metadata only, in immutable
+manifest order. The objective,
 identity, origin, timestamps, and revision are part of the same payload.
 
 While a blocked audit is open, the same payload carries its **Blocker identity**
@@ -247,3 +366,43 @@ While a blocked audit is open, the same payload carries its **Blocker identity**
 `get_goal`'s text repeats the identity so the model can pass it back verbatim in
 `update_goal`'s `blocker_id`. The human-facing status deliberately shows only the
 description and the count.
+
+### `update_goal`'s completion usage report
+
+A **budgeted** Goal's successful completion adds one field to that result, so the
+final response can state what the work cost without another provider request:
+
+```json
+{
+  "goal": { "id": "goal_1a2b3c4d", "status": "complete", "tokenBudget": 250000, "remainingTokens": 201790, "...": "..." },
+  "completionReport": {
+    "instruction": "This budgeted Goal is complete. Your final response must report the cost and duration of the work: 48210 accounted tokens of the 250000-token Token budget, 201790 tokens of remaining capacity, and 5m 12s of Active elapsed time. ...",
+    "accountedTokens": 48210,
+    "activeSeconds": 312,
+    "tokenBudget": 250000,
+    "remainingTokens": 201790,
+    "accountingNotes": ["..."]
+  }
+}
+```
+
+`instruction` is the exact wording the final response must follow, and it is also
+appended to the tool result's text content so the model acts on it. The numeric
+fields let a programmatic caller read the same facts without parsing prose. See
+[budgets](behavior/budgets.md#completion-usage-report) for the accounting
+approximations the notes carry.
+
+The report is present only on a successful **budgeted** completion. An
+unbudgeted Goal, a refusal, and every other `update_goal` action keep the plain
+`{ goal }` payload, so no result ever claims a budget or a remaining capacity
+the Goal does not have.
+
+## No model tool for the audit history
+
+The durable audit history (see [behavior/history.md](behavior/history.md)) is
+deliberately **not** a model tool. `get_goal` is the model's authoritative view of
+the current Goal, and the history is derived diagnostic data: exposing it as a tool
+would invite the model to treat a past record as present state — to reason from a
+revision that has since moved, or to expect a record to be replayed. The timeline
+is therefore a user-facing surface only, rendered read-only by `/goal history`,
+and no tool, command, or option mutates a Goal from a record.
