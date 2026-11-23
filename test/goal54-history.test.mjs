@@ -907,9 +907,9 @@ test("/goal:history is read-only and cannot be mistaken for a lifecycle command"
 		assert.equal(runCount(session), runsBefore, "and starts no run");
 		assert.equal(historyEntries(after).length, 1, "the timeline did not grow");
 
-		// The command is a whole-argument subcommand, so an objective that merely
-		// starts with the word is still an objective. Clearing first keeps this a
-		// fresh creation rather than a confirmed replacement.
+		// History is now its own `/goal:history` command, so text after `/goal`
+		// that merely begins with the word is still an Objective. Clearing first
+		// keeps this a fresh creation rather than a confirmed replacement.
 		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		await session.prompt("/goal history of the release pipeline");

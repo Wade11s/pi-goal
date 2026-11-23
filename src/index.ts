@@ -271,13 +271,6 @@ export interface ParsedGoalArgs {
 }
 
 /**
- * Parsed `/goal:resume` request.
- *
- * The budget option is the only way to resume a `budget_limited` Goal, and only
- * the two explicit spellings are recognized. It is also the only argument the
- * command accepts: a verb command never reads its argument as an Objective.
- */
-/**
  * The creation options `/goal` accepts, as flag names without the leading `--`.
  *
  * One vocabulary for three readers: the option scanner below, the `/goal `
@@ -290,6 +283,13 @@ const GOAL_ATTACHMENT_FLAG_NAMES = GOAL_CREATION_FLAG_NAMES.filter((name) => nam
 const GOAL_OPTION_SCANNER = new RegExp(`^--(${GOAL_CREATION_FLAG_NAMES.join("|")})(?:=(\\S+))?(?:\\s+|$)`);
 const GOAL_ATTACHMENT_OPTION_SCANNER = new RegExp(`^--(${GOAL_ATTACHMENT_FLAG_NAMES.join("|")})(?:=|\\s|$)`);
 
+/**
+ * Parsed `/goal:resume` request.
+ *
+ * The budget option is the only way to resume a `budget_limited` Goal, and only
+ * the two explicit spellings are recognized. It is also the only argument the
+ * command accepts: a verb command never reads its argument as an Objective.
+ */
 export type ResumeBudgetRequest =
 	| { kind: "none" }
 	| { kind: "value"; value: number };
