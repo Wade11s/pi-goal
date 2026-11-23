@@ -15,6 +15,7 @@ import {
 	PiRpcSession,
 	assertOnlyFailures,
 	assertStepsConsumed,
+	goalSnapshots,
 	lastGoalSnapshot,
 	readSessionEntries,
 	script,
@@ -519,14 +520,19 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 		// kickoff, its continuation, and a held response.
 		await abortActiveLoop(session, 4);
 
-		// Now the loser confirms: replacing an existing Goal needs the user's
-		// explicit confirmation, and the test declines on the user's behalf.
-		await session.respondToConfirm(() => true, false);
-		await session.waitForNotify((r) => r.message.includes("Replacement cancelled"));
+		// Now the loser runs, serialized behind the winner, and finds the winner's
+		// committed Goal. An unfinished Goal refuses `/goal <objective>`: the loser is
+		// refused with the warning that names /goal:clear, and nothing — no dialog —
+		// is asked of the user.
+		const refused = await session.waitForNotify((r) =>
+			r.message.startsWith("Goal not created: an unfinished Goal is already set"),
+		);
+		assert.equal(refused.notifyType, "warning");
+		assert.match(refused.message, /run \/goal:clear first/);
 		assert.equal(
 			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
-			1,
-			"exactly one replacement confirmation was asked",
+			0,
+			"no replacement confirmation was asked",
 		);
 
 		// No kickoff delivery was rejected (the original defect surfaced as an
@@ -556,8 +562,10 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 				(r) => r.type === "extension_ui_request" && r.message?.includes("Second concurrent objective"),
 			),
 		);
+		const mark = session.records.length;
 		await session.prompt("/goal");
-		const status = await session.waitForNotify(
+		const status = await session.notifyAfter(
+			mark,
 			(r) => r.message.includes("First concurrent objective") && r.message.includes("active"),
 		);
 		assert.ok(status);
@@ -725,15 +733,15 @@ test("a stray argument on a verb command is a usage error that touches nothing",
 
 test("/goal Edit the README to add X and /goal Clear the lint errors create Goals", async () => {
 	const session = await PiRpcSession.start();
-	// Kickoff, its continuation, and a held response so the first loop stops
-	// deliberately; the replacement's own kickoff then completes it.
+	// Each Goal's kickoff completes it, so the session rests after each one: the
+	// first Goal is complete when the second command arrives, which is what lets
+	// that command create.
 	script(
 		[
-			{ text: "On it." },
-			{ text: "Continuing." },
-			{ hang: true },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ text: "Done." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done again." },
 		],
 		session,
 	);
@@ -747,36 +755,49 @@ test("/goal Edit the README to add X and /goal Clear the lint errors create Goal
 			lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.objective,
 			"Edit the README to add X",
 		);
-		await abortActiveLoop(session, 3);
+		await session.waitForSettled(1);
+		const first = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(first.status, "complete", "the first Goal finished before the second command");
 
 		// Only the bare word is reserved: an Objective that merely begins with `clear`
-		// is still an Objective, and replacing the unfinished Goal still asks first.
-		const replaceId = "replace-with-clear-the-lint-errors";
-		const replaceResponse = session.waitFor(
-			"response for the replacement",
-			(records) => records.find((r) => r.type === "response" && r.id === replaceId),
+		// is still an Objective. With no unfinished Goal in the way it is created —
+		// superseding the complete record, with no dialog — never run as /goal:clear.
+		const mark = session.records.length;
+		const second = await session.prompt("/goal Clear the lint errors");
+		assert.equal(second.data.disposition, "handled");
+		const replaced = await session.notifyAfter(mark, (r) => r.message.includes("created and activated, replacing"));
+		assert.ok(replaced.message.includes(`replacing ${first.id}`), replaced.message);
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"no confirmation was asked",
 		);
-		session.writeCommand({ id: replaceId, type: "prompt", message: "/goal Clear the lint errors" });
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		const replaced = await replaceResponse;
-		assert.equal(replaced.data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
-		// The replacement's own kickoff completes it. Five provider responses in
-		// all: the first kickoff, its continuation, the held one, the completion,
-		// and the completion's own wrap-up turn.
-		await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the replacement to complete");
+		// The second Goal's own kickoff completes it. Four provider responses in
+		// all, two per Goal, and no run was aborted.
+		await waitForSnapshot(
+			session,
+			(s) => s.data.goal?.status === "complete" && s.data.goal?.id !== first.id,
+			"the second Goal to complete",
+		);
+		await session.waitForSettled(2);
 		const entries = readSessionEntries(await session.sessionFile());
 		const snapshot = lastGoalSnapshot(entries);
+		assert.notEqual(snapshot.data.goal.id, first.id);
 		assert.equal(snapshot.data.goal.objective, "Clear the lint errors");
 		assert.equal(snapshot.data.goal.status, "complete");
+		assert.equal(
+			snapshot.data.goal.usage.totalTokens,
+			15,
+			"only the second Goal's own kickoff turn, which completed it; the turn after completion is not Goal work",
+		);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
-		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 4);
 	} finally {
 		await session.stop();
 	}
 });
 
-test("create rejects invalid objectives and refuses to replace an existing Goal", async () => {
+test("create rejects invalid objectives and refuses to replace an unfinished Goal", async () => {
 	const session = await PiRpcSession.start();
 	// Kickoff, its continuation, and a held response so the loop stops
 	// deliberately with the Goal still active.
@@ -796,29 +817,39 @@ test("create rejects invalid objectives and refuses to replace an existing Goal"
 		// Nothing was created so far.
 		assert.equal(session.records.filter((r) => r.type === "agent_start").length, 0);
 
-		// Create one Goal, then attempt to replace it: confirmation is required.
-		// The command's response only arrives after the dialog is answered, so the
-		// prompt is submitted without awaiting it and the dialog is answered first.
+		// Create one Goal, then attempt to replace it. An unfinished Goal refuses
+		// `/goal <objective>`: the command answers on its own, with a warning that
+		// names /goal:clear, and nothing is asked of the user.
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await abortActiveLoop(session, 3);
-		const replaceId = "replace-objective";
-		const replaceResponse = session.waitFor(
-			"response for the replacement attempt",
-			(records) => records.find((r) => r.type === "response" && r.id === replaceId),
-		);
-		session.writeCommand({ id: replaceId, type: "prompt", message: "/goal A different objective entirely" });
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), false);
-		const replaced = await replaceResponse;
+		const before = await goalBytes(session);
+		const mark = session.records.length;
+		const replaced = await session.prompt("/goal A different objective entirely");
 		assert.equal(replaced.data.disposition, "handled");
-		const kept = await session.waitForNotify((r) => r.message.includes("Replacement cancelled"));
-		assert.equal(kept.notifyType, "info");
+		const refused = await session.notifyAfter(mark, (r) =>
+			r.message.startsWith("Goal not created: an unfinished Goal is already set"),
+		);
+		assert.equal(refused.notifyType, "warning");
+		assert.match(refused.message, /\(active, "/);
+		assert.match(refused.message, /run \/goal:clear first/);
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"no confirmation was asked",
+		);
+		assert.equal(await goalBytes(session), before, "the refused replacement wrote no Goal bytes");
 
 		// The original objective is intact.
+		const reportMark = session.records.length;
 		await session.prompt("/goal");
-		const notify = await session.waitForNotify((r) => r.message.includes(OBJECTIVE) && r.message.includes("active"));
+		const notify = await session.notifyAfter(
+			reportMark,
+			(r) => r.message.includes(OBJECTIVE) && r.message.includes("active"),
+		);
 		assert.ok(notify);
 		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(lastGoalSnapshot(entries).data.goal.objective, OBJECTIVE);
+		assert.equal(goalSnapshots(entries).length, 1, "no second Goal was ever written");
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();

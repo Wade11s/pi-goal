@@ -39,7 +39,6 @@ import {
 	readSessionEntries,
 	runCount,
 	script,
-	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 import {
 	FOREIGN_ID,
@@ -339,7 +338,7 @@ test("only the third consecutive Goal turn transitions, and no turn can double-c
 	}
 });
 
-test("a Replacement Goal starts a fresh audit and inherits no chain", async () => {
+test("a Goal created after the audited one is cleared starts a fresh audit and inherits no chain", async () => {
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "pi-goal-audit-gate");
 	const chained = (id) => [
@@ -367,13 +366,20 @@ test("a Replacement Goal starts a fresh audit and inherits no chain", async () =
 		const blocked = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 		assertAudit(blocked.blockedAudit, BLOCKER, 3);
 
-		// A Replacement Goal is a new identity, so it starts with no audit at all.
-		const replace = submitCommand(session, "replace", `/goal ${EDITED_OBJECTIVE}`);
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		await replace;
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		// An unfinished Goal is never replaced from the command path (ADR-0003): the
+		// next Goal starts after the audited one is cleared. It is a new identity, so
+		// it starts with no audit at all.
+		await session.prompt("/goal:clear");
+		await session.waitForNotify((r) => r.message.includes("cleared"));
+		await session.prompt(`/goal ${EDITED_OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await session.waitForToolResult("update_goal", 5);
 		await session.waitForSettled(2);
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"no replacement confirmation was asked",
+		);
 
 		const results = toolResults(session, "update_goal");
 		assert.equal(
@@ -382,7 +388,7 @@ test("a Replacement Goal starts a fresh audit and inherits no chain", async () =
 			"three reports that blocked the old Goal, one for the new one, and the completion",
 		);
 		const replaced = structuredGoal(results[3].result);
-		assert.notEqual(replaced.id, blocked.id, "a Replacement Goal is a new identity");
+		assert.notEqual(replaced.id, blocked.id, "a new Goal is a new identity");
 		assert.match(String(results[3].result.content[0].text), /Blocker recorded \(1 of 3 consecutive Goal turns\)/);
 		assert.notEqual(replaced.blockerId, issued, "the old chain cannot resume under the new identity");
 		assert.equal(replaced.blockedTurns, 1);

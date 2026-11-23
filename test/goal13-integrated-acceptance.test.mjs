@@ -48,17 +48,6 @@ function goalStates(entries) {
 	return entries.filter((e) => e.type === "custom" && e.customType === "goal-state");
 }
 
-/** The newest snapshot marked `superseded`, or null. */
-function supersededSnapshot(entries) {
-	let snapshot;
-	for (const entry of entries) {
-		if (entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded === true) {
-			snapshot = entry;
-		}
-	}
-	return snapshot;
-}
-
 /**
  * A 100-token Goal whose kickoff accounts 85 and whose continuation fails after
  * 30 more (115 total). The failed run is a hard exit, so the Goal is durably
@@ -166,18 +155,21 @@ test("a held model transition is stale after a budget-raising resume", async () 
 	}
 });
 
-test("a tool-created Goal replaced by /goal charges only its Goal-owned Continuation work to the superseded record", async () => {
+test("a tool-created Goal completed by /goal charges only its Goal-owned Continuation work to the replaced record", async () => {
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "provider-gate");
 	// Turn 1 is the creating run (ordinary, 140 tokens). Turn 2 closes it. Turn 3
-	// is the first Continuation, the first Goal-owned work (40 tokens). The
-	// replacement then runs and is aborted.
+	// is the first Continuation, the first Goal-owned work (40 tokens) — and the turn
+	// that completes the Goal, so the creation /goal then supersedes is a complete
+	// Goal, the only replacement the single-Goal rule allows (ADR-0003). The new Goal
+	// then runs and is aborted.
 	script(
 		[
 			{ toolCalls: [{ name: "create_goal", args: { objective: OBJECTIVE, userRequest: REQUEST } }], usage: { input: 120, output: 20 } },
 			{ text: "Creating run closing response.", usage: { input: 30, output: 10 } },
-			{ text: "Continuation answer.", waitForFile: gate, usage: { input: 30, output: 10 } },
-			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], waitForFile: gate, usage: { input: 30, output: 10 } },
+			{ text: "Completion acknowledged.", usage: { input: 20, output: 2 } },
+			{ text: "New Goal kickoff.", usage: { input: 20, output: 2 } },
 			{ hang: true },
 		],
 		session,
@@ -194,71 +186,78 @@ test("a tool-created Goal replaced by /goal charges only its Goal-owned Continua
 			records.filter((r) => r.type === "turn_start").length >= 3 ? true : undefined,
 		);
 
-		// Replace the Goal while its first Continuation is still in flight, held at
-		// the gate. The confirmation describes the tool-created Goal.
-		const replacePromise = session.prompt(`/goal A replacement objective`);
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
-
-		// Release the held Continuation response: it belongs to the old identity and
-		// is frozen onto its superseded record at the replacement boundary.
+		// Release the held Continuation: it completes the tool-created Goal, and its 40
+		// tokens are the only work the old identity ever accounts for.
 		writeFileSync(gate, "", "utf8");
 		const deadline = Date.now() + 15_000;
 		let entries;
 		for (;;) {
 			entries = readSessionEntries(await session.sessionFile());
-			const superseded = supersededSnapshot(entries);
-			if (superseded?.data.goal?.id === created.id && superseded.data.goal.usage.totalTokens === 40) break;
-			if (Date.now() > deadline) throw new Error("the old identity's Continuation tail was not frozen");
+			const old = entries
+				.filter((e) => e.type === "custom" && e.customType === "goal-state" && e.data?.goal?.id === created.id)
+				.at(-1);
+			if (old?.data.goal.status === "complete" && old.data.goal.usage.totalTokens === 40) break;
+			if (Date.now() > deadline) throw new Error("the old identity's Continuation work was not recorded");
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 
-		// The scripted turns so far: 1–2 the creating run, 3 the held Continuation, and
-		// 4 the replacement kickoff, delivered as that run's steered next turn. Turn 5
-		// is the replacement's own Continuation, and it can only start after turn 4's
+		// Create the next Goal while the completing run's own follow-up turn is still
+		// in flight. A complete Goal does not block creation and asks nothing of the
+		// user (ADR-0003): no replacement confirmation exists anymore.
+		const replacePromise = session.prompt(`/goal A replacement objective`);
+		assert.equal((await replacePromise).data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"no replacement confirmation was asked",
+		);
+
+		// The scripted turns so far: 1–2 the creating run, 3 the held Continuation, 4 the
+		// completing run's own follow-up answer, and 5 the new Goal's kickoff. Turn 6 is
+		// the new Goal's own Continuation, and it can only start after turn 5's
 		// `turn_end` — the boundary Pi emits after appending the kickoff message and
 		// pi-goal flushes accounting. Waiting for it keeps the 22-token read below
 		// deterministic (an early read can catch the kickoff mid-flight and see 0) and
 		// makes the final abort land on this run's hanging tail instead of its start.
-		await session.waitFor("the replacement's continuation after its accounted kickoff", (records) =>
-			records.filter((r) => r.type === "turn_start").length >= 5 ? true : undefined,
+		await session.waitFor("the new Goal's continuation after its accounted kickoff", (records) =>
+			records.filter((r) => r.type === "turn_start").length >= 6 ? true : undefined,
 		);
 
-		// The replacement's own kickoff is the only work charged to the new identity.
+		// The new Goal's own kickoff is the only work charged to it.
 		const replacementTotal = await liveUsage(session);
-		assert.equal(replacementTotal, 22, "the replacement accounts only its own kickoff");
+		assert.equal(replacementTotal, 22, "the new Goal accounts only its own kickoff");
 
 		await session.sendSimple("abort");
 		await session.waitForSettled(1);
 
 		assert.equal(
 			runCount(session),
-			3,
-			"the creating run, the run carrying the held Continuation and the replacement kickoff, and the replacement's continuation",
+			4,
+			"the creating run, the completing run, the new Goal's kickoff run, and its continuation",
 		);
 		assert.equal(
 			continuationEntries(readSessionEntries(await session.sessionFile())).length,
 			2,
-			"the old identity's Continuation and the replacement's",
+			"the old identity's Continuation and the new Goal's",
 		);
 
 		entries = readSessionEntries(await session.sessionFile());
 		const oldRecords = entries.filter((e) => e.type === "custom" && e.customType === "goal-state" && e.data?.goal?.id === created.id);
-		const oldTotal = oldRecords.reduce((sum, e) => sum + (e.data.goal.usage?.totalTokens ?? 0), 0);
-		// The old identity's records must not include the creating run's 140 tokens
-		// or the replacement's 22: only its own Continuation work.
-		assert.equal(oldTotal, 40, "the superseded records carry only Goal-owned work");
-		assert.ok(
-			oldRecords.every((e) => e.data.goal.usage.totalTokens <= 40),
-			"no creating-run usage leaked into the old identity",
+		// The old identity's records must not include the creating run's 140 tokens or
+		// the new Goal's own work: only its own Continuation work, repeated by the
+		// completion snapshot and by the creation's preserved record.
+		assert.deepEqual(
+			oldRecords.map((e) => `${e.data.goal.status}:${e.data.goal.usage.totalTokens}`),
+			["active:0", "complete:40", "complete:40"],
+			"the creation, the completion, and the record the new creation preserves",
 		);
 
 		const current = currentGoalSnapshot(entries).data.goal;
-		assert.notEqual(current.id, created.id, "the replacement is current");
+		assert.notEqual(current.id, created.id, "the new Goal is current");
 		assert.equal(current.origin, "command");
 
-		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 6, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 	} finally {

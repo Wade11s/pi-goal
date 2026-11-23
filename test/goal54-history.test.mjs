@@ -462,63 +462,74 @@ test("the blocked threshold and a provider usage limit append their stops; audit
 	}
 });
 
-test("a declined replacement and every refusal append no history", async () => {
+test("a refused creation against an unfinished Goal and every refusal append no history; creation after completion records the supersede", async () => {
 	const session = await PiRpcSession.start({});
+	const gate = join(session.cwd, "provider-gate");
+	// First Goal: a held kickoff (so the refusal below is observed while the Goal is
+	// provably unfinished), then its Continuation completes it. Second Goal: its
+	// kickoff and the Continuation that completes it.
 	script(
 		[
-			{ text: "A kickoff.", usage: { input: 30, output: 10 } },
-			{ hang: true },
+			{ text: "A kickoff.", usage: { input: 30, output: 10 }, waitForFile: gate },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 20, output: 5 } },
+			{ text: "Done.", usage: { input: 5, output: 2 } },
 			{ text: "B kickoff.", usage: { input: 30, output: 10 } },
 			{
 				toolCalls: [{ name: "update_goal", args: { action: "complete" } }],
 				usage: { input: 20, output: 5 },
 			},
-			{ text: "Done.", usage: { input: 5, output: 2 } },
+			{ text: "Done again.", usage: { input: 5, output: 2 } },
 		],
 		session,
 	);
 	try {
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await abortActiveLoop(session, 2);
 		const first = goalSnapshots(readSessionEntries(await session.sessionFile()))[0].data.goal.id;
 
-		// Declining the replacement confirmation is not a transition: nothing was
-		// committed, so nothing may reach the timeline.
-		const decline = session.prompt(`/goal ${REPLACEMENT}`);
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), false);
-		await decline;
-		await session.waitForNotify((r) => r.message.includes("Replacement cancelled"));
+		// The refusal is not a transition: nothing was committed, so nothing may
+		// reach the timeline.
+		const mark = session.records.length;
+		const refused = await session.prompt(`/goal ${REPLACEMENT}`);
+		assert.equal(refused.data.disposition, "handled");
+		await session.notifyAfter(mark, (r) => r.message.startsWith("Goal not created: an unfinished Goal is already set"));
 		assert.deepEqual(historyKinds(readSessionEntries(await session.sessionFile())), ["created"]);
 
-		// Confirming commits the new identity; the superseded freeze of the old one is
-		// bookkeeping and writes no record of its own.
-		const replace = session.prompt(`/goal ${REPLACEMENT}`);
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		await replace;
+		// The first Goal finishes, and only its own completion is recorded.
+		writeFileSync(gate, "", "utf8");
+		await session.waitForSettled(1);
+		assert.deepEqual(historyKinds(readSessionEntries(await session.sessionFile())), ["created", "completed"]);
+
+		// Creating after completion commits the new identity and records the supersede
+		// from the status the complete record had; the complete record's preserved
+		// snapshot is bookkeeping and writes no record of its own.
+		const replace = await session.prompt(`/goal ${REPLACEMENT}`);
+		assert.equal(replace.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
 		await session.waitForSettled(2);
 		let entries = readSessionEntries(await session.sessionFile());
-		assert.deepEqual(historyKinds(entries), ["created", "replaced", "completed"]);
-		const replaced = historyRecords(entries)[1];
+		assert.deepEqual(historyKinds(entries), ["created", "completed", "replaced", "completed"]);
+		const replaced = historyRecords(entries)[2];
 		assert.notEqual(replaced.goalId, first, "the record names the replacement identity");
-		assert.equal(replaced.from, "active", "the status the replaced identity had");
+		assert.equal(replaced.from, "complete", "the status the superseded identity had");
 		assert.equal(replaced.to, "active");
 		assert.equal(replaced.revision, 0);
 		assert.equal(
 			historyEntries(entries).filter((entry) => entry.data.goalId === first).length,
-			1,
-			"the replaced identity is never re-recorded",
+			2,
+			"the superseded identity is recorded for its creation and completion only, never again",
 		);
+		assertHistoryFollowsSnapshots(entries);
 
 		// Clearing names the Goal that was cleared, and no other.
 		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		entries = readSessionEntries(await session.sessionFile());
-		assert.deepEqual(historyKinds(entries), ["created", "replaced", "completed", "cleared"]);
-		assert.equal(historyRecords(entries)[3].goalId, replaced.goalId);
-		assert.equal(historyRecords(entries)[3].revision, 1);
+		assert.deepEqual(historyKinds(entries), ["created", "completed", "replaced", "completed", "cleared"]);
+		assert.equal(historyRecords(entries)[4].goalId, replaced.goalId);
+		assert.equal(historyRecords(entries)[4].revision, 1);
 
-		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 6);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();

@@ -23,10 +23,11 @@
  * objective in place (same identity, same history) and steers an active run;
  * `/goal:pause` stops admission of further automatic runs immediately;
  * `/goal:resume` restarts eligible work; `/goal:clear` writes a durable
- * tombstone and returns the session to ordinary prompt behavior. Replacing an
- * unfinished objective through `/goal <objective>` requires confirmation
- * first. None of these commands wait for an active run to become idle — an
- * active Goal's own continuation loop would otherwise starve them — so every
+ * tombstone and returns the session to ordinary prompt behavior. `/goal <objective>`
+ * never replaces an unfinished Goal: it refuses and names `/goal:clear`, while a
+ * complete Goal is superseded without a dialog. None of these commands wait for
+ * an active run to become idle — an active Goal's own continuation loop would
+ * otherwise starve them — so every
  * transition is persisted first (Pi's appendEntry writes through
  * synchronously) and only then announced, and work-start messages are delivered
  * through Pi's steering when a run is in flight.
@@ -201,9 +202,6 @@ import {
 	type SafetyStop,
 } from "./safety.ts";
 
-/** Auto-decline a replacement confirmation after this long (safe default: no discard). */
-const REPLACE_CONFIRM_TIMEOUT_MS = 120_000;
-
 /**
  * Auto-cancel an interactive objective edit after this long.
  *
@@ -362,7 +360,7 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 const EDIT_ATTACHMENT_GUIDANCE =
 	"Goal not edited: /goal:edit changes only the objective and title and keeps the Goal's immutable " +
 	"attachment manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
-	"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).";
+	"--remote-image <https URL> ... <objective> (run /goal:clear first when the current Goal is unfinished; a complete goal does not block).";
 
 /** Where a parsed `/goal:edit` title option ends and the objective begins. */
 interface GoalEditTitleOption {
@@ -695,10 +693,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	/**
 	 * One bridged command at a time.
 	 *
-	 * Serializing is what keeps attribution exact: the sink holds the transitions of
-	 * *the* command in flight, and a confirmation dialog can keep a command busy for
-	 * minutes. A second request is refused rather than queued, so a caller always
-	 * learns immediately that its request did not run.
+	 * Serializing is what keeps attribution exact: the sink holds the transitions
+	 * of *the* command in flight, and a dialog (the objective editor) or a busy
+	 * session can keep a command waiting for minutes. A second request is refused
+	 * rather than queued, so a caller always learns immediately that its request
+	 * did not run.
 	 */
 	let bridgeInFlight = false;
 
@@ -1348,10 +1347,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * Serializes Goal creation across concurrent /goal commands. Commands that
 	 * arrive while Pi is busy both wait for idle; without serialization both
 	 * could pass the existing-Goal check before either persists, and the second
-	 * would silently replace the first. Every create-or-replace runs its guards,
-	 * confirmation, write, kickoff, and durability confirmation exclusively, so
-	 * a losing command always sees the winner's committed Goal and has to be
-	 * confirmed by the user before replacing it.
+	 * would silently take the slot. Every creation runs its guards, the
+	 * unfinished-Goal refusal, write, kickoff, and durability confirmation
+	 * exclusively, so a losing command always sees the winner's committed Goal and
+	 * is refused by it.
 	 */
 	let createLock: Promise<void> = Promise.resolve();
 	function runExclusive(fn: () => Promise<void>): Promise<void> {
@@ -2951,7 +2950,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * Both the registered user command and the in-process command bridge reach it
 	 * through {@link runGoalCommand} with the same argument text, so a bridged
 	 * command *is* the command the user sees: the same parsing, the same
-	 * replacement confirmation dialog, the same `goal.enabled` gate, the same
+	 * unfinished-Goal refusal, the same `goal.enabled` gate, the same
 	 * Token-budget validation, and the same durable-before-announced ordering.
 	 * Nothing downstream can tell the difference, which is the point — a second
 	 * entry point that re-used the lifecycle helpers instead would be a second
@@ -3207,7 +3206,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					args: request.args,
 					message:
 						"Goal command not run: another bridged Goal command is still running (it may be waiting for a " +
-						"confirmation dialog). Retry after it finishes.",
+						"dialog or for the session to go idle). Retry after it finishes.",
 					goal: publicState,
 					admissionEnabled: admission.enabled,
 				}),
@@ -3476,7 +3475,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			"Lifecycle status and its manifest — attachments are never silently dropped and the Goal is never completed " +
 			"for this reason — but no automatic continuation is requested while the artifacts cannot be verified. Restore " +
 			"the original bytes (content-addressed by their sha256) under the pi-goal-store directory beside the session " +
-			"file, or replace the Goal with a new one that re-attaches the files."
+			"file, or /goal:clear this Goal and create a new one that re-attaches the files."
 		);
 	}
 
@@ -3978,33 +3977,30 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Ask the user to confirm replacing an unfinished Goal. Auto-declines on
-	 * timeout or dismissal, so a mistaken or unattended command can never
-	 * discard work. Without any UI (for example print mode) there is no way to
-	 * confirm, so the current Goal is kept and the user is told how to proceed.
+	 * Refuse `/goal <objective>` while an unfinished Goal holds the session's single
+	 * Goal slot (ADR-0003: one session works one Goal at a time).
+	 *
+	 * Abandoning a Goal is the user's explicit `/goal:clear` — or finishing it — never
+	 * a side effect of a creation dialog, so there is nothing to confirm and nothing
+	 * for a UI to answer: the refusal is identical with or without one, opens no
+	 * dialog, and mutates nothing. It is a warning, which is also what makes the
+	 * command bridge and the RPC companion answer `refused` rather than `declined`.
+	 * A *complete* Goal never reaches this: finished work does not get in the way of
+	 * the next Goal, which supersedes it through the ordinary replacement machinery.
 	 */
-	async function confirmReplacement(ctx: ExtensionCommandContext, existing: GoalRecord): Promise<boolean> {
-		if (!ctx.hasUI) {
-			ctx.ui.notify(
-				"Replacing the current Goal needs a confirmation this Pi mode cannot display (no UI), " +
-					"so the current Goal was kept. Use /goal:clear followed by /goal <objective> instead.",
-				"warning",
-			);
-			return false;
-		}
-		return ctx.ui.confirm(
-			"Replace the current Goal?",
-			`The current ${existing.status} Goal "${previewObjective(existing.objective)}" would be discarded ` +
-				"(a new Goal replaces it, with a fresh identity and no retained usage history). Replace it?",
-			{ timeout: dialogTimeoutMs(REPLACE_CONFIRM_TIMEOUT_MS) },
+	function refuseUnfinishedGoal(ctx: ExtensionCommandContext, existing: GoalRecord): void {
+		ctx.ui.notify(
+			`Goal not created: an unfinished Goal is already set (${existing.status}, "${previewObjective(existing.objective)}"). ` +
+				"/goal does not replace an unfinished Goal. Finish the current Goal, or run /goal:clear first and then " +
+				"run /goal <objective> again. The current Goal is unchanged.",
+			"warning",
 		);
 	}
 
 	async function createOrReplaceGoal(rawObjective: string, ctx: ExtensionCommandContext): Promise<void> {
-		// Admission control before anything else: a disabled extension refuses a
-		// creation *and* a replacement, and it refuses before the confirmation
-		// dialog — asking the user to confirm a replacement that cannot happen would
-		// be a lie about what the extension will do.
+		// Admission control before anything else: a disabled extension refuses every
+		// creation — including the one that would supersede a complete Goal — and it
+		// refuses before anything else is validated or asked of the user.
 		if (!admission.enabled) {
 			ctx.ui.notify(admissionDisabledRefusal("Goal not created:"), "warning");
 			return;
@@ -4043,41 +4039,25 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 
 		// Serialized create-or-replace: concurrent /goal commands (for example two
-		// sent while Pi is busy) run exclusively; the authoritative existing-Goal
-		// check and the replacement confirmation both happen inside the lock, so
-		// the second command always sees the first's committed Goal and must be
-		// confirmed before replacing it. Every await is followed by a revalidation
-		// of the Goal the command captured: a confirmation or kickoff that was
-		// prepared against older state must never override the lifecycle commands
-		// the user ran in the meantime.
+		// sent while Pi is busy) run exclusively, and the authoritative existing-Goal
+		// check happens inside the lock, so the second command always sees the first's
+		// committed Goal and is refused by it. Every await is followed by a
+		// revalidation of the Goal the command captured: a kickoff that was prepared
+		// against older state must never override the lifecycle commands the user ran
+		// in the meantime.
 		await runExclusive(async () => {
-			const existing = store.get();
-			if (existing && existing.status !== "complete") {
-				const confirmed = await confirmReplacement(ctx, existing);
-				// The answer applies only to the exact record the dialog described.
-				// If the Goal was cleared, edited, paused, resumed, or replaced
-				// while the dialog was open, neither answer may act on it.
-				const current = store.get();
-				if (!current || current.id !== existing.id || current.revision !== existing.revision) {
-					ctx.ui.notify(
-						`Replacement cancelled: the Goal changed while the confirmation was open` +
-							(current ? ` (now ${current.status}, revision ${current.revision})` : " (no Goal is set anymore)") +
-							", so the confirmation no longer described the current state. Nothing was replaced; " +
-							"run /goal <objective> again to confirm against the current Goal.",
-						"warning",
-					);
-					return;
-				}
-				if (!confirmed) {
-					ctx.ui.notify(
-						`Replacement cancelled: the current ${existing.status} Goal was kept. ` +
-							"Use /goal:edit <objective> to change the objective without replacing the Goal.",
-						"info",
-					);
-					return;
-				}
-			}
 			const previous = store.get();
+			// Single-Goal creation (ADR-0003): an unfinished Goal — active, paused,
+			// blocked, usage_limited, or budget_limited — is never replaced from the
+			// command path. Abandoning it is the user's explicit /goal:clear (or
+			// finishing it), never a side effect of a creation, so the command refuses
+			// here, before any dialog and before any durable transition. A complete Goal
+			// does not block: the creation below supersedes it through the ordinary
+			// replacement machinery, which keeps its record on the branch as history.
+			if (previous && previous.status !== "complete") {
+				refuseUnfinishedGoal(ctx, previous);
+				return;
+			}
 			const replacing = previous != null;
 
 			// A fresh create (for example after a Clear) has no current Goal to preserve,
@@ -4209,10 +4189,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 			let delivery: "started" | "steered";
 			if (replacing) {
-				// Replacing must work while the discarded Goal's own run is still
-				// in flight - waiting for idle would deadlock behind its
-				// continuation loop - so the kickoff is steered into the active
-				// run or starts immediately when idle.
+				// The superseded Goal is complete, but its completing run may still be in
+				// flight (the model's final summary), and the user's next Goal is never
+				// parked behind the previous Goal's last words: the kickoff is steered into
+				// the active run or starts immediately when idle.
 				delivery = deliverWorkMessage(formatKickoffMessage(goal, attachmentContents), ctx);
 			} else {
 				// There is no Goal continuation loop that could starve this wait

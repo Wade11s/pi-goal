@@ -1,7 +1,7 @@
 # Goal lifecycle
 
-Create, replace, edit, inspect, pause, resume, and clear a Goal. Every transition
-is durable before it is announced.
+Create, supersede, edit, inspect, pause, resume, and clear a Goal. Every transition
+is durable before it is announced, and one session works one Goal at a time.
 
 [← README](../README.md) · See also [attachments](attachments.md) ·
 [budgets](budgets.md) · [continuation](continuation.md) ·
@@ -14,7 +14,7 @@ spelled the way Pi spells every other namespace (`/skill:name`):
 
 | Command | Meaning |
 | --- | --- |
-| `/goal` | bare: inspect the current Goal; with an Objective: create (or replace) |
+| `/goal` | bare: inspect the current Goal; with an Objective: create (refused while an unfinished Goal exists; supersedes a complete one) |
 | `/goal:pause` | stop admission of further automatic runs, keep the Goal |
 | `/goal:resume [--budget N \| --budget=N]` | restart eligible work with a fresh Blocked audit; raise a `budget_limited` Goal's ceiling |
 | `/goal:clear` | durable tombstone, no resurrection |
@@ -37,8 +37,8 @@ argument.`) that touches no Goal. `/goal ` completes its creation flags
 verbs as subcommands of one command, after Codex — `/goal`, a space, then `pause`,
 `resume`, `clear`, `history`, `edit`, or `resume --budget N`. Those are now
 refused with the command to type instead — *"Goal not created: `pause` is a
-Goal command; use /goal:pause."* — before any replacement confirmation is
-asked, so the refusal writes no snapshot, announces
+Goal command; use /goal:pause."* — before any Goal work is admitted, so the
+refusal writes no snapshot, announces
 no transition, and appends no history record. The guard ignores case and
 surrounding whitespace (`/goal Pause` and `/goal  pause  ` are caught too) and
 scans leading creation options before matching, so `/goal --no-budget clear`
@@ -63,8 +63,8 @@ word, so `Clear the lint errors`, `Resume work on X`, and
   before announcing success.
 - Sends the objective into the model context as a user message and starts initial
   work immediately.
-- When an **unfinished** Goal already exists, asks for confirmation first (see
-  *Replace a Goal* below).
+- Refuses while an **unfinished** Goal already exists, naming `/goal:clear`
+  (see *One Goal at a time* below).
 - Accepts any valid Objective text — including one that begins with a verb word
   such as "clear the lint errors" or "Edit the README" — except the bare
   reserved words of the old spelling, which are refused with the Goal command
@@ -78,54 +78,65 @@ Explicit local text/images and remote images use the same creation path:
 
 The repeatable leading options validate and materialize every artifact before
 the snapshot commits; a remote image is fetched once through the HTTPS-only,
-public-destination, bounded-read policy. Disabled admission refuses the command
-before a replacement dialog, any fetch, or any materialization; plain Objective
-arguments stay text. See [Objective attachments](attachments.md) for types,
+public-destination, bounded-read policy. Disabled admission, and the refusal that
+an unfinished Goal produces, both come before any fetch or any materialization;
+plain Objective arguments stay text. See [Objective attachments](attachments.md) for types,
 limits, fetch security, trust framing, and failure atomicity.
 
-## Replace a Goal
+## One Goal at a time
 
-Setting a new objective while an unfinished Goal exists is a *replacement*: a new
-Goal identity takes over the session's single Goal slot and starts at zero
-Goal-owned usage. A replacement never happens silently — `/goal <objective>`
-shows a confirmation dialog first, and a declined (or timed-out, or dismissed)
-dialog keeps the current Goal untouched. The dialog is answered over the RPC
-extension-UI subprotocol in RPC mode, so headless hosts confirm the same way an
-interactive user does. Modes without any UI cannot confirm and keep the current
-Goal (use `/goal:clear` then `/goal <objective>` there). Replacing a **complete**
-Goal asks nothing, because nothing unfinished is discarded.
+A session works one Goal at a time (ADR-0003). While an **unfinished** Goal exists
+— `active`, `paused`, `blocked`, `usage_limited`, or `budget_limited` —
+`/goal <objective>` refuses with a warning that names `/goal:clear`:
 
-The replaced Goal is not erased. Its already-accounted usage is written as a
+```
+Goal not created: an unfinished Goal is already set (active, "Ship the release notes page").
+/goal does not replace an unfinished Goal. Finish the current Goal, or run /goal:clear first
+and then run /goal <objective> again. The current Goal is unchanged.
+```
+
+The refusal opens no dialog, asks nothing of the host, and mutates nothing: no
+snapshot, no history record, no run. Abandoning a Goal is the user's explicit
+`/goal:clear`, or finishing it, never a side effect of a creation. The command
+bridge and the RPC companion see the same thing — a `set` or a bridged `/goal`
+against an unfinished Goal answers **`refused`** with that diagnostic verbatim,
+and the old declined-replacement outcome no longer exists.
+
+A **complete** Goal does not block: the creation proceeds with no dialog and
+takes the session's single Goal slot, and the complete record is **superseded**
+through the retained replacement machinery. `create_goal` is unchanged: it still
+refuses while any Goal exists, complete or not.
+
+The superseded Goal is not erased. Its already-accounted usage is written as a
 durable **current** snapshot before the new identity commits — current, not
-historical, so a crash between that write and the replacement's own snapshot
-still reconstructs the old Goal — and its admission segment stays open past the
-commit so a response and tool results that were already in flight are charged to
-it rather than to the replacement or to nobody. That tail is frozen onto the old
-identity's record as a **superseded** snapshot at the next freeze boundary — the
-next delivered user message, a shutdown that keeps the session file, a new Goal
-creation, a second replacement, a durability-rollback restore, or the first load
-of a branch whose freeze never ran — and a tail that collected nothing new is not
-written at a boundary that carries its own marker on the branch, so an idle
-replacement does not grow the snapshot log. Creating a Goal is the exception: it
-leaves no marker of its own, so an open admission is closed *durably* there, as a
-superseded snapshot. That write is the only evidence on the branch that the
-admission closed, and it is what makes the live path refuse a response that lands
-after the creation exactly as the replay does, instead of one charging it to the
-old identity. A replacement whose durability cannot be confirmed is retracted by
-restoring the previous record: the tail is frozen onto that record first — its
-entries sit before the restored snapshot, so no later replay could recover them —
-and the restored identity's admission stays open, so a response that was still
-streaming when the replacement was retracted is charged to it rather than dropped.
-`/goal:clear` of the replacement does not freeze an open tail: the
-old identity's admission stays open past the tombstone so its in-flight work is
-still attributed to it, and the tail freezes at the next boundary. The frozen
-record is marked `superseded`, so it is loadable and replayable but never becomes
-the current Goal: a crash immediately after the freeze still reconstructs the
-replacement. The old identity's active-time clock stops at the replacement, its
-own budget exhaustion is recorded on its own record only, and it never continues
-or earns a wrap-up.
+historical, so a crash between that write and the new Goal's own snapshot still
+reconstructs the old Goal — and the new identity starts at zero Goal-owned usage.
+A complete Goal's completing run may still be in flight when the next Goal takes
+the slot; that run's remaining work is charged to nobody, never to the new
+identity, because Completion is terminal for accounting.
 
-A replacement may select a fresh attachment manifest with leading
+The superseded-tail machinery is retained for the branch shapes a released
+pi-goal produced (see `test/fixtures/historical/`): a 0.2.0 session could replace
+an *unfinished* Goal mid-flight, and its admission segment stayed open past the
+commit so a response and tool results that were already in flight were charged to
+the old identity rather than to the new one or to nobody. That tail is frozen onto
+the old identity's record as a **superseded** snapshot at the next freeze boundary
+— the next delivered user message, a shutdown that keeps the session file, a new
+Goal creation, a durability-rollback restore, or the first load of a branch whose
+freeze never ran. A tail that collected nothing new is not written at a boundary
+that carries its own marker on the branch. Creating a Goal is the exception: it
+leaves no marker of its own, so an open admission is closed *durably* there, as a
+superseded snapshot; that write is the only evidence on the branch that the
+admission closed, and it keeps the live path and the replay on the same line.
+`/goal:clear` of the new Goal does not freeze an open tail: the old identity's
+admission stays open past the tombstone so its in-flight work is still attributed
+to it. The frozen record is marked `superseded`, so it is loadable and replayable
+but never becomes the current Goal: a crash immediately after the freeze still
+reconstructs the replacement. The old identity's active-time clock stops at the
+replacement, its own budget exhaustion is recorded on its own record only, and it
+never continues or earns a wrap-up.
+
+A creation may select a fresh attachment manifest with leading
 `--file`/`--image`/`--remote-image` options. Both identities' committed artifacts
 remain in the extension-owned store, because an older selected branch may still
 reference them; V1 performs no destructive automatic garbage collection.
@@ -386,7 +397,7 @@ new Goal work:
 
 | Refused while disabled | Why |
 | --- | --- |
-| `/goal <objective>` — creation **and** replacement | Both open a new Goal identity and start work. The refusal comes before the replacement confirmation and before any attachment is materialized, so no dialog or artifact promises a replacement that will not happen. |
+| `/goal <objective>` — creation, and the creation that supersedes a complete Goal | Both open a new Goal identity and start work. The refusal comes before any attachment is materialized, so no dialog or artifact promises a creation that will not happen. |
 | `create_goal` | Same admission, from the model side. The refusal reports `goal: null` (or the unchanged current Goal) and leaves the one-shot creation authority intact, so a corrected call can retry after re-enabling. |
 | `/goal:edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. A title-only `/goal:edit --title` is a label change and stays available. |
 | `/goal:resume` | The resume message restarts the loop. |
@@ -508,6 +519,6 @@ These commands are **usable while work is running** and never wait for the
 agent to become idle — an active Goal's own continuation loop keeps Pi busy
 almost continuously, so a lifecycle command that waited for idle could never
 run. Pause and clear answer immediately and take effect at the next settlement;
-edit, resume, and a confirmed replacement deliver their work message through
-Pi's steering when a run is in flight. None of them require abandoning the
+edit, resume, and a creation that supersedes a complete Goal deliver their work
+message through Pi's steering when a run is in flight. None of them require abandoning the
 session, and none of them cancel the user's run.

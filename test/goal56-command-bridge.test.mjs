@@ -14,10 +14,11 @@
  * stream (the store's commit is the event bar) but retracted before any success
  * is reported, and the bridge must answer `refused`, never `committed`.
  *
- * Everything observable end to end — the companion's public protocol, replacement
- * confirmation, creation authority, disabled admission, invalid budgets, and
- * byte-identical Goal state after a refusal — is covered against a real
- * `pi --mode rpc` subprocess in `goal56-goal-rpc-companion.test.mjs`.
+ * Everything observable end to end — the companion's public protocol, the
+ * single-Goal refusal against an unfinished Goal, creation authority, disabled
+ * admission, invalid budgets, and byte-identical Goal state after a refusal — is
+ * covered against a real `pi --mode rpc` subprocess in
+ * `goal56-goal-rpc-companion.test.mjs`.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -144,7 +145,7 @@ function fakePi(sessionFile, options = {}) {
 }
 
 /** A command context with just enough surface for the Goal command handlers. */
-function fakeCtx({ sessionFile, confirm } = {}) {
+function fakeCtx({ sessionFile, confirm, isIdle } = {}) {
 	const notifications = [];
 	const ctx = {
 		ui: {
@@ -159,7 +160,7 @@ function fakeCtx({ sessionFile, confirm } = {}) {
 		mode: "rpc",
 		hasUI: true,
 		cwd: "/tmp",
-		isIdle: () => true,
+		isIdle: isIdle ?? (() => true),
 		hasPendingMessages: () => false,
 		sessionManager: {
 			getSessionFile: () => sessionFile,
@@ -181,7 +182,7 @@ async function startBridgeHarness(dir, options = {}) {
 	const sessionFile = join(dir, "session.jsonl");
 	const harness = fakePi(sessionFile, options);
 	goalExtension(harness.pi);
-	const { ctx, notifications } = fakeCtx({ sessionFile, confirm: options.confirm });
+	const { ctx, notifications } = fakeCtx({ sessionFile, confirm: options.confirm, isIdle: options.isIdle });
 	for (const handler of harness.handlers.get("session_start") ?? []) {
 		await handler({ type: "session_start" }, ctx);
 	}
@@ -270,12 +271,12 @@ test("the outcome classifier never claims success it cannot prove", () => {
 		{ ok: false, disposition: "refused" },
 	);
 	// Only info: the operation did not commit, but nothing went wrong — the user
-	// declined the replacement, or there was nothing to do.
+	// cancelled (the objective editor, for example), or there was nothing to do.
 	assert.deepEqual(
 		classifyGoalBridgeOutcome({
 			action: "create",
 			transitions: [],
-			diagnostics: [{ level: "info", text: "Replacement cancelled: the current active Goal was kept." }],
+			diagnostics: [{ level: "info", text: "There is no Goal to edit. Create one with /goal <objective> first." }],
 			committed: false,
 		}),
 		{ ok: false, disposition: "declined" },
@@ -296,7 +297,7 @@ test("each action accepts only the transitions that can answer it", () => {
 	assert.deepEqual(committedKindsFor("pause"), ["paused"]);
 	assert.deepEqual(committedKindsFor("resume"), ["resumed", "budget-recovered"]);
 	assert.deepEqual(committedKindsFor("clear"), ["cleared"]);
-	// A completion that lands while a confirmation dialog is open must never be
+	// A completion that lands while the command is still waiting must never be
 	// reported as the answer to the command that is waiting.
 	assert.equal(committedKindsFor("create").includes("completed"), false);
 });
@@ -599,23 +600,73 @@ test("a creation that fails its durability poll is answered as refused, never co
 	assert.equal(goalStateBytes(sessionFile), "", "nothing durable was written");
 });
 
-test("a replacement declined through the user dialog changes nothing", async (t) => {
+/** Poll until `predicate` holds, failing the test if it never does. */
+async function waitFor(predicate, description, timeoutMs = 5000) {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+test("a creation against an unfinished Goal is refused, forwards the command's warning verbatim, and changes nothing", async (t) => {
 	const dir = withTempDir(t);
-	// The user's answer is captured so the test can decline it after the command is
-	// already waiting, which is where a second request must be refused.
-	let release;
-	const answer = new Promise((resolve) => {
-		release = resolve;
+	// A dialog-capable UI whose answer is never asked for: the refusal replaced the
+	// confirmation, so nothing may request a decision from the host.
+	let confirmations = 0;
+	const { pi, sessionFile, notifications } = await startBridgeHarness(dir, {
+		confirm: async () => {
+			confirmations += 1;
+			return true;
+		},
 	});
-	const { pi, sessionFile } = await startBridgeHarness(dir, { confirm: () => answer });
 
 	const first = await bridge(pi, "goal", `${OBJECTIVE}`, { id: "set-first" });
 	assert.equal(first.ok, true, JSON.stringify(first.diagnostics));
 	const before = goalStateBytes(sessionFile);
 
-	const pending = bridge(pi, "goal", "A replacement objective", { id: "set-replace" });
-	// Let the command reach the confirmation dialog before asserting the guard.
-	await new Promise((resolve) => setTimeout(resolve, 50));
+	const refused = await bridge(pi, "goal", "A replacement objective", { id: "set-replace" });
+	assert.equal(refused.ok, false);
+	assert.equal(refused.disposition, "refused", "an unfinished Goal refuses the creation; nothing is declined");
+	assert.equal(refused.action, "create");
+	assert.deepEqual(refused.transitions, []);
+	assert.equal(refused.goal.id, first.goal.id, "the current Goal is unchanged");
+	assert.deepEqual(
+		refused.diagnostics.map((diagnostic) => diagnostic.level),
+		["warning"],
+		"one warning — which is exactly why the outcome is refused",
+	);
+	assert.match(refused.diagnostics[0].text, /^Goal not created: an unfinished Goal is already set \(active, "/);
+	assert.match(refused.diagnostics[0].text, /run \/goal:clear first/);
+	assert.equal(
+		refused.diagnostics[0].text,
+		notifications.at(-1).message,
+		"the diagnostic is the command's own notification, forwarded verbatim",
+	);
+	assert.equal(confirmations, 0, "no confirmation was requested");
+	assert.equal(goalStateBytes(sessionFile), before, "the refused creation writes no Goal bytes");
+});
+
+test("one bridged command at a time: a second request is refused while the first is still waiting", async (t) => {
+	const dir = withTempDir(t);
+	// The first request is held in the creation path's own wait for the session to
+	// go idle — what a companion host hits when it sets a Goal into a busy session.
+	// No dialog is involved anywhere in the scenario.
+	let idle = true;
+	const { pi, sessionFile } = await startBridgeHarness(dir, { isIdle: () => idle });
+
+	const first = await bridge(pi, "goal", `${OBJECTIVE}`, { id: "set-first" });
+	assert.equal(first.ok, true, JSON.stringify(first.diagnostics));
+	const cleared = await bridge(pi, "goal:clear", "", { id: "clear-first" });
+	assert.equal(cleared.ok, true, JSON.stringify(cleared.diagnostics));
+
+	idle = false;
+	const pending = bridge(pi, "goal", "A second objective", { id: "set-second" });
+	// Let the command reach its wait: the creation it is holding is already on disk.
+	await waitFor(
+		() => lastSnapshot(sessionFile)?.data.goal?.objective === "A second objective",
+		"the held creation to reach its wait for idle",
+	);
 	const busy = await bridge(pi, "goal:clear", "", { id: "clear-while-busy" });
 	assert.equal(busy.ok, false);
 	assert.equal(busy.disposition, "refused");
@@ -625,18 +676,22 @@ test("a replacement declined through the user dialog changes nothing", async (t)
 		busy.diagnostics.some((diagnostic) => /another bridged Goal command is still running/.test(diagnostic.text)),
 		JSON.stringify(busy.diagnostics),
 	);
-
-	release(false);
-	const declined = await pending;
-	assert.equal(declined.ok, false);
-	assert.equal(declined.disposition, "declined");
-	assert.deepEqual(declined.transitions, []);
-	assert.equal(declined.goal.id, first.goal.id, "the current Goal is unchanged");
-	assert.ok(
-		declined.diagnostics.some((diagnostic) => /Replacement cancelled/.test(diagnostic.text)),
-		JSON.stringify(declined.diagnostics),
+	assert.equal(
+		lastSnapshot(sessionFile)?.data.goal?.objective,
+		"A second objective",
+		"the refused second request touched nothing",
 	);
-	assert.equal(goalStateBytes(sessionFile), before, "a declined replacement writes no Goal bytes");
+
+	// The held command finishes as soon as the session is idle, and commits.
+	idle = true;
+	const created = await pending;
+	assert.equal(created.ok, true, JSON.stringify(created.diagnostics));
+	assert.equal(created.disposition, "committed");
+	assert.deepEqual(
+		created.transitions.map((transition) => transition.kind),
+		["created"],
+	);
+	assert.equal(created.goal.objective, "A second objective");
 });
 
 test("a bridged command cannot take over the session", () => {

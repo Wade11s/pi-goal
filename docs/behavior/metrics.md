@@ -183,7 +183,7 @@ guarantees.
 
 A companion that needs Codex-shaped Goal get/set/clear RPC methods is a
 different, equally optional companion: it maps those operations onto pi-goal's
-existing public command semantics (preserving replacement confirmation, Goal
+existing public command semantics (preserving the single-Goal refusal, Goal
 creation authority, and durable-before-announced behavior) and is not part of
 core either.
 

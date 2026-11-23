@@ -432,22 +432,40 @@ test("an Objective edit never renames the session", async () => {
 
 test("a Replacement Goal never renames the session", async () => {
 	const session = await PiRpcSession.start({ settings: NAMING_ON });
-	script([{ text: "Kickoff answer." }, { hang: true }], session);
+	// The first Goal completes in its own run, so the replacement supersedes a
+	// *complete* Goal — the only replacement the single-Goal rule still allows.
+	script(
+		[
+			{ text: "Kickoff answer." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+			{ text: "Replacement kickoff." },
+			{ hang: true },
+		],
+		session,
+	);
 	try {
 		const response = await session.prompt(`/goal ${OBJECTIVE}`);
 		assert.equal(response.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		assert.equal(await liveSessionName(session), OBJECTIVE);
-		await session.waitFor("the continuation run started", (records) =>
-			records.filter((r) => r.type === "agent_start").length >= 2 ? true : undefined,
+		await session.waitForSettled(1);
+		assert.equal(
+			lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.status,
+			"complete",
+			"the first Goal finished before the replacement",
 		);
 
 		const mark = session.records.length;
 		const replacePromise = session.prompt(`/goal ${REPLACEMENT_OBJECTIVE}`);
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
 		assert.equal((await replacePromise).data.disposition, "handled");
 		const replaced = await session.notifyAfter(mark, (r) => r.message.includes("created and activated, replacing"));
 		assert.match(replaced.message, /created and activated, replacing goal_[0-9a-f]+/);
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"a complete Goal never asks for a replacement confirmation",
+		);
 
 		// The replacement really happened: a new identity at revision 0.
 		const entries = readSessionEntries(await session.sessionFile());

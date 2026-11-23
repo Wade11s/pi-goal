@@ -7,6 +7,13 @@
  * edit, a resume, an automatic Continuation, or the one Budget wrap-up. Ordinary
  * prompts, creation controls, pre-creation responses, and unrelated same-batch
  * tool results are excluded in every lifecycle status.
+ *
+ * Single-Goal creation (issue #83, ADR-0003) removed the one live path that could
+ * replace an *unfinished* Goal, so the replacement scenarios here supersede a
+ * complete Goal and the abandoned-run ones are expressed through `/goal:clear`.
+ * The retired machinery is still load-bearing for historical branches, which is
+ * why the recovered-tail cases replay the immutable 0.2.0 fixture in
+ * `test/fixtures/historical/` instead of driving the removed command behavior.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -70,52 +77,6 @@ async function abortActiveLoop(session, runs) {
 	);
 	await session.sendSimple("abort");
 	return session.waitForSettled(1);
-}
-
-/**
- * Read a session file, ignoring a line Pi is still writing.
- *
- * A crash test kills the process at an exact branch position, so it has to observe
- * the file as it is rather than assume a complete last line.
- */
-function readBranchEntries(file) {
-	const entries = [];
-	for (const line of readFileSync(file, "utf8").split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			entries.push(JSON.parse(line));
-		} catch {
-			// A partially written line is not an entry yet.
-		}
-	}
-	return entries;
-}
-
-/**
- * Wait until the session file holds an entry matching `predicate`, and return the
- * branch *up to and including it*.
- *
- * A crash test needs an exact branch position, and Pi keeps appending while the
- * poll runs, so the prefix is cut at the matching entry rather than taken as the
- * whole file.
- */
-async function waitForBranchEntry(file, predicate, description) {
-	const deadline = Date.now() + 5000;
-	while (Date.now() < deadline) {
-		let entries;
-		try {
-			entries = readBranchEntries(file);
-		} catch (error) {
-			// Pi defers creating the session file until the first user/assistant
-			// message, so the path can be reported before it exists.
-			if (error.code !== "ENOENT") throw error;
-			entries = [];
-		}
-		const index = entries.findIndex(predicate);
-		if (index !== -1) return entries.slice(0, index + 1);
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-	throw new Error(`Timed out waiting for ${description}`);
 }
 
 /**
@@ -248,13 +209,21 @@ test("an ordinary prompt while a Goal is paused is not charged", async () => {
 	}
 });
 
-test("a Replacement Goal starts at zero and never inherits the old identity's usage", async () => {
+test("a Goal created while a complete Goal's run is still in flight starts at zero and never inherits its usage", async () => {
+	// One session works one Goal at a time (ADR-0003): an unfinished Goal refuses
+	// `/goal <objective>`, so the only replacement the command surface can still
+	// produce supersedes a *complete* Goal. That Goal's completing run may still be
+	// in flight (its final wrap-up response), which is the seam this test pins: the
+	// creation takes the slot with a fresh ledger and the old run's late work is
+	// charged to nobody, never to the new identity.
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "provider-gate");
 	script(
 		[
-			{ text: "Original kickoff.", waitForFile: gate, usage: { input: 100, output: 10 } },
-			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
+			{ text: "Original kickoff.", usage: { input: 100, output: 10 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 20, output: 2 } },
+			{ text: "Wrapping up.", waitForFile: gate, usage: { input: 20, output: 2 } },
+			{ text: "New Goal kickoff.", usage: { input: 20, output: 2 } },
 			{ hang: true },
 		],
 		session,
@@ -262,28 +231,45 @@ test("a Replacement Goal starts at zero and never inherits the old identity's us
 	try {
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await waitForTurns(session, 1);
-		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		const original = await waitForStoredGoal(session, (goal) => goal.status === "complete", "the Goal to complete");
+		assert.equal(original.usage.totalTokens, 132, "the kickoff (110) and the completing turn (22)");
 
-		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		// The completing run's wrap-up response is held, so the creation happens while
+		// that run is still in flight. A complete Goal does not block it, and nothing
+		// is asked of the user.
+		const created = await session.prompt("/goal A new objective entirely");
+		assert.equal(created.data.disposition, "handled");
+		const replaced = await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		assert.match(replaced.message, new RegExp(`replacing ${original.id}`));
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"a complete Goal never asks for a replacement confirmation",
+		);
 		writeFileSync(gate, "", "utf8");
 
-		// The steered replacement response and the aborted continuation are the new
-		// Goal's only work: 22 + 15.
-		await abortActiveLoop(session, 2);
+		// The new identity's own kickoff (22) and its aborted continuation (15) are its
+		// only work; the held wrap-up (22) is not.
+		await abortActiveLoop(session, 3);
 		const status = await reportStatus(session);
 		assert.equal(status.status, "active");
-		assert.equal(status.totalTokens, 37, "the replacement starts at zero and inherits nothing");
-		// The newest *current* snapshot is the replacement. The newest goal-state entry
-		// may be the old identity's finalized historical record: it is marked
-		// superseded, so it never selects the current Goal.
-		const current = currentGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(status.totalTokens, 37, "the new Goal starts at zero and inherits nothing");
+		const entries = readSessionEntries(await session.sessionFile());
+		const current = currentGoalSnapshot(entries).data.goal;
 		assert.equal(current.id, status.goalId);
 		assert.notEqual(current.id, original.id);
-		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
+		assert.equal(current.revision, 0, "a creation starts at revision 0");
+
+		// The complete record keeps exactly the usage it had already accounted, and the
+		// replacement's preserve snapshot is the old identity's own record: no late
+		// report is added to it, because completion is terminal for accounting.
+		const oldSnapshots = goalSnapshots(entries).filter((e) => e.data.goal?.id === original.id);
+		assert.deepEqual(
+			oldSnapshots.map((e) => `${e.data.goal.status}:${e.data.goal.usage.totalTokens}`),
+			["active:0", "complete:132", "complete:132"],
+			"creation, completion, and the preserved record that precedes the new identity",
+		);
+		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -392,13 +378,13 @@ test("a held blocked report prepared against an edited Goal is refused without m
 	}
 });
 
-test("a steered Replacement attributes the old identity's in-flight work to the old identity", async () => {
-	// The replacement is staged while the previous identity's run is still in flight,
-	// so the branch reads: the old kickoff, the old response, the replacement
-	// snapshot, the old response's tool result, and only then the steered replacement
-	// kickoff. The response and its nested tool result were admitted for the old
-	// identity, so they stay with it — durably — and are never charged to the
-	// replacement, live or replayed.
+test("a Goal created while a complete Goal's nested run is still in flight is never charged its tail", async () => {
+	// One session works one Goal at a time (ADR-0003), so the command surface's only
+	// replacement supersedes a *complete* Goal. Its completing run can still be in
+	// flight — here holding a nested tool call whose result lands after the creation
+	// snapshot — and that tail was admitted for the old identity. Completion is
+	// terminal for accounting, so it belongs to nobody: it is never charged to the new
+	// identity, live or replayed, and the old record keeps exactly its accounted work.
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
 	const session = await PiRpcSession.start({
@@ -409,12 +395,14 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 	const gate = join(workDir, "provider-gate");
 	script(
 		[
+			{ text: "Original kickoff.", usage: { input: 100, output: 10 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 20, output: 2 } },
 			{
 				toolCalls: [{ name: NESTED_OUTER_TOOL, args: {} }],
 				waitForFile: gate,
-				usage: { input: 100, output: 10 },
+				usage: { input: 20, output: 2 },
 			},
-			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
+			{ text: "New Goal kickoff.", usage: { input: 20, output: 2 } },
 			{ hang: true },
 		],
 		session,
@@ -422,64 +410,58 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 	try {
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await waitForTurns(session, 1);
-		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		const original = await waitForStoredGoal(session, (goal) => goal.status === "complete", "the Goal to complete");
+		assert.equal(original.usage.totalTokens, 132, "the kickoff (110) and the completing turn (22)");
 
-		// Replace while the provider request that holds the old kickoff is streaming.
-		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
+		// Create the next Goal while the completing run's nested call is still held.
+		const created = await session.prompt("/goal A new objective entirely");
+		assert.equal(created.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
 
-		// Release the old response: it is finalized *after* the replacement snapshot,
+		// Release the old run's nested call: it finalizes *after* the creation snapshot,
 		// and its nested tool result lands after that.
 		writeFileSync(gate, "", "utf8");
 		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
-		await abortActiveLoop(session, 2);
+		await abortActiveLoop(session, 3);
 
 		const status = await reportStatus(session);
 		assert.equal(status.status, "active");
 		assert.equal(
 			status.totalTokens,
 			37,
-			"22 for the steered replacement response + 15 for the aborted continuation; the old identity's " +
-				"response and nested tool result are not charged to the replacement",
+			"22 for the new Goal's own kickoff + 15 for its aborted continuation; the old run's held response " +
+				"and nested tool result are not charged to it",
 		);
 		assert.equal(status.nestedTokens, 0, "the old identity's nested usage is not transferred");
 
-		// The old identity's in-flight assistant response (110) and nested tool result
-		// (50) are frozen onto its superseded snapshot, at exact totals.
-		//
 		// The nested usage arrives merged into the tool result's own `usage` — the
 		// shape the store has to charge exactly once — so the report is read off the
-		// branch entry the finalized call produced. Asserting it pins where the
-		// accounted contribution comes from instead of leaving it a bare literal.
+		// branch entry the finalized call produced. It is real accounted-shaped work
+		// that the creation boundary must leave with nobody.
 		const liveFile = await session.sessionFile();
 		const outerResult = toolResults(session, NESTED_OUTER_TOOL).at(-1);
 		assert.equal(outerResult.isError, false, "the nested work ran and finalized cleanly");
-		const outerEntry = readSessionEntries(liveFile).find(
+		const liveEntries = readSessionEntries(liveFile);
+		const outerEntry = liveEntries.find(
 			(entry) => entry.type === "message" && entry.message?.toolCallId === outerResult.toolCallId,
 		);
 		assert.equal(outerEntry.message.usage.totalTokens, 150, "Pi reports the nested usage on the tool result");
 		assert.equal(
 			outerEntry.message.usage.totalTokens - outerEntry.message.usage.cacheRead,
 			NESTED_LEAF_ACCOUNTED,
-			"only the uncached part of the nested report is accounted",
+			"only the uncached part of the nested report would be accounted",
 		);
-		const liveStates = goalSnapshots(readSessionEntries(liveFile));
-		const oldSnapshots = liveStates.filter((e) => e.data.goal?.id === original.id);
-		const finalized = oldSnapshots.at(-1);
-		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
-		assert.equal(finalized.data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
-		assert.equal(finalized.data.goal.status, "active");
-		// The freeze is a single append and the newest goal-state entry on the branch.
-		// There is no re-affirmation to lose: the superseded marker is what keeps this
-		// historical record from becoming the current Goal.
-		assert.equal(liveStates.at(-1).data.goal.id, original.id);
-		assert.equal(liveStates.at(-1).data.superseded, true);
 
-		// A fresh process reconstructs from the branch. The old tail must stay on the
-		// old identity's durable record and must not be charged to the replacement.
+		const liveStates = goalSnapshots(liveEntries);
+		const oldSnapshots = liveStates.filter((e) => e.data.goal?.id === original.id);
+		assert.equal(oldSnapshots.at(-1).data.goal.usage.totalTokens, 132, "the old identity's total is unchanged");
+		assert.equal(oldSnapshots.at(-1).data.goal.usage.nestedTokens, 0, "no late nested usage was added");
+		assert.equal(oldSnapshots.at(-1).data.goal.status, "complete");
+		assert.equal(liveStates.at(-1).data.goal.id, currentGoalSnapshot(liveEntries).data.goal.id);
+		assert.notEqual(liveStates.at(-1).data.goal.id, original.id, "the new identity is current");
+
+		// A fresh process reconstructs from the branch and must reach the same totals:
+		// the late tail belongs to neither identity.
 		const { resumed, dir } = await reload(session, workDir);
 		script([{ text: "Never requested." }, { hang: true }], resumed);
 		try {
@@ -491,14 +473,10 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 			const reloadedOld = goalSnapshots(readSessionEntries(await resumed.sessionFile()))
 				.filter((e) => e.data.goal?.id === original.id)
 				.at(-1);
-			assert.equal(
-				reloadedOld.data.goal.usage.totalTokens,
-				160,
-				"the old identity's durable total survives reload",
-			);
-			assert.equal(reloadedOld.data.goal.status, "active");
+			assert.equal(reloadedOld.data.goal.usage.totalTokens, 132, "the old identity's durable total survives reload");
+			assert.equal(reloadedOld.data.goal.status, "complete");
 			// The reload neither re-affirms the replacement nor rewrites the historical
-			// snapshot: the tail it recovers is already durable.
+			// snapshot: there is no tail to recover, so it appends nothing.
 			assert.equal(
 				goalSnapshots(readSessionEntries(await resumed.sessionFile())).length,
 				liveStates.length,
@@ -510,7 +488,7 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 			await resumed.stop();
 			rmSync(dir, { recursive: true, force: true });
 		}
-		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -519,12 +497,12 @@ test("a steered Replacement attributes the old identity's in-flight work to the 
 	}
 });
 
-test("Clear during the superseded identity's in-flight response keeps the tail attributed", async () => {
-	// A replacement commits while the old identity's request is streaming, then the
-	// user clears the replacement before that response is finalized. Clear of the
-	// replacement must not erase the old identity's admitted work: the response and
-	// its nested tool result land after the tombstone and stay on the old identity's
-	// superseded record.
+test("a refused creation during an in-flight nested response leaves the tail with the active identity", async () => {
+	// The refusal #83 adds is the riskiest point to get wrong for accounting: it is a
+	// command that runs *while* the active Goal's response is on the wire. It must
+	// change no Goal bytes and no ownership, so the response and its nested tool
+	// result that finalize afterwards are still charged to the identity that was
+	// admitted for them — not to nobody, and not to a Goal that was never created.
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
 	const session = await PiRpcSession.start({
@@ -540,7 +518,6 @@ test("Clear during the superseded identity's in-flight response keeps the tail a
 				waitForFile: gate,
 				usage: { input: 100, output: 10 },
 			},
-			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
 			{ hang: true },
 		],
 		session,
@@ -550,65 +527,53 @@ test("Clear during the superseded identity's in-flight response keeps the tail a
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 1);
 		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		const before = readFileSync(await session.sessionFile(), "utf8");
 
-		// Replace A→B while A's request is streaming, then Clear B before A's
-		// response is finalized.
-		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
-
-		const clearPromise = submitCommand(session, "clear-busy", "/goal:clear");
-		assert.equal((await clearPromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("cleared"));
-
-		// Release the old response: it lands after the tombstone and must still be
-		// charged to A.
-		writeFileSync(gate, "", "utf8");
-		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
-		await session.waitForSettled(1);
-
-		// The session has no Goal, and the old identity's tail is frozen on its
-		// superseded record.
-		const statusPromise = submitCommand(session, "status", "/goal");
-		assert.equal((await statusPromise).data.disposition, "handled");
-		await session.waitFor("a no-Goal report", (records) =>
-			records.find(
-				(r) =>
-					r.type === "extension_ui_request" &&
-					r.method === "notify" &&
-					r.message.includes("No Goal is set"),
-			),
+		// Refuse a second Goal while the kickoff's request is streaming.
+		const refused = await session.prompt("/goal A replacement objective");
+		assert.equal(refused.data.disposition, "handled");
+		const refusal = await session.waitForNotify((r) =>
+			r.message.startsWith("Goal not created: an unfinished Goal is already set"),
+		);
+		assert.equal(refusal.notifyType, "warning");
+		assert.equal(
+			readFileSync(await session.sessionFile(), "utf8"),
+			before,
+			"the refusal wrote no Goal bytes while the run was in flight",
 		);
 
-		const liveStates = goalSnapshots(readSessionEntries(await session.sessionFile()));
-		assert.equal(currentGoalSnapshot(liveStates).data.goal, null, "the tombstone is the newest current state");
-		const oldSnapshots = liveStates.filter((e) => e.data.goal?.id === original.id);
-		const finalized = oldSnapshots.at(-1);
-		assert.equal(finalized.data.superseded, true, "the tail is frozen as history");
-		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
-		assert.equal(finalized.data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
+		// Release the response: it and its nested tool result were admitted for the
+		// active identity, and the refusal did not disturb that.
+		writeFileSync(gate, "", "utf8");
+		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
+		await abortActiveLoop(session, 1);
 
-		// A fresh process reconstructs no Goal and keeps the old identity's total.
+		const status = await reportStatus(session);
+		assert.equal(status.goalId, original.id, "the refused command left the same Goal in place");
+		assert.equal(status.status, "active");
+		assert.equal(
+			status.totalTokens,
+			175,
+			"the exact assistant (110) plus nested tool-result (50) tail, and the aborted continuation (15) it earned",
+		);
+		assert.equal(status.nestedTokens, NESTED_LEAF_ACCOUNTED);
+
+		// A fresh process reconstructs the same attribution from the branch.
 		const { resumed, dir } = await reload(session, workDir);
 		script([{ text: "Never requested." }, { hang: true }], resumed);
 		try {
-			// A session with no Goal emits no startup notify; the status line is the
-			// observable signal that session_start has finished.
-			await resumed.waitFor("the startup status line", (records) =>
-				records.find((r) => r.type === "extension_ui_request" && r.method === "setStatus"),
-			);
-			const reloadedStates = goalSnapshots(readSessionEntries(await resumed.sessionFile()));
-			const reloadedOld = reloadedStates.filter((e) => e.data.goal?.id === original.id).at(-1);
-			assert.equal(reloadedOld.data.goal.usage.totalTokens, 160, "the old total survives reload");
-			assert.equal(reloadedOld.data.superseded, true);
+			await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
+			const restored = await reportStatus(resumed);
+			assert.equal(restored.goalId, original.id);
+			assert.equal(restored.totalTokens, 175, "the reload converges on the live total");
+			assert.equal(restored.nestedTokens, NESTED_LEAF_ACCOUNTED);
 			assertStepsConsumed(resumed, 0, []);
 			assert.equal(resumed.extensionErrors().length, 0);
 		} finally {
 			await resumed.stop();
 			rmSync(dir, { recursive: true, force: true });
 		}
-		assertStepsConsumed(session, 2, []);
+		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0);
 	} finally {
 		await session.stop();
@@ -617,15 +582,13 @@ test("Clear during the superseded identity's in-flight response keeps the tail a
 	}
 });
 
-test("creating a Goal after a Clear closes the old admission so live and replay agree", async () => {
-	// A replacement commits while A's request is streaming, the user clears the
-	// replacement, and a new Goal C is created before A's response is finalized.
-	// Creating a Goal is a boundary that leaves no marker of its own on the branch, so
-	// the old admission has to be closed durably there: a live path that merely dropped
-	// it would refuse A's response while the replay still charged it to A and froze a
-	// 110-token record the live path never accounted. The replacement's own steered
-	// kickoff is queued for the cleared B identity, so it must not open C's admission
-	// either (issue #39); only C's own aborted kickoff is charged.
+test("clearing a refused Goal and creating its successor keeps live and replay agreement", async () => {
+	// The escape hatch the refusal names is `/goal:clear` followed by a fresh creation,
+	// and it can be taken while the abandoned Goal's response is still on the wire.
+	// The clear is the boundary that abandons that admission, so the late response is
+	// charged to nobody — never to the successor — and the replay of the branch has to
+	// reach the same totals instead of retroactively charging it to the cleared
+	// identity.
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
 	const session = await PiRpcSession.start({ cwd: workDir, sessionDir });
@@ -633,7 +596,7 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 	script(
 		[
 			{ text: "Original kickoff.", waitForFile: gate, usage: { input: 100, output: 10 } },
-			{ text: "Steered kickoff.", usage: { input: 20, output: 2 } },
+			{ text: "New Goal kickoff.", usage: { input: 20, output: 2 } },
 			{ hang: true },
 		],
 		session,
@@ -644,52 +607,55 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 		await waitForTurns(session, 1);
 		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 
-		// Replace A→B while A's request is streaming, then Clear B before it lands.
-		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		// Refuse the successor first: that is the command that names /goal:clear.
+		const refused = await session.prompt("/goal A third objective");
+		assert.equal(refused.data.disposition, "handled");
+		const refusal = await session.waitForNotify((r) =>
+			r.message.startsWith("Goal not created: an unfinished Goal is already set"),
+		);
+		assert.match(refusal.message, /run \/goal:clear first/);
 
-		const clearPromise = submitCommand(session, "clear-busy", "/goal:clear");
-		assert.equal((await clearPromise).data.disposition, "handled");
+		// Take the escape hatch while the old response is still streaming.
+		const cleared = await session.prompt("/goal:clear");
+		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
-		// Create Goal C while A's request is still streaming. The creation boundary closes
-		// A's admission, and that close is durable before C's own snapshot.
+		// Create the successor while the old response is still streaming. The creation
+		// boundary is durable before the successor's own snapshot; a *fresh* creation
+		// then waits for the session to go idle before it delivers its kickoff, so the
+		// command is submitted and its response awaited after the release.
 		const createPromise = submitCommand(session, "create-c", "/goal A third objective");
 		await waitForStoredGoal(session, (goal) => goal.objective === "A third objective", "the new Goal's snapshot");
 		const statesAtCreation = goalSnapshots(readSessionEntries(await session.sessionFile()));
 		assert.equal(currentGoalSnapshot(statesAtCreation).data.goal.objective, "A third objective");
-		const closeAtCreation = statesAtCreation.filter((e) => e.data.goal?.id === original.id).at(-1);
-		assert.equal(closeAtCreation.data.superseded, true, "the old admission is closed with durable evidence");
-		assert.equal(closeAtCreation.data.goal.usage.totalTokens, 0, "A's response had not landed yet");
 
-		// Release A's response: it lands after the creation boundary and is charged to
-		// nobody, live and on replay.
+		// Release the old response: it lands after the creation boundary and is charged
+		// to nobody, live and on replay. The successor's own kickoff follows once the
+		// session is idle, and its continuation is the aborted 15.
 		writeFileSync(gate, "", "utf8");
-		await abortActiveLoop(session, 2);
 		assert.equal((await createPromise).data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await abortActiveLoop(session, 3);
 
 		const status = await reportStatus(session);
 		assert.equal(status.status, "active");
 		assert.equal(
 			status.totalTokens,
-			15,
-			"only the aborted C kickoff is charged; A's late response and the cleared B identity's " +
-				"steered kickoff are charged to nobody",
+			37,
+			"the successor's own kickoff (22) and aborted continuation (15); the cleared identity's " +
+				"late response is charged to nobody",
 		);
 		assert.equal(status.nestedTokens, 0);
 
-		const liveStates = goalSnapshots(readSessionEntries(await session.sessionFile()));
+		const liveEntries = readSessionEntries(await session.sessionFile());
+		const liveStates = goalSnapshots(liveEntries);
 		assert.equal(
 			liveStates.length,
 			statesAtCreation.length,
 			"the live path appends nothing after the creation boundary",
 		);
 		const oldStates = liveStates.filter((e) => e.data.goal?.id === original.id);
-		assert.equal(oldStates.length, 3, "creation, the replacement's preserve, and the durable close");
-		assert.equal(oldStates.at(-1).data.superseded, true);
+		assert.equal(oldStates.length, 1, "the cleared identity keeps its creation snapshot only");
 		for (const state of oldStates) {
 			assert.equal(state.data.goal.usage.totalTokens, 0, "the late response was never accounted, live");
 		}
@@ -701,7 +667,7 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 			await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
 			const restored = await reportStatus(resumed);
 			assert.equal(restored.status, "active");
-			assert.equal(restored.totalTokens, 15, "the reload converges on the live total");
+			assert.equal(restored.totalTokens, 37, "the reload converges on the live total");
 			assert.equal(
 				goalSnapshots(readSessionEntries(await resumed.sessionFile())).length,
 				liveStates.length,
@@ -709,17 +675,17 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 			);
 
 			// The next delivered user message is a freeze boundary. It must not invent a
-			// historical record for the old identity's late response: live refused it, so the
-			// replay has to refuse it too instead of freezing a total nobody accounted.
+			// historical record for the cleared identity's late response: live refused it,
+			// so the replay has to refuse it too instead of freezing a total nobody accounted.
 			await resumed.prompt("/goal:pause");
 			await resumed.waitForNotify((r) => r.message.includes("paused"));
 			await resumed.prompt("anything else after the reload?");
 			await resumed.waitForSettled(1);
 			const afterBoundary = goalSnapshots(readSessionEntries(await resumed.sessionFile()));
 			const oldAfterBoundary = afterBoundary.filter((e) => e.data.goal?.id === original.id);
-			assert.equal(oldAfterBoundary.length, 3, "no historical freeze is invented for the late response");
+			assert.equal(oldAfterBoundary.length, 1, "no historical freeze is invented for the late response");
 			for (const state of oldAfterBoundary) {
-				assert.equal(state.data.goal.usage.totalTokens, 0, "and the old identity's total stays exact");
+				assert.equal(state.data.goal.usage.totalTokens, 0, "and the cleared identity's total stays exact");
 			}
 			assertStepsConsumed(resumed, 1, []);
 			assert.equal(resumed.extensionErrors().length, 0, JSON.stringify(resumed.extensionErrors()));
@@ -736,210 +702,150 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 	}
 });
 
-test("old-budget exhaustion is recorded on the superseded identity and admits no old continuation", async () => {
-	// The old identity's in-flight tail crosses its own budget. The exhaustion belongs
-	// to the old identity's durable record only: the replacement keeps its fresh
-	// ledger and its own admission, and the superseded identity never continues or
-	// earns a wrap-up.
+/**
+ * Start a real Pi session on a copy of an immutable historical branch fixture.
+ *
+ * The fixtures were captured from a released pi-goal whose command surface could
+ * still replace an unfinished Goal, a behavior #83 removed. Their header records
+ * the capturing machine's working directory, so the copy gets a fresh one; every
+ * other line is byte-identical, and `mutate` may derive a variant by rewriting
+ * parsed entries (as the budget case below does) without touching the fixture.
+ */
+function prepareHistoricalSession(fixture, sessionFile, cwd, mutate) {
+	copyFileSync(join(import.meta.dirname, "fixtures", "historical", fixture), sessionFile);
+	const lines = readFileSync(sessionFile, "utf8").split("\n");
+	const header = JSON.parse(lines[0]);
+	header.cwd = cwd;
+	lines[0] = JSON.stringify(header);
+	if (!mutate) {
+		writeFileSync(sessionFile, lines.join("\n"), "utf8");
+		return;
+	}
+	const entries = lines.filter((line) => line.trim() !== "").map((line) => JSON.parse(line));
+	mutate(entries);
+	writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+}
+
+const HISTORICAL_REPLACED = "v0.2.0-open-superseded-tail.jsonl";
+/** The replaced identity and the replacement the fixture's `/goal` created. */
+const HISTORICAL_OLD_ID = "goal_a59e4c80";
+const HISTORICAL_NEW_ID = "goal_298e9038";
+
+/** Start a session on the historical branch, with a script that must stay unread. */
+async function startHistorical(fixture, mutate) {
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
-	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
-	const session = await PiRpcSession.start({
-		cwd: workDir,
-		sessionDir,
-		extraExtensions: [NESTED_EXTENSION],
-	});
-	const gate = join(workDir, "provider-gate");
-	script(
-		[
-			{
-				toolCalls: [{ name: NESTED_OUTER_TOOL, args: {} }],
-				waitForFile: gate,
-				usage: { input: 100, output: 10 },
-			},
-			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
-			{ hang: true },
-		],
-		session,
-	);
+	const dir = mkdtempSync(join(tmpdir(), "pi-goal-historical-"));
+	const sessionFile = join(dir, "historical.jsonl");
+	prepareHistoricalSession(fixture, sessionFile, workDir, mutate);
+	const session = await PiRpcSession.start({ sessionFile, cwd: workDir });
+	script([{ text: "Never requested." }, { hang: true }], session);
+	return { session, workDir, dir, sessionFile };
+}
+
+test("a historical branch that replaced an unfinished Goal mid-flight recovers the old tail as history", async () => {
+	// The branch was captured from pi-goal 0.2.0, which still replaced an unfinished
+	// Goal after a confirmation dialog, and it died in the window the superseded
+	// machinery exists for: the old identity's response landed after the replacement
+	// snapshot, with no freeze boundary after it. The command surface can no longer
+	// produce that branch (#83), which is exactly why the retained machinery has to
+	// reconstruct it: the replacement is current at zero usage, the old tail is
+	// recovered onto one superseded record, and the restored replacement is an
+	// ordinary unfinished Goal that `/goal <objective>` now refuses.
+	const { session, workDir, dir, sessionFile } = await startHistorical(HISTORICAL_REPLACED);
 	try {
-		await session.prompt(`/goal --budget 100 ${OBJECTIVE}`);
-		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await waitForTurns(session, 1);
-		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		const restored = await session.waitForNotify((r) => r.message.includes("restored (active)"));
+		assert.ok(restored.message.includes(HISTORICAL_NEW_ID), restored.message);
+		const entries = readSessionEntries(sessionFile);
+		const current = currentGoalSnapshot(entries).data.goal;
+		assert.equal(current.id, HISTORICAL_NEW_ID, "the replacement — never the superseded record — is current");
+		assert.equal(current.usage.totalTokens, 0, "the replacement is not charged for the old identity's tail");
 
-		const replacePromise = submitCommand(session, "replace-busy", "/goal A replacement objective");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		// The tail is frozen as one historical record at the first durable boundary of
+		// this runtime, and it can never become the current Goal again.
+		const frozen = goalSnapshots(entries).filter((entry) => entry.data.superseded === true);
+		assert.equal(frozen.length, 1, "exactly one historical snapshot is recovered from the branch");
+		assert.equal(frozen[0].data.goal.id, HISTORICAL_OLD_ID, "the tail stays with the identity that was replaced");
+		assert.equal(frozen[0].data.goal.usage.totalTokens, 110, "the exact assistant tail the branch carries");
+		assert.equal(frozen[0].data.goal.status, "active", "its Lifecycle status is the one it had when replaced");
 
-		writeFileSync(gate, "", "utf8");
-		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
-		await abortActiveLoop(session, 2);
+		// The derived history timeline still renders both identities.
+		await session.prompt("/goal:history");
+		const history = await session.waitForNotify((r) => r.message.includes("Goal history on this branch (2 records"));
+		for (const expected of ["created", "replaced", HISTORICAL_OLD_ID, HISTORICAL_NEW_ID]) {
+			assert.ok(history.message.includes(expected), `the timeline names ${expected}`);
+		}
 
+		// The restored replacement is an unfinished Goal, so the single-Goal rule applies
+		// to it without any special case for "recovered from a replacement".
+		const status = await reportStatus(session);
+		assert.equal(status.goalId, HISTORICAL_NEW_ID);
+		assert.equal(status.status, "active");
+		assert.equal(status.totalTokens, 0);
+		const beforeRefusal = readFileSync(sessionFile, "utf8");
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		const refusal = await session.waitForNotify((r) =>
+			r.message.startsWith("Goal not created: an unfinished Goal is already set"),
+		);
+		assert.equal(refusal.notifyType, "warning");
+		assert.match(refusal.message, /run \/goal:clear first/);
+		assert.equal(readFileSync(sessionFile, "utf8"), beforeRefusal, "the refusal wrote no Goal bytes");
+		assertStepsConsumed(session, 0, []);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(workDir, { recursive: true, force: true });
+	}
+});
+
+test("a historical branch whose recovered tail crosses the old Goal's budget records the stop on its own record", async () => {
+	// The live command surface can no longer replace an unfinished Goal, so the only
+	// way an old identity's in-flight tail crosses a budget after it was replaced is a
+	// branch like this one. The fixture's old Goal is derived into a budgeted Goal: the
+	// recovered 110-token tail crosses the 100-token budget, so the exhaustion belongs
+	// to the old identity's durable record only. The replacement keeps its fresh ledger
+	// and its own admission, and the superseded identity never continues or earns a
+	// wrap-up.
+	const budgetTheOldGoal = (entries) => {
+		for (const entry of entries) {
+			if (entry.customType !== "goal-state") continue;
+			if (entry.data?.goal?.id !== HISTORICAL_OLD_ID) continue;
+			entry.data.goal.tokenBudget = 100;
+		}
+	};
+	const { session, workDir, dir, sessionFile } = await startHistorical(HISTORICAL_REPLACED, budgetTheOldGoal);
+	try {
+		await session.waitForNotify((r) => r.message.includes("restored (active)"));
 		const status = await reportStatus(session);
 		assert.equal(status.status, "active");
-		assert.equal(status.totalTokens, 37, "the replacement keeps its own fresh ledger");
+		assert.equal(status.totalTokens, 0, "the replacement keeps its own fresh ledger");
 
-		const oldSnapshots = goalSnapshots(readSessionEntries(await session.sessionFile())).filter(
-			(e) => e.data.goal?.id === original.id,
-		);
+		const entries = readSessionEntries(sessionFile);
+		const oldSnapshots = goalSnapshots(entries).filter((e) => e.data.goal?.id === HISTORICAL_OLD_ID);
 		const finalized = oldSnapshots.at(-1);
+		assert.equal(finalized.data.superseded, true, "the recovered tail is historical");
 		assert.equal(finalized.data.goal.status, "budget_limited", "the old identity's exhaustion is recorded");
-		assert.equal(finalized.data.goal.usage.totalTokens, 160, "the in-flight tail is attributed to the old identity");
-		assert.equal(finalized.data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
+		assert.equal(finalized.data.goal.usage.totalTokens, 110, "the in-flight tail stays attributed to it");
+		assert.equal(finalized.data.goal.tokenBudget, 100);
 
 		// No old continuation and no old wrap-up: the superseded identity never continues.
-		const entries = readSessionEntries(await session.sessionFile());
 		assert.equal(
-			continuationEntries(entries).filter((e) => e.content.includes(original.id)).length,
+			continuationEntries(entries).filter((e) => e.content.includes(HISTORICAL_OLD_ID)).length,
 			0,
 			"the superseded identity earns no continuation",
 		);
 		assert.equal(
-			customMessageEntries(entries, "goal-budget-wrapup").filter((e) => e.content.includes(original.id)).length,
+			customMessageEntries(entries, "goal-budget-wrapup").filter((e) => e.content.includes(HISTORICAL_OLD_ID)).length,
 			0,
 			"the superseded identity earns no wrap-up",
 		);
-
-		const { resumed, dir } = await reload(session, workDir);
-		script([{ text: "Never requested." }, { hang: true }], resumed);
-		try {
-			await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
-			const restored = await reportStatus(resumed);
-			assert.equal(restored.status, "active");
-			assert.equal(restored.totalTokens, 37);
-			const reloadedOld = goalSnapshots(readSessionEntries(await resumed.sessionFile()))
-				.filter((e) => e.data.goal?.id === original.id)
-				.at(-1);
-			assert.equal(reloadedOld.data.goal.status, "budget_limited", "the old status survives reload");
-			assert.equal(reloadedOld.data.goal.usage.totalTokens, 160, "the old total survives reload");
-			assertStepsConsumed(resumed, 0, []);
-			assert.equal(resumed.extensionErrors().length, 0);
-		} finally {
-			await resumed.stop();
-			rmSync(dir, { recursive: true, force: true });
-		}
-		assertStepsConsumed(session, 3, [{ stopReason: "aborted" }]);
-		assert.equal(session.extensionErrors().length, 0);
+		assertStepsConsumed(session, 0, []);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();
-		rmSync(workDir, { recursive: true, force: true });
-		rmSync(sessionDir, { recursive: true, force: true });
-	}
-});
-
-test("a hard crash between the old identity's tail and its freeze boundary recovers the tail on reload", async () => {
-	// The crash window: the process dies after the old identity's in-flight response and
-	// its nested tool result landed, but before any freeze boundary ran. The branch that
-	// leaves behind carries the tail with no historical snapshot after it, so the next
-	// load has to recover the tail from the branch instead of dropping work the live
-	// path had already charged to the superseded identity.
-	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
-	const sessionDir = mkdtempSync(join(tmpdir(), "pi-goal-sessions-"));
-	const session = await PiRpcSession.start({
-		cwd: workDir,
-		sessionDir,
-		extraExtensions: [NESTED_EXTENSION],
-	});
-	const gate = join(workDir, "provider-gate");
-	script(
-		[
-			{
-				toolCalls: [{ name: NESTED_OUTER_TOOL, args: {} }],
-				waitForFile: gate,
-				usage: { input: 100, output: 10 },
-			},
-			{ text: "Replacement kickoff.", usage: { input: 20, output: 2 } },
-			{ hang: true },
-		],
-		session,
-	);
-	let crashEntries;
-	let crashFile;
-	let original;
-	try {
-		await session.prompt(`/goal ${OBJECTIVE}`);
-		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await waitForTurns(session, 1);
-		original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
-
-		const replacePromise = submitCommand(session, "replace-crash", "/goal A replacement objective");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
-
-		// Release the old response: it is finalized *after* the replacement snapshot,
-		// and its nested tool result lands after that.
-		writeFileSync(gate, "", "utf8");
-		await session.waitForToolResult(NESTED_OUTER_TOOL, 1);
-
-		// Pi emits the tool-execution record before it appends the tool result, so wait
-		// for the entry itself to be on the branch before dying.
-		crashFile = await session.sessionFile();
-		crashEntries = await waitForBranchEntry(
-			crashFile,
-			(entry) => entry.type === "message" && entry.message?.role === "toolResult",
-			"the old identity's tool result on the branch",
-		);
-
-		// Die here — before the replacement's kickoff is delivered, and therefore before
-		// any freeze boundary could have run.
-		session.killNow();
-		await session.waitForExit();
-	} finally {
-		await session.stop();
-	}
-
-	// The branch the crash leaves: everything through the old identity's tool result.
-	// A checkpoint, the freeze, and the steered kickoff all come after it, so keeping
-	// this prefix is exactly the state a SIGKILL at that point produces.
-	const crashGoalStates = crashEntries.filter(
-		(entry) => entry.type === "custom" && entry.customType === "goal-state",
-	);
-	assert.ok(crashEntries.length > 1, "the old identity's tool result is on the branch");
-	assert.equal(
-		crashEntries.at(-1).message.role,
-		"toolResult",
-		"the crash position is the old identity's nested tool result",
-	);
-	assert.equal(
-		crashGoalStates.filter((entry) => entry.data.superseded === true).length,
-		0,
-		"no freeze boundary ran before the crash",
-	);
-
-	const dir = mkdtempSync(join(tmpdir(), "pi-goal-reload-"));
-	const copy = join(dir, basename(crashFile));
-	writeFileSync(copy, crashEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
-
-	const resumed = await PiRpcSession.start({ sessionFile: copy, cwd: workDir });
-	script([{ text: "Never requested." }, { hang: true }], resumed);
-	try {
-		await resumed.waitForNotify((r) => r.message.includes("restored (active)"));
-		const restored = await reportStatus(resumed);
-		assert.equal(restored.status, "active");
-		assert.equal(restored.totalTokens, 0, "the replacement is not charged for the old identity's tail");
-
-		// The recovered tail is frozen at the first durable boundary of this runtime.
-		const resumedEntries = readSessionEntries(await resumed.sessionFile());
-		const frozen = goalSnapshots(resumedEntries).filter((entry) => entry.data.superseded === true);
-		assert.equal(frozen.length, 1, "exactly one historical snapshot is recovered from the branch");
-		assert.equal(frozen[0].data.goal.id, original.id, "the tail stays with the identity that was replaced");
-		assert.equal(frozen[0].data.goal.usage.totalTokens, 160, "the exact assistant plus tool-result tail");
-		assert.equal(frozen[0].data.goal.usage.nestedTokens, NESTED_LEAF_ACCOUNTED);
-		assert.equal(
-			resumedEntries.filter((entry) => entry.type === "custom" && entry.customType === "goal-state").length,
-			crashGoalStates.length + 1,
-			"the reload appends the recovered freeze and nothing else",
-		);
-		assertStepsConsumed(resumed, 0, []);
-		assert.equal(resumed.extensionErrors().length, 0, JSON.stringify(resumed.extensionErrors()));
-	} finally {
-		await resumed.stop();
 		rmSync(dir, { recursive: true, force: true });
+		rmSync(workDir, { recursive: true, force: true });
 	}
-	rmSync(workDir, { recursive: true, force: true });
-	rmSync(sessionDir, { recursive: true, force: true });
 });
 
 test("an ordinary prompt typed during an admitted Goal response stays attributed and converges", async () => {

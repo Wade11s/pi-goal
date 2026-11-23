@@ -29,7 +29,6 @@ import {
 	readSessionEntries,
 	runCount,
 	script,
-	submitCommand,
 } from "./helpers/rpc-harness.mjs";
 import { advanceAuditGate, scriptAuditChain } from "./helpers/blocked-audit.mjs";
 
@@ -359,76 +358,90 @@ test("a provider usage limit emits usage-limited for its durable stop", async ()
 	}
 });
 
-test("a Replacement Goal emits for the new identity; a declined replacement emits nothing; clear names the cleared Goal", async () => {
+test("a refused creation against an unfinished Goal emits nothing; creation after completion emits `replaced` for the new identity; clear names the cleared Goal", async () => {
 	const session = await startEventsSession();
 	const FIRST = "First objective in this session";
 	const SECOND = "Second objective replacing the first";
+	const gate = join(session.cwd, "provider-gate");
+	// First Goal: a held kickoff (so the refusal below is observed while the Goal is
+	// provably unfinished), then its Continuation completes it. Second Goal: its
+	// kickoff and the Continuation that completes it.
 	script(
 		[
-			{ text: "A kickoff.", usage: { input: 30, output: 10 } },
-			{ hang: true },
-			{ text: "B kickoff.", usage: { input: 30, output: 10 } },
+			{ text: "A kickoff.", usage: { input: 30, output: 10 }, waitForFile: gate },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 20, output: 5 } },
 			{ text: "Done.", usage: { input: 5, output: 2 } },
+			{ text: "B kickoff.", usage: { input: 30, output: 10 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 20, output: 5 } },
+			{ text: "Done again.", usage: { input: 5, output: 2 } },
 		],
 		session,
 	);
 	try {
 		await session.prompt(`/goal ${FIRST}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await abortActiveLoop(session, 2);
 		const entriesAfterFirst = readSessionEntries(await session.sessionFile());
 		const first = goalSnapshots(entriesAfterFirst)[0].data.goal.id;
 		assert.deepEqual(eventKinds(entriesAfterFirst), ["created"]);
 
-		// Declining the replacement confirmation keeps the current Goal: no
-		// durable transition happened, so nothing may be announced.
-		const declinePromise = submitCommand(session, "decline-1", `/goal ${SECOND}`);
-		await session.respondToConfirm(() => true, false);
-		await declinePromise;
-		await session.waitForNotify((r) => r.message.includes("Replacement cancelled"));
+		// The refusal keeps the current Goal: no durable transition happened, so
+		// nothing may be announced.
+		const mark = session.records.length;
+		const refused = await session.prompt(`/goal ${SECOND}`);
+		assert.equal(refused.data.disposition, "handled");
+		await session.notifyAfter(mark, (r) => r.message.startsWith("Goal not created: an unfinished Goal is already set"));
 		assert.deepEqual(eventKinds(readSessionEntries(await session.sessionFile())), ["created"]);
 
-		// Confirming the replacement commits the new identity, and the event names
-		// the replacement — the Goal that now owns the session's single slot.
-		const replacePromise = submitCommand(session, "replace-1", `/goal ${SECOND}`);
-		await session.respondToConfirm(() => true, true);
-		await replacePromise;
+		// The first Goal finishes on its own terms.
+		writeFileSync(gate, "", "utf8");
+		await session.waitForSettled(1);
+		assert.deepEqual(eventKinds(readSessionEntries(await session.sessionFile())), ["created", "completed"]);
+
+		// Creating after completion commits the new identity, and the event names the
+		// replacement — the Goal that now owns the session's single slot.
+		const replace = await session.prompt(`/goal ${SECOND}`);
+		assert.equal(replace.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
 		await session.waitForSettled(2);
 		const entries = readSessionEntries(await session.sessionFile());
-		assert.deepEqual(eventKinds(entries), ["created", "replaced", "completed"], "no event for the superseded freeze");
-		const replaced = eventLog(entries)[1].data;
+		assert.deepEqual(
+			eventKinds(entries),
+			["created", "completed", "replaced", "completed"],
+			"no event for the completed record's preserved snapshot",
+		);
+		const replaced = eventLog(entries)[2].data;
 		assert.notEqual(replaced.goal.id, first, "the replacement event carries the new identity");
 		assert.equal(replaced.goal.revision, 0);
 		assert.equal(replaced.goal.objective.length, SECOND.length);
 		assert.equal(
-			entries.indexOf(eventLog(entries)[1]),
+			entries.indexOf(eventLog(entries)[2]),
 			entries.indexOf(snapshotAtRevision(entries, replaced.goal.id, 0)) + 1,
 			"the replacement event directly follows the new identity's durable snapshot",
 		);
-		// The replaced identity is never re-announced: its preserved snapshot is
-		// branch history, and the only event that ever named it is its own creation.
+		// The superseded identity is never re-announced: its preserved snapshot is
+		// branch history, and the only events that ever named it are its own
+		// creation and completion.
 		assert.ok(
 			goalSnapshots(entries).some((s) => s.data.goal?.id === first),
-			"the replaced identity's totals were preserved on the branch",
+			"the superseded identity's totals were preserved on the branch",
 		);
-		assert.equal(
-			eventLog(entries).filter((e) => e.data.goal.id === first).length,
-			1,
-			"only the original creation ever named the replaced identity",
+		assert.deepEqual(
+			eventLog(entries).filter((e) => e.data.goal.id === first).map((e) => e.data.kind),
+			["created", "completed"],
+			"the superseded identity is announced for its own transitions only",
 		);
 
 		// Clearing names the Goal that was cleared — the replacement — and no other.
 		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		const finalEntries = readSessionEntries(await session.sessionFile());
-		assert.deepEqual(eventKinds(finalEntries), ["created", "replaced", "completed", "cleared"]);
-		const cleared = eventLog(finalEntries)[3].data;
+		assert.deepEqual(eventKinds(finalEntries), ["created", "completed", "replaced", "completed", "cleared"]);
+		const cleared = eventLog(finalEntries)[4].data;
 		assert.equal(cleared.goal.id, replaced.goal.id, "the clear event identifies the cleared Goal");
 		assert.equal(cleared.goal.status, "complete", "the status it had when cleared");
 		assert.equal(cleared.goal.revision, 1, "its last committed revision");
 
-		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 6);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();

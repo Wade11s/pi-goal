@@ -39,9 +39,10 @@ attachments use.
   word `--file` after its first plain word is never truncated — only a genuine
   leading flag is consumed. Local option values are whitespace-free paths;
   paths containing spaces are not representable by this parser.
-- Attachment selection exists at **creation** and **Replacement Goal** time. A
-  replacement confirmation is asked first exactly as for a text-only
-  replacement; a declined dialog changes nothing.
+- Attachment selection exists at **creation** and **Replacement Goal** time. The
+  creation that supersedes a complete Goal validates and materializes its
+  attachments exactly as a fresh creation does; an unfinished Goal refuses the
+  creation before any attachment is validated, fetched, or materialized.
 - Relative paths resolve against the **session working directory** recorded in
   the session header, not against the directory the Pi process happens to be
   launched from. A session resumed from another directory therefore attaches

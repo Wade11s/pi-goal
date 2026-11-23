@@ -18,8 +18,8 @@
  * depends on:
  *
  * - an extension command's RPC `prompt` response arrives after the handler runs,
- *   so a method that waits for a confirmation dialog is submitted without
- *   awaiting its prompt response and the dialog is answered first;
+ *   and no method opens a dialog: a `set` is the `/goal` command, which refuses an
+ *   unfinished Goal outright and supersedes a complete one without asking;
  * - a reply is the appended entry, so a host correlates on the request id;
  * - the scripted provider's `waitForFile` gate holds a run open deterministically,
  *   which is how "get while an unfinished Goal is active" is asserted without a
@@ -36,6 +36,7 @@ import { join } from "node:path";
 import {
 	PiRpcSession,
 	assertCleanRun,
+	assertOnlyFailures,
 	assertStepsConsumed,
 	goalSnapshots,
 	lastGoalSnapshot,
@@ -85,32 +86,9 @@ async function waitForResponse(session, id) {
 }
 
 /**
- * Wait until the branch carries a finalized superseded record for a replaced
- * identity. The freeze happens at the next durable boundary, not at the
- * replacement commit, so the test waits for the record instead of assuming it.
- */
-async function waitForSuperseded(session, timeoutMs = 15_000) {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		const file = await session.sessionFile();
-		if (existsSync(file)) {
-			const entries = readSessionEntries(file).filter(
-				(entry) => entry.type === "custom" && entry.customType === "goal-state" && entry.data?.superseded === true,
-			);
-			if (entries.length > 0) return entries;
-		}
-		if (Date.now() > deadline) throw new Error("timed out waiting for the superseded Goal record");
-		await new Promise((resolve) => setTimeout(resolve, 20));
-	}
-}
-
-/**
- * Send one method call without waiting for either answer.
- *
- * Both are returned because the two arrive in different orders depending on the
- * method: a plain `get` answers its prompt only after the handler finishes, while
- * a `set` that opens a confirmation dialog blocks that prompt response until the
- * host answers the dialog.
+ * Send one method call and return both of its answers as promises: the RPC prompt
+ * response (which arrives once the handler finishes) and the appended response
+ * entry (which is what a host correlates on).
  */
 function submit(session, id, method, params, authority) {
 	const request = { version: REQUEST_VERSION, id, method };
@@ -249,16 +227,23 @@ test("get, set, and clear round-trip through the companion's public protocol", a
 	assertCleanRun(session);
 });
 
-test("set against an unfinished Goal surfaces the replacement decision", async (t) => {
+test("set against an unfinished Goal is refused with pi-goal's diagnostic verbatim; once the Goal is complete, set supersedes it and the old run cannot touch the new Goal", async (t) => {
 	const dir = tempDir(t);
 	const session = await PiRpcSession.start({ extraExtensions: [COMPANION] });
 	t.after(() => session.stop());
-	const gate = join(dir, "release-kickoff");
+	const kickoffGate = join(dir, "release-kickoff");
+	const tailGate = join(dir, "release-tail");
+	// Turn 1 is the first Goal's kickoff, held while `set` is refused. Released, the
+	// run completes the Goal (turn 2) and prepares one more `update_goal` against it
+	// (turn 3), held while the second `set` supersedes the completed Goal; released,
+	// that stale call must be refused. Turn 4 is the replacement's steered kickoff,
+	// and turn 5 its first Continuation, aborted to bound the scenario.
 	script(
 		[
-			{ waitForFile: gate },
+			{ text: "Working on the original.", waitForFile: kickoffGate },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-			{ text: "The completion attempt was refused; reporting that." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], waitForFile: tailGate },
+			{ text: "Working on the replacement." },
 			{ hang: true },
 		],
 		session,
@@ -267,63 +252,106 @@ test("set against an unfinished Goal surfaces the replacement decision", async (
 	const first = await call(session, "set-first", "thread/goal/set", { objective: OBJECTIVE, budget: null }, "external-user");
 	assert.equal(first.ok, true, JSON.stringify(first));
 	assert.equal(first.goal.tokenBudget, null, "a null budget is the explicit unbounded request");
+	assert.equal(first.goal.origin, "command", "a bridged set is the user path, not create_goal");
+
+	// An unfinished Goal refuses `set` exactly as the typed command does: refused,
+	// never a declined replacement, with pi-goal's own warning carried verbatim.
 	const before = await goalBytes(session);
 	const beforeIds = goalSnapshots(readSessionEntries(await session.sessionFile())).length;
-
-	// Declining is a decision, not a failure of the Goal: nothing changes, and the
-	// response names the decision instead of claiming a replacement happened.
-	const decline = submit(session, "set-declined", "thread/goal/set", { objective: REPLACEMENT }, "external-user");
-	await session.respondToConfirm((request) => request.title.includes("Replace the current Goal"), false);
-	const declined = await decline.response;
-	assert.equal(declined.ok, false);
-	assert.equal(declined.disposition, "declined");
-	assert.equal(declined.error.code, "declined");
-	assert.deepEqual(declined.transitions, []);
-	assert.equal(declined.goal.id, first.goal.id, "the current Goal is still the first one");
-	assert.match(declined.error.message, /Replacement cancelled/);
-	assert.equal(await goalBytes(session), before, "a declined replacement writes no Goal bytes");
+	const mark = session.records.length;
+	const refused = await call(session, "set-refused", "thread/goal/set", { objective: REPLACEMENT }, "external-user");
+	assert.equal(refused.ok, false);
+	assert.equal(refused.disposition, "refused", "the declined-replacement outcome no longer exists");
+	assert.equal(refused.error.code, "refused");
+	assert.deepEqual(refused.transitions, []);
+	assert.equal(refused.goal.id, first.goal.id, "the current Goal is still the first one");
+	const warning = await session.notifyAfter(mark, (record) =>
+		record.message.startsWith("Goal not created: an unfinished Goal is already set"),
+	);
+	assert.equal(warning.notifyType, "warning");
+	assert.equal(refused.error.message, warning.message, "pi-goal's diagnostic is forwarded verbatim");
+	assert.match(refused.error.message, /run \/goal:clear first/);
+	assert.equal(
+		session.records.filter((record) => record.type === "extension_ui_request" && record.method === "confirm").length,
+		0,
+		"no confirmation dialog was opened",
+	);
+	assert.equal(await goalBytes(session), before, "a refused set writes no Goal bytes");
 	assert.equal(goalSnapshots(readSessionEntries(await session.sessionFile())).length, beforeIds);
 
-	// Accepting replaces the Goal: new identity, and the old one is kept as a
-	// superseded historical record rather than rewritten.
-	const replace = submit(session, "set-accepted", "thread/goal/set", { objective: REPLACEMENT }, "external-user");
-	await session.respondToConfirm((request) => request.title.includes("Replace the current Goal"), true);
-	const replaced = await replace.response;
+	// The run completes the Goal and prepares one more call against it.
+	writeFileSync(kickoffGate, "release\n");
+	await session.waitFor(
+		"the held follow-up turn started",
+		(records) => (records.filter((record) => record.type === "turn_start").length >= 3 ? true : undefined),
+	);
+	const completed = await call(session, "get-complete", "thread/goal/get");
+	assert.equal(completed.goal.id, first.goal.id);
+	assert.equal(completed.goal.status, "complete");
+
+	// A complete Goal does not block: `set` commits a replacement — a new identity,
+	// with the complete record preserved on the branch rather than rewritten.
+	const replaced = await call(session, "set-accepted", "thread/goal/set", { objective: REPLACEMENT }, "external-user");
 	assert.equal(replaced.ok, true, JSON.stringify(replaced));
 	assert.equal(replaced.disposition, "committed");
 	assert.deepEqual(
 		replaced.transitions.map((transition) => transition.kind),
 		["replaced"],
 	);
-	assert.notEqual(replaced.goal.id, first.goal.id, "a Replacement Goal is a new identity");
+	assert.notEqual(replaced.goal.id, first.goal.id, "the replacement is a new identity");
 	assert.equal(replaced.goal.objective, REPLACEMENT);
+	assert.equal(replaced.goal.status, "active");
 	assert.equal(replaced.goal.usage.totalTokens, 0, "the replacement starts with no Goal-owned usage");
-	// Release the held kickoff. The run that was admitted for the replaced identity
-	// is still bound to it, so its `update_goal complete` is refused as stale rather
+
+	// Release the held call. The run that was admitted for the completed identity is
+	// still bound to it, so its `update_goal complete` is refused as stale rather
 	// than completing a Goal it was never prepared for — the execution binding (#37)
-	// survives the adapter unchanged.
-	writeFileSync(gate, "release\n");
-	const stale = await session.waitForToolResult("update_goal", 1);
+	// survives the supersede unchanged.
+	writeFileSync(tailGate, "release\n");
+	const stale = await session.waitForToolResult("update_goal", 2);
 	assert.equal(stale.isError, true);
 	assert.match(String(stale.result.content[0].text), /prepared against a Goal state that has since changed/);
 	assert.ok(
 		String(stale.result.content[0].text).includes(first.goal.id),
 		"the refusal names the Goal identity the run was bound to",
 	);
+	await session.waitFor(
+		"the replacement's continuation started",
+		(records) => (records.filter((record) => record.type === "agent_start").length >= 2 ? true : undefined),
+	);
+	await session.sendSimple("abort");
+	await session.waitForSettled(1);
 
-	// The freeze boundary that finalizes the replaced identity's in-flight tail is
-	// the delivery of the next message (here the replacement's steered kickoff), so
-	// its superseded history record lands at that boundary, not at the commit.
-	const superseded = await waitForSuperseded(session);
-	assert.equal(superseded.length, 1, "the replaced Goal identity is preserved as history");
-	assert.equal(superseded[0].data.goal.id, first.goal.id);
+	// The durable shape: the complete record's already-accounted totals are preserved
+	// as the snapshot immediately before the replacement's own, and nothing after it
+	// rewrites the old identity. A completed record has no in-flight tail, so no
+	// `superseded` freeze is appended for it.
+	const entries = readSessionEntries(await session.sessionFile());
+	const states = goalSnapshots(entries);
+	const old = states.filter((entry) => entry.data.goal?.id === first.goal.id);
+	assert.deepEqual(
+		old.map((entry) => `${entry.data.goal.status}:${entry.data.goal.revision}:${entry.data.superseded === true}`),
+		["active:0:false", "complete:1:false", "complete:1:false"],
+		"creation, completion, and the preserved record that precedes the replacement",
+	);
+	assert.equal(states.at(-2).data.goal.id, first.goal.id, "the preserved record directly precedes the replacement");
+	assert.equal(states.at(-1).data.goal.id, replaced.goal.id, "the replacement is the newest current snapshot");
+	assert.deepEqual(
+		entries
+			.filter((entry) => entry.customType === "goal-history")
+			.map((entry) => `${entry.data.kind}:${entry.data.from}>${entry.data.to}`),
+		["created:null>active", "completed:active>complete", "replaced:complete>active"],
+		"the audit history records the supersede from the status the complete record had",
+	);
 
 	// The replacement is still the current Goal and was not touched by the stale call.
 	const afterStale = await call(session, "get-after-stale", "thread/goal/get");
 	assert.equal(afterStale.ok, true);
 	assert.equal(afterStale.goal.id, replaced.goal.id);
 	assert.equal(afterStale.goal.status, "active");
-	assertCleanRun(session);
+	assert.equal(afterStale.goal.revision, 0);
+	assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+	assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 });
 
 test("a disabled extension refuses set and never rewrites an existing Goal", async (t) => {

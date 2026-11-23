@@ -109,13 +109,28 @@ function imageBlocks(message) {
 	return message.content.filter((block) => block.type === "image");
 }
 
-/** Create and pause a Goal, so a replacement needs no in-flight continuation loop. */
+/** Create and pause a Goal, so its own lifecycle needs no in-flight continuation loop. */
 async function createPausedGoal(session) {
 	await session.prompt(`/goal ${OBJECTIVE}`);
 	await session.waitForNotify((record) => record.message.includes("created and activated"));
 	await abortActiveLoop(session, 2);
 	await session.prompt("/goal:pause");
 	await session.waitForNotify((record) => record.message.includes("paused"));
+}
+
+/**
+ * Create a Goal and let it complete.
+ *
+ * One session works one Goal at a time (ADR-0003), so a complete Goal is the only
+ * state a `/goal <objective>` creation can supersede. The caller scripts the
+ * kickoff, the completing turn, and its wrap-up response.
+ */
+async function createCompleteGoal(session) {
+	await session.prompt(`/goal ${OBJECTIVE}`);
+	await session.waitForNotify((record) => record.message.includes("created and activated"));
+	await session.waitForSettled(1);
+	const entries = readSessionEntries(await session.sessionFile());
+	assert.equal(lastGoalSnapshot(entries).data.goal.status, "complete", "the first Goal finished");
 }
 
 function toolResults(session, toolName) {
@@ -478,21 +493,31 @@ test("a failed remote replacement leaves the previous Goal untouched and retract
 	const spec = join(dirs.workDir, "spec.md");
 	writeFileSync(spec, "local supporting material", "utf8");
 	const session = await startSession(dirs, fixture);
-	script([{ text: "Kickoff.", usage: { input: 30, output: 8 } }, { hang: true }], session);
+	// The first Goal completes, so each failed creation below is a real attempt at
+	// superseding it rather than the unfinished-Goal refusal.
+	script(
+		[
+			{ text: "Kickoff.", usage: { input: 30, output: 8 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
 	let sessionFile;
 	try {
 		await session.prompt(`/goal --file ${spec} ${OBJECTIVE}`);
-		await abortActiveLoop(session, 2);
+		await session.waitForSettled(1);
 		sessionFile = await session.sessionFile();
 		const root = attachmentStoreRoot(sessionFile);
 		const before = readSessionEntries(sessionFile);
 		const first = goalSnapshots(before)[0].data.goal;
+		const baseline = goalSnapshots(before).at(-1).data.goal;
 		const snapshotCount = goalSnapshots(before).length;
+		assert.equal(baseline.status, "complete", "the first Goal finished before the failed attempts");
 
 		// A failed fetch refuses the replacement before anything is written.
 		let mark = session.records.length;
 		let failedPromise = session.prompt(`/goal --remote-image ${fixture.url("/status/500")} Third objective`);
-		await session.respondToConfirm(() => true, true);
 		await failedPromise;
 		let notice = await session.notifyAfter(mark, (record) => record.message.includes("Goal not created:"));
 		assert.match(notice.message, /returned HTTP 500/);
@@ -500,7 +525,6 @@ test("a failed remote replacement leaves the previous Goal untouched and retract
 		// A successful fetch whose bytes fail image validation also writes nothing.
 		mark = session.records.length;
 		failedPromise = session.prompt(`/goal --remote-image ${fixture.url("/svg")} Fourth objective`);
-		await session.respondToConfirm(() => true, true);
 		await failedPromise;
 		notice = await session.notifyAfter(mark, (record) => record.message.includes("Goal not created:"));
 		assert.match(notice.message, /not a recognized image/);
@@ -511,7 +535,6 @@ test("a failed remote replacement leaves the previous Goal untouched and retract
 		try {
 			mark = session.records.length;
 			failedPromise = session.prompt(`/goal --remote-image ${fixture.url("/png")} Fifth objective`);
-			await session.respondToConfirm(() => true, true);
 			await failedPromise;
 			notice = await session.notifyAfter(mark, (record) =>
 				record.message.includes("writing the replacement to the session failed"),
@@ -528,7 +551,6 @@ test("a failed remote replacement leaves the previous Goal untouched and retract
 		try {
 			mark = session.records.length;
 			failedPromise = session.prompt(`/goal --remote-image ${fixture.url("/png")} Sixth objective`);
-			await session.respondToConfirm(() => true, true);
 			await failedPromise;
 			notice = await session.notifyAfter(mark, (record) => record.message.includes("Goal not created:"));
 			assert.match(notice.message, /attachment store could not be written/);
@@ -540,15 +562,18 @@ test("a failed remote replacement leaves the previous Goal untouched and retract
 		assert.equal(goalSnapshots(after).length, snapshotCount, "no failed replacement appended a snapshot");
 		const latest = goalSnapshots(after).at(-1).data.goal;
 		assert.equal(latest.id, first.id);
-		assert.equal(latest.revision, first.revision);
-		assert.deepEqual(latest.attachments, first.attachments);
+		assert.equal(latest.revision, baseline.revision);
+		assert.deepEqual(latest.attachments, baseline.attachments);
 		assert.deepEqual(storedGoalIds(root), [first.id], "the uncommitted remote artifact was retracted");
 		assert.equal(runCount(session), 2, "no failed replacement started a kickoff");
-		assert.deepEqual(eventLog(after).map((entry) => entry.data.kind), ["created"], "no success event for a failure");
+		assert.deepEqual(
+			eventLog(after).map((entry) => entry.data.kind),
+			["created", "completed"],
+			"no success event for a failure",
+		);
 		assert.equal(fixture.count("/png"), 2, "the snapshot and store failures each followed one successful fetch");
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		if (sessionFile) chmodSync(sessionFile, 0o644);
@@ -558,26 +583,34 @@ test("a failed remote replacement leaves the previous Goal untouched and retract
 	}
 });
 
-test("a clear during a stalled remote-image fetch wins over the in-flight replacement", async () => {
+test("a clear during a stalled remote-image fetch wins over the in-flight creation", async () => {
 	const fixture = await RemoteImageFixture.start();
 	const dirs = sharedDirs();
 	const session = await startSession(dirs, fixture);
-	script([{ text: "Kickoff answer.", usage: { input: 20, output: 5 } }, { hang: true }], session);
+	// Kickoff, the completing turn, and its wrap-up: the creation below supersedes a
+	// complete Goal, the only creation the single-Goal rule allows (ADR-0003).
+	script(
+		[
+			{ text: "Kickoff answer.", usage: { input: 20, output: 5 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
 	try {
-		await createPausedGoal(session);
+		await createCompleteGoal(session);
 		const sessionFile = await session.sessionFile();
 		const mark = session.records.length;
 		const replacePromise = submitCommand(
 			session,
-			"replace-while-fetching",
+			"create-while-fetching",
 			`/goal --remote-image ${fixture.url("/hold")} A replacement objective`,
 		);
-		await session.respondToConfirm((record) => record.title.includes("Replace the current Goal"), true);
 		await fixture.waitForRequest("/hold");
 
-		// The fetch is stalled here. Clear runs in a second prompt while the
-		// first command still awaits the body, so the tombstone is durable before
-		// the replacement revalidates its captured record.
+		// The fetch is stalled here. Clear runs in a second prompt while the first
+		// command still awaits the body, so the tombstone is durable before the
+		// creation revalidates its captured record.
 		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((record) => record.message.includes("cleared"));
@@ -597,11 +630,11 @@ test("a clear during a stalled remote-image fetch wins over the in-flight replac
 		assert.equal(lastGoalSnapshot(entries).data.goal, null, "the clear tombstone remains last");
 		assert.ok(
 			goalSnapshots(entries).every((snapshot) => snapshot.data.goal?.objective !== "A replacement objective"),
-			"the cleared Goal was not resurrected by the stale command",
+			"the stale command did not resurrect a Goal after the clear",
 		);
 		assert.deepEqual(
 			eventLog(entries).map((entry) => entry.data.kind),
-			["created", "paused", "cleared"],
+			["created", "completed", "cleared"],
 			"the cancelled command emitted no success event",
 		);
 		assert.deepEqual(
@@ -611,8 +644,8 @@ test("a clear during a stalled remote-image fetch wins over the in-flight replac
 		);
 		assert.equal(fixture.countExact("/hold"), 1, "the fetch was not repeated");
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3);
+		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		fixture.releaseHeld();
@@ -622,58 +655,85 @@ test("a clear during a stalled remote-image fetch wins over the in-flight replac
 	}
 });
 
-test("an edit during a stalled remote-image fetch cancels the replacement against the edited revision", async () => {
+test("a refused edit during a stalled remote-image fetch leaves the creation to commit", async () => {
 	const fixture = await RemoteImageFixture.start();
 	const dirs = sharedDirs();
 	const session = await startSession(dirs, fixture);
-	script([{ text: "Kickoff answer.", usage: { input: 20, output: 5 } }, { hang: true }], session);
+	// The first Goal completes (and so cannot be edited); the creation that supersedes
+	// it fetches a remote image while the user tries the edit.
+	script(
+		[
+			{ text: "Kickoff answer.", usage: { input: 20, output: 5 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done again." },
+		],
+		session,
+	);
 	try {
-		await createPausedGoal(session);
+		await createCompleteGoal(session);
 		const sessionFile = await session.sessionFile();
 		const mark = session.records.length;
 		const replacePromise = submitCommand(
 			session,
-			"replace-while-edit-fetching",
+			"create-while-editing",
 			`/goal --remote-image ${fixture.url("/hold")} A replacement objective`,
 		);
-		await session.respondToConfirm((record) => record.title.includes("Replace the current Goal"), true);
 		await fixture.waitForRequest("/hold");
 
+		// Editing a complete Goal is refused, so it never advances the revision the
+		// creation captured. The creation must therefore still commit rather than
+		// cancelling against a "changed" Goal.
 		const edited = await session.prompt("/goal:edit The revised objective");
 		assert.equal(edited.data.disposition, "handled");
-		const editNotice = await session.waitForNotify((record) => record.message.includes("objective updated"));
-		assert.match(editNotice.message, /revision 2/);
+		const refusal = await session.notifyAfter(mark, (record) =>
+			record.message.includes("a complete Goal is finished and cannot be edited"),
+		);
+		assert.equal(refusal.notifyType, "warning");
+		assert.equal(
+			session.records.filter((record) => record.type === "extension_ui_request" && record.method === "confirm").length,
+			0,
+			"superseding a complete Goal asks for no confirmation",
+		);
 
 		fixture.releaseHeld();
 		await replacePromise;
-
-		const cancelled = await session.notifyAfter(mark, (record) =>
-			record.message.includes("Goal not created: the Goal changed while the remote image was being fetched"),
+		const created = await session.waitForNotify((record) => record.message.includes("created and activated, replacing"));
+		assert.match(created.message, /replacing goal_[0-9a-f]+/);
+		// The new Goal's own kickoff runs and completes, so the scenario is the Goal
+		// lifecycle rather than a race between delivery and teardown.
+		await session.waitFor("the new Goal to complete", (records) =>
+			records.filter((record) => record.type === "agent_settled").length >= 2 ? true : undefined,
 		);
-		assert.equal(cancelled.notifyType, "warning");
-		assert.match(cancelled.message, /now paused, revision 2/);
-		assert.match(cancelled.message, /Nothing was replaced/);
+		await session.waitFor("the new Goal's completing snapshot", () => {
+			let entries;
+			try {
+				entries = readSessionEntries(sessionFile);
+			} catch {
+				return undefined;
+			}
+			const latest = goalSnapshots(entries).at(-1)?.data.goal;
+			return latest?.status === "complete" && latest.objective === "A replacement objective" ? true : undefined;
+		});
 
 		const entries = readSessionEntries(sessionFile);
-		const goal = lastGoalSnapshot(entries).data.goal;
-		assert.equal(goal.objective, "The revised objective", "the edit is still the current record");
-		assert.equal(goal.status, "paused");
-		assert.equal(goal.revision, 2);
-		assert.equal(goalSnapshots(entries).length, 3, "the cancelled replacement appended no snapshot");
+		const goals = goalSnapshots(entries);
+		const replacement = goals.at(-1).data.goal;
+		assert.equal(replacement.objective, "A replacement objective", "the creation's own objective is current");
+		assert.equal(replacement.attachments.length, 1, "the fetched artifact is in the committed manifest");
+		const superseded = goals.filter((entry) => entry.data.goal?.objective === OBJECTIVE).at(-1).data.goal;
+		assert.equal(superseded.status, "complete", "the complete record is preserved, not edited");
+		assert.equal(superseded.attachments, undefined, "and its manifest is untouched");
 		assert.deepEqual(
 			eventLog(entries).map((entry) => entry.data.kind),
-			["created", "paused", "objective-edited"],
-			"the cancelled command emitted no success event",
-		);
-		assert.deepEqual(
-			storedGoalIds(attachmentStoreRoot(sessionFile)),
-			[],
-			"the never-committed fetch was retracted",
+			["created", "completed", "replaced", "completed"],
+			"the refused edit emitted nothing; the new Goal completed on its own turn",
 		);
 		assert.equal(fixture.countExact("/hold"), 1, "the fetch was not repeated");
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 5);
+		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		fixture.releaseHeld();

@@ -1,9 +1,8 @@
 /**
  * Deterministic regressions for the PR #12 review blockers.
  *
- * Each case holds a real scripted provider response open (or a blocking RPC
- * confirmation dialog) while user lifecycle commands run, so the ordering is
- * explicit rather than timing-dependent.
+ * Each case holds a real scripted provider response open while user lifecycle
+ * commands run, so the ordering is explicit rather than timing-dependent.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -62,15 +61,6 @@ async function waitForStoredGoal(session, predicate, description = "stored Goal"
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`Timed out waiting for ${description}`);
-}
-
-/** Pause the active Goal after deliberately aborting its continuation loop. */
-async function createPausedGoal(session) {
-	await session.prompt(`/goal ${OBJECTIVE}`);
-	await session.waitForNotify((r) => r.message.includes("created and activated"));
-	await abortActiveLoop(session, 2);
-	await session.prompt("/goal:pause");
-	await session.waitForNotify((r) => r.message.includes("paused"));
 }
 
 async function abortActiveLoop(session, runs) {
@@ -132,13 +122,20 @@ test("a held completion cannot complete the Goal a user edited while it was in f
 	}
 });
 
-test("a held completion cannot complete a Goal the user replaced while it was in flight", async () => {
+test("a held model call prepared against a completed Goal cannot complete the Goal created after it", async () => {
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "provider-gate");
+	// The kickoff settles and its Continuation completes the Goal; the turn after
+	// that prepares one more `update_goal` against the completed Goal and is held
+	// while the user creates the next Goal. Released, the stale call must be
+	// refused; the steered kickoff's turn answers, and the new Goal's own
+	// Continuation is aborted to bound the scenario.
 	script(
 		[
 			{ text: "Working toward the original objective." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], waitForFile: gate },
+			{ text: "The stale completion was refused; working on the new objective." },
 			{ hang: true },
 		],
 		session,
@@ -147,45 +144,54 @@ test("a held completion cannot complete a Goal the user replaced while it was in
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 2);
+		await waitForStoredGoal(session, (goal) => goal.status === "complete", "the first Goal to complete");
 
-		const replacePromise = submitCommand(session, "replace-held", "/goal The replacement objective");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
+		// The next /goal supersedes the completed Goal while the old run is still in
+		// flight, steers its kickoff into that run, and asks nothing.
+		const replacePromise = submitCommand(session, "create-next", "/goal The next objective");
 		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
 		const replacement = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal((await replacePromise).data.disposition, "handled");
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"no confirmation was asked",
+		);
 
 		writeFileSync(gate, "", "utf8");
-		const stale = await session.waitForToolResult("update_goal", 1);
+		const stale = await session.waitForToolResult("update_goal", 2);
 		assert.equal(stale.isError, true);
 		assert.match(String(stale.result.content[0].text), /prepared against/);
 		const refused = structuredGoal(stale.result);
 		assert.equal(refused.id, replacement.id);
-		assert.equal(refused.objective, "The replacement objective");
+		assert.equal(refused.objective, "The next objective");
 		assert.equal(refused.status, "active");
 		assert.equal(refused.revision, 0);
 
-		await session.sendSimple("abort");
-		await session.waitForSettled(1);
-		await replacePromise;
+		// The new Goal's own Continuation is the run that gets aborted to bound the
+		// scenario; the steered kickoff's turn has answered by then.
+		await abortActiveLoop(session, 3);
 
 		const entries = readSessionEntries(await session.sessionFile());
-		// The freeze of the old identity's in-flight tail is the last snapshot, and it is
-		// historical: the replacement is re-selected as the current Goal from its own
-		// snapshot rather than from a second, re-affirming append.
+		// The completed record's preserved snapshot precedes the replacement's own,
+		// and the refused call changed neither: a completed record has no in-flight
+		// tail, so nothing is frozen after the replacement.
 		assert.deepEqual(
-			goalSnapshots(entries).map((s) => `${s.data.goal.id === replacement.id ? "new" : "old"}:${s.data.goal.status}:${s.data.goal.revision}:${s.data.superseded === true ? "superseded" : "current"}`),
-			["old:active:0:current", "old:active:0:current", "new:active:0:current", "old:active:0:superseded"],
-			"replacement preserves a durable superseded old-goal record and the stale completion cannot complete the replacement",
+			goalSnapshots(entries).map(
+				(s) => `${s.data.goal.id === replacement.id ? "new" : "old"}:${s.data.goal.status}:${s.data.goal.revision}:${s.data.superseded === true ? "superseded" : "current"}`,
+			),
+			["old:active:0:current", "old:complete:1:current", "old:complete:1:current", "new:active:0:current"],
+			"the completed record is preserved as history and the stale call cannot complete the replacement",
 		);
 		const oldSnapshots = goalSnapshots(entries).filter((s) => s.data.goal.id !== replacement.id);
 		assert.equal(oldSnapshots[0].data.goal.usage.totalTokens, 0, "the creation snapshot is not polluted");
-		assert.equal(oldSnapshots[1].data.goal.usage.totalTokens, 15, "the superseded snapshot carries the exact already-accounted kickoff total");
 		assert.equal(
 			oldSnapshots.at(-1).data.goal.usage.totalTokens,
 			30,
-			"the finalized superseded record carries the in-flight completion turn's response",
+			"the completed record carries exactly its kickoff and completing turn; the turn that held the stale call was never its work",
 		);
 		assert.equal(currentGoalSnapshot(entries).data.goal.id, replacement.id);
-		assert.equal(lastGoalSnapshot(entries).data.superseded, true, "the newest goal-state entry is the historical freeze");
+		assert.equal(lastGoalSnapshot(entries).data.goal.id, replacement.id, "the newest goal-state entry is the replacement's");
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
@@ -275,86 +281,6 @@ test("a held model pause cannot pause the Goal a user edited while it was in fli
 			"the held model pause never persisted",
 		);
 		assert.equal(lastGoalSnapshot(entries).data.goal.objective, "A revised objective");
-		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
-		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
-	} finally {
-		await session.stop();
-	}
-});
-
-test("replacing after a clear in the confirmation consults the cleared state, for either answer", async () => {
-	for (const confirmed of [true, false]) {
-		const session = await PiRpcSession.start();
-		script([{ text: "Old work." }, { hang: true }], session);
-		try {
-			await createPausedGoal(session);
-			const replacePromise = submitCommand(session, `replace-${confirmed}`, "/goal A replacement objective");
-			await session.waitFor("replacement confirmation", (records) =>
-				records.find((r) => r.type === "extension_ui_request" && r.method === "confirm"),
-			);
-
-			const cleared = await session.prompt("/goal:clear");
-			assert.equal(cleared.data.disposition, "handled");
-			const clearedNotify = await session.waitForNotify((r) => r.message.includes("cleared"));
-			assert.equal(clearedNotify.notifyType, "info");
-
-			await session.respondToConfirm(() => true, confirmed);
-			const replaceResponse = await replacePromise;
-			assert.equal(replaceResponse.data.disposition, "handled");
-			const cancelled = await session.waitForNotify(
-				(r) => r.message.includes("Replacement cancelled") && r.message.includes("no Goal is set anymore"),
-			);
-			assert.equal(cancelled.notifyType, "warning");
-			assert.ok(
-				!cancelled.message.includes("current active Goal was kept"),
-				"a cleared Goal was not described as kept",
-			);
-
-			const entries = readSessionEntries(await session.sessionFile());
-			assert.equal(lastGoalSnapshot(entries).data.goal, null, "the tombstone remains last");
-			assert.ok(
-				goalSnapshots(entries).every((s) => s.data.goal?.objective !== "A replacement objective"),
-				"neither answer created the replacement",
-			);
-			assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
-		} finally {
-			await session.stop();
-		}
-	}
-});
-
-test("replacing after an edit in the confirmation still describes and acts on the current Goal", async () => {
-	const session = await PiRpcSession.start();
-	script([{ text: "Old work." }, { hang: true }], session);
-	try {
-		await createPausedGoal(session);
-		const replacePromise = submitCommand(session, "replace-after-edit", "/goal A replacement objective");
-		const dialog = await session.waitFor("replacement confirmation", (records) =>
-			records.find((r) => r.type === "extension_ui_request" && r.method === "confirm"),
-		);
-		assert.match(String(dialog.message), new RegExp(OBJECTIVE));
-
-		const edited = await session.prompt("/goal:edit The revised objective");
-		assert.equal(edited.data.disposition, "handled");
-		const editNotify = await session.waitForNotify((r) => r.message.includes("objective updated"));
-		assert.match(editNotify.message, /revision 2/);
-
-		await session.respondToConfirm(() => true, true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		const cancelled = await session.waitForNotify((r) => r.message.includes("Replacement cancelled"));
-		assert.equal(cancelled.notifyType, "warning");
-		assert.match(cancelled.message, /changed while the confirmation was open/);
-
-		const entries = readSessionEntries(await session.sessionFile());
-		const goal = lastGoalSnapshot(entries).data.goal;
-		assert.equal(goal.objective, "The revised objective");
-		assert.equal(goal.status, "paused");
-		assert.equal(goal.revision, 2);
-		assert.ok(
-			goalSnapshots(entries).every((s) => s.data.goal?.objective !== "A replacement objective"),
-			"Yes discarded nothing and created nothing",
-		);
-		assert.equal(runCount(session), 2, "no initial work started after the pause");
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
@@ -511,35 +437,55 @@ test("a failed replacement write keeps the previous Goal and restores it after a
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 	const resumedDir = mkdtempSync(join(tmpdir(), "pi-goal-resumed-"));
 	const session = await PiRpcSession.start({ cwd: workDir });
-	script([{ text: "Old Goal work." }, { hang: true }], session);
+	// The first Goal completes before the replacement is attempted, so what the
+	// failed write must keep is a finished Goal with its final accounted totals.
+	script(
+		[
+			{ text: "Old Goal work." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
 	let sessionFile;
+	let original;
 	try {
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await abortActiveLoop(session, 2);
-		const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		await session.waitForSettled(1);
+		original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(original.status, "complete");
+		assert.equal(original.usage.totalTokens, 30, "its kickoff and its completing turn");
 		sessionFile = await session.sessionFile();
 
-		// The replacement snapshot cannot be appended.
+		// The preserved record that precedes the replacement cannot be appended.
 		chmodSync(sessionFile, 0o444);
-		const replacePromise = submitCommand(session, "replace-write-failure", "/goal A replacement that cannot be written");
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
+		const replaceResponse = await session.prompt("/goal A replacement that cannot be written");
+		assert.equal(replaceResponse.data.disposition, "handled");
 		const failure = await session.waitForNotify((r) =>
 			r.message.includes("writing the replacement to the session failed"),
 		);
 		assert.equal(failure.notifyType, "error");
 		assert.match(failure.message, /current Goal is unchanged/);
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"no confirmation was asked",
+		);
 
-		// Memory and disk both still hold the original Goal: no tombstone.
+		// Memory and disk both still hold the original Goal: no new identity, and
+		// nothing was appended.
+		const mark = session.records.length;
 		await session.prompt("/goal");
-		const status = await session.waitForNotify((r) => r.message.includes(OBJECTIVE));
-		assert.match(status.message, /active/);
+		const status = await session.notifyAfter(mark, (r) => r.message.includes(OBJECTIVE));
+		assert.match(status.message, /— complete/);
 		assert.match(status.message, new RegExp(`Goal ${original.id}`));
 		const onDisk = goalSnapshots(readSessionEntries(sessionFile));
-		assert.equal(onDisk.length, 1, "the failed replacement appended no snapshot");
-		assert.equal(onDisk[0].data.goal.id, original.id);
-		assert.equal(onDisk[0].data.goal.objective, OBJECTIVE);
+		assert.equal(onDisk.length, 2, "the failed replacement appended no snapshot: creation and completion only");
+		assert.ok(onDisk.every((s) => s.data.goal.id === original.id), "no other identity reached the branch");
+		assert.equal(onDisk.at(-1).data.goal.status, "complete");
+		assertCleanRun(session);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 
 		chmodSync(sessionFile, 0o644);
 		copyFileSync(sessionFile, join(resumedDir, basename(sessionFile)));
@@ -556,17 +502,20 @@ test("a failed replacement write keeps the previous Goal and restores it after a
 	sessionFile = join(resumedDir, basename(sessionFile));
 
 	const second = await PiRpcSession.start({ sessionFile, cwd: workDir });
-	script([{ text: "Restored work." }, { hang: true }], second);
+	script([{ text: "Unrequested." }], second);
 	try {
-		const restored = await second.waitForNotify((r) => r.message.includes("restored (active)"));
-		assert.match(restored.message, /goal_[0-9a-f]+/);
+		const restored = await second.waitForNotify((r) => r.message.includes("restored (complete)"));
+		assert.match(restored.message, new RegExp(original.id));
+		const mark = second.records.length;
 		await second.prompt("/goal");
-		const status = await second.waitForNotify((r) => r.message.includes(OBJECTIVE) && r.message.includes("active"));
+		const status = await second.notifyAfter(mark, (r) => r.message.includes(OBJECTIVE) && r.message.includes("— complete"));
 		assert.ok(status);
-		assert.equal(lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal.objective, OBJECTIVE);
-		await second.prompt("continue the restored goal");
-		await abortActiveLoop(second, 2);
-		assertOnlyFailures(second, [{ stopReason: "aborted" }]);
+		const entries = readSessionEntries(sessionFile);
+		assert.equal(lastGoalSnapshot(entries).data.goal.objective, OBJECTIVE);
+		assert.equal(lastGoalSnapshot(entries).data.goal.id, original.id);
+		assert.equal(goalSnapshots(entries).length, 2, "the restart appended no snapshot of its own");
+		assert.equal(runCount(second), 0, "a completed Goal never continues");
+		assertCleanRun(second);
 		assert.equal(second.extensionErrors().length, 0, JSON.stringify(second.extensionErrors()));
 	} finally {
 		await second.stop();
@@ -574,7 +523,6 @@ test("a failed replacement write keeps the previous Goal and restores it after a
 		rmSync(workDir, { recursive: true, force: true });
 	}
 });
-
 test("model pause rejects negated, whole-negated-sentence, and incidental-fragment quotes", async () => {
 	const session = await PiRpcSession.start();
 	script(

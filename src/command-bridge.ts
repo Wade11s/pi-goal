@@ -1,8 +1,9 @@
 /**
  * The in-process Goal command bridge (issue #56; request shape revised in #79).
  *
- * pi-goal's Goal command family is the *user* command surface: it owns
- * replacement confirmation, `goal.enabled` admission, Token-budget validation,
+ * pi-goal's Goal command family is the *user* command surface: it owns the
+ * single-Goal refusal (`/goal <objective>` never replaces an unfinished Goal),
+ * `goal.enabled` admission, Token-budget validation,
  * attachment materialization, the on-disk durability gate, and the
  * durable-before-announced announcement order. A host integration (a
  * Codex-shaped RPC client, an IDE, a companion package) that re-implemented any
@@ -87,7 +88,8 @@ export type GoalBridgeAction = "status" | "create" | "edit" | "pause" | "resume"
  * Filtering by this set is what keeps an unrelated concurrent transition — a
  * continuation that completes while a confirmation dialog is open — from being
  * reported as the outcome of this request. A transition outside the set is
- * simply not this command's answer.
+ * simply not this command's answer — not even a completion that lands while the
+ * command is still waiting.
  */
 const COMMITTING_KINDS: Record<Exclude<GoalBridgeAction, "status" | "history" | "invalid">, readonly GoalTransitionKind[]> = {
 	create: ["created", "replaced"],
@@ -109,7 +111,7 @@ export type GoalBridgeDisposition =
 	| "committed"
 	/** A read-only query answered (there is nothing to commit). */
 	| "reported"
-	/** Nothing committed, and the command reported no problem: the user said no, or there was nothing to do. */
+	/** Nothing committed, and the command reported no problem: the user cancelled (for example the objective editor), or there was nothing to do. */
 	| "declined"
 	/** Nothing committed, and the command reported a warning or error. */
 	| "refused"

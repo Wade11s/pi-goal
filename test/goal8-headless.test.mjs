@@ -279,6 +279,41 @@ test("bare /goal:edit never opens a terminal-only dialog when no UI exists", asy
 	}
 });
 
+test("/goal <objective> with an unfinished Goal refuses identically with or without a UI, and never asks for a confirmation", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-goal-single-goal-"));
+	const sessionFile = join(dir, "session.jsonl");
+	try {
+		const { pi, commands } = fakePi(sessionFile);
+		goalExtension(pi);
+
+		const created = [];
+		await commands.get("goal").handler(OBJECTIVE, fakeCtx({ hasUI: false, sessionFile, notifications: created }));
+		assert.ok(created.some((n) => n.message.includes("created and activated")), JSON.stringify(created));
+		const before = goalStateBytes(sessionFile);
+
+		// The refusal replaced a dialog that a UI-less host could not answer; it must
+		// not depend on the UI at all; and a dialog-capable UI must not be asked.
+		for (const hasUI of [false, true]) {
+			const notifications = [];
+			let confirmations = 0;
+			const ctx = fakeCtx({ hasUI, sessionFile, notifications });
+			ctx.ui.confirm = async () => {
+				confirmations += 1;
+				return true;
+			};
+			await commands.get("goal").handler(EDITED_OBJECTIVE, ctx);
+			assert.deepEqual(notifications.map((n) => n.type), ["warning"], `hasUI ${hasUI}`);
+			assert.match(notifications[0].message, /^Goal not created: an unfinished Goal is already set \(active, "/, `hasUI ${hasUI}`);
+			assert.match(notifications[0].message, /Finish the current Goal, or run \/goal:clear first/, `hasUI ${hasUI}`);
+			assert.equal(confirmations, 0, `hasUI ${hasUI}: no confirmation was requested`);
+			assert.equal(goalStateBytes(sessionFile), before, `hasUI ${hasUI}: no Goal bytes changed`);
+		}
+		assert.equal(lastSnapshot(sessionFile).data.goal.objective, OBJECTIVE, "the unfinished Goal is untouched");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("bare /goal:edit opens a prefilled editor and applies the edited objective", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-interactive-"));
 	const sessionFile = join(dir, "session.jsonl");
