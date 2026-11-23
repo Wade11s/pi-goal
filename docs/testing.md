@@ -41,7 +41,9 @@ temporary working, session, and agent directories (`PI_CODING_AGENT_DIR` /
 spawned session gets a settings file that sets `goal.clarifyOnCreate: false`, so
 the suites written before Objective clarification keep the direct-creation path;
 the clarification suite opts back in explicitly and owns the clarifying
-coverage, while the production default (`true`) is pinned by the unit seam. A
+coverage, one scenario omits the key entirely (`omitClarifyOnCreate`) so the
+production default (`true`) is exercised end to end, and the default itself is
+also pinned by the unit seam. A
 scripted test model provider (`test/extensions/scripted-provider.ts`, driven by
 `PI_GOAL_TEST_SCRIPT`, including hanging and delayed responses for
 interrupted-run and queueing tests), an optional second extension
@@ -203,9 +205,13 @@ model receives. The auxiliary `test/extensions/events-peer.ts` proves the
 confirmed title never reaches Goal-updated events or history.
 `test/goal84-objective-clarification-store.test.mjs` pins the cheap cases against
 a fake Pi: the setting's default and malformed-value fallback, the confirmation
-document's format/parse rules, the UI-less direct creation with its notice, and
+document's format/parse rules, the UI-less direct creation with its notice,
 `propose_goal` registration/refusal gating (including a reload that turns the
-setting off while Pi keeps the registration).
+setting off while Pi keeps the registration), and the failure matrix a real
+session cannot inject — a foreign extension owning the tool name (creation fails
+closed), a failed `pending: null` write (surfaced, the clarification stays open,
+and a save is refused), and a duplicate confirmation whose save already committed
+(the stale cancel clears nothing and reports the committed Goal).
 
 The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
 surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a

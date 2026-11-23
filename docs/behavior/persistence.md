@@ -49,9 +49,13 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   separate from `goal-state` and written before any Goal exists: it carries the raw
   idea and the leading `--budget` / `--no-budget` / `--file` / `--image` /
   `--remote-image` flags, and a later `pending: null` entry records that the
-  clarification ended (saved, cancelled, or timed out). It is not Goal state —
-  nothing is reconstructed from it, no Goal snapshot or event is written beside it,
-  and its attachments stay unread flags rather than a manifest. Restart
+  clarification ended (saved, cancelled, or timed out). That end is written before
+  memory forgets the pending entry, and only for the exact pending clarification
+  the confirmation captured: a newer `/goal` or a concurrent confirmation keeps its
+  own state, and a failed end-write leaves the pending open and is surfaced rather
+  than reported as cleared. It is not Goal state — nothing is reconstructed from
+  it, no Goal snapshot or event is written beside it, and its attachments stay
+  unread flags rather than a manifest. Restart
   reconstruction of a pending clarification is issue #85: today a restart starts
   with none, and `propose_goal` refuses until the user runs `/goal` again.
 - The kickoff is delivered as a **user message** carrying the user's own

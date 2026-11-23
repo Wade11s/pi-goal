@@ -297,7 +297,9 @@ can prevent that.
   `disposition: "declined"` with an info-only diagnostic. The model's
   `propose_goal` confirmation runs outside the bridge, so a host that wants the
   old immediate behavior either sets `goal.clarifyOnCreate: false` or answers the
-  task that follows. An unfinished Goal still refuses before any clarification.
+  task that follows. If the confirmation tool could not be registered, the
+  creation is refused (`refused`, with the diagnostic) instead of bypassing
+  confirmation. An unfinished Goal still refuses before any clarification.
 - **Four methods, not a lifecycle API.** No `pause`, `resume`, `edit`, or
   separate attachment method: those stay user commands. `set` accepts local `files` and
   `images` because the command surface does, but nothing here infers a composer

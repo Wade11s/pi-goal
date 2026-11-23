@@ -41,7 +41,11 @@ all (Pi refuses the call).
 The user edits either part, and **saving is the creation authority**: the
 committed Goal carries exactly the saved title (one line, 1–80 characters) and
 Objective (3–2000 characters), with `origin: "command"`, through the same commit
-a typed `/goal` uses. The model's arguments are only the prefill. A saved
+a typed `/goal` uses. The model's arguments are only the prefill. Because the
+editor is the only authority on this path, a UI-capable host that cannot register
+`propose_goal` (another extension owns the name, or registration failed) refuses
+`/goal` outright instead of falling back to a direct creation; a UI-less host is
+the one exception, and it creates directly with a notice. A saved
 document whose first line is not the `Title:` line, or whose title breaks the
 one-line rule, is refused and the same document reopens for correction instead of
 discarding the user's Objective. Every refusal and save is validated by the same
@@ -51,7 +55,13 @@ three Objective sections are **not** validated.
 Cancel, dismissal, and the standard dialog timeout all create nothing: no Goal
 bytes, no materialized attachment, no remote fetch, any current Goal untouched,
 the pending clarification cleared, and a tool result telling the model that no
-Goal was created (a legitimate outcome, so it is not an error result). A save
+Goal was created (a legitimate outcome, so it is not an error result). The clear
+is **conditional on the captured clarification still being current** and is made
+durable before memory forgets it: a duplicate confirmation whose save already
+committed clears nothing and reports the committed Goal, and a failed
+`pending: null` write is surfaced as an error while the clarification stays open
+— it is never reported as cleared, and the save that would follow it is refused
+rather than committing a Goal with an open pending record before it. A save
 opens no second path either: the held `--budget`/`--no-budget` and
 `--file`/`--image`/`--remote-image` flags resolve and materialize only inside that
 commit. If an **unfinished** Goal appeared while the editor was open, the save is

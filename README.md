@@ -110,7 +110,9 @@ uses Pi's host-provided packages (`peerDependencies` only).
   the clarification: attachments are read or fetched only after the confirmed
   save, so a cancelled draft has no side effects.
 - Set `goal.clarifyOnCreate: false` to restore immediate creation. A UI-less host
-  (print/JSON mode) skips clarification, creates directly, and says so.
+  (print/JSON mode) skips clarification, creates directly, and says so; a
+  UI-capable host whose confirmation tool cannot be registered refuses instead of
+  bypassing the confirmation.
 - When an **unfinished** Goal already exists, `/goal <objective>` refuses with a
   warning naming `/goal:clear` (before any clarification); a **complete** Goal is
   superseded without a dialog.

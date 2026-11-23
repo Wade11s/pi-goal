@@ -98,7 +98,12 @@ What the raw idea is held with matters:
 `goal.clarifyOnCreate: false` restores immediate creation (below). A host without
 a dialog-capable UI — print and JSON modes — skips clarification, creates directly
 from the raw idea, and prints a notice saying so; there is no interview it could
-confirm. `goal.enabled: false` refuses before any clarification starts.
+confirm. A UI-capable host whose `propose_goal` tool could not be registered (for
+example because another extension owns that name) **fails closed**: it refuses
+with an error naming the conflicting tool and both ways forward, records no
+pending clarification, and creates no Goal. The saved editor is the only creation
+authority on that path, so a direct commit would silently bypass the mandatory
+confirmation. `goal.enabled: false` refuses before any clarification starts.
 
 ### Direct creation
 

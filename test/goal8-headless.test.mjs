@@ -88,6 +88,20 @@ function fakeCtx({ hasUI, sessionFile, editorResult, notifications }) {
 	};
 }
 
+/**
+ * Apply the fake host's settings before a command runs.
+ *
+ * `goal.clarifyOnCreate` is read at `session_start` and its production default is
+ * `true`; this fake declares it false, so these command-surface tests run the
+ * direct-creation path they were written for. A test that never starts a session
+ * would see the clarifying default instead.
+ */
+async function startSession(handlers, sessionFile) {
+	const start = handlers.get("session_start");
+	assert.ok(start, "pi-goal registered a session_start handler");
+	await start({ type: "session_start" }, fakeCtx({ hasUI: true, sessionFile, notifications: [] }));
+}
+
 function lastSnapshot(sessionFile) {
 	const entries = readFileSync(sessionFile, "utf8")
 		.split("\n")
@@ -321,8 +335,9 @@ test("bare /goal:edit opens a prefilled editor and applies the edited objective"
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-interactive-"));
 	const sessionFile = join(dir, "session.jsonl");
 	try {
-		const { pi, commands } = fakePi(sessionFile);
+		const { pi, commands, handlers } = fakePi(sessionFile);
 		goalExtension(pi);
+		await startSession(handlers, sessionFile);
 
 		const created = [];
 		await commands.get("goal").handler(OBJECTIVE, fakeCtx({ hasUI: true, sessionFile, notifications: created }));
@@ -397,8 +412,9 @@ test("/goal:edit keeps refusing attachment flags with the Replacement Goal guida
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-edit-flags-"));
 	const sessionFile = join(dir, "session.jsonl");
 	try {
-		const { pi, commands } = fakePi(sessionFile);
+		const { pi, commands, handlers } = fakePi(sessionFile);
 		goalExtension(pi);
+		await startSession(handlers, sessionFile);
 		const created = [];
 		await commands.get("goal").handler(OBJECTIVE, fakeCtx({ hasUI: true, sessionFile, notifications: created }));
 		const before = goalStateBytes(sessionFile);
@@ -430,8 +446,9 @@ test("a stray argument on a verb is a usage error that touches no Goal", async (
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-verb-args-"));
 	const sessionFile = join(dir, "session.jsonl");
 	try {
-		const { pi, commands } = fakePi(sessionFile);
+		const { pi, commands, handlers } = fakePi(sessionFile);
 		goalExtension(pi);
+		await startSession(handlers, sessionFile);
 		const created = [];
 		await commands.get("goal").handler(OBJECTIVE, fakeCtx({ hasUI: true, sessionFile, notifications: created }));
 		const before = goalStateBytes(sessionFile);

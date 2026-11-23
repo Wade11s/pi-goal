@@ -52,6 +52,10 @@ export class PiRpcSession {
 		// User-level settings written to <agent-dir>/settings.json before the spawn,
 		// for tests that need deterministic retry or compaction behavior.
 		this.settings = options.settings ?? undefined;
+		// Omit `goal.clarifyOnCreate` from the written settings, so the session runs
+		// with the production default (true) instead of the harness default (false).
+		// This is how a test proves the default-on path rather than an explicit opt-in.
+		this.omitClarifyOnCreate = options.omitClarifyOnCreate ?? false;
 		// Whether the pi-goal package itself is loaded. The companion adapter's
 		// optionality test loads only the companion, which is what proves the
 		// companion is not a mandatory dependency of pi-goal (and vice versa).
@@ -95,12 +99,13 @@ export class PiRpcSession {
 		// Objective clarification (`goal.clarifyOnCreate`, default true in production)
 		// is switched off here so the existing suites keep the direct-creation path
 		// they were written for. The clarification suite opts back in explicitly with
-		// `settings: { goal: { clarifyOnCreate: true } }` and owns the default-on
-		// coverage; the production default itself is pinned by the unit seam.
-		const settings = {
-			...(this.settings ?? {}),
-			goal: { clarifyOnCreate: false, ...(this.settings?.goal ?? {}) },
-		};
+		// `settings: { goal: { clarifyOnCreate: true } }`, one scenario omits the key
+		// entirely (`omitClarifyOnCreate`) to exercise the production default, and the
+		// default itself is also pinned by the unit seam.
+		const goal = { ...(this.settings?.goal ?? {}) };
+		if (this.omitClarifyOnCreate) delete goal.clarifyOnCreate;
+		else if (goal.clarifyOnCreate === undefined) goal.clarifyOnCreate = false;
+		const settings = { ...(this.settings ?? {}), goal };
 		writeFileSync(join(this.agentDir, "settings.json"), JSON.stringify(settings), "utf8");
 		const args = ["--mode", "rpc"];
 		for (const extension of this.preExtensions) args.push("-e", extension);

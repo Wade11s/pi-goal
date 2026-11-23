@@ -1330,10 +1330,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notify(
 				ctx,
 				`pi-goal did not register ${PROPOSE_GOAL_TOOL_NAME}: another extension already provides a tool with that ` +
-					"name, and pi-goal will not replace it. /goal creations will create the Goal directly instead of " +
-					"clarifying it, because the confirmation editor could not be opened through another extension's tool. " +
-					"Rename that extension's tool, or set goal.clarifyOnCreate to false to stop pi-goal from offering " +
-					"Objective clarification.",
+					"name, and pi-goal will not replace it. Because Objective clarification is enabled " +
+					"(goal.clarifyOnCreate is true), /goal <objective> will refuse rather than create a Goal without the " +
+					"confirmation editor that is its creation authority. Rename that extension's tool (or unload it), or " +
+					"set goal.clarifyOnCreate to false to create directly without confirmation.",
 				"warning",
 			);
 			return;
@@ -1374,8 +1374,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			proposeGoalRegistered = false;
 			notify(
 				ctx,
-				`pi-goal could not register the ${PROPOSE_GOAL_TOOL_NAME} tool (${describeError(error)}), so /goal creations ` +
-					"will create the Goal directly instead of clarifying it. The Goal lifecycle itself is unaffected.",
+				`pi-goal could not register the ${PROPOSE_GOAL_TOOL_NAME} tool (${describeError(error)}). Because Objective ` +
+					"clarification is enabled (goal.clarifyOnCreate is true), /goal <objective> will refuse rather than " +
+					"create a Goal without the confirmation editor that is its creation authority. Fix the registration " +
+					"failure, or set goal.clarifyOnCreate to false to create directly without confirmation.",
 				"warning",
 			);
 			return;
@@ -1384,9 +1386,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (!proposeGoalRegistered) {
 			notify(
 				ctx,
-				`pi-goal registered ${PROPOSE_GOAL_TOOL_NAME}, but another extension's tool of the same name took its place, ` +
-					"so /goal creations will create the Goal directly instead of clarifying it. Rename that extension's tool, " +
-					"or set goal.clarifyOnCreate to false to stop pi-goal from offering Objective clarification.",
+				`pi-goal registered ${PROPOSE_GOAL_TOOL_NAME}, but another extension's tool of the same name took its place. ` +
+					"Because Objective clarification is enabled (goal.clarifyOnCreate is true), /goal <objective> will refuse " +
+					"rather than create a Goal without the confirmation editor that is its creation authority. Rename that " +
+					"extension's tool, or set goal.clarifyOnCreate to false to create directly without confirmation.",
 				"warning",
 			);
 		}
@@ -4254,16 +4257,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Whether this `/goal <objective>` should clarify before committing.
+	 * Refuse a creation that asked for clarification in a host that cannot complete it.
 	 *
-	 * Three independent conditions, each with its own fallback: the setting is on,
-	 * the confirmation tool really is registered (an interview that cannot end in an
-	 * editor is a dead end), and the host can open a dialog. `goal.enabled` is not
-	 * checked here on purpose — it is refused earlier, by the creation path, before
-	 * anything about a clarification is decided.
+	 * Direct creation is authorized in exactly two cases: `goal.clarifyOnCreate:
+	 * false`, and a UI-less host that has no confirmation editor to open. A
+	 * UI-capable host with the setting on has **one** creation authority — the saved
+	 * confirmation editor — so when `propose_goal` could not be registered (or did
+	 * not survive registration) falling back to a direct, title-less commit would
+	 * silently bypass the mandatory confirmation. Fail closed instead: no Goal, no
+	 * pending interview that could never be confirmed, and a diagnostic naming both
+	 * ways forward.
 	 */
-	function clarificationApplies(ctx: ExtensionCommandContext): boolean {
-		return clarifyOnCreate.enabled && proposeGoalRegistered && ctx.hasUI;
+	function refuseUnavailableClarification(ctx: ExtensionCommandContext): void {
+		ctx.ui.notify(
+			"Goal not created: Objective clarification is enabled (goal.clarifyOnCreate is true), but the " +
+				`${PROPOSE_GOAL_TOOL_NAME} tool could not be registered (another extension may already own that name), so ` +
+				"there is no confirmation editor to authorize a Goal. No Goal was created and no clarification was started. " +
+				"Rename the conflicting tool (or unload that extension) and run /goal again, or set goal.clarifyOnCreate " +
+				"to false to create directly without confirmation.",
+			"error",
+		);
 	}
 
 	async function createOrReplaceGoal(rawObjective: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -4312,29 +4325,34 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 		const request = creationRequestFromCommand(parsed, validation.objective);
 
-		// Objective clarification (ADR-0003): with a dialog-capable UI and the
-		// confirmation tool really registered, `/goal` starts the interview and
-		// commits nothing. Every other case creates directly — the setting's escape
-		// hatch, and the two hosts that cannot complete the flow.
-		if (clarifyOnCreate.enabled && !clarificationApplies(ctx)) {
-			const outcome = await commitGoalCreation(request, ctx);
-			if (!outcome.ok) return;
-			ctx.ui.notify(
-				proposeGoalRegistered
-					? "Objective clarification was skipped: this Pi mode has no dialog-capable UI, so the confirmation " +
-							"editor could not be opened. The Goal was created directly from the raw idea; start Pi with a " +
-							"dialog-capable UI (TUI or RPC) to review and edit a drafted Goal before it is created."
-					: "Objective clarification was skipped: the propose_goal tool could not be registered, so the " +
-							"confirmation editor could not be opened. The Goal was created directly from the raw idea.",
-				"info",
-			);
+		// Objective clarification (ADR-0003). Two host shapes are decided here; the
+		// third is decided inside `startClarification`, under the creation lock:
+		//
+		// - the setting is on but the host has no dialog-capable UI: create directly
+		//   from the raw idea, with the notice that says so (there is no interview it
+		//   could confirm);
+		// - the setting is on and the host has a UI: clarify — and `startClarification`
+		//   refuses when an unfinished Goal is in the way (that check stays outermost),
+		//   or when the confirmation tool could not be registered. The latter fails
+		//   closed: the saved editor is the only creation authority here, so a direct
+		//   commit would silently bypass the mandatory confirmation;
+		// - the setting is off: the unchanged direct creation.
+		if (clarifyOnCreate.enabled) {
+			if (!ctx.hasUI) {
+				const outcome = await commitGoalCreation(request, ctx);
+				if (!outcome.ok) return;
+				ctx.ui.notify(
+					"Objective clarification was skipped: this Pi mode has no dialog-capable UI, so the confirmation " +
+						"editor could not be opened. The Goal was created directly from the raw idea; start Pi with a " +
+						"dialog-capable UI (TUI or RPC) to review and edit a drafted Goal before it is created.",
+					"info",
+				);
+				return;
+			}
+			await startClarification(request, ctx);
 			return;
 		}
-		if (!clarifyOnCreate.enabled) {
-			await commitGoalCreation(request, ctx);
-			return;
-		}
-		await startClarification(request, ctx);
+		await commitGoalCreation(request, ctx);
 	}
 
 	/**
@@ -4355,8 +4373,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	async function startClarification(request: GoalCreationRequest, ctx: ExtensionCommandContext): Promise<void> {
 		await runExclusive(async () => {
 			const previous = store.get();
+			// The single-Goal refusal is the outermost creation rule, so it is decided
+			// before the host's ability to clarify: an unfinished Goal refuses `/goal`
+			// identically whether or not the confirmation tool exists.
 			if (previous && previous.status !== "complete") {
 				refuseUnfinishedGoal(ctx, previous);
+				return;
+			}
+			// Only now is the host's ability to complete the flow relevant. A
+			// UI-capable host with the setting on has one creation authority — the
+			// saved confirmation editor — so a missing tool fails closed instead of
+			// recording an interview that could never be confirmed (see
+			// `refuseUnavailableClarification`).
+			if (!proposeGoalRegistered) {
+				refuseUnavailableClarification(ctx);
 				return;
 			}
 			const pending: PendingClarification = {
@@ -4389,39 +4419,90 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	/** What ending one captured pending clarification did. */
+	type PendingClarificationEnd =
+		/** The captured clarification was current and its end is durable. */
+		| { kind: "ended" }
+		/** It is no longer the current pending clarification; nothing was cleared. */
+		| { kind: "stale" }
+		/** The durable `pending: null` entry could not be written; memory still holds it. */
+		| { kind: "persistence"; error: unknown };
+
 	/**
-	 * Record durably that the pending clarification ended.
+	 * Record durably that one captured pending clarification ended.
 	 *
-	 * A `pending: null` entry is the branch's record that the interview is over, so a
-	 * completed, cancelled, or timed-out clarification never leaves an open one
-	 * behind. The in-memory view is cleared first and unconditionally: even if the
-	 * bookkeeping append fails, this session must not keep accepting a proposal for
-	 * an interview the user already ended.
+	 * Two rules make this safe when the state moved while a confirmation editor was
+	 * open — the model can issue concurrent `propose_goal` calls, and a newer `/goal`
+	 * can replace the pending entry:
+	 *
+	 * - **Identity.** Only the captured pending is ended. If it is no longer the
+	 *   current one, nothing is cleared: the newer clarification, or the Goal another
+	 *   confirmation committed, is not a stale call's state to end.
+	 * - **Durability before memory.** The `pending: null` entry is appended first and
+	 *   the in-memory view is cleared only after the append succeeded. A failed append
+	 *   leaves memory and branch agreeing that the clarification is still open, so the
+	 *   caller surfaces the failure instead of reporting a clear that never landed.
 	 */
-	function clearPendingClarification(): void {
-		if (pendingClarification === null) return;
-		pendingClarification = null;
+	function endPendingClarification(pending: PendingClarification): PendingClarificationEnd {
+		if (pendingClarification !== pending) return { kind: "stale" };
 		try {
 			pi.appendEntry(CLARIFICATION_ENTRY_TYPE, pendingClarificationEntry(null));
 		} catch (error) {
-			console.error(`[pi-goal] could not record the end of the pending clarification: ${describeError(error)}`);
+			return { kind: "persistence", error };
 		}
+		pendingClarification = null;
+		return { kind: "ended" };
 	}
 
 	/**
-	 * The tool result for a confirmation that created nothing.
+	 * The tool result for a confirmation that created no Goal.
 	 *
-	 * Cancel, timeout, and a host without a dialog all land here, and all mean the
-	 * same thing to the model: nothing was created, nothing was materialized or
-	 * fetched, the current Goal (if any) is untouched, and the clarification is over.
-	 * It is deliberately not an error result — cancellation is a legitimate user
-	 * decision, not a failure — but the text is explicit so the model does not read a
-	 * silent no-op as success.
+	 * Cancel, timeout, a host without a dialog, and a stale duplicate all land here.
+	 * The result is built from what actually happened, never from the assumption that
+	 * the captured clarification is still current:
+	 *
+	 * - still current and ended durably: zero side effects, and the model is told so;
+	 * - no longer current (another confirmation committed, or a newer `/goal` replaced
+	 *   it): nothing is cleared and the text names the state that is actually current,
+	 *   because the structured payload must not contradict the prose;
+	 * - the durable clear failed: reported as a tool error, because the clarification
+	 *   is still open in the session and claiming a successful cancellation would be a
+	 *   lie about durable state.
 	 */
-	function clarificationCancelled(reason: string) {
-		clearPendingClarification();
+	function clarificationNotCreated(pending: PendingClarification, reason: string, ctx: ExtensionContext) {
 		const current = store.get();
 		const state = current ? toPublicState(current) : null;
+		const ended = endPendingClarification(pending);
+		if (ended.kind === "persistence") {
+			const message =
+				`No Goal was created: ${reason}. The pending clarification could not be recorded as ended ` +
+				`(${describeError(ended.error)}), so it is still open and could be confirmed later. Nothing was created ` +
+				"or materialized. Fix the session write and retry, or run /goal again to start over.";
+			// Both surfaces: the model must not treat this as a clean cancel, and the
+			// user must see that their cancellation did not become durable.
+			ctx.ui.notify(message, "error");
+			return goalToolError(message, state);
+		}
+		if (ended.kind === "stale") {
+			const detail = current
+				? `The current Goal ${current.id} (${current.status}) was not changed by this confirmation.`
+				: "No Goal is current.";
+			const pendingDetail =
+				pendingClarification === null ? "" : " A newer clarification is open; it is unchanged.";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text:
+							`No Goal was created by this confirmation: ${reason}, and it was no longer the current ` +
+							`clarification (another confirmation or a newer /goal took over). ${detail}${pendingDetail} ` +
+							"Do not call propose_goal again for this document.",
+					},
+				],
+				structuredContent: { goal: state },
+				details: { goal: state },
+			};
+		}
 		return {
 			content: [
 				{
@@ -4486,84 +4567,104 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const objective = validateObjective(String(params.objective ?? ""));
 		if (!objective.ok) return goalToolError(objective.error, currentState());
 		if (!ctx.hasUI) {
-			return clarificationCancelled(
+			return clarificationNotCreated(
+				pending,
 				"this Pi mode has no dialog-capable UI to confirm the Goal in, so the confirmation editor could not be opened",
+				ctx,
 			);
 		}
 
 		let document = formatClarificationDocument(title.title, objective.objective);
-		try {
-			for (;;) {
-				const edited = await withDialogTimeout(
+		for (;;) {
+			// Only the host call is guarded: everything after it is validation or the
+			// commit, and a throw there must never be reported as a cancelled editor.
+			let edited: string | undefined;
+			try {
+				edited = await withDialogTimeout(
 					ctx.ui.editor(CLARIFICATION_EDITOR_TITLE, document),
 					dialogTimeoutMs(EDIT_TIMEOUT_MS),
 					undefined,
 				);
-				if (edited === undefined) {
-					return clarificationCancelled("the user cancelled the confirmation, or it timed out unanswered");
-				}
-				const parsed = parseClarificationDocument(edited);
-				if (!parsed.ok) {
-					ctx.ui.notify(parsed.error, "error");
-					document = edited;
-					continue;
-				}
-				const confirmedTitle = validateGoalTitle(parsed.title, "created");
-				if (!confirmedTitle.ok) {
-					ctx.ui.notify(confirmedTitle.error, "error");
-					document = edited;
-					continue;
-				}
-				const confirmedObjective = validateObjective(parsed.objective);
-				if (!confirmedObjective.ok) {
-					ctx.ui.notify(confirmedObjective.error, "error");
-					document = edited;
-					continue;
-				}
-				// A second `/goal` while the editor was open replaced the pending
-				// clarification; the document on screen describes the old interview, so
-				// committing it would create a Goal the user has already moved on from.
-				if (pendingClarification !== pending) {
-					return goalToolError(
-						"Goal not created: a newer /goal replaced this clarification while the confirmation was open, so " +
-							"nothing was created from this document. Use the newer clarification instead.",
-						currentState(),
-					);
-				}
-				clearPendingClarification();
-				const outcome = await commitGoalCreation(
-					{
-						objective: confirmedObjective.objective,
-						budget: pending.budget,
-						attachments: pending.attachments,
-						title: confirmedTitle.title,
-						kickoff: "steer",
-					},
+			} catch (error) {
+				return clarificationNotCreated(
+					pending,
+					`the confirmation editor failed (${describeError(error)})`,
 					ctx,
 				);
-				if (!outcome.ok) return goalToolError(outcome.message, currentState());
-				const state = toPublicState(outcome.goal);
-				const delivery =
-					outcome.delivery === "started"
-						? "Initial work started."
-						: "Initial work was steered into the run that was already in flight.";
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text:
-								`Goal ${outcome.goal.id} created and activated from the confirmed clarification. ` +
-								`Title: ${JSON.stringify(outcome.goal.title ?? "")}. ` +
-								`The user edited and saved this Objective, so it is the Goal contract: ${JSON.stringify(outcome.goal.objective)}. ${delivery} ` +
-								"Continue toward it and call get_goal if the objective or its status is absent or truncated.",
-						},
-					],
-					structuredContent: { goal: state },
-					details: { goal: state },
-				};
 			}
-		} catch (error) {
-			return clarificationCancelled(`the confirmation editor failed (${describeError(error)})`);
+			if (edited === undefined) {
+				return clarificationNotCreated(pending, "the user cancelled the confirmation, or it timed out unanswered", ctx);
+			}
+			const parsed = parseClarificationDocument(edited);
+			if (!parsed.ok) {
+				ctx.ui.notify(parsed.error, "error");
+				document = edited;
+				continue;
+			}
+			const confirmedTitle = validateGoalTitle(parsed.title, "created");
+			if (!confirmedTitle.ok) {
+				ctx.ui.notify(confirmedTitle.error, "error");
+				document = edited;
+				continue;
+			}
+			const confirmedObjective = validateObjective(parsed.objective);
+			if (!confirmedObjective.ok) {
+				ctx.ui.notify(confirmedObjective.error, "error");
+				document = edited;
+				continue;
+			}
+			// End the captured clarification durably *before* committing. The identity
+			// check is what keeps a concurrent confirmation, or a newer `/goal`, from
+			// having its state ended by this stale document; the durability check is what
+			// keeps a failed `pending: null` write from being reported as a clear and
+			// followed by a Goal snapshot that would leave an open pending before it.
+			const ended = endPendingClarification(pending);
+			if (ended.kind === "stale") {
+				return goalToolError(
+					"Goal not created: this confirmation was no longer the current clarification when it was saved " +
+						"(a newer /goal replaced it, or another confirmation already committed). Nothing was created " +
+						"from this document; use the current state instead.",
+					currentState(),
+				);
+			}
+			if (ended.kind === "persistence") {
+				const message =
+					`Goal not created: the pending clarification could not be recorded as ended ` +
+					`(${describeError(ended.error)}), so the confirmation was not committed. Nothing was created or ` +
+					"materialized; fix the session write and retry.";
+				ctx.ui.notify(message, "error");
+				return goalToolError(message, currentState());
+			}
+			const outcome = await commitGoalCreation(
+				{
+					objective: confirmedObjective.objective,
+					budget: pending.budget,
+					attachments: pending.attachments,
+					title: confirmedTitle.title,
+					kickoff: "steer",
+				},
+				ctx,
+			);
+			if (!outcome.ok) return goalToolError(outcome.message, currentState());
+			const state = toPublicState(outcome.goal);
+			const delivery =
+				outcome.delivery === "started"
+					? "Initial work started."
+					: "Initial work was steered into the run that was already in flight.";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text:
+							`Goal ${outcome.goal.id} created and activated from the confirmed clarification. ` +
+							`Title: ${JSON.stringify(outcome.goal.title ?? "")}. ` +
+							`The user edited and saved this Objective, so it is the Goal contract: ${JSON.stringify(outcome.goal.objective)}. ${delivery} ` +
+							"Continue toward it and call get_goal if the objective or its status is absent or truncated.",
+					},
+				],
+				structuredContent: { goal: state },
+				details: { goal: state },
+			};
 		}
 	}
 

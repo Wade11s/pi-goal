@@ -56,6 +56,7 @@ const DRAFT_OBJECTIVE = [
 	"2. A fresh account completes the sample project, verified by running the acceptance script.",
 ].join("\n");
 const CLARIFY_SETTINGS = { goal: { clarifyOnCreate: true } };
+const PROPOSE_GOAL_PEER = new URL("./extensions/propose-goal-name-peer.ts", import.meta.url).pathname;
 
 function scratch() {
 	return {
@@ -791,6 +792,95 @@ test("cancelling a clarification over a complete Goal leaves that Goal byte-iden
 
 		assertCleanRun(session);
 		assertStepsConsumed(session, 6);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("the production default clarifies when goal.clarifyOnCreate is absent from settings", async () => {
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, { omitClarifyOnCreate: true });
+		// The harness normally injects `false`; this scenario omits the key entirely so
+		// the extension's own default (true) is what the session runs with.
+		const written = JSON.parse(readFileSync(join(session.agentDir, "settings.json"), "utf8"));
+		assert.ok(written.goal, "the settings file still has a goal block");
+		assert.equal("clarifyOnCreate" in written.goal, false, "the key is absent, not explicitly false");
+
+		script([{ text: "What should be different when this is done?" }], session);
+		const response = await session.prompt(`/goal ${IDEA}`);
+		assert.equal(response.data.disposition, "handled");
+		await waitForNextSettle(session);
+
+		assert.deepEqual(await newestClarification(session), {
+			idea: IDEA,
+			budget: { kind: "default" },
+			attachments: [],
+		});
+		assert.equal(goalSnapshots(readSessionEntries(await session.sessionFile())).length, 0, "no Goal was committed");
+		assert.equal(
+			session.records.some(
+				(record) =>
+					record.type === "extension_ui_request" &&
+					record.method === "notify" &&
+					record.message.includes("goal.clarifyOnCreate must be a boolean"),
+			),
+			false,
+			"an absent setting is not a configuration problem",
+		);
+		await session.waitForNotify((record) => record.message.includes("Objective clarification started"));
+
+		assertCleanRun(session);
+		assertStepsConsumed(session, 1);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("a host that cannot register propose_goal fails closed instead of committing without confirmation", async () => {
+	const dirs = scratch();
+	let session;
+	try {
+		// The peer owns the `propose_goal` name before pi-goal's session_start, so
+		// pi-goal must not shadow it. With clarification enabled and a UI available,
+		// the mandatory confirmation editor is unavailable and the creation must be
+		// refused — never downgraded to a direct, title-less commit.
+		session = await startSession(dirs, { extraExtensions: [PROPOSE_GOAL_PEER] });
+		script([], session);
+
+		const response = await session.prompt(`/goal ${IDEA}`);
+		assert.equal(response.data.disposition, "handled");
+		const refusal = await session.waitForNotify((record) =>
+			record.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.equal(refusal.notifyType, "error");
+		assert.match(refusal.message, /propose_goal tool could not be registered/);
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.match(refusal.message, /set goal\.clarifyOnCreate to false/);
+
+		// The startup warning explains the same condition before the command runs.
+		assert.ok(
+			session.records.some(
+				(record) =>
+					record.type === "extension_ui_request" &&
+					record.method === "notify" &&
+					record.message.includes("pi-goal did not register propose_goal") &&
+					record.message.includes("will refuse rather than create a Goal"),
+			),
+			"the registration failure is reported at session start",
+		);
+
+		const { entries } = await session.getEntries();
+		assert.equal(clarificationEntries(entries).length, 0, "no pending interview was recorded");
+		assert.equal(goalSnapshots(entries).length, 0, "no Goal was created");
+		assert.equal(editorRequests(session).length, 0, "no editor could be opened");
+		assert.equal(runCount(session), 0, "no interview was started");
+
+		assertCleanRun(session);
+		assertStepsConsumed(session, 0);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await cleanup(dirs, session);

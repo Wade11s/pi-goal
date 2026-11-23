@@ -91,11 +91,20 @@ test("the confirmation document is one Title line, a blank line, and the Objecti
  * observable. `getAllTools()` reports pi-goal's own tools with one shared source
  * path, which is how the registration checks identify this extension.
  */
-function fixture(settings = {}) {
+function fixture(settings = {}, options = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-clarify-unit-"));
 	const sessionFile = join(dir, "session.jsonl");
 	writeFileSync(sessionFile, "");
-	const state = { settings, notifications: [], messages: [], editors: [] };
+	const state = {
+		settings,
+		notifications: [],
+		messages: [],
+		editors: [],
+		/** Queued confirmation-editor answers; a function is called for its value. */
+		editorResponses: [],
+		/** Injected failure for the durable `pending: null` append. */
+		failClarificationClear: false,
+	};
 	const handlers = new Map();
 	const commands = new Map();
 	const tools = [];
@@ -119,12 +128,20 @@ function fixture(settings = {}) {
 			return [...commands.values()];
 		},
 		getAllTools() {
-			return [...tools.map((tool) => ({ name: tool.name, sourceInfo: { path: OWN_SOURCE } }))];
+			const own = tools.map((tool) => ({ name: tool.name, sourceInfo: { path: OWN_SOURCE } }));
+			// A foreign owner of `propose_goal`, for the fail-closed registration case:
+			// a different source path means pi-goal must not shadow the tool.
+			return options.foreignProposeGoal
+				? [...own, { name: "propose_goal", sourceInfo: { path: join(dir, "peer-extension.ts") } }]
+				: own;
 		},
 		getSettings() {
 			return state.settings;
 		},
 		appendEntry(customType, data) {
+			if (state.failClarificationClear && customType === CLARIFICATION_ENTRY_TYPE && data?.pending === null) {
+				throw new Error("injected clarification clear failure");
+			}
 			appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType, data })}\n`);
 		},
 		sendUserMessage(content) {
@@ -150,7 +167,8 @@ function fixture(settings = {}) {
 			confirm: async () => false,
 			editor: async (title, prefill) => {
 				state.editors.push({ title, prefill });
-				return undefined;
+				const next = state.editorResponses.shift();
+				return typeof next === "function" ? await next() : next;
 			},
 		},
 		mode: "print",
@@ -282,5 +300,161 @@ test("propose_goal is registered only while clarification is on, and refuses wit
 		);
 	} finally {
 		rmSync(disabled.dir, { recursive: true, force: true });
+	}
+});
+
+/** Start the extension with a pending clarification and return the fake command context. */
+async function startPendingClarification(fx) {
+	goalExtension(fx.pi);
+	await startSession(fx);
+	const ctx = { ...fx.ctx, hasUI: true, mode: "tui" };
+	await fx.commands.get("goal").handler(OBJECTIVE, ctx);
+	return ctx;
+}
+
+/** The pending payload `/goal` recorded, for exact before/after comparisons. */
+function pendingPayload(fx) {
+	return customEntries(fx, CLARIFICATION_ENTRY_TYPE).at(-1)?.data.pending;
+}
+
+test("a host where another extension owns propose_goal refuses the creation and records nothing", async () => {
+	const fx = fixture({ goal: { clarifyOnCreate: true } }, { foreignProposeGoal: true });
+	try {
+		goalExtension(fx.pi);
+		await startSession(fx);
+		assert.ok(
+			fx.state.notifications.some(
+				(notice) =>
+					notice.message.includes("pi-goal did not register propose_goal") &&
+					notice.message.includes("will refuse rather than create a Goal"),
+			),
+			`the startup warning is actionable: ${JSON.stringify(fx.state.notifications)}`,
+		);
+
+		const ctx = { ...fx.ctx, hasUI: true, mode: "tui" };
+		await fx.commands.get("goal").handler(OBJECTIVE, ctx);
+
+		const refusal = fx.state.notifications.find((notice) =>
+			notice.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.ok(refusal, JSON.stringify(fx.state.notifications));
+		assert.equal(refusal.type, "error");
+		assert.match(refusal.message, /propose_goal tool could not be registered/);
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.match(refusal.message, /set goal\.clarifyOnCreate to false/);
+
+		assert.equal(customEntries(fx, "goal-state").length, 0, "no Goal was created without confirmation");
+		assert.equal(customEntries(fx, CLARIFICATION_ENTRY_TYPE).length, 0, "no undeliverable interview was recorded");
+		assert.equal(fx.state.editors.length, 0);
+		assert.equal(fx.state.messages.length, 0);
+		assert.equal(fx.tools.some((tool) => tool.name === "propose_goal"), false, "the foreign tool was not shadowed");
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
+	}
+});
+
+test("a failed durable clear is surfaced and blocks the save instead of being reported as cleared", async () => {
+	const fx = fixture({ goal: { clarifyOnCreate: true } });
+	try {
+		const ctx = await startPendingClarification(fx);
+		const propose = fx.tools.find((tool) => tool.name === "propose_goal");
+		const pending = pendingPayload(fx);
+		const toolCtx = { ...ctx, hasUI: true };
+		fx.state.failClarificationClear = true;
+
+		// Cancel with a broken `pending: null` append: the clarification is still open,
+		// so the result must say so instead of claiming a clear that never landed.
+		fx.state.editorResponses.push(undefined);
+		const cancelled = await propose.execute("call-cancel", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
+		assert.equal(cancelled.isError, true);
+		const cancelText = cancelled.content.map((block) => block.text).join("\n");
+		assert.match(cancelText, /could not be recorded as ended/);
+		assert.match(cancelText, /still open/);
+		assert.ok(
+			fx.state.notifications.some(
+				(notice) => notice.type === "error" && notice.message.includes("could not be recorded as ended"),
+			),
+			"the durable failure is also surfaced to the user, not only to the model",
+		);
+		assert.deepEqual(
+			customEntries(fx, CLARIFICATION_ENTRY_TYPE).map((entry) => entry.data.pending),
+			[pending],
+			"no clear entry landed, and memory still holds the pending clarification",
+		);
+
+		// A save on the still-open clarification must refuse: committing here would
+		// leave an open pending record before the Goal snapshot.
+		fx.state.editorResponses.push(formatClarificationDocument(TITLE, DRAFT));
+		const saved = await propose.execute("call-save", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
+		assert.equal(saved.isError, true);
+		assert.match(saved.content[0].text, /the confirmation was not committed/);
+		assert.ok(
+			fx.state.notifications.some(
+				(notice) => notice.type === "error" && notice.message.includes("the confirmation was not committed"),
+			),
+			"the failed save is surfaced to the user too",
+		);
+		assert.equal(customEntries(fx, "goal-state").length, 0, "no Goal bytes were written");
+
+		// Once the session write works again, the same clarification can be cancelled.
+		fx.state.failClarificationClear = false;
+		fx.state.editorResponses.push(undefined);
+		const retried = await propose.execute("call-cancel-2", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
+		assert.notEqual(retried.isError, true);
+		assert.deepEqual(
+			customEntries(fx, CLARIFICATION_ENTRY_TYPE).map((entry) => entry.data.pending),
+			[pending, null],
+			"the retry records the durable end",
+		);
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
+	}
+});
+
+test("a duplicate confirmation whose save already committed cannot clear or misreport the newer state", async () => {
+	const fx = fixture({ goal: { clarifyOnCreate: true } });
+	try {
+		const ctx = await startPendingClarification(fx);
+		const propose = fx.tools.find((tool) => tool.name === "propose_goal");
+		const pending = pendingPayload(fx);
+		const toolCtx = { ...ctx, hasUI: true };
+
+		// Two confirmations for the same pending clarification, both already holding an
+		// editor: the first saves, the second is cancelled after that commit.
+		let releaseSecond;
+		const secondAnswer = new Promise((resolve) => {
+			releaseSecond = resolve;
+		});
+		fx.state.editorResponses.push(
+			() => formatClarificationDocument(TITLE, DRAFT),
+			() => secondAnswer,
+		);
+		const saving = propose.execute("call-save", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
+		const cancelling = propose.execute("call-cancel", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
+
+		const saved = await saving;
+		const committed = customEntries(fx, "goal-state").at(-1).data.goal;
+		assert.equal(saved.structuredContent.goal.id, committed.id);
+		assert.equal(committed.title, TITLE);
+		assert.equal(committed.objective, DRAFT);
+
+		releaseSecond(undefined);
+		const cancelled = await cancelling;
+		const text = cancelled.content.map((block) => block.text).join("\n");
+		assert.match(text, /^No Goal was created by this confirmation: the user cancelled the confirmation/);
+		assert.match(text, new RegExp(`current Goal ${committed.id} \\(active\\) was not changed`));
+		assert.equal(
+			cancelled.structuredContent.goal.id,
+			committed.id,
+			"the structured payload follows the committed Goal, matching the prose",
+		);
+		assert.equal(customEntries(fx, "goal-state").length, 1, "the stale confirmation committed nothing");
+		assert.deepEqual(
+			customEntries(fx, CLARIFICATION_ENTRY_TYPE).map((entry) => entry.data.pending),
+			[pending, null],
+			"exactly one clear entry, and the committed pending was not ended twice",
+		);
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
 	}
 });
