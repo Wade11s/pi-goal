@@ -4,7 +4,7 @@
  * Every test drives a real `pi --mode rpc` subprocess with the pi-goal package
  * loaded and the scripted test provider, and asserts public behavior only: the
  * durable `goal-history` session entries and their interleaving with the
- * authoritative `goal-state` entries, the read-only `/goal history` rendering, the
+ * authoritative `goal-state` entries, the read-only `/goal:history` rendering, the
  * Goal state itself across restart and branch navigation, and the pi process's own
  * diagnostics. Nothing here reaches into the extension's internals, and no test
  * mutates a Goal from history — the timeline is a diagnostic surface, and the
@@ -147,7 +147,7 @@ function dropEntry(sessionFile, predicate) {
 /** Render the branch's history through the read-only command and return the text. */
 async function renderHistory(session) {
 	const mark = session.records.length;
-	await session.prompt("/goal history");
+	await session.prompt("/goal:history");
 	const notify = await session.notifyAfter(
 		mark,
 		(record) => record.message.includes("Goal history") || record.message.includes("No Goal history"),
@@ -202,32 +202,32 @@ test("every user transition appends one history record, and a restart renders th
 
 		// Pause from idle, then refuse a second pause: one durable transition, one
 		// history record, and nothing for the refusal.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused (revision 1)"));
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("already paused"));
 		assert.deepEqual(historyKinds(readSessionEntries(await session.sessionFile())), ["created", "paused"]);
 
 		// Editing a paused Goal changes durable state only, and is still a transition.
-		await session.prompt(`/goal edit ${EDITED}`);
+		await session.prompt(`/goal:edit ${EDITED}`);
 		await session.waitForNotify((r) => r.message.includes("objective updated"));
 
 		// Resume restarts work; the resumed run is held at the gate, so a second
 		// resume is the refusal path and must write nothing.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed"));
 		await session.waitFor("resumed run started", (records) =>
 			records.filter((r) => r.type === "agent_start").length >= 3 ? true : undefined,
 		);
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("already active"));
 		writeFileSync(gate, "", "utf8");
 		await session.waitForSettled(2);
 
 		// Clear from complete, then refuse a second clear.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("No Goal is set"));
 
 		const entries = readSessionEntries(await session.sessionFile());
@@ -354,7 +354,7 @@ test("the budget stop, its recovery, and the completion each append exactly one 
 			"budget-limited",
 		]);
 
-		await session.prompt("/goal resume --budget 500");
+		await session.prompt("/goal:resume --budget 500");
 		await session.waitFor("the resumed run started", (records) =>
 			records.filter((r) => r.type === "agent_start").length >= 4 ? true : undefined,
 		);
@@ -440,7 +440,7 @@ test("the blocked threshold and a provider usage limit append their stops; audit
 
 		// The user's resume is the decision the stop asked for, and the provider's
 		// usage limit is its own durable stop.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForSettled(2);
 		entries = readSessionEntries(await session.sessionFile());
 		assert.deepEqual(historyKinds(entries), ["created", "blocked", "resumed", "usage-limited"]);
@@ -511,7 +511,7 @@ test("a declined replacement and every refusal append no history", async () => {
 		);
 
 		// Clearing names the Goal that was cleared, and no other.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		entries = readSessionEntries(await session.sessionFile());
 		assert.deepEqual(historyKinds(entries), ["created", "replaced", "completed", "cleared"]);
@@ -600,7 +600,7 @@ test("attachment manifest metadata is recorded by hash and never as contents", a
 
 		// Every later transition keeps the same manifest hashes, because the manifest
 		// is immutable for the identity.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused (revision 1)"));
 		const paused = historyRecords(readSessionEntries(await session.sessionFile()))[1];
 		assert.deepEqual(paused.attachments, created.attachments);
@@ -624,7 +624,7 @@ test("malformed history is skipped, surfaced as a notice, and cannot change the 
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await abortActiveLoop(session, 2);
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused (revision 1)"));
 		const sessionFile = await session.sessionFile();
 		const before = readSessionEntries(sessionFile);
@@ -657,7 +657,7 @@ test("malformed history is skipped, surfaced as a notice, and cannot change the 
 
 			// Later transitions keep working: the edit commits and appends normally.
 			script([{ text: "Edited." }], reloaded);
-			await reloaded.prompt(`/goal edit ${EDITED}`);
+			await reloaded.prompt(`/goal:edit ${EDITED}`);
 			await reloaded.waitForNotify((r) => r.message.includes("objective updated"));
 			const after = readSessionEntries(sessionFile);
 			assert.deepEqual(historyKinds(after), ["created", "paused", "objective-edited"]);
@@ -692,9 +692,9 @@ test("an unknown transition kind or status is malformed, never a real timeline e
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await abortActiveLoop(session, 2);
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused (revision 1)"));
-		await session.prompt(`/goal edit ${EDITED}`);
+		await session.prompt(`/goal:edit ${EDITED}`);
 		await session.waitForNotify((r) => r.message.includes("objective updated"));
 		const sessionFile = await session.sessionFile();
 		const before = readSessionEntries(sessionFile);
@@ -747,7 +747,7 @@ test("a crash gap between the commit and the append leaves only a diagnostic gap
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await abortActiveLoop(session, 2);
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused (revision 1)"));
 		const sessionFile = await session.sessionFile();
 		assert.deepEqual(historyKinds(readSessionEntries(sessionFile)), ["created", "paused"]);
@@ -780,7 +780,7 @@ test("a crash gap between the commit and the append leaves only a diagnostic gap
 
 			// Later transitions remain correct and keep appending.
 			script([{ text: "Edited." }], reloaded);
-			await reloaded.prompt(`/goal edit ${EDITED}`);
+			await reloaded.prompt(`/goal:edit ${EDITED}`);
 			await reloaded.waitForNotify((r) => r.message.includes("objective updated"));
 			const after = readSessionEntries(sessionFile);
 			assert.deepEqual(historyKinds(after), ["created", "objective-edited"]);
@@ -820,7 +820,7 @@ test("history is branch-local: each selected branch renders only its own timelin
 		await session.prompt("/goal First objective ALPHA");
 		await abortActiveLoop(session, 4);
 
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		await session.prompt("/goal Second objective BETA");
 		await abortActiveLoop(session, 7);
@@ -878,7 +878,7 @@ test("history is branch-local: each selected branch renders only its own timelin
 	}
 });
 
-test("/goal history is read-only and cannot be mistaken for a lifecycle command", async () => {
+test("/goal:history is read-only and cannot be mistaken for a lifecycle command", async () => {
 	const session = await PiRpcSession.start({});
 	// One script for the whole scenario: the provider's step counter is
 	// process-global, so a mid-scenario rewrite would have to pad the steps the
@@ -910,7 +910,7 @@ test("/goal history is read-only and cannot be mistaken for a lifecycle command"
 		// The command is a whole-argument subcommand, so an objective that merely
 		// starts with the word is still an objective. Clearing first keeps this a
 		// fresh creation rather than a confirmed replacement.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		await session.prompt("/goal history of the release pipeline");
 		await session.waitForNotify((r) => r.message.includes("created and activated"));

@@ -230,7 +230,7 @@ test("an ordinary prompt while a Goal is paused is not charged", async () => {
 		// 110 kickoff + 15 for the aborted continuation request.
 		assert.equal(before.totalTokens, 125);
 
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused"));
 
 		await session.prompt("anything else while paused?");
@@ -310,7 +310,7 @@ test("Clear publishes no further usage for the cleared identity and transfers no
 		const before = await reportStatus(session);
 		assert.equal(before.totalTokens, 125);
 
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
 		// An ordinary run after the clear is not Goal work.
@@ -367,7 +367,7 @@ test("a held blocked report prepared against an edited Goal is refused without m
 		assert.equal(before.revision, 0);
 		assert.equal(before.blockedAudit, undefined);
 
-		const editResponse = await session.prompt("/goal edit Verify a completely different new objective");
+		const editResponse = await session.prompt("/goal:edit Verify a completely different new objective");
 		assert.equal(editResponse.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("objective updated"));
 
@@ -558,7 +558,7 @@ test("Clear during the superseded identity's in-flight response keeps the tail a
 		assert.equal((await replacePromise).data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
 
-		const clearPromise = submitCommand(session, "clear-busy", "/goal clear");
+		const clearPromise = submitCommand(session, "clear-busy", "/goal:clear");
 		assert.equal((await clearPromise).data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
@@ -650,7 +650,7 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 		assert.equal((await replacePromise).data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
 
-		const clearPromise = submitCommand(session, "clear-busy", "/goal clear");
+		const clearPromise = submitCommand(session, "clear-busy", "/goal:clear");
 		assert.equal((await clearPromise).data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
@@ -711,7 +711,7 @@ test("creating a Goal after a Clear closes the old admission so live and replay 
 			// The next delivered user message is a freeze boundary. It must not invent a
 			// historical record for the old identity's late response: live refused it, so the
 			// replay has to refuse it too instead of freezing a total nobody accounted.
-			await resumed.prompt("/goal pause");
+			await resumed.prompt("/goal:pause");
 			await resumed.waitForNotify((r) => r.message.includes("paused"));
 			await resumed.prompt("anything else after the reload?");
 			await resumed.waitForSettled(1);
@@ -1036,7 +1036,7 @@ test("already-admitted in-flight Goal work stays attributable through a pause", 
 		await session.waitForToolResult("get_goal", 1);
 		// Pause while the second provider request is held: the in-flight work is
 		// already admitted and must still be accounted.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused"));
 		writeFileSync(gate, "", "utf8");
 		await session.waitForSettled(1);

@@ -121,7 +121,7 @@ test("a held model transition is stale after a budget-raising resume", async () 
 
 		// The budget-raising resume changes identity state while the response is in
 		// flight. It is the user's decision, so it proceeds.
-		await session.prompt("/goal resume --budget 200");
+		await session.prompt("/goal:resume --budget 200");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 		assert.match(resumed.message, /cumulative token ceiling is now 200 tokens/);
 
@@ -302,7 +302,7 @@ test("a tool-created Goal's budget exhaustion recovers through a cumulative rais
 		assert.equal(limited.data.goal.usage.totalTokens, 120, "90 + the 30-token crossing");
 		assert.equal(await liveUsage(session), 135, "the live total includes the 15-token wrap-up");
 
-		await session.prompt("/goal resume --budget 200");
+		await session.prompt("/goal:resume --budget 200");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 		assert.match(resumed.message, /cumulative token ceiling is now 200 tokens/);
 		assert.match(resumed.message, /135 tokens already accounted/);

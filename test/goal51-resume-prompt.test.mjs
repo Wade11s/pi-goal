@@ -1,7 +1,7 @@
 /**
  * Issue #51: the opt-in paused-Goal resume prompt.
  *
- * The prompt is convenience over the user-owned `/goal resume` transition, so
+ * The prompt is convenience over the user-owned `/goal:resume` transition, so
  * every test here asserts the transition it does (or does not) perform, never a
  * private flag:
  *
@@ -130,7 +130,7 @@ async function reachPaused(first) {
 	await first.prompt(`/goal ${OBJECTIVE}`);
 	await first.waitForNotify((record) => record.message.includes("created and activated"));
 	await abortActiveLoop(first, 2);
-	await first.prompt("/goal pause");
+	await first.prompt("/goal:pause");
 	await first.waitForNotify((record) => record.message.includes("paused"));
 	assertOnlyFailures(first, [{ stopReason: "aborted" }]);
 }
@@ -161,7 +161,7 @@ async function reachAuditedPaused(first, dirs) {
 		(snapshot) => snapshot.data.goal?.blockedAudit?.turns === 1,
 		"the durable partial blocked audit",
 	);
-	await first.prompt("/goal pause");
+	await first.prompt("/goal:pause");
 	await first.waitForNotify((record) => record.message.includes("paused"));
 	writeFileSync(gate, "", "utf8");
 	await first.waitForSettled(1);
@@ -294,7 +294,7 @@ test("accepting the resume prompt runs the durable user resume with a fresh Bloc
 		second = reopened.session;
 
 		const dialog = await second.respondToConfirm(isResumePrompt, true);
-		assert.match(String(dialog.message), /the same durable transition as \/goal resume/);
+		assert.match(String(dialog.message), /the same durable transition as \/goal:resume/);
 		const resumedNotice = await second.waitForNotify((record) => record.message.includes("resumed"));
 		assert.match(resumedNotice.message, new RegExp(`Goal ${before.id} resumed`));
 		assert.match(resumedNotice.message, new RegExp(`revision ${before.revision + 1}`));
@@ -343,7 +343,7 @@ test("declining the resume prompt leaves the paused Goal unchanged and asks once
 		assert.equal(declined.notifyType, "info");
 		assert.match(declined.message, /stays paused/);
 		assert.match(declined.message, /declined, dismissed, or timed out/);
-		assert.match(declined.message, /\/goal resume/);
+		assert.match(declined.message, /\/goal:resume/);
 
 		const after = await durableGoal(second);
 		assert.equal(after.status, "paused");
@@ -439,7 +439,7 @@ test("accepting after the Goal changed while the prompt was open resumes nothing
 		);
 		// The user clears the Goal while the dialog is open. The prompt described the
 		// paused record, so its answer may not act on the cleared session.
-		const cleared = await second.prompt("/goal clear");
+		const cleared = await second.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await second.waitForNotify((record) => record.message.includes("cleared"));
 
@@ -517,10 +517,10 @@ test("a disabled extension never offers the resume prompt and says why", async (
 		);
 		assert.equal(suppressed.notifyType, "warning");
 		assert.match(suppressed.message, /goal\.enabled is false/);
-		assert.match(suppressed.message, /Re-enable goal\.enabled and run \/goal resume/);
+		assert.match(suppressed.message, /Re-enable goal\.enabled and run \/goal:resume/);
 
 		// The explicit path stays refused too, and the Goal is untouched either way.
-		const refused = await second.prompt("/goal resume");
+		const refused = await second.prompt("/goal:resume");
 		assert.equal(refused.data.disposition, "handled");
 		await second.waitForNotify((record) => record.message.includes("Goal not resumed:"));
 		assert.equal(confirmRequests(second).length, 0, "the disabled extension asked nothing");
@@ -621,7 +621,7 @@ test("print and JSON modes never ask: the resume prompt needs an interactive UI"
 			const notice = notifications.find((entry) => entry.message.includes("has no interactive UI to ask it"));
 			assert.ok(notice, `expected the UI-less notice, got ${JSON.stringify(notifications)}`);
 			assert.match(notice.message, /nothing was asked and the Goal stays paused/);
-			assert.match(notice.message, /Use \/goal resume/);
+			assert.match(notice.message, /Use \/goal:resume/);
 			assert.ok(
 				notifications.some((entry) => entry.message.includes("restored (paused)")),
 				"the ordinary restore notice still lands",

@@ -114,7 +114,7 @@ async function createPausedGoal(session) {
 	await session.prompt(`/goal ${OBJECTIVE}`);
 	await session.waitForNotify((record) => record.message.includes("created and activated"));
 	await abortActiveLoop(session, 2);
-	await session.prompt("/goal pause");
+	await session.prompt("/goal:pause");
 	await session.waitForNotify((record) => record.message.includes("paused"));
 }
 
@@ -578,7 +578,7 @@ test("a clear during a stalled remote-image fetch wins over the in-flight replac
 		// The fetch is stalled here. Clear runs in a second prompt while the
 		// first command still awaits the body, so the tombstone is durable before
 		// the replacement revalidates its captured record.
-		const cleared = await session.prompt("/goal clear");
+		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((record) => record.message.includes("cleared"));
 
@@ -639,7 +639,7 @@ test("an edit during a stalled remote-image fetch cancels the replacement agains
 		await session.respondToConfirm((record) => record.title.includes("Replace the current Goal"), true);
 		await fixture.waitForRequest("/hold");
 
-		const edited = await session.prompt("/goal edit The revised objective");
+		const edited = await session.prompt("/goal:edit The revised objective");
 		assert.equal(edited.data.disposition, "handled");
 		const editNotice = await session.waitForNotify((record) => record.message.includes("objective updated"));
 		assert.match(editNotice.message, /revision 2/);

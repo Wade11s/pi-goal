@@ -144,7 +144,7 @@ proves fetch-once and hash stability across Continuations, restart, and a cloned
 selected branch; it also covers redirect revalidation, credentials, HTTP,
 loopback/private/link-local/DNS refusals, actual-byte MIME validation, the
 per-image and total bounds, disabled admission before any request, and rollback
-with no success event. It also holds a fetch open to prove that a `/goal clear`,
+with no success event. It also holds a fetch open to prove that a `/goal:clear`,
 an edit, or a `create_goal` tool call during the network wait wins over the
 stale command, which cancels with a warning, retracts its uncommitted artifacts,
 and emits no success event. `test/goal50-remote-images-store.test.mjs` pins URL
@@ -324,10 +324,24 @@ profile is proven to reach the child Pi as real launch arguments.
 
 ### Goal RPC companion and the command bridge
 
+`test/goal8-headless.test.mjs` drives the command handlers with a fake Pi API and
+is the only deterministic place the registered command surface can be observed
+(issue #79): the six names of the Goal command family — `goal`, `goal:pause`,
+`goal:resume`, `goal:clear`, `goal:history`, `goal:edit` — and no seventh `goal*`
+command; the `/` menu descriptions; the argument completions `/goal ` (the five
+creation flags, prefix-filtered, nothing when no flag matches) and `/goal:resume `
+(`--budget`); a stray argument on a verb as a usage error that writes no Goal
+bytes; and the headless (`hasUI: false`) `/goal:edit` guard.
+
 `test/goal56-command-bridge.test.mjs` covers the bridge with a fake Pi API, which
-is the only way to reach three narrow cases deterministically: the whole outcome
-classifier truth table, strict request validation, and a creation that commits in
-memory, announces its transition on the event stream, and then fails its on-disk
+is the only way to reach a few narrow cases deterministically: the whole outcome
+classifier truth table; strict version-2 request validation (a `name` outside the
+family, a non-string `args`, and a version-1 request refused with the upgrade
+message); the action derived from the command name for all six commands, with
+`/goal` refusing the old `pause` argument as a `create` that was `refused`, never
+`invalid`; a family name that is not a registered command at dispatch time,
+answered `invalid` with no Goal mutation; and a creation that commits in memory,
+announces its transition on the event stream, and then fails its on-disk
 durability poll. That last one is the point of the seam: the bridge must answer
 `refused` for the retracted creation even though the event stream already
 announced it, and the test asserts the answer and the empty `goal-state` bytes.
@@ -339,7 +353,8 @@ and the test asserts the underlying session was never touched), the once-only
 reply contract (a reply callback that throws is not called a second time), and
 the companion's structural optionality: protocol constants agree with core, the
 package declares no pi-goal dependency, imports nothing from `src/`, registers no
-model tool, and never names a durable Goal entry.
+model tool, never names a durable Goal entry, and no longer carries a parser
+mirror.
 
 `test/goal56-goal-rpc-companion.test.mjs` drives the companion's public protocol
 against a real `pi --mode rpc` subprocess: one `/goal-rpc <json>` extension
@@ -350,20 +365,24 @@ declined and accepted with the superseded history record, the stale-run binding
 refusal that survives a replacement, disabled admission, invalid budgets (both
 pi-goal's whole-number rule and the companion's own envelope checks), declared
 model authority, and a companion-only session with no pi-goal installed, which
-answers `unavailable` instead of crashing. It also pins the objective guard that
-keeps a `set` from smuggling a lifecycle command — `clear`, `pause`, `history`,
-`resume`, `edit`, `resume --budget …`, and a leading option token are all
-`invalid-request` while an ordinary objective that merely starts with one of those
-words is still created — and the strict request envelope (`version: 1` required,
-unknown top-level fields refused). Every refusal asserts the structured error
-code **and** that the raw `goal-state` bytes are unchanged, so "nothing happened"
-is proved rather than assumed.
+answers `unavailable` instead of crashing. It also pins that a reserved-word
+Objective is **pi-goal's** refusal, not the companion's — `clear`, `pause`,
+`history`, `resume`, `edit`, and `resume --budget …` each come back `refused`
+with pi-goal's own diagnostic verbatim and the Goal bytes unchanged — while an
+Objective that begins with `edit` (`edit the release notes`) and one that merely
+begins with another verb word are created, and a leading option token is
+answered by pi-goal's creation path verbatim; and the strict request envelope
+(`version: 1` required, unknown top-level fields refused). Every refusal asserts
+the structured error code **and** that the raw `goal-state` bytes are unchanged,
+so "nothing happened" is proved rather than assumed.
 
 ## Interactive smoke test
 
 Deterministic RPC tests are the automated gate. The manual real-Pi procedure —
-installation, creation, automatic continuation, interactive editing, pause,
-resume, status, restart persistence, clear, and the clear tombstone — is in
+installation, the six Goal command family commands in the `/` menu, creation,
+automatic continuation, interactive editing, pause, resume, status, the
+refusals of the old space-separated spellings, the two argument completions,
+restart persistence, clear, and the clear tombstone — is in
 [smoke-test.md](smoke-test.md).
 
 ## Verification
@@ -390,9 +409,16 @@ To verify the package installation and the interactive surface by hand, follow
       keeps the same hash across restart and cloned branches, refuses
       non-public destinations and unsafe redirects, and never fetches again
 - [ ] automatic continuation at settlement
-- [ ] bare `/goal edit` interactive editing
-- [ ] `/goal pause`, `/goal resume`, and `/goal clear`
-- [ ] `/goal resume --budget <new-total>` after budget exhaustion, including the
+- [ ] the `/` menu lists `/goal`, `/goal:pause`, `/goal:resume`, `/goal:clear`,
+      `/goal:history`, and `/goal:edit` and nothing else matching `goal*`
+- [ ] `/goal ` completes `--budget`, `--no-budget`, `--file`, `--image`, and
+      `--remote-image`; `/goal:resume ` completes `--budget`
+- [ ] bare `/goal:edit` interactive editing
+- [ ] `/goal:pause`, `/goal:resume`, and `/goal:clear`
+- [ ] the old space-separated spellings (`/goal` followed by a space and a bare
+      verb word, or `resume --budget N`) are refused with the command to type
+      and change nothing
+- [ ] `/goal:resume --budget <new-total>` after budget exhaustion, including the
       `--budget=` spelling and the positive-headroom/maximum refusals
 - [ ] the compact status indicator for `active`, `paused`, `blocked`,
       `usage_limited`, `budget_limited`, and `complete`

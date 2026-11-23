@@ -128,7 +128,7 @@ test("tree navigation reconstructs the selected branch: an older snapshot, a tom
 
 		// Clear Goal 1, then create Goal 2 on the same linear branch: the branch now
 		// holds [G1 create, tombstone, G2 create, ...].
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		await session.prompt("/goal Second objective BETA");
 		await abortActiveLoop(session, 7);
@@ -231,7 +231,7 @@ test("abandoned-branch Goal changes never leak into the selected branch", async 
 		await abortActiveLoop(session, 4);
 
 		// Edit on the current branch: revision 1, new objective.
-		await session.prompt("/goal edit Edited objective TWO");
+		await session.prompt("/goal:edit Edited objective TWO");
 		await session.waitForNotify((r) => r.message.includes("objective updated"));
 		await abortActiveLoop(session, 7);
 
@@ -658,7 +658,7 @@ test("cloning after a clear inherits the durable tombstone, not the cleared Goal
 		await session.waitForSettled(1);
 		await session.prompt("/goal Cleared before cloning");
 		await abortActiveLoop(session, 4);
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		const sourceFile = await session.sessionFile();
 		const sourceBefore = readFileSync(sourceFile, "utf8");
@@ -724,7 +724,7 @@ test("restart after tree navigation resumes Pi's selected branch and reconstruct
 		await first.waitForSettled(1);
 		await first.prompt("/goal Original restart objective");
 		await abortActiveLoop(first, 4);
-		await first.prompt("/goal edit Edited restart objective");
+		await first.prompt("/goal:edit Edited restart objective");
 		await first.waitForNotify((r) => r.message.includes("objective updated"));
 		await abortActiveLoop(first, 7);
 
@@ -776,7 +776,7 @@ test("restart after tree navigation resumes Pi's selected branch and reconstruct
 	}
 });
 
-test("a blocked Goal reconstructed from a branch keeps its audit, and /goal resume clears it", async () => {
+test("a blocked Goal reconstructed from a branch keeps its audit, and /goal:resume clears it", async () => {
 	const session = await PiRpcSession.start({ extraExtensions: [TREE_NAV] });
 	// Kickoff, three blocker reports that block the Goal, a get_goal read of the
 	// reconstructed branch, then the resumed work: its kickoff, one continuation,
@@ -844,7 +844,7 @@ test("a blocked Goal reconstructed from a branch keeps its audit, and /goal resu
 		assert.equal(state.blocker, BLOCKER);
 		assert.equal(state.blockerId, issued, "the selected branch reconstructs the audit's Blocker identity");
 
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
 		assert.match(resumed.message, /fresh audit/);
 		assert.match(resumed.message, /revision 4/);

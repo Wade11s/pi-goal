@@ -8,18 +8,36 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
 	PiRpcSession,
 	assertOnlyFailures,
+	assertStepsConsumed,
 	lastGoalSnapshot,
 	readSessionEntries,
 	script,
+	waitForSnapshot,
 } from "./helpers/rpc-harness.mjs";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
+
+/** The Goal command family, exactly as Pi lists it. */
+const GOAL_COMMANDS = ["goal", "goal:pause", "goal:resume", "goal:clear", "goal:history", "goal:edit"];
+
+/** Every raw `goal-state` line of the session, as bytes, for a before/after "nothing happened" proof. */
+async function goalBytes(session) {
+	return readFileSync(await session.sessionFile(), "utf8")
+		.split("\n")
+		.filter((line) => line.trim() !== "" && line.includes('"goal-state"'))
+		.join("\n");
+}
+
+/** The number of `goal-history` records on the branch. */
+async function historyCount(session) {
+	return readSessionEntries(await session.sessionFile()).filter((entry) => entry.customType === "goal-history").length;
+}
 
 /**
  * Stop an active Goal's continuation loop deliberately.
@@ -44,9 +62,19 @@ test("loading the extension exposes /goal and leaves Goal-less sessions unchange
 	const session = await PiRpcSession.start();
 	script([{ text: "Hello from the scripted provider." }], session);
 	try {
-		// /goal is discoverable as an extension command.
+		// The Goal command family is discoverable as six extension commands, and
+		// nothing else matching goal* is registered: no /goal:status, no
+		// /goal:create.
 		const { commands } = await session.getCommands();
-		assert.ok(commands.some((c) => c.name === "goal" && c.source === "extension"));
+		const family = commands.filter((c) => c.name.startsWith("goal"));
+		assert.deepEqual(
+			family.map((c) => c.name).sort(),
+			[...GOAL_COMMANDS].sort(),
+		);
+		for (const command of family) {
+			assert.equal(command.source, "extension");
+			assert.ok(command.description && command.description.length > 0, `/${command.name} is described in the / menu`);
+		}
 
 		// An ordinary prompt runs exactly one agent run and settles normally.
 		const response = await session.prompt("Hello there");
@@ -541,36 +569,189 @@ test("two /goal commands issued while Pi is busy create exactly one Goal", async
 	}
 });
 
-test("objectives that merely begin with a reserved subcommand word are accepted", async () => {
+test("the old space-separated spellings are refused with the command to type, and touch nothing", async () => {
 	const session = await PiRpcSession.start();
 	// Kickoff, its continuation, and a held response so the loop stops
-	// deliberately with the Goal still active.
+	// deliberately with the Goal still active: an unfinished Goal is what a
+	// misread `/goal pause` would have asked to replace.
 	script([{ text: "On it." }, { text: "Continuing." }, { hang: true }], session);
 	try {
-		const objective = "clear the lint errors and make the build green";
-		const response = await session.prompt(`/goal ${objective}`);
-		assert.equal(response.data.disposition, "handled");
+		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await abortActiveLoop(session, 3);
+		const before = await goalBytes(session);
+		const historyBefore = await historyCount(session);
+		const runs = session.records.filter((r) => r.type === "agent_start").length;
 
-		await session.prompt("/goal");
-		const notify = await session.waitForNotify(
-			(r) => r.message.includes(objective) && r.message.includes("active"),
+		// Every reserved word, in both cases and with surrounding whitespace, plus
+		// the budget-raising spelling in both forms. Each is refused with the Goal
+		// command to type instead — never aliased, never created.
+		const refused = [
+			["pause", "/goal pause", "Goal not created: `pause` is a Goal command; use /goal:pause."],
+			["Pause", "/goal Pause", "Goal not created: `pause` is a Goal command; use /goal:pause."],
+			["PAUSE", "/goal PAUSE", "Goal not created: `pause` is a Goal command; use /goal:pause."],
+			["padded", "/goal   pause  ", "Goal not created: `pause` is a Goal command; use /goal:pause."],
+			["resume", "/goal resume", "Goal not created: `resume` is a Goal command; use /goal:resume."],
+			["RESUME", "/goal RESUME", "Goal not created: `resume` is a Goal command; use /goal:resume."],
+			["clear", "/goal clear", "Goal not created: `clear` is a Goal command; use /goal:clear."],
+			["Clear", "/goal Clear", "Goal not created: `clear` is a Goal command; use /goal:clear."],
+			["history", "/goal history", "Goal not created: `history` is a Goal command; use /goal:history."],
+			["History", "/goal History", "Goal not created: `history` is a Goal command; use /goal:history."],
+			["edit", "/goal edit", "Goal not created: `edit` is a Goal command; use /goal:edit."],
+			["EDIT", "/goal EDIT", "Goal not created: `edit` is a Goal command; use /goal:edit."],
+			[
+				"budget",
+				"/goal resume --budget 150",
+				"Goal not created: `resume --budget` is a Goal command; use /goal:resume --budget <new-total> (or --budget=<new-total>).",
+			],
+			[
+				"budget=",
+				"/goal resume --budget=150",
+				"Goal not created: `resume --budget` is a Goal command; use /goal:resume --budget <new-total> (or --budget=<new-total>).",
+			],
+			[
+				"Budget mixed case",
+				"/goal Resume --budget 150",
+				"Goal not created: `resume --budget` is a Goal command; use /goal:resume --budget <new-total> (or --budget=<new-total>).",
+			],
+		];
+		for (const [label, command, message] of refused) {
+			const mark = session.records.length;
+			const response = await session.prompt(command);
+			assert.equal(response.data.disposition, "handled", command);
+			const notify = await session.notifyAfter(mark, (r) => r.message.includes("Goal not created"));
+			assert.equal(notify.notifyType, "error", `${command}: an error, not a warning`);
+			assert.equal(notify.message, message, `${command} names the verb command to type`);
+			assert.equal(await goalBytes(session), before, `${command} wrote no Goal bytes`);
+			assert.equal(await historyCount(session), historyBefore, `${command} appended no history record`);
+		}
+		// Nothing ran, no replacement was asked, and the Goal is exactly as it was.
+		assert.equal(session.records.filter((r) => r.type === "agent_start").length, runs, "no run started");
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"no replacement confirmation was asked",
 		);
-		assert.ok(notify);
+		await session.prompt("/goal");
+		const status = await session.waitForNotify((r) => r.message.includes(OBJECTIVE) && r.message.includes("active"));
+		assert.ok(status);
+		assert.equal(lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.status, "active");
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+	} finally {
+		await session.stop();
+	}
+});
 
-		// Exact reserved words are now real subcommands: /goal clear clears the
-		// active Goal (durably — a tombstone snapshot), and the session reports
-		// that no Goal is set anymore.
-		await session.prompt("/goal clear");
+test("a stray argument on a verb command is a usage error that touches nothing", async () => {
+	const session = await PiRpcSession.start();
+	script([{ text: "On it." }, { text: "Continuing." }, { hang: true }], session);
+	try {
+		await session.prompt(`/goal ${OBJECTIVE}`);
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		await abortActiveLoop(session, 3);
+		const before = await goalBytes(session);
+		const runs = session.records.filter((r) => r.type === "agent_start").length;
+
+		for (const [command, message] of [
+			["/goal:pause foo", "/goal:pause takes no argument."],
+			["/goal:clear the lint errors", "/goal:clear takes no argument."],
+			["/goal:history of the release", "/goal:history takes no argument."],
+			["/goal:resume", null],
+		]) {
+			const mark = session.records.length;
+			const response = await session.prompt(command);
+			assert.equal(response.data.disposition, "handled", command);
+			if (message === null) {
+				// Bare `/goal:resume` of an active Goal is a no-op notice, not a usage
+				// error: the command takes no argument and got none.
+				await session.notifyAfter(mark, (r) => r.message.includes("already active"));
+			} else {
+				const notify = await session.notifyAfter(mark, (r) => r.message.includes("takes no argument"));
+				assert.equal(notify.notifyType, "error", command);
+				assert.equal(notify.message, message, command);
+			}
+			assert.equal(await goalBytes(session), before, `${command} wrote no Goal bytes`);
+		}
+		for (const [command, pattern] of [
+			["/goal:resume foo", /\/goal:resume takes no argument except --budget <new-total>/],
+			["/goal:resume 150", /\/goal:resume takes no argument except --budget <new-total>/],
+		]) {
+			const mark = session.records.length;
+			await session.prompt(command);
+			const notify = await session.notifyAfter(mark, (r) => r.message.includes("Goal not resumed"));
+			assert.equal(notify.notifyType, "error", command);
+			assert.match(notify.message, pattern, command);
+			assert.equal(await goalBytes(session), before, `${command} wrote no Goal bytes`);
+		}
+		assert.equal(session.records.filter((r) => r.type === "agent_start").length, runs, "no run started");
+
+		// The bare verbs still commit exactly as they did under the old spelling.
+		await session.prompt("/goal:pause");
+		const paused = await session.waitForNotify((r) => r.message.includes("paused (revision"));
+		assert.equal(paused.notifyType, "info");
+		assert.equal(lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.status, "paused");
+		await session.prompt("/goal:history");
+		await session.waitForNotify((r) => r.message.includes("paused"));
+		await session.prompt("/goal:clear");
 		const cleared = await session.waitForNotify((r) => r.message.includes("cleared"));
 		assert.equal(cleared.notifyType, "info");
-		assert.match(cleared.message, /back to ordinary prompt behavior/);
-		await session.prompt("/goal");
-		await session.waitForNotify((r) => r.message.includes("No Goal is set"));
-		const clearedEntries = readSessionEntries(await session.sessionFile());
-		assert.equal(lastGoalSnapshot(clearedEntries).data.goal, null, "clear wrote a tombstone snapshot");
+		assert.equal(lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal, null, "clear wrote a tombstone");
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 		assertOnlyFailures(session, [{ stopReason: "aborted" }]);
+	} finally {
+		await session.stop();
+	}
+});
+
+test("/goal Edit the README to add X and /goal Clear the lint errors create Goals", async () => {
+	const session = await PiRpcSession.start();
+	// Kickoff, its continuation, and a held response so the first loop stops
+	// deliberately; the replacement's own kickoff then completes it.
+	script(
+		[
+			{ text: "On it." },
+			{ text: "Continuing." },
+			{ hang: true },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
+	try {
+		// The regression for the old first-word hijack: `edit` as the first word used
+		// to be applied as an edit of the *current* Goal instead of creating one.
+		const created = await session.prompt("/goal Edit the README to add X");
+		assert.equal(created.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated"));
+		assert.equal(
+			lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.objective,
+			"Edit the README to add X",
+		);
+		await abortActiveLoop(session, 3);
+
+		// Only the bare word is reserved: an Objective that merely begins with `clear`
+		// is still an Objective, and replacing the unfinished Goal still asks first.
+		const replaceId = "replace-with-clear-the-lint-errors";
+		const replaceResponse = session.waitFor(
+			"response for the replacement",
+			(records) => records.find((r) => r.type === "response" && r.id === replaceId),
+		);
+		session.writeCommand({ id: replaceId, type: "prompt", message: "/goal Clear the lint errors" });
+		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
+		const replaced = await replaceResponse;
+		assert.equal(replaced.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		// The replacement's own kickoff completes it. Five provider responses in
+		// all: the first kickoff, its continuation, the held one, the completion,
+		// and the completion's own wrap-up turn.
+		await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the replacement to complete");
+		const entries = readSessionEntries(await session.sessionFile());
+		const snapshot = lastGoalSnapshot(entries);
+		assert.equal(snapshot.data.goal.objective, "Clear the lint errors");
+		assert.equal(snapshot.data.goal.status, "complete");
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
 	} finally {
 		await session.stop();
 	}
@@ -589,7 +770,7 @@ test("create rejects invalid objectives and refuses to replace an existing Goal"
 
 		// Subcommands with no Goal to act on report that clearly instead of
 		// pretending a Goal exists.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		const noGoal = await session.waitForNotify((r) => r.message.includes("No Goal is set"));
 		assert.equal(noGoal.notifyType, "info");
 

@@ -54,7 +54,7 @@ are excluded in every lifecycle status.
 External child usage follows **observation-time ownership** in V1. A provider
 returns only the newly observed delta on the parent tool result, and that delta
 belongs to the admission segment that observes it. Consequently, child work
-performed while a Goal is paused but first observed after `/goal resume` can
+performed while a Goal is paused but first observed after `/goal:resume` can
 belong to the resumed segment; it is not retroactively attributed to the paused
 segment. The same boundary rule applies to durable replay: the persisted parent
 tool result, not the child's private snapshot, is the accounting record. Strict

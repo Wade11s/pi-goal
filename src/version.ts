@@ -10,4 +10,4 @@
  * `package.json`'s `version`, so a release that bumps one and not the other
  * fails the gate instead of shipping a wrong metrics value.
  */
-export const PI_GOAL_VERSION = "0.1.1";
+export const PI_GOAL_VERSION = "0.2.0";

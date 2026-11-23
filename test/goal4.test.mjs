@@ -63,7 +63,7 @@ async function abortActiveLoop(session, runs) {
 	return session.waitForSettled(1);
 }
 
-test("/goal edit changes the objective in place while idle, keeps history, and restarts work", async () => {
+test("/goal:edit changes the objective in place while idle, keeps history, and restarts work", async () => {
 	const session = await PiRpcSession.start();
 	// Kickoff, its continuation, a held response so the loop stops deliberately,
 	// then the edit kickoff, its continuation, and the wrap-up after completion.
@@ -84,7 +84,7 @@ test("/goal edit changes the objective in place while idle, keeps history, and r
 		await abortActiveLoop(session, 3);
 		const before = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 
-		const response = await session.prompt("/goal edit Ship the release notes page instead");
+		const response = await session.prompt("/goal:edit Ship the release notes page instead");
 		assert.equal(response.data.disposition, "handled");
 		const edited = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.equal(edited.notifyType, "info");
@@ -135,7 +135,7 @@ test("/goal edit changes the objective in place while idle, keeps history, and r
 	}
 });
 
-test("/goal edit while a run is active steers it immediately and never waits for idle", async () => {
+test("/goal:edit while a run is active steers it immediately and never waits for idle", async () => {
 	const session = await PiRpcSession.start();
 	// The gated kickoff response keeps the run provably mid-flight until the test
 	// releases it; the steered turn and the completion follow.
@@ -157,7 +157,7 @@ test("/goal edit while a run is active steers it immediately and never waits for
 		// Edit while the model request is still held: the command must complete
 		// (response "handled") *before* the gate is released — an implementation
 		// waiting for idle behind the Goal's own run could never do that.
-		const editResponsePromise = submitCommand(session, "edit-1", "/goal edit Fix the flaky integration tests");
+		const editResponsePromise = submitCommand(session, "edit-1", "/goal:edit Fix the flaky integration tests");
 		const editResponse = await editResponsePromise;
 		assert.equal(editResponse.data.disposition, "handled");
 		const edited = await session.waitForNotify((r) => r.message.includes("objective updated"));
@@ -196,7 +196,7 @@ test("/goal edit while a run is active steers it immediately and never waits for
 	}
 });
 
-test("/goal pause while a run is active takes effect immediately and never aborts it", async () => {
+test("/goal:pause while a run is active takes effect immediately and never aborts it", async () => {
 	const session = await PiRpcSession.start();
 	// The gated kickoff response holds the run open; the next step answers the
 	// ordinary prompt sent after the pause.
@@ -209,7 +209,7 @@ test("/goal pause while a run is active takes effect immediately and never abort
 
 		// Pause while the model request is still held: the response must arrive
 		// before the gate is released (no waiting for the run to become idle).
-		const pauseResponse = await submitCommand(session, "pause-1", "/goal pause");
+		const pauseResponse = await submitCommand(session, "pause-1", "/goal:pause");
 		assert.equal(pauseResponse.data.disposition, "handled");
 		const paused = await session.waitForNotify((r) => r.message.includes("paused"));
 		assert.equal(paused.notifyType, "info");
@@ -266,24 +266,24 @@ test("pause then edit then resume: paused Goals do not run, edits stick, resume 
 		const created = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 
 		// Pause while idle: durable, no run.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		const paused = await session.waitForNotify((r) => r.message.includes("paused"));
 		assert.match(paused.message, /revision 1/);
 
 		// Pausing again is an idempotent no-op.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("already paused"));
 
 		// Editing a paused Goal updates the objective but starts nothing.
 		const runsAtPause = runCount(session);
-		await session.prompt("/goal edit Land the refined objective end to end");
+		await session.prompt("/goal:edit Land the refined objective end to end");
 		const edited = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(edited.message, /revision 2/);
 		assert.match(edited.message, /stays paused/);
 		assert.equal(runCount(session), runsAtPause, "editing a paused Goal starts no run");
 
 		// Resume restarts eligible work with a fresh kickoff and retained progress.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
 		assert.match(resumed.message, /revision 3/);
 		assert.match(resumed.message, /retained progress/);
@@ -293,7 +293,7 @@ test("pause then edit then resume: paused Goals do not run, edits stick, resume 
 		await session.waitFor("resumed run started", (records) =>
 			records.filter((r) => r.type === "agent_start").length >= 3 ? true : undefined,
 		);
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("already active"));
 
 		writeFileSync(gate, "", "utf8");
@@ -330,7 +330,7 @@ test("pause then edit then resume: paused Goals do not run, edits stick, resume 
 	}
 });
 
-test("/goal clear writes a durable tombstone and restores ordinary behavior across a restart", async () => {
+test("/goal:clear writes a durable tombstone and restores ordinary behavior across a restart", async () => {
 	const workDir = mkdtempSync(join(tmpdir(), "pi-goal-work-"));
 	const session = await PiRpcSession.start({ cwd: workDir });
 	script([{ text: "On it." }, { hang: true }, { text: "Ordinary answer." }], session);
@@ -341,7 +341,7 @@ test("/goal clear writes a durable tombstone and restores ordinary behavior acro
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await abortActiveLoop(session, 2);
 
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		const cleared = await session.waitForNotify((r) => r.message.includes("cleared"));
 		assert.equal(cleared.notifyType, "info");
 		assert.match(cleared.message, /back to ordinary prompt behavior/);
@@ -395,7 +395,7 @@ test("/goal clear writes a durable tombstone and restores ordinary behavior acro
 	}
 });
 
-test("/goal clear while a run is active responds immediately and stops continuation at settlement", async () => {
+test("/goal:clear while a run is active responds immediately and stops continuation at settlement", async () => {
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "provider-gate");
 	script([{ text: "Working.", waitForFile: gate }, { text: "Ordinary answer." }], session);
@@ -406,7 +406,7 @@ test("/goal clear while a run is active responds immediately and stops continuat
 
 		// Clear while the model request is still held: the response must arrive
 		// before the gate is released.
-		const clearResponse = await submitCommand(session, "clear-1", "/goal clear");
+		const clearResponse = await submitCommand(session, "clear-1", "/goal:clear");
 		assert.equal(clearResponse.data.disposition, "handled");
 		const cleared = await session.waitForNotify((r) => r.message.includes("cleared"));
 		assert.equal(cleared.notifyType, "info");
@@ -613,7 +613,7 @@ test("the model can pause only with a corroborated explicit user request, and ne
 		assert.equal(runCount(session), 2, "the request run and the kickoff run");
 
 		// The user owns resuming after a model-requested pause.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
 		assert.match(resumed.message, /revision 2/);
 		await session.waitForSettled(3);
@@ -679,20 +679,20 @@ test("lifecycle subcommands without a Goal report clearly and start nothing", as
 	const session = await PiRpcSession.start();
 	script([{ text: "Never requested." }], session);
 	try {
-		for (const command of ["/goal pause", "/goal resume", "/goal clear"]) {
+		for (const command of ["/goal:pause", "/goal:resume", "/goal:clear"]) {
 			const response = await session.prompt(command);
 			assert.equal(response.data.disposition, "handled");
 			const notify = await session.waitForNotify((r) => r.message.includes("No Goal is set"));
 			assert.equal(notify.notifyType, "info");
 		}
 
-		await session.prompt("/goal edit Fresh objective text");
+		await session.prompt("/goal:edit Fresh objective text");
 		const noEdit = await session.waitForNotify((r) => r.message.includes("no Goal to edit"));
 		assert.equal(noEdit.notifyType, "warning");
 
-		// Bare `/goal edit` is the interactive editing entry point. With no Goal
+		// Bare `/goal:edit` is the interactive editing entry point. With no Goal
 		// there is nothing to edit, so it reports that and opens no dialog.
-		await session.prompt("/goal edit");
+		await session.prompt("/goal:edit");
 		const noGoal = await session.waitForNotify((r) => r.message.includes("no Goal to edit"));
 		assert.equal(noGoal.notifyType, "warning");
 		assert.equal(
@@ -701,9 +701,14 @@ test("lifecycle subcommands without a Goal report clearly and start nothing", as
 			"no editor dialog was opened",
 		);
 
-		// Case-insensitive subcommand recognition.
-		await session.prompt("/goal EDIT reworded objective");
-		await session.waitForNotify((r) => r.message.includes("no Goal to edit"));
+		// Case-insensitivity belongs to the reserved-word guard, not to the command
+		// names: Pi dispatches on the text before the first space and looks the name
+		// up exactly, so `/goal:PAUSE` is not a lifecycle command — it is prompt text.
+		// The `/goal` creation path still catches the old spelling in any case and
+		// with surrounding whitespace, names the verb to type, and starts nothing.
+		await session.prompt("/goal  EDIT  ");
+		const refused = await session.waitForNotify((r) => r.message.includes("is a Goal command; use /goal:edit"));
+		assert.equal(refused.notifyType, "error");
 
 		assert.equal(session.records.filter((r) => r.type === "agent_start").length, 0, "no run was started");
 		assert.equal(

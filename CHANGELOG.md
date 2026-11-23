@@ -6,6 +6,45 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
 ## [Unreleased]
 
+**Breaking** — the Goal command family is colon-namespaced (0.2.0). Pi
+registers six commands instead of one, and the old space-separated subcommands
+are refused rather than aliased. A Codex user is corrected once, with the right
+spelling in the message; nothing is silently reinterpreted.
+
+- The user lifecycle controls are now `/goal` (create with an Objective, inspect
+  without one) plus `/goal:pause`, `/goal:resume [--budget N | --budget=N]`,
+  `/goal:clear`, `/goal:history`, and `/goal:edit`. Each verb is its own `/`
+  menu line with its own description, and `/goal ` completes the creation flags
+  while `/goal:resume ` completes `--budget`.
+- **The old spellings are refused with the right spelling in the message.**
+  `/goal pause`, `/goal resume`, `/goal clear`, `/goal history`, `/goal edit`
+  (any case, surrounding whitespace ignored), and `/goal resume --budget …`
+  answer *"Goal not created: `pause` is a Goal command; use /goal:pause."* (the
+  resume case names `/goal:resume --budget`) and touch no Goal, session, or
+  history record. There are no aliases.
+- **`/goal Edit the README to add X` now creates a Goal.** An Objective is only
+  ever the argument of `/goal`, so `edit` as a first word no longer means "edit
+  the current Goal", and `Clear the lint errors`, `Resume work on X`, and
+  `history of the release` stay ordinary Objectives. A stray argument on a verb
+  that takes none (`/goal:pause foo`) is a usage error that mutates nothing.
+- **The Goal command bridge is version 2.** A request carries Pi's own dispatch
+  shape — `{ version: 2, id, name, args, reply }`, where `name` is one of the
+  six commands — instead of "the text after `/goal`". A version-1 request is
+  refused with the upgrade message, a `name` outside the family is dropped as
+  malformed, and the dispositions, transitions filter, once-only reply, busy
+  guard, and session-control guard are unchanged.
+- **The RPC companion no longer mirrors pi-goal's parser** and is bumped to
+  `0.2.0` with the bridge. Its `thread/goal/get`, `set`, and `clear` methods,
+  params, and `authority: "external-user"` rule are unchanged, but a `set` whose
+  Objective is `clear` is now refused by pi-goal itself with its own diagnostic
+  (returned as `refused`, verbatim, with the Goal bytes unchanged) and a `set`
+  whose Objective begins with `edit` is now created.
+- Unchanged: Lifecycle statuses, Admission control, Continuation, the Blocked
+  audit, budgets, accounting, attachments, session naming, the resume prompt, the
+  progress-plan tool, metrics, the Goal-updated event stream, `create_goal`'s own
+  creation authority (it still accepts any Objective, including `clear`), and the
+  bridge channel name. Decision record: ADR-0002.
+
 - Add the optional Codex-shaped Goal RPC companion
   (`companion/goal-rpc`): independently installable, no dependency on pi-goal,
   removable without affecting pi-goal. It maps `thread/goal/get`,
@@ -27,20 +66,21 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   `docs/behavior/companion.md`, including the honest difference from Codex's
   private in-tree app-server methods (Codex-shaped names, not a wire-compatible
   protocol). Deterministic coverage: `test/goal56-command-bridge.test.mjs` and
-  `test/goal56-goal-rpc-companion.test.mjs`. The companion refuses a `set`
-  objective that pi-goal's command surface would read as anything other than a
-  create (the subcommands `pause`/`clear`/`history`/`edit`/`resume`, anything led
-  by `edit` or `resume --budget`, and any leading option token) before rendering
-  command text, so a host `set` can never clear, pause, resume, or edit the
-  current Goal; its request envelope requires `version: 1` and refuses unknown
-  top-level fields. The bridge's session-control guard covers the whole surface Pi
+  `test/goal56-goal-rpc-companion.test.mjs`. The companion holds no copy of
+  pi-goal's parser: an Objective is only ever the argument of `/goal`, so a `set`
+  has no text it could write that becomes a lifecycle verb, and the one shape the
+  old spelling left — an Objective that is the bare word `clear` — is refused by
+  pi-goal's own creation path and returned through the bridge as `refused` with
+  the diagnostic verbatim and the Goal bytes unchanged. Its own request envelope
+  still requires `version: 1` and refuses unknown top-level fields. The bridge's
+  session-control guard covers the whole surface Pi
   offers a command handler (`newSession`, `fork`, `navigateTree`, `switchSession`,
   `reload`, `abort`, `shutdown`, `compact`), and a bridged request is answered
   exactly once even when the caller's reply callback throws.
 
 - Add the non-authoritative durable Goal audit history: every committed transition
   covered by `pi-goal:updated` is appended to the session branch as a `goal-history`
-  entry and rendered read-only by `/goal history`. Each record carries the
+  entry and rendered read-only by `/goal:history`. Each record carries the
   committed identity, revision, transition, previous and current Lifecycle
   statuses, timestamp, usage summary, Active elapsed time, and attachment manifest
   hashes when present — never attachment contents and never objective text. The
@@ -130,7 +170,7 @@ git:github.com/Wade11s/pi-goal@vX.Y.Z`.
   documented in the entry above and in `docs/behavior/attachments.md`.
 - Add the opt-in paused-Goal resume prompt (`goal.resumePrompt`, default `false`):
   one confirmation at session start for a restored `paused` Goal. Accepting runs
-  the same durable `/goal resume` transition (same identity and history, fresh
+  the same durable `/goal:resume` transition (same identity and history, fresh
   Blocked audit); declining, dismissing, timing out, or having no interactive UI
   leaves the Goal unchanged. It is never offered for any other Lifecycle status,
   never makes print/JSON/headless startup wait, and is not offered at all while

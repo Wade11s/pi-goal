@@ -77,7 +77,7 @@ test("the metrics stream mirrors committed transitions and carries no sensitive 
 		await session.prompt(`/goal --budget 100 ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await session.waitForSettled(1);
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
 		const entries = readSessionEntries(await session.sessionFile());
@@ -191,7 +191,7 @@ test("a failing metrics consumer cannot roll back a transition or create a false
 		// Arm the consumer's injected failure for the paused transition, then pause.
 		await session.prompt("/metricsfail paused");
 		await session.waitForNotify((r) => r.message.includes("metricsfail armed"));
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 
 		// The transition committed and was reported as a success: the durable
 		// snapshot exists, the pause was announced, and no extension error turned
@@ -226,7 +226,7 @@ test("a failing metrics consumer cannot roll back a transition or create a false
 		// metric for the transition that follows the failure.
 		await session.prompt("/metricsfail");
 		await session.waitForNotify((r) => r.message.includes("metricsfail disarmed"));
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		assert.deepEqual(
 			metricsLog(readSessionEntries(await session.sessionFile())).map((entry) => entry.metrics.kind),

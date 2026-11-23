@@ -42,7 +42,7 @@ top-level field, an unknown parameter, and an unknown method are all answered
 | --- | --- | --- |
 | `thread/goal/get` | none | bare `/goal` |
 | `thread/goal/set` | `objective`, `budget` (`number` \| `null`), `files`, `images` | `/goal [--budget N\|--no-budget] [--file p] [--image p] <objective>` |
-| `thread/goal/clear` | none | `/goal clear` |
+| `thread/goal/clear` | none | `/goal:clear` |
 
 Each call appends one `goal-rpc-response` session entry (published on Pi's RPC
 stream as `entry_appended`):
@@ -65,6 +65,8 @@ stream as `entry_appended`):
 `ok` is true only for a durable commit (or a successful read). `error.code` is one
 of `unauthorized`, `invalid-request`, `unavailable`, `refused`, `declined`,
 `invalid-command`, and `error.message` carries pi-goal's own diagnostics verbatim.
+`invalid-command` means pi-goal said the named command was not a registered
+command at dispatch time, so nothing ran.
 
 Mutating methods require `"authority": "external-user"`: the host's assertion that
 a real user action is behind the call. `"model"` is refused with a message pointing
@@ -83,13 +85,16 @@ local paths handed to pi-goal's attachment options.
 
 - A `set` against an unfinished Goal opens pi-goal's replacement confirmation; the
   call stays unanswered until the host answers the dialog (or it times out).
-- A `set` objective is refused when pi-goal's command surface would read it as
-  something other than a create: the subcommands `pause`/`clear`/`history`/`edit`/
-  `resume`, anything led by `edit` or `resume --budget`, and anything led by
-  `--budget`/`--no-budget`/`--file`/`--image`/`--remote-image`. The refusal names
-  the collision and states that nothing ran, so a `set` can never clear, pause,
-  resume, or edit the current Goal. An objective that merely *starts* with one of
-  those words ("clear the cache") is still a create.
+- A `set` objective is pi-goal's to accept or refuse, exactly as if it had been
+  typed after `/goal`. The lifecycle verbs are their own command names, which a
+  `set` never sends, so no objective can become a pause, clear, resume, edit, or
+  history request. The one shape the old space-separated spelling left — an
+  objective that is the bare word `clear`, `pause`, `history`, `resume`, or
+  `edit` — is refused by pi-goal itself, with its own diagnostic returned here
+  verbatim as `refused` and the durable Goal bytes unchanged. An objective that
+  merely *starts* with one of those words ("clear the cache", "edit the release
+  notes") is created, and a leading option token is consumed by pi-goal's
+  creation path just as when it is typed.
 - `files`/`images` paths with whitespace are refused rather than reinterpreted
   (pi-goal's command surface has no quoting).
 - `PI_GOAL_RPC_TIMEOUT_MS` bounds the wait for a pi-goal answer (default 120 s); a

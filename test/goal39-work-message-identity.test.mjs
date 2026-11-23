@@ -151,14 +151,14 @@ test("a stale queued resume for a cleared Goal cannot open the new Goal's admiss
 
 		// Pause then resume while B's kickoff is in flight: the resume work message
 		// is queued as a steer and has not been delivered yet.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed"));
 
 		// Clear B, then create C with a token budget of 1. C commits active and
 		// waits for the in-flight B run.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		const createPromise = submitCommand(session, "create-c", `/goal --budget 1 ${OBJECTIVE_C}`);
 		const c = await waitForStoredGoal(
@@ -256,9 +256,9 @@ test("a stale queued resume for a replaced Goal stays on the old identity and ne
 		await waitForTurns(session, 1);
 		const b = currentGoalSnapshot(goalSnapshots(readSessionEntries(await session.sessionFile()))).data.goal;
 
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed"));
 
 		// Replace B with C while B's kickoff is in flight. The replacement confirms,
@@ -328,9 +328,9 @@ test("a legitimate same-identity resume still opens its own Goal's admission", a
 		await waitForTurns(session, 1);
 		const goal = currentGoalSnapshot(goalSnapshots(readSessionEntries(await session.sessionFile()))).data.goal;
 
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed"));
 
 		writeFileSync(gate, "", "utf8");

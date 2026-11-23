@@ -3,7 +3,8 @@
 This procedure verifies the user-facing package against a real Pi process: the
 documented installation workflow, Goal creation, automatic continuation,
 interactive objective editing, pause, resume, status reporting, restart
-persistence, and clear. It is a manual complement to the deterministic RPC suite
+persistence, clear, and the colon-namespaced command family with its
+old-spelling refusals. It is a manual complement to the deterministic RPC suite
 (`npm test`), which remains the automated gate.
 
 ## Prerequisites
@@ -42,7 +43,11 @@ Expect the checkout path under **User packages** (or **Project packages** for
 pi
 ```
 
-The extension registers `/goal`, `get_goal`, `create_goal`, and `update_goal`.
+The extension registers six Goal commands — `/goal`, `/goal:pause`,
+`/goal:resume`, `/goal:clear`, `/goal:history`, and `/goal:edit` — plus the
+`get_goal`, `create_goal`, and `update_goal` model tools. Typing `/` lists each
+command on its own line with its own description, and there is no `/goal:status`
+and no `/goal:create` (bare `/goal` and `/goal <objective>` already are those).
 When a UI exists, the footer/status bar shows a compact Goal indicator as soon as
 a Goal exists.
 
@@ -77,7 +82,7 @@ asks for an evidence audit. `/goal` still reports `active`.
 ## 6. Edit the objective interactively
 
 ```
-/goal edit
+/goal:edit
 ```
 
 Pi opens a multi-line editor prefilled with the current objective. Change it to:
@@ -93,7 +98,7 @@ the editor leaves the objective unchanged.
 ## 7. Pause
 
 ```
-/goal pause
+/goal:pause
 ```
 
 Expect a `Goal ... paused` notification and the status indicator changes to
@@ -111,7 +116,7 @@ Expect `paused` with the paused-state hint line.
 ## 9. Resume
 
 ```
-/goal resume
+/goal:resume
 ```
 
 Expect a `Goal ... resumed` notification, the status indicator returns to
@@ -141,7 +146,7 @@ objective, revision history, accounted usage, and active time.
 ## 12. Clear
 
 ```
-/goal clear
+/goal:clear
 /goal
 ```
 
@@ -173,20 +178,20 @@ A `budget_limited` Goal is resumed only by raising its cumulative ceiling. Run
 the commands below in order, while the Goal is still `budget_limited`:
 
 ```
-/goal resume
-/goal resume --budget 1
-/goal resume --budget=500
+/goal:resume
+/goal:resume --budget 1
+/goal:resume --budget=500
 ```
 
 - The bare resume is refused with guidance to supply a new total
-  (`/goal resume --budget <new-total>`).
+  (`/goal:resume --budget <new-total>`).
 - A value at or below the current usage is refused with the no-positive-headroom
   reason, and the Goal stays `budget_limited`. `--budget 1` is always such a
   value here: the Goal was created with `--budget 1`, so its usage has already
   reached that total.
 - A value above the configured `goal.maxTokenBudget` is refused, never clamped,
   and the Goal also stays `budget_limited`. With `"maxTokenBudget": 100000` set
-  in Pi settings, `/goal resume --budget=200000` shows the refusal; without a
+  in Pi settings, `/goal:resume --budget=200000` shows the refusal; without a
   configured maximum no raise is refused on that ground.
 - `--budget=500` — the `=` spelling, on a still-`budget_limited` Goal — is the
   successful raise. It sets the absolute ceiling to 500 tokens and the Goal
@@ -195,13 +200,13 @@ the commands below in order, while the Goal is still `budget_limited`:
 - A further `--budget` after a successful raise (for example `--budget=250`
   tried out of habit) is refused for status, not for headroom or maximum:
   "the `--budget` option only resumes a budget_limited Goal". Use a bare
-  `/goal resume`, which reports the Goal already active, or let the resumed work
+  `/goal:resume`, which reports the Goal already active, or let the resumed work
   exhaust the new ceiling first so the Goal is `budget_limited` again.
 - The pending old-episode wrap-up is cancelled by a valid raise. If the resumed
   work later exhausts the new ceiling, the Goal is `budget_limited` again and
   another raise — either spelling — resumes it; exactly one fresh wrap-up is
   delivered for that new exhaustion episode.
-- `/goal edit <objective>` without a resume preserves `budget_limited` and does
+- `/goal:edit <objective>` without a resume preserves `budget_limited` and does
   not cancel an owed wrap-up; edit first, then resume with the new budget.
 
 ## 15. Optional: RPC / headless check
@@ -215,8 +220,8 @@ pi --mode rpc -e ./
 ```
 
 A host that implements the RPC extension-UI subprotocol can answer the
-`/goal edit` editor dialog; a host without a dialog-capable UI receives guidance
-to use `/goal edit <objective>` instead of a blocking terminal dialog.
+`/goal:edit` editor dialog; a host without a dialog-capable UI receives guidance
+to use `/goal:edit <objective>` instead of a blocking terminal dialog.
 
 ## 16. Optional: blocker identity and the blocked audit
 
@@ -240,7 +245,7 @@ consecutive Goal turns, using the identity pi-goal issues.
   action, a resume, or a Replacement Goal.
 - `/goal` shows the blocker description and the `Blocked audit: N of 3` count. It
   deliberately does not show the opaque identity.
-- `/goal resume` after the stop restarts the Goal with a fresh audit.
+- `/goal:resume` after the stop restarts the Goal with a fresh audit.
 
 ## 17. Optional: legacy 0.1.0 cutover
 
@@ -313,9 +318,9 @@ with a real provider.
 
 1. Create a Goal whose run stays busy for several turns, and let its first turn
    land.
-2. `/goal pause`, then `/goal resume` immediately: the resume work message is
+2. `/goal:pause`, then `/goal:resume` immediately: the resume work message is
    queued as a steer while the run is busy.
-3. `/goal clear`, then `/goal --budget 1 <objective>` for the new Goal.
+3. `/goal:clear`, then `/goal --budget 1 <objective>` for the new Goal.
 4. Let the queued message land.
 
 Expect the new Goal's own kickoff to be delivered exactly once and its ledger to
@@ -352,22 +357,22 @@ reproduce the user-visible surface by hand.
    `... no continuation was requested at this settlement` notification. Bare
    `/goal` twice a few seconds apart: `Active time` must still be increasing —
    disabling the extension does not stop the clock.
-5. Try `/goal <objective>`, `/goal edit <objective>`, and `/goal resume`. Expect a
+5. Try `/goal <objective>`, `/goal:edit <objective>`, and `/goal:resume`. Expect a
    refusal naming what is refused and what still works; no replacement
    confirmation dialog may open.
-6. `/goal pause`, then `/goal edit <objective>`: the edit of an already-stopped
+6. `/goal:pause`, then `/goal:edit <objective>`: the edit of an already-stopped
    Goal is allowed and says no work was started.
 7. Remove the setting (or set it to `true`) and restart on the same session. The
    restored active Goal continues at the next settlement again.
 
 ## 22. Optional: the paused-Goal resume prompt (`goal.resumePrompt`)
 
-`goal.resumePrompt` is convenience over `/goal resume`, not a replacement for it.
+`goal.resumePrompt` is convenience over `/goal:resume`, not a replacement for it.
 The deterministic coverage is `test/goal51-resume-prompt.test.mjs` (a real `pi
 --mode rpc` session per case, reopened on a copied session file); the steps below
 reproduce the user-visible surface by hand.
 
-1. `/goal <objective>`, let one continuation run, then `/goal pause`.
+1. `/goal <objective>`, let one continuation run, then `/goal:pause`.
 2. Add `"goal": { "resumePrompt": true }` to Pi settings and restart Pi on the
    same session. Expect one `Resume the paused Goal?` confirmation after the
    `Goal ... restored (paused)` notice. Do **not** answer it yet: `/goal` must
@@ -380,14 +385,14 @@ reproduce the user-visible surface by hand.
    (declined, dismissed, or timed out)` and a Goal that is still `paused` with an
    unchanged revision, no new run, and no new continuation.
 5. While a `blocked`, `usage_limited`, or `budget_limited` Goal is restored, no
-   prompt may appear; those recoveries stay explicit (`/goal resume`, or
-   `/goal resume --budget <new-total>` with valid new headroom).
+   prompt may appear; those recoveries stay explicit (`/goal:resume`, or
+   `/goal:resume --budget <new-total>` with valid new headroom).
 6. Set `"goal": { "enabled": false, "resumePrompt": true }` and restart on a
    paused Goal. Expect no dialog, a notice that the prompt is enabled but
-   pi-goal is disabled, and `/goal resume` still refused; the Goal stays paused
+   pi-goal is disabled, and `/goal:resume` still refused; the Goal stays paused
    either way.
 7. Remove the setting (or set it to `false`) and restart: the paused Goal is
-   restored with no dialog and only `/goal resume` restarts it.
+   restored with no dialog and only `/goal:resume` restarts it.
 
 ## 23. Optional: naming the session from the Objective
 
@@ -400,9 +405,9 @@ the steps below reproduce the user-visible surface by hand.
 2. `/goal <objective>` in a session with no name. Expect the session name (shown in
    the session selector and the footer) to become the Objective's first line.
 3. Name the session yourself (`/name <name>` or `ctrl+r` to rename it in place),
-   then `/goal clear` and `/goal <another objective>`. Expect your name to survive:
+   then `/goal:clear` and `/goal <another objective>`. Expect your name to survive:
    pi-goal never overwrites a name that exists.
-4. With a named session, `/goal edit <new objective>`. Expect the name to be
+4. With a named session, `/goal:edit <new objective>`. Expect the name to be
    unchanged while the Goal's objective and revision change.
 5. With a named session, `/goal <another objective>` and confirm the replacement.
    Expect the name to be unchanged again.
@@ -431,15 +436,15 @@ The durable artifacts live beside the session file:
 <session-directory>/pi-goal-store/<goal-id>/<sha256>.<ext>
 ```
 
-1. Run `/goal edit Refine the attached requirements without changing the files`.
-   The manifest and hashes stay unchanged. `/goal edit --file ./other.txt New
+1. Run `/goal:edit Refine the attached requirements without changing the files`.
+   The manifest and hashes stay unchanged. `/goal:edit --file ./other.txt New
    objective` is refused with Replacement Goal guidance.
 2. Replace the Goal with a different `--file`/`--image` selection and confirm.
    The new identity gets its own manifest; the old identity's artifact directory
    remains.
 3. Restart the session. The attachments verify and later Continuations use the
    same hashes; the original source paths are not needed.
-4. `/goal clear` removes the current Goal but does **not** remove either Goal's
+4. `/goal:clear` removes the current Goal but does **not** remove either Goal's
    committed artifacts. V1 deliberately has no destructive automatic garbage
    collection because an older selected branch may still need them.
 5. For the integrity check, create another attachment-bearing active Goal, stop
@@ -507,7 +512,7 @@ the user-visible surface by hand.
 After any of the transitions above, read the timeline:
 
 ```
-/goal history
+/goal:history
 ```
 
 Expect one line per committed transition — identity, revision, previous and
@@ -515,9 +520,9 @@ current Lifecycle status, timestamp, usage summary, Active elapsed time, and an
 `attachments:` line with manifest hashes when the Goal has attachments. The
 header names the timeline as non-authoritative.
 
-1. Restart the session and run `/goal history` again: the same records, because
+1. Restart the session and run `/goal:history` again: the same records, because
    they are durable session entries rather than runtime state.
-2. Run `/goal` before and after `/goal history`: nothing changes. The rendering
+2. Run `/goal` before and after `/goal:history`: nothing changes. The rendering
    writes no `goal-state`, `goal-history`, or `goal-usage` entry and starts no
    run, and no command mutates a Goal from a record.
 3. Pause, resume, edit, and clear, checking the timeline after each: every
@@ -525,12 +530,44 @@ header names the timeline as non-authoritative.
    second clear, a declined replacement) get none.
 4. For the malformed-entry check, stop Pi and truncate one `goal-history` line's
    JSON payload in the session file (leave the entry's id, parent, and timestamp
-   intact). Restart: `/goal` reports the unchanged Goal, and `/goal history`
+   intact). Restart: `/goal` reports the unchanged Goal, and `/goal:history`
    renders the readable records plus a notice that one entry could not be read.
 5. For the crash-gap check, stop Pi and delete one `goal-history` line, re-pointing
    the following entry's `parentId` at the removed entry's parent. Restart: the
    Goal is unchanged, the timeline simply has no record for that transition, and
    the next transition appends normally.
+
+## 27. Optional: the command family, its completions, and both refusals
+
+Section 2 checks that the six commands are listed. These steps check that they
+behave as a namespace and that the old spelling has no side effects.
+
+1. Type `/` and read the Goal lines: `/goal`, `/goal:pause`, `/goal:resume`,
+   `/goal:clear`, `/goal:history`, `/goal:edit` — six entries, each with its own
+   description. Nothing matching `goal*` beyond those six.
+2. Type `/goal ` and wait: the completion list offers `--budget`, `--no-budget`,
+   `--file`, `--image`, and `--remote-image`, filtered as you type (`--f` leaves
+   `--file`; `--zzz` leaves nothing and Pi's default behaviour applies).
+3. Type `/goal:resume ` and wait: the list offers `--budget`. No other command in
+   the family completes anything.
+4. With an `active` Goal, run `/goal` and `/goal:history` and note the reported
+   state and the timeline's length. Now type the old spellings one at a time:
+   `/goal pause`, `/goal resume`, `/goal clear`, `/goal history`, `/goal edit`,
+   `/goal Pause`, `/goal  pause  `, `/goal resume --budget 150`, and
+   `/goal resume --budget=150`. Each answers an error notification of the form
+   *"Goal not created: `pause` is a Goal command; use /goal:pause."* (the resume
+   cases name `/goal:resume --budget <new-total> (or --budget=<new-total>)`). No
+   replacement confirmation opens, no run starts, and `/goal` plus
+   `/goal:history` show exactly the state and timeline you noted: no snapshot, no
+   transition, no history record.
+5. Try the stray-argument usage errors: `/goal:pause foo`, `/goal:clear the lint
+   errors`, and `/goal:history of the release` each answer *"/goal:<verb> takes no
+   argument."* and change nothing; `/goal:resume --budget` without a number is
+   refused with the guidance to supply a new total. None of them half-applies a
+   lifecycle action.
+6. Confirm the behaviour flip the other way: `/goal Edit the README to add a
+   smoke-test line` **creates** a Goal named after that Objective (it is not an
+   edit of the current Goal), and so does `/goal Clear the lint errors`.
 
 ## Checklist
 
@@ -543,16 +580,21 @@ header names the timeline as non-authoritative.
       refuses HTTP, credentials, non-public destinations, bad redirects, MIME
       mismatches, and oversized bodies without a success event.
 - [ ] `/goal <objective>` creates an active Goal and starts work.
+- [ ] The `/` menu lists exactly the six Goal commands, `/goal ` completes the
+      five creation flags and `/goal:resume ` completes `--budget`, every old
+      space-separated spelling is refused with the verb to type and no side
+      effect, a stray verb argument is a usage error, and an Objective that
+      begins with a verb word (`/goal Edit …`, `/goal Clear …`) still creates.
 - [ ] The status indicator and bare `/goal` report `active`.
 - [ ] An active Goal continues automatically after a turn.
-- [ ] Bare `/goal edit` opens a prefilled editor and applies the edit.
-- [ ] `/goal pause` changes status to `paused` and stops continuation.
-- [ ] `/goal resume` changes status back to `active` and restarts work.
-- [ ] `/goal resume --budget <new-total>` resumes a `budget_limited` Goal with a
+- [ ] Bare `/goal:edit` opens a prefilled editor and applies the edit.
+- [ ] `/goal:pause` changes status to `paused` and stops continuation.
+- [ ] `/goal:resume` changes status back to `active` and restarts work.
+- [ ] `/goal:resume --budget <new-total>` resumes a `budget_limited` Goal with a
       higher cumulative ceiling, and the `--budget=` spelling works.
-- [ ] A bare `/goal resume` of a `budget_limited` Goal, a no-headroom raise, and
+- [ ] A bare `/goal:resume` of a `budget_limited` Goal, a no-headroom raise, and
       a raise above `goal.maxTokenBudget` are all refused with guidance.
-- [ ] `/goal clear` removes the Goal and the status indicator.
+- [ ] `/goal:clear` removes the Goal and the status indicator.
 - [ ] The Goal survives a restart with its usage intact.
 - [ ] `/reload` after a clear does not resurrect the Goal.
 - [ ] A legacy 0.1.0 session loads without work, is cut over once, and reports its
@@ -575,11 +617,11 @@ header names the timeline as non-authoritative.
       work-admitting edit, resume, and automatic continuation are all refused,
       while inspection, pause, clear, and in-flight terminal updates still work.
 - [ ] An active-but-disabled Goal keeps its `active` status and keeps accruing
-      `Active time`; `/goal pause`, not disabling the extension, stops it.
+      `Active time`; `/goal:pause`, not disabling the extension, stops it.
 - [ ] Re-enabling `goal.enabled` restores admission, and the restored active Goal
       continues only at the next settlement.
 - [ ] With `goal.resumePrompt: true`, a restored `paused` Goal is asked once;
-      accepting runs `/goal resume`'s durable transition (fresh Blocked audit),
+      accepting runs `/goal:resume`'s durable transition (fresh Blocked audit),
       while declining, dismissing, timing out, or having no UI leaves it paused
       and unchanged.
 - [ ] `active`, `complete`, `blocked`, `usage_limited`, and `budget_limited` Goals
@@ -599,7 +641,7 @@ header names the timeline as non-authoritative.
       revision — only `update_goal` completes it.
 - [ ] With the setting absent or `false`, no `update_plan` tool is registered and
       no Continuation mentions it.
-- [ ] `/goal history` renders one record per committed transition (identity,
+- [ ] `/goal:history` renders one record per committed transition (identity,
       revision, previous/current status, timestamp, usage, active time, manifest
       hashes), survives a restart, writes nothing, and mutates nothing.
 - [ ] A truncated `goal-history` entry is skipped and surfaced as a notice while

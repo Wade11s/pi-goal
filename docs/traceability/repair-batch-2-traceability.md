@@ -15,12 +15,12 @@ seams are unit-tested against a fake Pi API.
 
 | Row | Contract | Test evidence |
 | --- | --- | --- |
-| Command surface | Only `/goal resume --budget <new-total>` and `--budget=<new-total>` resume a `budget_limited` Goal | `test/goal10-budget-recovery.test.mjs` ("`/goal resume --budget <new-total>` resumes…"; "`/goal resume --budget=<new-total> is an absolute ceiling…") |
-| Bare-resume guidance | Bare `/goal resume` on `budget_limited` is refused with guidance and changes nothing | `test/goal10-budget-recovery.test.mjs` ("a bare resume of a budget_limited Goal is guidance…") |
+| Command surface | Only `/goal:resume --budget <new-total>` and `--budget=<new-total>` resume a `budget_limited` Goal | `test/goal10-budget-recovery.test.mjs` ("`/goal:resume --budget <new-total>` resumes…"; "`/goal:resume --budget=<new-total> is an absolute ceiling…") |
+| Bare-resume guidance | Bare `/goal:resume` on `budget_limited` is refused with guidance and changes nothing | `test/goal10-budget-recovery.test.mjs` ("a bare resume of a budget_limited Goal is guidance…") |
 | Budget option rejected elsewhere | `--budget` is refused for `active`, `paused`, `blocked`, `usage_limited`, and `complete`; their existing lifecycle behavior is unchanged | `test/goal10-budget-recovery.test.mjs` ("…the budget option is refused in every other status"); `test/goal10-budget-recovery-store.test.mjs` ("the budget option is refused for every non-budget_limited status") |
-| Edit is independent | `/goal edit` preserves `budget_limited`, starts no work, and does not cancel an owed wrap-up; the wrap-up uses the latest objective | `test/goal10-budget-recovery.test.mjs` ("an objective edit without a resume preserves budget_limited…"); `test/goal10-budget-recovery-store.test.mjs` ("an objective edit before a budget-raising resume has its own revision") |
+| Edit is independent | `/goal:edit` preserves `budget_limited`, starts no work, and does not cancel an owed wrap-up; the wrap-up uses the latest objective | `test/goal10-budget-recovery.test.mjs` ("an objective edit without a resume preserves budget_limited…"); `test/goal10-budget-recovery-store.test.mjs` ("an objective edit before a budget-raising resume has its own revision") |
 | Model/ordinary-prompt authority | Ordinary prompts, `create_goal`, and `update_goal` cannot authorize a resume or a budget raise | `test/goal10-budget-recovery.test.mjs` ("ordinary prompts and model tools cannot authorize a resume or a budget raise") |
-| Absolute cumulative ceiling | The new value is an absolute total, not an increment; all prior usage stays charged | `test/goal10-budget-recovery.test.mjs` ("`/goal resume --budget=<new-total> is an absolute ceiling…"); `test/accounting.test.mjs` ("a budget-raising resume is an absolute cumulative ceiling with positive headroom") |
+| Absolute cumulative ceiling | The new value is an absolute total, not an increment; all prior usage stays charged | `test/goal10-budget-recovery.test.mjs` ("`/goal:resume --budget=<new-total> is an absolute ceiling…"); `test/accounting.test.mjs` ("a budget-raising resume is an absolute cumulative ceiling with positive headroom") |
 | Positive headroom | A value at or below the current `usage.totalTokens` is refused; no resume into an immediate stop | `test/goal10-budget-recovery.test.mjs` ("a budget-raising resume validates positive headroom…"); `test/goal10-budget-recovery-store.test.mjs` ("…refuses a ceiling at or below the accounted usage"); `test/accounting.test.mjs` |
 | Configured maximum | `goal.maxTokenBudget` is a hard cap; values above it are refused, never clamped | `test/goal10-budget-recovery.test.mjs` ("…never clamps or uses the default"); `test/goal10-budget-recovery-store.test.mjs` ("…never clamps the configured maximum"); `test/accounting.test.mjs` |
 | No implicit default | `goal.defaultTokenBudget` is never resume authority | `test/goal10-budget-recovery.test.mjs` ("…never clamps or uses the default"); `test/accounting.test.mjs` ("…never treats the configured default as implicit authority") |
@@ -61,12 +61,12 @@ pre-repair command surface has no budget-raising resume. Representative failures
 ✖ a persistence failure at the resume commit leaves the Goal budget_limited and unchanged
   AssertionError: Expected values to be strictly equal
 
-✖ /goal resume --budget <new-total> resumes a budget_limited Goal, cancels the pending wrap-up, and preserves identity and usage
+✖ /goal:resume --budget <new-total> resumes a budget_limited Goal, cancels the pending wrap-up, and preserves identity and usage
   Error: Timed out waiting for: response for prompt req-5
   (the pre-repair command surface treats `--budget` on resume as an objective,
    so the budget_limited Goal is never resumed)
 
-✖ /goal resume --budget=<new-total> is an absolute ceiling: resumed work that immediately crosses it earns exactly one fresh wrap-up
+✖ /goal:resume --budget=<new-total> is an absolute ceiling: resumed work that immediately crosses it earns exactly one fresh wrap-up
   Error: Timed out waiting for: response for prompt req-9
 
 ✖ a budget-raising resume validates positive headroom and the configured maximum, and never clamps or uses the default

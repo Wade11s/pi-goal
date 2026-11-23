@@ -49,7 +49,7 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
 - Creation is durability-first: the snapshot is written and made visible, the
   kickoff triggers the file flush, and only after that snapshot is the **last**
   `goal-state` entry on disk is success announced. Visibility comes first so a
-  `/goal clear`, `edit`, `pause`, or `resume` issued while creation waits for
+  `/goal:clear`, `edit`, `pause`, or `resume` issued while creation waits for
   idle acts on the same record the creation captured; every wait revalidates
   the exact id and revision, and a changed record suppresses the queued stale
   kickoff. A tombstone written during the wait therefore counts as *not* durable
@@ -82,7 +82,7 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   the local event stream and is projected from that stream's payload, so the two
   cannot disagree — and it is never read by reconstruction: a missing, truncated, or
   malformed entry cannot resurrect, clear, replace, or otherwise change the current
-  Goal. `/goal history` renders it, read-only. See [Goal audit history](history.md).
+  Goal. `/goal:history` renders it, read-only. See [Goal audit history](history.md).
 - Usage accounting is durable too. Token totals are always recoverable from the
   session branch, and the accounted active time is checkpointed into separate
   `goal-usage` custom entries — kept apart from `goal-state` so the lifecycle log

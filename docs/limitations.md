@@ -12,14 +12,14 @@ what it cannot preempt, and what is intentionally left to the user.
   its error message, and this section all say so. Because of that, a blocked or
   usage-limited Goal waits for the user: the model cannot complete or resume it
   either, so it does not quietly resume work the user was told had stopped.
-  Restarting it is the user's `/goal resume`, which keeps the identity and starts
+  Restarting it is the user's `/goal:resume`, which keeps the identity and starts
   a fresh audit.
 - A model-requested pause is corroborated by exact-quote matching plus a
   conservative lexical check that the newer human message contains an
   affirmative pause instruction. The extension does not semantically understand
   the request: unusual phrasing can be refused, and a pause request delivered
   only as an image, or one whose exact words were never sent as text, cannot be
-  corroborated. The user can always pause directly with `/goal pause`.
+  corroborated. The user can always pause directly with `/goal:pause`.
 - `create_goal` is corroborated by exact-quote matching plus a conservative
   deterministic clause-order check. The extension does not semantically
   understand the request: unusual phrasing can be refused, a request delivered
@@ -53,7 +53,7 @@ what it cannot preempt, and what is intentionally left to the user.
   but their attachments unverifiable; automatic Continuation then stops with an
   explicit error and no artifact-driven Lifecycle change until the original
   bytes are restored or the Goal is replaced.
-- `/goal history` reports the branch's `goal-history` records as they are. A
+- `/goal:history` reports the branch's `goal-history` records as they are. A
   process that dies between a lifecycle commit and the history append leaves one
   transition with no record: the timeline never invents a placeholder for it, and
   the authoritative Goal — reconstructed from `goal-state` alone — is unaffected.
@@ -66,11 +66,11 @@ what it cannot preempt, and what is intentionally left to the user.
   an unfinished Goal gives the session a fresh identity and fresh revisions, and
   preserves the replaced Goal's accounted history on its own superseded record
   rather than transferring any of it. Refining the finish line without replacing
-  anything is what `/goal edit` is for.
-- Bare `/goal edit` needs a dialog-capable UI. TUI and RPC hosts that implement
+  anything is what `/goal:edit` is for.
+- Bare `/goal:edit` needs a dialog-capable UI. TUI and RPC hosts that implement
   Pi's extension-UI subprotocol can answer the editor dialog; print/JSON mode and
   hosts without a dialog-capable UI get guidance to use
-  `/goal edit <objective>` instead of blocking. A dialog that is never answered
+  `/goal:edit <objective>` instead of blocking. A dialog that is never answered
   auto-cancels after 120 seconds and leaves the objective unchanged.
 - Budget enforcement happens when a turn's usage is accounted, not inside the
   provider loop: the extension cannot preempt a model call Pi has already

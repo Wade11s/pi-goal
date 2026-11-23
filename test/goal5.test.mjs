@@ -1961,7 +1961,7 @@ async function noticeMatching(session, ...needles) {
 	);
 }
 
-test("/goal resume restarts a blocked Goal with a fresh audit", async () => {
+test("/goal:resume restarts a blocked Goal with a fresh audit", async () => {
 	const session = await PiRpcSession.start();
 	// Three consecutive reports block the Goal, the user resumes it, and the
 	// resumed work reports the same blocker again: the audit that stopped the Goal
@@ -1994,7 +1994,7 @@ test("/goal resume restarts a blocked Goal with a fresh audit", async () => {
 		const blocked = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 		assertAudit(blocked.blockedAudit, BLOCKER, 3);
 
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
 		assert.match(resumed.message, /blocked audit that ended it is cleared/, "the notice says what the resume clears");
 		assert.match(resumed.message, /fresh audit/);
@@ -2041,7 +2041,7 @@ test("/goal resume restarts a blocked Goal with a fresh audit", async () => {
 	}
 });
 
-test("/goal resume restarts a usage_limited Goal, and a complete Goal is still refused", async () => {
+test("/goal:resume restarts a usage_limited Goal, and a complete Goal is still refused", async () => {
 	const session = await PiRpcSession.start();
 	script(
 		[
@@ -2061,7 +2061,7 @@ test("/goal resume restarts a usage_limited Goal, and a complete Goal is still r
 		const limited = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 		assert.equal(limited.status, "usage_limited", "the provider usage limit stops the Goal");
 
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
 		assert.match(resumed.message, /usage-limit stop/, "the notice names the stop it cleared");
 		assert.match(resumed.message, /revision 2/);
@@ -2079,7 +2079,7 @@ test("/goal resume restarts a usage_limited Goal, and a complete Goal is still r
 
 		// Completing is still terminal for the identity: a finished Goal is replaced,
 		// never resumed.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const refused = await session.waitForNotify((r) => r.message.includes("cannot be resumed"));
 		assert.match(refused.message, /complete/);
 		assert.equal(lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.status, "complete");
@@ -2092,7 +2092,7 @@ test("/goal resume restarts a usage_limited Goal, and a complete Goal is still r
 	}
 });
 
-test("/goal resume restarts a Goal stopped by an anti-loop bound without re-stopping it", async () => {
+test("/goal:resume restarts a Goal stopped by an anti-loop bound without re-stopping it", async () => {
 	const session = await PiRpcSession.start();
 	// The activity-free bound stops the Goal, and the resume has to give the loop a
 	// fresh baseline: an inherited count of three would stop the very next automatic
@@ -2119,7 +2119,7 @@ test("/goal resume restarts a Goal stopped by an anti-loop bound without re-stop
 		const stopped = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 		assert.equal(stopped.blockedAudit.turns, 3, "the activity-free bound reached its threshold");
 
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
 		assert.match(resumed.message, /fresh audit/);
 
@@ -2148,7 +2148,7 @@ test("/goal resume restarts a Goal stopped by an anti-loop bound without re-stop
 	}
 });
 
-test("/goal resume restarts a blocked Goal with a budget, and a budget-limited one needs a higher total", async () => {
+test("/goal:resume restarts a blocked Goal with a budget, and a budget-limited one needs a higher total", async () => {
 	const session = await PiRpcSession.start();
 	// A Goal with a token budget: three blocker reports block it, the resume
 	// restarts it, the resumed work crosses the budget, and the wrap-up is the last
@@ -2191,7 +2191,7 @@ test("/goal resume restarts a blocked Goal with a budget, and a budget-limited o
 		assert.equal(blocked.tokenBudget, 100, "the budget survives the stop");
 
 		// The resume keeps the budget and the identity, and clears the audit.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed"));
 		assert.match(resumed.message, /fresh audit/);
 
@@ -2210,7 +2210,7 @@ test("/goal resume restarts a blocked Goal with a budget, and a budget-limited o
 
 		// budget_limited cannot be resumed bare: the resume needs a higher cumulative
 		// total, so the refusal is guidance and the Goal keeps its state.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const refused = await session.waitForNotify((r) => r.message.includes("higher cumulative total"));
 		assert.match(refused.message, /budget_limited/);
 		assert.match(refused.message, /--budget <new-total>/);
@@ -2309,7 +2309,7 @@ test("a usage-limit error on an already budget-limited Goal is not reported as a
 test("a provider error on an already usage-limited Goal does not promise a continuation", async () => {
 	const session = await PiRpcSession.start();
 	// The Goal is usage_limited, then a later user turn fails at the provider. That
-	// Goal does not continue until /goal resume, so the notice may not say it does.
+	// Goal does not continue until /goal:resume, so the notice may not say it does.
 	script(
 		[
 			{ text: "Kickoff answer." },

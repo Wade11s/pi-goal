@@ -7,6 +7,45 @@ is durable before it is announced.
 [budgets](budgets.md) · [continuation](continuation.md) ·
 [persistence](persistence.md) · [tools](../tools.md)
 
+## The Goal command family
+
+The user lifecycle controls are six commands that share the `goal` namespace,
+spelled the way Pi spells every other namespace (`/skill:name`):
+
+| Command | Meaning |
+| --- | --- |
+| `/goal` | bare: inspect the current Goal; with an Objective: create (or replace) |
+| `/goal:pause` | stop admission of further automatic runs, keep the Goal |
+| `/goal:resume [--budget N \| --budget=N]` | restart eligible work with a fresh Blocked audit; raise a `budget_limited` Goal's ceiling |
+| `/goal:clear` | durable tombstone, no resurrection |
+| `/goal:history` | read-only rendering of the Goal audit history |
+| `/goal:edit` | bare: the prefilled editor dialog; with an Objective: the typed edit |
+
+Each verb is its own line in the `/` menu with its own description. There is no
+`/goal:status` and no `/goal:create`: bare `/goal` already is the status report
+and `/goal <objective>` already is the creation. An Objective is only ever the
+argument of `/goal`, so it can never be read as a lifecycle action: `/goal Edit
+the README to add X` creates a Goal, and so does `/goal Clear the lint errors`.
+
+`/goal:pause`, `/goal:clear`, and `/goal:history` take no argument; `/goal:resume`
+takes only `--budget`. A stray argument is a usage error (`/goal:pause takes no
+argument.`) that touches no Goal. `/goal ` completes its creation flags
+(`--budget`, `--no-budget`, `--file`, `--image`, `--remote-image`) and
+`/goal:resume ` completes `--budget`.
+
+**The old space-separated spellings are refused, not aliased.** 0.1.x spelled the
+verbs as subcommands of one command, after Codex — `/goal`, a space, then `pause`,
+`resume`, `clear`, `history`, `edit`, or `resume --budget N`. Those are now
+refused with the command to type instead — *"Goal not created: `pause` is a
+Goal command; use /goal:pause."* — before any option is scanned or any
+replacement confirmation is asked, so the refusal writes no snapshot, announces
+no transition, and appends no history record. The guard ignores case and
+surrounding whitespace (`/goal Pause` and `/goal  pause  ` are caught too) and
+matches only the bare word, so `Clear the lint errors`, `Resume work on X`, and
+`history of the release` are Objectives. It applies to the `/goal` command only;
+`create_goal` keeps its own creation authority. See
+[ADR-0002](../adr/0002-colon-namespaced-goal-command-family.md).
+
 ## Create a Goal
 
 ```
@@ -19,10 +58,11 @@ is durable before it is announced.
 - Sends the objective into the model context as a user message and starts initial
   work immediately.
 - When an **unfinished** Goal already exists, asks for confirmation first (see
-  *Replace a Goal* below); the words `pause`, `resume`, and `clear` are
-  subcommands only when they are the *entire* argument, and `edit` is a
-  subcommand whenever it is the first word — objectives that merely begin with
-  one of the other words (for example "clear the lint errors") are accepted.
+  *Replace a Goal* below).
+- Accepts any valid Objective text — including one that begins with a verb word
+  such as "clear the lint errors" or "Edit the README" — except the bare
+  reserved words of the old spelling, which are refused with the Goal command
+  to type instead (see *The Goal command family* above).
 
 Explicit local text/images and remote images use the same creation path:
 
@@ -46,7 +86,7 @@ shows a confirmation dialog first, and a declined (or timed-out, or dismissed)
 dialog keeps the current Goal untouched. The dialog is answered over the RPC
 extension-UI subprotocol in RPC mode, so headless hosts confirm the same way an
 interactive user does. Modes without any UI cannot confirm and keep the current
-Goal (use `/goal clear` then `/goal <objective>` there). Replacing a **complete**
+Goal (use `/goal:clear` then `/goal <objective>` there). Replacing a **complete**
 Goal asks nothing, because nothing unfinished is discarded.
 
 The replaced Goal is not erased. Its already-accounted usage is written as a
@@ -70,7 +110,7 @@ restoring the previous record: the tail is frozen onto that record first — its
 entries sit before the restored snapshot, so no later replay could recover them —
 and the restored identity's admission stays open, so a response that was still
 streaming when the replacement was retracted is charged to it rather than dropped.
-`/goal clear` of the replacement does not freeze an open tail: the
+`/goal:clear` of the replacement does not freeze an open tail: the
 old identity's admission stays open past the tombstone so its in-flight work is
 still attributed to it, and the tail freezes at the next boundary. The frozen
 record is marked `superseded`, so it is loadable and replayable but never becomes
@@ -87,14 +127,17 @@ reference them; V1 performs no destructive automatic garbage collection.
 ## Edit the objective
 
 ```
-/goal edit Ship the release notes page instead
+/goal:edit Ship the release notes page instead
 ```
+
+The argument is the new Objective, whole: an edit is reached by its own command,
+so nothing in the text can be mistaken for a subcommand.
 
 Changes the objective **in place**: the Goal keeps its identity, creation time,
 and revision history (the edit is the next revision), so no usage history is
 erased. Its immutable attachment manifest is retained verbatim and re-stated
-when an active Goal's edit admits work. `/goal edit --file …`,
-`/goal edit --image …`, and `/goal edit --remote-image …` are refused with
+when an active Goal's edit admits work. `/goal:edit --file …`,
+`/goal:edit --image …`, and `/goal:edit --remote-image …` are refused with
 guidance: changing attachments requires a Replacement Goal. If the Goal is active and a run is in flight, the new objective is
 delivered into that run through Pi's steering mechanism (after the current
 turn's tool calls, before the next model request), so the live work is
@@ -103,7 +146,7 @@ restarts work with a kickoff message. A paused Goal can be edited too — it sta
 paused until resumed. A complete Goal is finished and cannot be edited; replace
 it instead.
 
-Bare `/goal edit` opens Pi's multi-line editor prefilled with the current
+Bare `/goal:edit` opens Pi's multi-line editor prefilled with the current
 objective. Saving applies the edit in place; cancelling leaves it unchanged.
 The editor is a dialog-capable UI surface: TUI and RPC hosts support it through
 Pi's extension-UI subprotocol, while print/JSON mode (`ctx.hasUI` false) prints
@@ -158,12 +201,12 @@ block is status-aware: for an `active` Goal it adds that pausing, not disabling
 the extension, is what stops the clock, while a Goal that has already stopped
 says its clock is already stopped and that the refused Resume would be what
 restarts it after re-enabling. The per-status resume hints follow the same rule,
-so a disabled report never promises that `/goal resume` starts work.
+so a disabled report never promises that `/goal:resume` starts work.
 
 ## Inspect the Goal history
 
 ```
-/goal history
+/goal:history
 ```
 
 Renders the branch-local timeline of committed transitions: each record's
@@ -175,9 +218,9 @@ attachments. The command is **read-only** — it reads the selected branch's
 the only lifecycle authority, nothing reconstructs from history, and no command,
 tool, or option mutates a Goal from a history record.
 
-`history` is a subcommand only when it is the whole argument, exactly like
-`pause` and `clear`, so `/goal history of the release pipeline` is still an
-objective. See [Goal audit history](history.md) for what is recorded, what is
+The command takes no argument; `history of the release pipeline` is not a history
+request but an Objective, typed after `/goal`. See
+[Goal audit history](history.md) for what is recorded, what is
 deliberately not, the documented crash gap between a lifecycle commit and its
 history append, and how a malformed entry is surfaced.
 
@@ -206,18 +249,22 @@ only a successful write is reported (a failed write keeps the previous state
 and is reported as a persistence error).
 
 ```
-/goal pause
-/goal resume
-/goal clear
+/goal:pause
+/goal:resume
+/goal:resume --budget <new-total>
+/goal:clear
 ```
 
-- `/goal pause` immediately stops admission of further automatic Goal runs: the
+The verb commands take no argument other than `--budget` on `/goal:resume`;
+anything else (`/goal:pause foo`) is a usage error that touches no Goal.
+
+- `/goal:pause` immediately stops admission of further automatic Goal runs: the
   continuation seam only continues an `active` Goal, so whatever run is in
   flight finishes on its own and its settlement admits no continuation. Pause
   never aborts work — interrupting a run stays with the user, through Pi's
-  normal abort. A paused Goal also stops accruing active time, and `/goal resume`
+  normal abort. A paused Goal also stops accruing active time, and `/goal:resume`
   restarts that clock with the work.
-- `/goal resume` restarts eligible work — a **paused**, **blocked**, or
+- `/goal:resume` restarts eligible work — a **paused**, **blocked**, or
   **usage_limited** Goal, or a **budget_limited** Goal with a higher cumulative
   token budget: the transition is durable, then a resume kickoff message
   restates the objective and asks for a fresh evidence audit of the retained
@@ -233,12 +280,12 @@ and is reported as a persistence error).
   the exact bytes the resume message will carry. That load happens **before**
   the durable resume transition, so a missing or corrupt artifact refuses the
   resume with an explicit integrity error and leaves the stopped Lifecycle
-  status, revision, and snapshot unchanged; `/goal resume` remains actionable
+  status, revision, and snapshot unchanged; `/goal:resume` remains actionable
   after the artifact is repaired or the Goal is replaced.
   The `--budget` option is valid only for a `budget_limited` Goal; it is refused
   for `active`, `paused`, `blocked`, `usage_limited`, and `complete`, whose
   existing lifecycle behavior is unchanged.
-- `/goal clear` removes the Goal from any status by writing a durable tombstone
+- `/goal:clear` removes the Goal from any status by writing a durable tombstone
   snapshot, so restarts and reloads cannot resurrect it, and the session returns
   to ordinary prompt-by-prompt behavior. Its committed attachment artifacts are
   retained for historical branches; clear is not a destructive GC operation.
@@ -254,7 +301,7 @@ user-owned resume, never a replacement for it. When a session start restores a
 Goal whose Lifecycle status is `paused` and a dialog-capable UI exists, pi-goal
 asks **once** whether to resume it.
 
-- **Accept** runs the same durable transition as `/goal resume`: the same
+- **Accept** runs the same durable transition as `/goal:resume`: the same
   identity, creation time, objective, and accounted history, one revision
   advance, and a **fresh Blocked audit** (the audit that described the stop the
   user just overruled is dropped). The resume kickoff then restarts work exactly as
@@ -267,7 +314,7 @@ asks **once** whether to resume it.
   `usage_limited`, and `budget_limited` never prompt in V1: blocked and
   usage-limited recovery is an explicit user decision with its own reasoning,
   and budget-limited recovery still requires valid new headroom
-  (`/goal resume --budget <new-total>`).
+  (`/goal:resume --budget <new-total>`).
 - **Nothing waits on the prompt.** Print and JSON modes have no dialog-capable
   UI, so nothing is asked and the notice says the Goal stays paused. In TUI and
   RPC mode the dialog is created without being awaited by the `session_start`
@@ -277,7 +324,7 @@ asks **once** whether to resume it.
 - **A disabled extension does not ask.** While `goal.enabled` is false the prompt
   cannot admit the resume it would perform, so it is not offered at all: the
   restore notice names the disabled condition and the two explicit ways forward
-  (re-enable and `/goal resume`, or leave the Goal paused).
+  (re-enable and `/goal:resume`, or leave the Goal paused).
 
 The prompt is read from Pi's effective settings at session start like the other
 settings, so changing it takes effect on the next session start or reload. An
@@ -294,13 +341,13 @@ new Goal work:
 | --- | --- |
 | `/goal <objective>` — creation **and** replacement | Both open a new Goal identity and start work. The refusal comes before the replacement confirmation and before any attachment is materialized, so no dialog or artifact promises a replacement that will not happen. |
 | `create_goal` | Same admission, from the model side. The refusal reports `goal: null` (or the unchanged current Goal) and leaves the one-shot creation authority intact, so a corrected call can retry after re-enabling. |
-| `/goal edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. |
-| `/goal resume` | The resume message restarts the loop. |
+| `/goal:edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. |
+| `/goal:resume` | The resume message restarts the loop. |
 | The automatic Continuation, and an owed Budget wrap-up | Both are unattended Goal work. A pending wrap-up is **deferred, not lost**: it is delivered at the first settlement after re-enabling. |
 | The opt-in resume prompt (`goal.resumePrompt`) | The dialog would only offer a resume that admission refuses, so it is not opened; the restore notice says why. |
 
 What stays available: bare `/goal` and `get_goal` (which surface the disabled
-condition), `/goal pause`, `/goal clear`, and every terminal update from work
+condition), `/goal:pause`, `/goal:clear`, and every terminal update from work
 already in flight — a `budget_limited` transition, an `update_goal` completion, a
 blocker report. An in-flight provider request is never aborted, and work already
 queued is delivered as ordinary work rather than dropped.

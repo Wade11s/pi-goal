@@ -20,10 +20,10 @@
  *
  * Carrying Pi's own dispatch shape rather than "the text after `/goal`" is what
  * lets the bridge stay free of a parser: a request names `/goal:pause`, it does
- * not spell `pause` and hope both sides parse it the same way. The companion
- * that used to mirror pi-goal's parser to avoid a `set` rendering `/goal clear`
- * therefore no longer needs a mirror at all — an Objective is only ever the
- * argument of `/goal`.
+ * not spell `pause` after `/goal` and hope both sides parse it the same way. The
+ * companion that used to mirror pi-goal's parser so that a `set` could never
+ * render the clear command therefore no longer needs a mirror at all — an
+ * Objective is only ever the argument of `/goal`.
  *
  * Two properties keep the result honest:
  *

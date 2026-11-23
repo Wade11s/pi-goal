@@ -31,8 +31,8 @@ A `budget_limited` Goal can be resumed only by raising its **cumulative**
 ceiling:
 
 ```
-/goal resume --budget 500000
-/goal resume --budget=500000
+/goal:resume --budget 500000
+/goal:resume --budget=500000
 ```
 
 - The new value is the Goal's new absolute total, not an increment and not a
@@ -42,14 +42,14 @@ ceiling:
   (no-headroom resumes are rejected rather than resuming into an immediate stop).
 - The configured `goal.maxTokenBudget` remains a hard cap: a value above it is
   refused, never clamped. `goal.defaultTokenBudget` is never implicit resume
-  authority; a bare `/goal resume` of a `budget_limited` Goal is refused with
+  authority; a bare `/goal:resume` of a `budget_limited` Goal is refused with
   guidance to supply a new total.
 - A successful raise is one durable transition: it preserves the identity,
   creation time, origin, objective, and complete usage history, sets the new
   ceiling and `active`, cancels any pending old-episode wrap-up, advances the
   revision exactly once, starts a fresh active-time segment, and commits before
   any resumed work message is admitted.
-- `/goal edit <objective>` stays independent: it preserves `budget_limited` and
+- `/goal:edit <objective>` stays independent: it preserves `budget_limited` and
   admits no substantive Goal work. To change both, edit first and then resume
   with the new budget. There is no combined edit-and-resume command.
 
@@ -106,7 +106,7 @@ Reaching the token budget is **not** completion:
    accounted, so remaining capacity keeps being reported (floored at zero).
 
 One bounded wrap-up is owed **per budget-exhaustion episode**, not per Goal
-lifetime. A valid `/goal resume --budget <new-total>` cancels an undelivered
+lifetime. A valid `/goal:resume --budget <new-total>` cancels an undelivered
 wrap-up; if the old wrap-up is already in flight, its admitted usage stays
 charged, the old budget gate lifts only after the new ceiling is durably
 authorized, and no second old-budget wrap-up is sent. If the resumed work later
@@ -122,7 +122,7 @@ flag is durable, so nothing is lost: the wrap-up is delivered at the first
 settlement after the setting is re-enabled, exactly once.
 
 Raising the budget or changing the objective is a user decision; a
-`budget_limited` Goal is resumed with `/goal resume --budget <new-total>`.
+`budget_limited` Goal is resumed with `/goal:resume --budget <new-total>`.
 
 ## Completion usage report
 

@@ -8,19 +8,20 @@ the model verifies completion, a genuine blocker persists, a provider usage limi
 or terminal failure stops the run, a conservative anti-loop bound is reached, the
 run is aborted, the lifecycle changes, or the Goal's token budget runs out.
 
-The extension adds one command and three model tools. It uses only public
-extension APIs and does not patch Pi core.
+The extension adds the Goal command family — six commands sharing the `goal`
+namespace, spelled after Pi's own `/skill:name` convention — and three model
+tools. It uses only public extension APIs and does not patch Pi core.
 
 | Surface | Purpose |
 | --- | --- |
 | `/goal <objective>` | Create a Goal and start work immediately |
 | `/goal` | Report objective, status, identity, usage, and remaining capacity |
-| `/goal history` | Read-only timeline of the branch's committed Goal transitions |
-| `/goal edit [objective]` | Change the objective in place, keeping identity and history |
-| `/goal pause` · `/goal resume` · `/goal clear` | Stop admission, restart work, or remove the Goal |
+| `/goal:history` | Read-only timeline of the branch's committed Goal transitions |
+| `/goal:edit [objective]` | Change the objective in place, keeping identity and history |
+| `/goal:pause` · `/goal:resume` · `/goal:clear` | Stop admission, restart work, or remove the Goal |
 | `/goal --budget <n>` · `/goal --no-budget` | Bound unattended usage at creation |
 | `/goal --file <path>` · `/goal --image <path>` · `/goal --remote-image <url>` | Attach explicit local text files, local images, or fetch a remote image once (repeatable leading options) |
-| `/goal resume --budget <new-total>` | Raise a `budget_limited` Goal's cumulative ceiling |
+| `/goal:resume --budget <new-total>` | Raise a `budget_limited` Goal's cumulative ceiling |
 | `get_goal` | Structured Goal state for the model |
 | `create_goal` | Model-created Goal, only on an explicit user request |
 | `update_goal` | Complete, report a blocker, or pause on an explicit request |
@@ -133,11 +134,19 @@ capacity. A Goal restored on session start is announced with a
 `Goal ... restored (active)` notification.
 
 ```sh
-/goal edit Ship the release notes page instead   # edit in place
-/goal pause                                      # stop admission, keep the Goal
-/goal resume                                     # restart work with a fresh audit
-/goal clear                                      # durable tombstone, no resurrection
+/goal:edit Ship the release notes page instead   # edit in place
+/goal:pause                                      # stop admission, keep the Goal
+/goal:resume                                     # restart work with a fresh audit
+/goal:clear                                      # durable tombstone, no resurrection
 ```
+
+Each verb is its own line in the `/` menu, `/goal ` completes its creation flags,
+and `/goal:resume ` completes `--budget`. An Objective is only ever the argument
+of `/goal`, so `/goal Edit the README` and `/goal Clear the lint errors` create
+Goals. The 0.1.x space-separated spellings (`/goal` followed by a bare verb
+word) are refused with the command to type instead — *"Goal not created: `pause`
+is a Goal command; use /goal:pause."* — and change nothing
+([ADR-0002](docs/adr/0002-colon-namespaced-goal-command-family.md)).
 
 Every lifecycle transition is **durable before it is announced**, and all of
 them work while the agent is busy — an active Goal keeps Pi continuously
@@ -149,9 +158,9 @@ occupied, so none of them wait for idle. Details:
 | Status | Meaning |
 | --- | --- |
 | `active` | Continues automatically; active time accrues. |
-| `paused` | The user stopped admission. In-flight work finishes, nothing continues, and the clock stops. `/goal resume` restarts it (an opt-in resume prompt may offer that at session start). |
-| `blocked` | Three consecutive Goal turns reported the same genuine blocker, or made no activity. `/goal resume` restarts with a fresh audit. |
-| `usage_limited` | The provider reported an exhausted plan or quota. `/goal resume` restarts. |
+| `paused` | The user stopped admission. In-flight work finishes, nothing continues, and the clock stops. `/goal:resume` restarts it (an opt-in resume prompt may offer that at session start). |
+| `blocked` | Three consecutive Goal turns reported the same genuine blocker, or made no activity. `/goal:resume` restarts with a fresh audit. |
+| `usage_limited` | The provider reported an exhausted plan or quota. `/goal:resume` restarts. |
 | `budget_limited` | The token budget was reached. One bounded wrap-up is allowed, then no continuation. Raise the cumulative budget to resume. |
 | `complete` | Terminal for the Goal's identity. Replace it with `/goal <objective>`. |
 
@@ -192,7 +201,7 @@ A Goal stops only in ways ordinary work cannot trigger:
 An ordinary command failure — non-zero exit, timeout, abort — is normal work and
 never counts toward the anti-loop bounds. Aborts and provider errors that Pi owns
 are hard exits, not Goal malfunctions. A `blocked` or `usage_limited` Goal never
-continues automatically: only the user's `/goal resume` restarts it.
+continues automatically: only the user's `/goal:resume` restarts it.
 
 → [Stopping safely on blockers and failures](docs/behavior/stopping.md)
 
@@ -212,7 +221,7 @@ continues automatically: only the user's `/goal resume` restarts it.
 - Reaching the budget is **not** completion: the Goal becomes `budget_limited`,
   the clock stops, and one bounded wrap-up is requested; the same gate blocks
   every tool call so no further substantive work runs.
-- `/goal resume --budget <new-total>` raises the **cumulative** ceiling (not an
+- `/goal:resume --budget <new-total>` raises the **cumulative** ceiling (not an
   increment). It must exceed the accounted total and stay within the configured
   maximum, and it earns one fresh wrap-up per exhaustion episode.
 - Completing a **budgeted** Goal returns a final-response usage report in the
@@ -266,11 +275,11 @@ pending-draft object to infer.
 pi-goal admits no new Goal work, so nothing unattended starts.
 
 - **Refused:** `/goal <objective>` (creation and replacement), `create_goal`,
-  `/goal edit` of an *active* Goal (an edit there steers work into a running
-  Goal), `/goal resume`, and the automatic continuation or budget wrap-up the
+  `/goal:edit` of an *active* Goal (an edit there steers work into a running
+  Goal), `/goal:resume`, and the automatic continuation or budget wrap-up the
   settlement seam would otherwise request. A pending wrap-up is deferred, not
   lost: it is delivered at the first settlement after re-enabling.
-- **Still available:** bare `/goal` and `get_goal`, `/goal pause`, `/goal clear`,
+- **Still available:** bare `/goal` and `get_goal`, `/goal:pause`, `/goal:clear`,
   and every terminal update from work already in flight — including a
   `budget_limited` transition and an `update_goal` completion. An in-flight
   provider request is never aborted.
@@ -316,7 +325,7 @@ Objective, so a Goal is easier to find later in a session list.
 
 `goal.resumePrompt` (default `false`) offers **one** confirmation dialog at
 session start when a restored Goal is `paused`: accepting runs the same durable
-transition as `/goal resume` (same identity and history, fresh Blocked audit),
+transition as `/goal:resume` (same identity and history, fresh Blocked audit),
 while declining, dismissing, timing out, or having no dialog-capable UI leaves
 the Goal paused and unchanged. Only `paused` is ever prompted for — `blocked`,
 `usage_limited`, and `budget_limited` recovery stays an explicit user decision —
@@ -424,7 +433,7 @@ it answers `unavailable` instead of failing.
 ### Goal audit history
 
 Every committed transition is also appended to the session branch as a
-`goal-history` entry, and `/goal history` renders them as a readable timeline:
+`goal-history` entry, and `/goal:history` renders them as a readable timeline:
 identity, revision, previous and current Lifecycle status, timestamp, usage
 summary, Active elapsed time, and attachment manifest hashes when the Goal has
 attachments.
@@ -435,7 +444,7 @@ attachments.
   current Goal, and a malformed entry is skipped and surfaced as a rendering
   notice only.
 - **Read-only.** No command, tool, or option mutates a Goal from a history
-  record; `/goal history` only reads and prints.
+  record; `/goal:history` only reads and prints.
 - **One record per committed transition** — never per token delta, accounting
   checkpoint, or clock tick, and never for a rolled-back transition.
 - **A crash between the commit and the append** leaves a documented diagnostic
@@ -476,11 +485,11 @@ attachments.
   mid-session. While the extension is disabled, an active Goal accrues no new
   Goal-owned usage either, because every run starts from a user prompt that
   closes the admission segment.
-- `/goal history` reports the branch's records as they are. A crash between a
+- `/goal:history` reports the branch's records as they are. A crash between a
   lifecycle commit and its history append leaves one transition without a record;
   the timeline never invents a placeholder for it, and the authoritative Goal is
   unaffected either way.
-- `goal.resumePrompt` is a convenience over the explicit `/goal resume`, never a
+- `goal.resumePrompt` is a convenience over the explicit `/goal:resume`, never a
   replacement for it: it is off by default, asks only once per session start and
   only for a restored `paused` Goal, and every answer other than an explicit
   "yes" — decline, dismissal, timeout, no UI — leaves the Goal untouched. It
@@ -565,6 +574,7 @@ retention and restore verification.
 | [Testing](docs/testing.md) | The automated gate and the rules that keep it honest |
 | [Smoke test](docs/smoke-test.md) | Manual real-Pi procedure |
 | [ADR-0001](docs/adr/0001-conservative-stopping.md) | Conservative stopping is deterministic and extension-owned |
+| [ADR-0002](docs/adr/0002-colon-namespaced-goal-command-family.md) | The Goal command family is colon-namespaced; the old spellings are refused |
 | [Traceability](docs/traceability/) | Point-in-time evidence matrices for the V1 repair programme |
 | [Domain glossary](GLOSSARY.md) | The vocabulary the code and docs use |
 

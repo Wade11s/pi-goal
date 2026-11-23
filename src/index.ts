@@ -1,8 +1,9 @@
 /**
  * pi-goal — Codex-style persistent Goals for Pi.
  *
- * Registers the /goal command, the get_goal / create_goal / update_goal model
- * tools, and the automatic-continuation seam. A Goal is a durable,
+ * Registers the Goal command family (`/goal`, `/goal:pause`, `/goal:resume`,
+ * `/goal:clear`, `/goal:history`, `/goal:edit`), the get_goal / create_goal /
+ * update_goal model tools, and the automatic-continuation seam. A Goal is a durable,
  * session-scoped record persisted as custom session entries and reconstructed
  * from the selected branch on session start (restart, resume, reload, and
  * fork/clone, which copy the branch into a new session) and after tree
@@ -461,11 +462,12 @@ const RESERVED_GOAL_VERBS = ["pause", "resume", "clear", "history", "edit"] as c
  * The reserved-word guard for the `/goal` creation path (ADR-0002).
  *
  * An Objective is only ever the argument of `/goal`, so it can never be read as
- * a lifecycle action — but Codex muscle memory types `/goal pause`, and without
- * this guard that would silently create a Goal named "pause" and start work on
- * it. The old spelling is refused, not aliased: the message names the verb
- * command to type instead, and nothing else happens. The guard is the only
- * trace of the old syntax in the code.
+ * a lifecycle action — but Codex muscle memory types the old space-separated
+ * spelling (a bare `pause` after `/goal`), and without this guard that would
+ * silently create a Goal named "pause" and start work on it. The old spelling is
+ * refused, not aliased: the message names the verb command to type instead, and
+ * nothing else happens. The guard is the only trace of the old syntax in the
+ * code.
  *
  * It matches the trimmed, lower-cased argument against the bare verb words and
  * against a leading `resume --budget`, and nothing else: `Clear the lint
@@ -2313,7 +2315,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (existing) {
 				// A Goal of any status, including a complete one, still occupies the
 				// session's single Goal slot. Replacing or clearing one is a user-owned
-				// action (/goal <objective> confirms a replacement; /goal clears).
+				// action (/goal <objective> confirms a replacement; bare /goal reports).
 				return goalToolError(
 					"A Goal is already set for this session (status: " +
 						`${existing.status}); cannot create another one. ` +

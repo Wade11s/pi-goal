@@ -10,7 +10,7 @@
  *
  * These are deliberately narrow and provider-free, like
  * `test/goal12-creation-authority-store.test.mjs`. The end-to-end pause
- * behavior (corroborated pause, refusals, `/goal pause` ownership) lives in
+ * behavior (corroborated pause, refusals, `/goal:pause` ownership) lives in
  * `test/goal4.test.mjs` and `test/goal4-regressions.test.mjs`.
  *
  * The module is imported straight from TypeScript; Node 22.6+ strips the
@@ -91,7 +91,7 @@ it("a comma-less discourse-marker lead corroborates a pause", () => {
 	// pause path, where the comma-less form ("Actually pause the goal") was
 	// previously refused. This is the intentional compatible acceptance: the
 	// phrase is an ordinary affirmative pause instruction, and the pause stays
-	// owned by the user through /goal pause.
+	// owned by the user through /goal:pause.
 	for (const message of ["Actually pause the goal", "Actually, pause the goal", "In fact pause the goal"]) {
 		const result = corroboratePauseRequest(branch(message), "pause the goal");
 		assert.equal(result.ok, true, `${JSON.stringify(message)} should corroborate: ${JSON.stringify(result)}`);

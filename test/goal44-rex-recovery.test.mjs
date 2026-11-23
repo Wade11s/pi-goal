@@ -240,7 +240,7 @@ test("restart restores totals and cursors; paused work joins only the later obse
 		writeFileSync(handleGate, "", "utf8");
 		assertChildDelta(await first.waitForToolResult("rex_wait", 1));
 		await abortContinuation(first);
-		await first.prompt("/goal pause");
+		await first.prompt("/goal:pause");
 		assert.equal(await liveUsage(first), 26 + CHILD_ACCOUNTED);
 		sessionFile = await first.sessionFile();
 		assertOnlyFailures(first, [{ stopReason: "aborted" }]);
@@ -269,7 +269,7 @@ test("restart restores totals and cursors; paused work joins only the later obse
 	await second.waitForNotify((record) => record.message.includes("restored (paused)"));
 	assert.equal(await liveUsage(second), 26 + CHILD_ACCOUNTED, "restart reconstruction itself charges nothing");
 	assertStepsConsumed(second, 0);
-	await second.prompt("/goal resume");
+	await second.prompt("/goal:resume");
 	const collected = await second.waitForToolResult("rex_observe", 1);
 	const repeated = await second.waitForToolResult("rex_observe", 2);
 	assertChildDelta(collected, 1); // exactly the paused turn's delta, not the full cumulative 200
@@ -327,7 +327,7 @@ test("selected-parent-branch replay drops the abandoned observation but retains 
 		{ text: "Done.", usage: { input: 4, output: 1 } },
 	];
 	script(branchSteps, session);
-	await session.prompt(`/goal edit ${OBJECTIVE}: selected branch`);
+	await session.prompt(`/goal:edit ${OBJECTIVE}: selected branch`);
 	const observed = await session.waitForToolResult("rex_observe", 1);
 	assertChildDelta(observed, 1); // zero spawn baseline, not the abandoned branch's later cursor
 	await awaitProviderSteps(session, 8);
