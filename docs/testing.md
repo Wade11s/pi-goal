@@ -37,7 +37,13 @@ npm test           # real-Pi RPC tests (requires `pi` 1.5.1+ on PATH)
 
 The automated tests spawn a real `pi --mode rpc` subprocess per test with
 temporary working, session, and agent directories (`PI_CODING_AGENT_DIR` /
-`--session-dir`; the temp directories are removed when each test finishes), a
+`--session-dir`; the temp directories are removed when each test finishes). Each
+spawned session gets a settings file that sets `goal.clarifyOnCreate: false`, so
+the suites written before Objective clarification keep the direct-creation path;
+the clarification suite opts back in explicitly and owns the clarifying
+coverage, one scenario omits the key entirely (`omitClarifyOnCreate`) so the
+production default (`true`) is exercised end to end, and the default itself is
+also pinned by the unit seam. A
 scripted test model provider (`test/extensions/scripted-provider.ts`, driven by
 `PI_GOAL_TEST_SCRIPT`, including hanging and delayed responses for
 interrupted-run and queueing tests), an optional second extension
@@ -186,6 +192,27 @@ naming preference for a title over the Objective's first line with the
 never-overwrite and write-failure rules unchanged, and the command surface
 (`--title` alone, combined, refused, and completing `--title`).
 
+Objective clarification (issue #84) is tested at both seams.
+`test/goal84-objective-clarification.test.mjs` drives real RPC sessions: the
+scripted provider plays the interview, the model makes real `propose_goal` calls,
+and the confirmation editor — one document whose first line is `Title: …` — is
+answered over the extension-UI subprotocol with save, edited save, an invalid
+title that reopens the document, cancel, and no answer at all
+(`PI_GOAL_DIALOG_TIMEOUT_MS`). Its zero-side-effect proofs read the durable
+`goal-state` and `goal-clarification` entries, the artifact store beside the
+session file, the local HTTPS fixture's request log, and the tool result the
+model receives. The auxiliary `test/extensions/events-peer.ts` proves the
+confirmed title never reaches Goal-updated events or history.
+`test/goal84-objective-clarification-store.test.mjs` pins the cheap cases against
+a fake Pi: the setting's default and malformed-value fallback, the confirmation
+document's format/parse rules, the UI-less direct creation with its notice,
+`propose_goal` registration/refusal gating (including a reload that turns the
+setting off while Pi keeps the registration), and the failure matrix a real
+session cannot inject — a foreign extension owning the tool name (creation fails
+closed), a failed `pending: null` write (surfaced, the clarification stays open,
+and a save is refused), and a duplicate confirmation whose save already committed
+(the stale cancel clears nothing and reports the committed Goal).
+
 The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
 surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
 durable Lifecycle status, is stopped, and is reopened from a copy of its session
@@ -244,10 +271,12 @@ truncated record.
 
 ### Dialog timeouts
 
-Every interactive dialog pi-goal opens (the interactive objective editor, the
-resume prompt) carries a `timeout` and a safe default answer, so an unattended
-host cannot make a command wait forever. `/goal <objective>` opens no dialog:
-an unfinished Goal refuses it and a complete one is superseded silently.
+Every interactive dialog pi-goal opens (the Objective-clarification confirmation
+editor, the interactive objective editor, the resume prompt) carries a `timeout`
+and a safe default answer, so an unattended host cannot make a command or a tool
+call wait forever. `/goal <objective>` itself opens no dialog: an unfinished Goal
+refuses it before any clarification, a complete one is superseded silently, and
+the confirmation editor belongs to the model's `propose_goal` call.
 `PI_GOAL_DIALOG_TIMEOUT_MS` overrides that bound with a positive integer number
 of milliseconds; it exists so the timeout branches are testable through the
 real-Pi harness without waiting the production interval out. An unset or invalid
@@ -450,7 +479,11 @@ To verify the package installation and the interactive surface by hand, follow
 [smoke-test.md](smoke-test.md). The smoke test covers:
 
 - [ ] `pi install ./` and `pi list`
-- [ ] `/goal <objective>` creation and immediate work
+- [ ] `/goal <raw idea>` Objective clarification: pending entry, interview,
+      confirmation editor, and a committed Goal carrying exactly the saved title
+      and Objective; cancelling or timing out creates and materializes nothing
+- [ ] `goal.clarifyOnCreate: false` creation and immediate work, and a UI-less
+      mode's direct creation with its notice
 - [ ] `/goal --file <path> --image <path> <objective>` sends encoded untrusted
       text and Pi image blocks, restarts with the same hashes, retains artifacts
       after replacement/clear, and suppresses Continuation on integrity failure

@@ -400,6 +400,49 @@ export function parseAdmissionSettings(settings: unknown): AdmissionSettings {
 }
 
 /**
+ * Extension-level Objective-clarification configuration
+ * (`goal.clarifyOnCreate`, issue #84).
+ *
+ * When true (the default), `/goal <raw idea>` starts an interview and a
+ * confirmation editor instead of committing a Goal immediately. Setting it to
+ * false restores the pre-0.3 direct creation. A UI-less host always creates
+ * directly, with a notice: the interview needs a dialog-capable host to end in a
+ * confirmation.
+ */
+export interface ClarifyOnCreateSettings {
+	/** Whether a UI-capable `/goal` creation clarifies first. Defaults to true. */
+	enabled: boolean;
+	/** Human-readable configuration problems, reported once per session. */
+	problems: string[];
+}
+
+/**
+ * Read `goal.clarifyOnCreate` from Pi's effective settings.
+ *
+ * The default is `true`: vague objectives are the problem this flow exists for,
+ * so the remedy is the default path and this setting is the escape hatch. An
+ * invalid value is reported once and ignored, which also resolves to `true` —
+ * a configuration mistake must not silently switch the user onto a flow they did
+ * not ask for, and it must not switch them off the one the default promises.
+ */
+export function parseClarifyOnCreateSettings(settings: unknown): ClarifyOnCreateSettings {
+	const goal = (settings && typeof settings === "object" ? (settings as Record<string, unknown>).goal : undefined) as
+		| Record<string, unknown>
+		| undefined;
+	const raw = readOptionalBoolean(goal?.clarifyOnCreate);
+	if (raw === "invalid") {
+		return {
+			enabled: true,
+			problems: [
+				"pi-goal: goal.clarifyOnCreate must be a boolean (true or false); ignoring it and clarifying each " +
+					"/goal creation as usual.",
+			],
+		};
+	}
+	return { enabled: raw ?? true, problems: [] };
+}
+
+/**
  * Extension-level convenience configuration (`goal.resumePrompt`).
  *
  * The prompt is a convenience over the durable `/goal:resume` transition, never

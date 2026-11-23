@@ -54,7 +54,7 @@ snapshot it follows can never disagree.
 | Kind | Produced by |
 | --- | --- |
 | `created` | `/goal <objective>` or an authorized `create_goal` committing a Goal into a free slot. |
-| `replaced` | `/goal <objective>` taking the session's Goal slot from an existing Goal — immediately when that Goal is already `complete`, otherwise once the user confirms the replacement. The event names the **replacement** identity; the replaced identity keeps its own durable superseded record and is never re-announced. |
+| `replaced` | `/goal <objective>` taking the session's Goal slot from an existing **complete** Goal — the only Goal a creation may supersede; an unfinished one refuses the creation before any dialog or clarification. The event names the **replacement** identity; the replaced identity keeps its own durable superseded record and is never re-announced. |
 | `objective-edited` | `/goal:edit` committing an in-place Goal edit for the same identity: a new objective, a new title, or both. The payload carries neither text; a title-only edit is this kind because it is still an in-place content edit of the same Goal. |
 | `paused` | `/goal:pause`, or `update_goal action:"pause"` after pause corroboration. |
 | `resumed` | `/goal:resume` restarting a paused, blocked, or usage-limited Goal. |

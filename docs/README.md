@@ -25,7 +25,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 
 | Doc | Covers |
 | --- | --- |
-| [behavior/lifecycle.md](behavior/lifecycle.md) | Create, replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Objective, the opt-in progress-plan tool, and the `goal.enabled` admission control |
+| [behavior/lifecycle.md](behavior/lifecycle.md) | Create (Objective clarification by default, or direct creation), replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Goal title or Objective, the opt-in progress-plan tool, and the `goal.enabled` admission control |
 | [behavior/attachments.md](behavior/attachments.md) | `--file`/`--image`/`--remote-image` Objective attachments: fetch security, limits, the immutable artifact store, the trust boundary, restore verification, and V1 retention |
 | [behavior/budgets.md](behavior/budgets.md) | `--budget` and `--no-budget`, settings defaults and hard maximum, cumulative budget raises, budget exhaustion and the bounded wrap-up |
 | [behavior/continuation.md](behavior/continuation.md) | The `agent_before_settle` seam, one provider request per settlement, the evidence audit, and the no-progress contract |

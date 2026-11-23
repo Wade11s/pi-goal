@@ -83,7 +83,10 @@ function fakePi(sessionFile, options = {}) {
 	const tools = [];
 	const commands = new Map();
 	const append = options.append ?? "write";
-	const settings = options.settings ?? {};
+	// Objective clarification is off by default here, exactly as the real-Pi harness
+	// defaults it, so the bridge cases exercise the direct-creation path; the
+	// clarified path is covered by its own suite and unit seam.
+	const settings = { ...(options.settings ?? {}), goal: { clarifyOnCreate: false, ...(options.settings?.goal ?? {}) } };
 	writeFileSync(sessionFile, "");
 	const pi = {
 		on(event, handler) {

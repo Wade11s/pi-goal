@@ -290,9 +290,16 @@ can prevent that.
   cannot talk to it without an adapter, and nothing here claims otherwise.
 - **No streaming or subscriptions.** One request, one response entry. A host that
   wants Goal updates subscribes to `pi-goal:updated` / `pi-goal:metrics` locally.
-- **A dialog can be part of a call.** Codex's `set` has no confirmation
-  interaction; here an unfinished Goal requires the user's answer, so a `set` may
-  stay unanswered until the host answers the dialog or the dialog times out.
+- **Clarification can be part of a call.** Codex's `set` creates immediately.
+  Here `goal.clarifyOnCreate` (default `true`) makes a bridged `/goal` start
+  Objective clarification instead: the command records the pending clarification
+  and sends the model the interview, commits no Goal, and answers `ok: false`,
+  `disposition: "declined"` with an info-only diagnostic. The model's
+  `propose_goal` confirmation runs outside the bridge, so a host that wants the
+  old immediate behavior either sets `goal.clarifyOnCreate: false` or answers the
+  task that follows. If the confirmation tool could not be registered, the
+  creation is refused (`refused`, with the diagnostic) instead of bypassing
+  confirmation. An unfinished Goal still refuses before any clarification.
 - **Four methods, not a lifecycle API.** No `pause`, `resume`, `edit`, or
   separate attachment method: those stay user commands. `set` accepts local `files` and
   `images` because the command surface does, but nothing here infers a composer
