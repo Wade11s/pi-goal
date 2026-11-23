@@ -2482,13 +2482,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const existing = store.get();
 			if (existing) {
 				// A Goal of any status, including a complete one, still occupies the
-				// session's single Goal slot. Replacing or clearing one is a user-owned
-				// action (/goal <objective> confirms a replacement; /goal:clear removes it).
+				// session's single Goal slot, and only the user changes that slot: an
+				// unfinished Goal refuses /goal <objective> (one session works one Goal
+				// at a time), a complete one is superseded by it without confirmation,
+				// and /goal:clear removes either.
 				return goalToolError(
 					"A Goal is already set for this session (status: " +
 						`${existing.status}); cannot create another one. ` +
 						"Use get_goal to inspect it, or update_goal to complete it. Only the user can replace " +
-						"or clear a Goal, with /goal <objective> or /goal:clear.",
+						"or clear a Goal, with /goal <objective> (a complete Goal only) or /goal:clear.",
 					toPublicState(existing),
 				);
 			}

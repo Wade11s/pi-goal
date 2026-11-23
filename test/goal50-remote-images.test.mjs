@@ -655,42 +655,48 @@ test("a clear during a stalled remote-image fetch wins over the in-flight creati
 	}
 });
 
-test("a refused edit during a stalled remote-image fetch leaves the creation to commit", async () => {
+test("a title edit during a stalled remote-image fetch cancels the stale creation and retracts its artifact", async () => {
 	const fixture = await RemoteImageFixture.start();
 	const dirs = sharedDirs();
 	const session = await startSession(dirs, fixture);
-	// The first Goal completes (and so cannot be edited); the creation that supersedes
-	// it fetches a remote image while the user tries the edit.
+	// The first Goal completes, so the creation below may supersede it; a title is a
+	// label, so `/goal:edit --title` is admitted for that complete Goal and advances
+	// its revision — a real change to the record the stalled creation captured.
 	script(
 		[
 			{ text: "Kickoff answer.", usage: { input: 20, output: 5 } },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ text: "Done." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-			{ text: "Done again." },
 		],
 		session,
 	);
 	try {
 		await createCompleteGoal(session);
 		const sessionFile = await session.sessionFile();
+		const root = attachmentStoreRoot(sessionFile);
+		const completed = lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal;
+		assert.equal(completed.status, "complete");
+		assert.equal(completed.revision, 1);
+
 		const mark = session.records.length;
-		const replacePromise = submitCommand(
+		const createPromise = submitCommand(
 			session,
-			"create-while-editing",
+			"create-while-title-editing",
 			`/goal --remote-image ${fixture.url("/hold")} A replacement objective`,
 		);
 		await fixture.waitForRequest("/hold");
 
-		// Editing a complete Goal is refused, so it never advances the revision the
-		// creation captured. The creation must therefore still commit rather than
-		// cancelling against a "changed" Goal.
-		const edited = await session.prompt("/goal:edit The revised objective");
+		// The title edit lands while the fetch is stalled: the captured record changes
+		// under the command, so it must not commit the creation against the old one.
+		const edited = await session.prompt('/goal:edit --title "Renamed while fetching"');
 		assert.equal(edited.data.disposition, "handled");
-		const refusal = await session.notifyAfter(mark, (record) =>
-			record.message.includes("a complete Goal is finished and cannot be edited"),
-		);
-		assert.equal(refusal.notifyType, "warning");
+		const editNotice = await session.notifyAfter(mark, (record) => record.message.includes("title set to"));
+		assert.match(editNotice.message, /revision 2/);
+		const editedGoal = lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal;
+		assert.equal(editedGoal.id, completed.id, "the title edit kept the Goal identity");
+		assert.equal(editedGoal.title, "Renamed while fetching");
+		assert.equal(editedGoal.status, "complete");
+		assert.equal(editedGoal.revision, 2);
 		assert.equal(
 			session.records.filter((record) => record.type === "extension_ui_request" && record.method === "confirm").length,
 			0,
@@ -698,41 +704,39 @@ test("a refused edit during a stalled remote-image fetch leaves the creation to 
 		);
 
 		fixture.releaseHeld();
-		await replacePromise;
-		const created = await session.waitForNotify((record) => record.message.includes("created and activated, replacing"));
-		assert.match(created.message, /replacing goal_[0-9a-f]+/);
-		// The new Goal's own kickoff runs and completes, so the scenario is the Goal
-		// lifecycle rather than a race between delivery and teardown.
-		await session.waitFor("the new Goal to complete", (records) =>
-			records.filter((record) => record.type === "agent_settled").length >= 2 ? true : undefined,
+		await createPromise;
+
+		const cancelled = await session.notifyAfter(mark, (record) =>
+			record.message.includes("Goal not created: the Goal changed while the remote image was being fetched"),
 		);
-		await session.waitFor("the new Goal's completing snapshot", () => {
-			let entries;
-			try {
-				entries = readSessionEntries(sessionFile);
-			} catch {
-				return undefined;
-			}
-			const latest = goalSnapshots(entries).at(-1)?.data.goal;
-			return latest?.status === "complete" && latest.objective === "A replacement objective" ? true : undefined;
-		});
+		assert.equal(cancelled.notifyType, "warning");
+		assert.match(cancelled.message, /now complete, revision 2/);
+		assert.match(cancelled.message, /Nothing was replaced/);
+		assert.match(cancelled.message, /fetched artifact was retracted/);
 
 		const entries = readSessionEntries(sessionFile);
-		const goals = goalSnapshots(entries);
-		const replacement = goals.at(-1).data.goal;
-		assert.equal(replacement.objective, "A replacement objective", "the creation's own objective is current");
-		assert.equal(replacement.attachments.length, 1, "the fetched artifact is in the committed manifest");
-		const superseded = goals.filter((entry) => entry.data.goal?.objective === OBJECTIVE).at(-1).data.goal;
-		assert.equal(superseded.status, "complete", "the complete record is preserved, not edited");
-		assert.equal(superseded.attachments, undefined, "and its manifest is untouched");
+		const goal = lastGoalSnapshot(entries).data.goal;
+		assert.equal(goal.id, completed.id, "the edited Goal is still the current record");
+		assert.equal(goal.title, "Renamed while fetching", "the edit is preserved, not rolled back");
+		assert.equal(goal.status, "complete");
+		assert.equal(goal.revision, 2);
+		assert.ok(
+			goalSnapshots(entries).every((snapshot) => snapshot.data.goal?.objective !== "A replacement objective"),
+			"the stale creation committed no new identity",
+		);
 		assert.deepEqual(
 			eventLog(entries).map((entry) => entry.data.kind),
-			["created", "completed", "replaced", "completed"],
-			"the refused edit emitted nothing; the new Goal completed on its own turn",
+			["created", "completed", "objective-edited"],
+			"the cancelled creation emitted no success event",
+		);
+		assert.deepEqual(
+			storedGoalIds(root),
+			[],
+			"the never-committed fetch was retracted despite the successful edit",
 		);
 		assert.equal(fixture.countExact("/hold"), 1, "the fetch was not repeated");
 
-		assertStepsConsumed(session, 5);
+		assertStepsConsumed(session, 3);
 		assertCleanRun(session);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {

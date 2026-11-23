@@ -151,12 +151,25 @@ async function assertRefused(session, command, status) {
 	const historyBefore = await historyCount(session);
 	const runs = runCount(session);
 	const confirms = confirmRequests(session);
+	// Every status sends two refused spellings, so the search has to start at the
+	// record the first command left behind. An unscoped wait would happily return
+	// the *other* command's warning and prove nothing about this one.
+	const mark = session.records.length;
 
 	const response = await session.prompt(command);
 	assert.equal(response.data.disposition, "handled", command);
-	const refusal = await session.waitForNotify((r) =>
+	const refusal = await session.notifyAfter(mark, (r) =>
 		r.message.startsWith("Goal not created: an unfinished Goal is already set"),
 	);
+	const appended = session.records.filter(
+		(record, index) =>
+			index >= mark &&
+			record.type === "extension_ui_request" &&
+			record.method === "notify" &&
+			record.message.startsWith("Goal not created: an unfinished Goal is already set"),
+	);
+	assert.equal(appended.length, 1, `${command}: exactly one refusal was appended`);
+	assert.equal(appended[0], refusal, `${command}: the new notification is this command's refusal`);
 	assert.equal(refusal.notifyType, "warning", `${command}: a warning, which is what the bridge reports as refused`);
 	assert.ok(refusal.message.includes(`(${status}, "`), `${command}: names the Lifecycle status`);
 	assert.ok(refusal.message.includes(OBJECTIVE), `${command}: names the Goal that is in the way`);
@@ -355,6 +368,51 @@ test("create_goal is unchanged: it still refuses while any Goal exists, with its
 		assert.equal(currentGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal.id, goal.id);
 		assert.equal(confirmRequests(session), 0);
 		assertStepsConsumed(session, 3);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await session.stop();
+	}
+});
+
+test("create_goal still refuses a complete Goal, the one Goal a creation may supersede", async () => {
+	// The asymmetry is the point: `/goal <objective>` may supersede a complete Goal,
+	// but the model-side creation path must still refuse while *any* Goal exists, so
+	// a complete record occupies the slot for `create_goal` exactly as an unfinished
+	// one does.
+	const session = await PiRpcSession.start();
+	// Kickoff, the completing turn, and its wrap-up; then the ordinary prompt that
+	// calls create_goal and reports the refusal.
+	script(
+		[
+			{ text: "On it." },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+			{ toolCalls: [{ name: "create_goal", args: { objective: NEXT, userRequest: "please create a goal" } }] },
+			{ text: "Refused; reporting that." },
+		],
+		session,
+	);
+	try {
+		await createGoal(session);
+		await session.waitForSettled(1);
+		const goal = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
+		assert.equal(goal.status, "complete");
+		const before = await goalBytes(session);
+
+		await session.prompt("please create a goal");
+		const refused = await session.waitForToolResult("create_goal", 1);
+		assert.equal(refused.isError, true, "create_goal refused");
+		assert.match(
+			String(refused.result.content[0].text),
+			/A Goal is already set for this session \(status: complete\); cannot create another one\./,
+		);
+		const described = structuredGoal(refused.result);
+		assert.equal(described.id, goal.id, "the refusal describes the complete Goal");
+		assert.equal(described.status, "complete");
+
+		assert.equal(await goalBytes(session), before, "the refused create_goal wrote no Goal bytes");
+		assert.equal(confirmRequests(session), 0, "no dialog was involved");
+		assertStepsConsumed(session, 5);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();

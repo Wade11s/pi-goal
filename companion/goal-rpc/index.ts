@@ -16,7 +16,8 @@
  * It is a thin adapter, not a second lifecycle. Every method is translated into
  * the Goal command family command a user would type and its exact argument text,
  * and executed by pi-goal's own command handler through the documented in-process
- * command bridge (`pi-goal:command-bridge`). Replacement confirmation,
+ * command bridge (`pi-goal:command-bridge`). The single-Goal creation rule, its
+ * refusal against an unfinished Goal (with the silent supersede of a complete one),
  * `goal.enabled` admission, Token-budget and attachment validation, and the
  * durable-before-announced ordering therefore all live in pi-goal, in one place:
  * this package never reads a Goal snapshot, never writes one, never touches a
