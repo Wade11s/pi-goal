@@ -48,9 +48,9 @@ The request carries Pi's own dispatch shape — the command name Pi dispatches o
 and the text after it — so the bridge never parses anything. A `name` outside the
 Goal command family is malformed and dropped, like a bad version; a version-1
 request (the old `command` string) is dropped for the same reason, so the caller's
-own timeout answers `unavailable` rather than a refusal. The upgrade message is a
-validation diagnostic, not a reply: nothing answers a payload whose `reply` cannot
-be trusted.
+own timeout answers `unavailable` rather than a refusal, and pi-goal logs the
+upgrade diagnostic in its own console so the mismatch is visible to whoever reads
+that side.
 
 The result echoes `name` and `args` (so a caller correlates the answer with
 exactly what it sent) and adds:
@@ -125,9 +125,11 @@ consumer that reacts to commits should keep reading the event stream.
   the bridge refuses instead of running a command against nothing.
 - **Validated envelopes.** A malformed request — an unknown or old `version`, a
   `name` outside the Goal command family, a non-string `args` — is dropped rather
-  than guessed, because it has no trustworthy `reply` and the caller's own timeout
-  covers the lost answer; a family `name` that Pi does not list as a registered
-  command at dispatch time is answered `invalid` without running anything.
+  than guessed, because it has no trustworthy `reply`; the caller's own timeout
+  covers the lost answer and pi-goal logs the refusal ("upgrade the companion or
+  pi-goal" for a version mismatch) in its console; a family `name` that Pi does
+  not list as a registered command at dispatch time is answered `invalid`
+  without running anything.
 - **No session control.** A bridged command may not start, fork, navigate, switch,
   or reload a session, and may not abort the user's run, compact its context, or
   shut Pi down. That is the whole session-control and agent/process-control

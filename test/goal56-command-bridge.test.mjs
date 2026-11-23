@@ -34,7 +34,6 @@ import {
 	classifyGoalBridgeOutcome,
 	commandContextForBridge,
 	committedKindsFor,
-	goalBridgeActionFor,
 	parseGoalCommandBridgeRequest,
 } from "../src/command-bridge.ts";
 import companionManifest from "../companion/goal-rpc/package.json" with { type: "json" };
@@ -302,22 +301,45 @@ test("each action accepts only the transitions that can answer it", () => {
 	assert.equal(committedKindsFor("create").includes("completed"), false);
 });
 
-test("the action is the command name, and only /goal looks at its argument", () => {
-	assert.equal(goalBridgeActionFor("goal", ""), "status");
-	assert.equal(goalBridgeActionFor("goal", "   "), "status");
-	assert.equal(goalBridgeActionFor("goal", OBJECTIVE), "create");
-	// The old space-separated spelling is still a create as far as the bridge is
-	// concerned: the creation path refuses it, and that refusal is the create
-	// action's answer (`refused`), never `invalid`.
-	assert.equal(goalBridgeActionFor("goal", "pause"), "create");
-	assert.equal(goalBridgeActionFor("goal", "--budget 5000 --file spec.md Ship it"), "create");
-	assert.equal(goalBridgeActionFor("goal:pause", ""), "pause");
-	assert.equal(goalBridgeActionFor("goal:pause", "foo"), "pause");
-	assert.equal(goalBridgeActionFor("goal:resume", "--budget 150"), "resume");
-	assert.equal(goalBridgeActionFor("goal:clear", ""), "clear");
-	assert.equal(goalBridgeActionFor("goal:history", ""), "history");
-	assert.equal(goalBridgeActionFor("goal:edit", ""), "edit");
-	assert.equal(goalBridgeActionFor("goal:edit", "New objective"), "edit");
+test("the action is the command name, and only /goal looks at its argument", async (t) => {
+	const dir = withTempDir(t);
+	const { pi } = await startBridgeHarness(dir);
+
+	// Observed through the public result's `action` field, one request per meaning,
+	// so the derivation is pinned by what a bridge consumer receives.
+	const cases = [
+		{ name: "goal", args: "", action: "status" },
+		{ name: "goal", args: "   ", action: "status" },
+		{ name: "goal", args: OBJECTIVE, action: "create" },
+		// The old space-separated spelling is still a create as far as the bridge is
+		// concerned: the creation path refuses it, and that refusal is the create
+		// action's answer (`refused`), never `invalid`.
+		{ name: "goal", args: "pause", action: "create" },
+		{ name: "goal", args: "--budget 5000 --file spec.md Ship it", action: "create" },
+		{ name: "goal:pause", args: "", action: "pause" },
+		{ name: "goal:pause", args: "foo", action: "pause" },
+		{ name: "goal:resume", args: "--budget 150", action: "resume" },
+		{ name: "goal:clear", args: "", action: "clear" },
+		{ name: "goal:history", args: "", action: "history" },
+		{ name: "goal:edit", args: "", action: "edit" },
+		{ name: "goal:edit", args: "New objective", action: "edit" },
+	];
+	for (const [index, { name, args, action }] of cases.entries()) {
+		const result = await bridge(pi, name, args, { id: `action-${index}` });
+		assert.equal(result.action, action, `/${name} ${JSON.stringify(args)}`);
+		assert.equal(result.name, name, "the result echoes the request's name");
+		assert.equal(result.args, args, "the result echoes the request's args");
+	}
+	// A `name` that passes protocol validation but is not a registered command at
+	// dispatch time answers `invalid` and runs nothing. `goal:status` is a
+	// well-formed v2 name outside the family, so the parser drops it and the
+	// caller's own timeout is the answer; the registered-family check is reached
+	// only for names inside the family.
+	assert.match(
+		parseGoalCommandBridgeRequest({ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal:status", args: "", reply: () => {} }).message,
+		/goal:pause/,
+		"an outside-family name is dropped at validation, never dispatched",
+	);
 });
 
 test("a malformed bridge request is dropped instead of half-executed", () => {
@@ -473,12 +495,14 @@ test("the disposition truth table holds for every command in the family", async 
 		assert.equal(goalStateBytes(sessionFile), "", `${name} with no Goal writes nothing`);
 	}
 	// A stray argument on a no-argument verb is the verb's usage error: refused.
+	const beforeUsage = goalStateBytes(sessionFile);
 	const usage = await bridge(pi, "goal:pause", "foo", { id: "pause-foo" });
 	assert.equal(usage.ok, false);
 	assert.equal(usage.disposition, "refused");
 	assert.equal(usage.action, "pause");
 	assert.deepEqual(usage.transitions, []);
 	assert.deepEqual(usage.diagnostics, [{ level: "error", text: "/goal:pause takes no argument." }]);
+	assert.equal(goalStateBytes(sessionFile), beforeUsage, "the usage refusal wrote no Goal bytes");
 	// The history rendering is a read: reported, with the timeline as diagnostics.
 	const emptyHistory = await bridge(pi, "goal:history", "", { id: "history-0" });
 	assert.equal(emptyHistory.ok, true);
@@ -541,11 +565,13 @@ test("the disposition truth table holds for every command in the family", async 
 	assert.equal(resumed.goal.status, "active");
 
 	// `/goal:edit` keeps its attachment-flag refusal over the bridge too.
+	const beforeFlag = goalStateBytes(sessionFile);
 	const flagRefusal = await bridge(pi, "goal:edit", "--file notes.md A revised objective", { id: "edit-flag" });
 	assert.equal(flagRefusal.ok, false);
 	assert.equal(flagRefusal.disposition, "refused");
 	assert.equal(flagRefusal.action, "edit");
 	assert.ok(flagRefusal.diagnostics.some((diagnostic) => /Replacement Goal/.test(diagnostic.text)));
+	assert.equal(goalStateBytes(sessionFile), beforeFlag, "the attachment refusal wrote no Goal bytes");
 });
 
 test("a creation that fails its durability poll is answered as refused, never committed", async (t) => {
@@ -763,7 +789,12 @@ test("the companion is independently installable and speaks the documented bridg
 	assert.equal(/from\s+"[^"]*\/src\//.test(source), false, "the companion must not import pi-goal internals");
 	assert.equal(source.includes("registerTool("), false, "the companion registers no model-callable tool");
 	assert.equal(source.includes("goal-state"), false, "the companion never names a durable Goal entry");
+	// The parser mirror is gone by construction: the companion holds no Objective
+	// collision vocabulary of its own (no reserved-word list, no option-token
+	// scanner), so a `set` cannot re-implement the command surface it translates.
 	assert.equal(source.includes("commandCollision"), false, "the parser mirror is gone");
+	assert.equal(source.includes("RESERVED_GOAL_VERBS"), false, "no reserved-word list of its own");
+	assert.equal(/"--(no-)?budget"\s*\|\|--(file|image|remote-image)/.test(source), false, "no option-token scanner of its own");
 	assert.equal(source.includes("appendEntry(GOAL_RPC_RESPONSE_ENTRY"), true, "the only write is its own response entry");
 	assert.equal(GOAL_RPC_RESPONSE_ENTRY, "goal-rpc-response");
 });

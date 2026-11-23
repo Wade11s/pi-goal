@@ -3121,8 +3121,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.events.on(GOAL_COMMAND_BRIDGE, (payload) => {
 		const parsed = parseGoalCommandBridgeRequest(payload);
 		// A malformed payload has no reply channel worth trusting: answering it would
-		// mean calling an unvalidated function from the bus.
-		if (!parsed.ok) return;
+		// mean calling an unvalidated function from the bus. The refusal still names
+		// itself (a version mismatch says "upgrade the companion or pi-goal"), so the
+		// mismatch is diagnosed in the host's log even though the caller's own timeout
+		// is what answers it.
+		if (!parsed.ok) {
+			console.error(`[pi-goal] dropped a malformed bridge request: ${parsed.message}`);
+			return;
+		}
 		const request = parsed.request;
 		// "Called exactly once" includes the failure case: a reply callback that
 		// throws (a broken host channel) has already been *called*, so the last-resort

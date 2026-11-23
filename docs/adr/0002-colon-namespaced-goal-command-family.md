@@ -59,8 +59,10 @@ creation.
    `{ version: 2, id, name, args, reply }` — the command name and the text after
    it — instead of "the text after `/goal`". The result echoes `name` and `args`
    in place of `command`; the dispositions (`committed`, `reported`, `declined`,
-   `refused`, `invalid`) are unchanged, and `invalid` is only a `name` outside
-   the family.
+   `refused`, `invalid`) are unchanged, and `invalid` is only a `name` that is
+   valid for the protocol but is not a registered command when the request is
+   dispatched — a `name` outside the family is malformed and dropped, like a bad
+   version.
 4. **The companion no longer mirrors the parser.** Its `set` sends
    `{ name: "goal", args: <objective> }` and pi-goal's own refusal comes back
    through the bridge as `refused` with the diagnostic verbatim. A `set` can no
