@@ -39,15 +39,16 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   label. It is plain Goal state, so it is persisted verbatim, reconstructed from
   the selected branch like the objective, and preserved by every later transition.
   It is **absent** for every snapshot written before titles existed and for every
-  Goal created by `/goal` or `create_goal`; those reconstruct unchanged with no
-  title rather than an empty one. A title string that fails the one-line 1–80 rule
+  Goal created without clarification (`create_goal`, a UI-less `/goal`, or
+  `goal.clarifyOnCreate: false`); those reconstruct unchanged with no title
+  rather than an empty one. A title string that fails the one-line 1–80 rule
   is dropped during reconstruction (never trusted, and never fatal), because a
   display label must not cost the user the Goal it describes. A title-only
   `/goal:edit --title` writes the next snapshot with the same identity and the
   next revision, so replay and a restart see exactly the committed label.
 - A pending Objective clarification is a **`goal-clarification`** custom entry,
-  separate from `goal-state` and written before any Goal exists. Version 2 carries
-  three states: **`pending`** (the raw idea plus the leading `--budget` /
+  separate from `goal-state` and written instead of committing a new Goal. Version
+  2 carries three states: **`pending`** (the raw idea plus the leading `--budget` /
   `--no-budget` / `--file` / `--image` / `--remote-image` flags), **`confirming`**
   (the same state plus the document the user saved in the confirmation editor,
   written *before* the creation commit), and **`ended`** (the terminal record for a
@@ -55,9 +56,9 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   wins on the branch. Cancellation and an uncommitted save are deliberately
   different records: a failed creation or a crash mid-fetch leaves `confirming`,
   so the user's edited draft and held flags survive and the editor reopens with
-  that draft; only a finished clarification is `ended`. It is not Goal state — no
-  Goal snapshot, Goal-updated event, history record, or Attachment manifest exists
-  beside it.
+  that draft; only a finished clarification is `ended`. It is not Goal state — it
+  creates no Goal snapshot, Goal-updated event, history record, or Attachment
+  manifest.
 - A pending entry also records the **base Goal identity** it was started against
   (`null` when no Goal existed, or the complete Goal it may supersede). It is
   reconstructed at the same two seams as the Goal, from the newest
@@ -153,7 +154,8 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
 - Ephemeral sessions (started with `--no-session`) cannot persist a Goal:
   creating one returns a clear error instead of claiming durable storage.
 - Sessions without a Goal behave exactly as before; installing the extension
-  only adds the command, the three tools, and the state they manage.
+  only adds the Goal command family, the four core model tools (plus the
+  opt-in `update_plan`), and the state they manage.
 
 ## Legacy 0.1.0 cutover
 

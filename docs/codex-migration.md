@@ -12,10 +12,10 @@ substitute for the per-capability table.
 | Side | Baseline |
 | --- | --- |
 | Codex | [`openai/codex@ab541fb`](https://github.com/openai/codex/tree/ab541fb9908198d95e9420668bb03f94dfe6324e/codex-rs/ext/goal), the source revision named in [NOTICE.md](../NOTICE.md), plus the Goal TUI files under `codex-rs/tui/` at the same revision |
-| pi-goal | `integration/complete-codex-migration-42` delivery tip promoted by PR #78 (P0–P4) |
+| pi-goal | `main` at the 0.3.0 release (Objective clarification and single-Goal creation, spec #81 / ADR-0003) |
 | pi-rex-subagent | released `v0.2.0` (`b2dd0d0`), accepted locally by #43, #44, and the neutral #45 suite |
 | Pi API evidence | pi-goal's declared minimum, Pi 1.5.1; selected behavior also checked against the installed Pi 1.6.0 documentation and type definitions |
-| Verification on 2026-11-22 | At the delivery tip promoted by PR #78: `npm run typecheck` passed and `npm test` passed 707/707, including the 14 provider-neutral conformance cases (seven against each provider), the released-Rex acceptance suites, and the companion public-protocol tests, with zero skips |
+| Verification on 2026-11-24 | At the 0.3.0 release tip: `npm run typecheck` passed and `npm test` passed 795/795, including the clarification, goal-title, single-Goal-creation, and clarification-persistence suites, the 14 provider-neutral conformance cases (seven against each provider), the released-Rex acceptance suites, and the companion public-protocol tests, with zero skips |
 
 The comparison covers the behavior in Codex `ext/goal`, its user-facing TUI
 integration, and the corresponding pi-goal behavior. Codex's Rust implementation
@@ -37,12 +37,14 @@ public extension API.
 The Goal state machine, automatic continuation, deterministic stopping rules,
 budgets, durable accounting, and restart/branch reconstruction are migrated. Some
 of them are stricter than Codex. Released Rex child usage crosses Pi's standard
-tool-result seam and has a provider-neutral conformance contract. Rich objective
-attachments, the resume prompt, session naming, the progress-plan tool, durable
-audit history, admission control, completion reporting, local events, and local
-metrics are delivered; the Codex-shaped RPC companion and the read-only review
-launch profile are optional host integrations. Remaining differences are
-intentional safety choices or host-specific surfaces, not missing mechanics.
+tool-result seam and has a provider-neutral conformance contract. Objective
+clarification with a confirmed Goal title and the single-Goal creation rule are
+delivered, as are rich objective attachments, the resume prompt, session naming,
+the progress-plan tool, durable audit history, admission control, completion
+reporting, local events, and local metrics; the Codex-shaped RPC companion and
+the read-only review launch profile are optional host integrations. Remaining
+differences are intentional safety choices or host-specific surfaces, not missing
+mechanics.
 
 Two corrections prevent an over-broad “complete” claim:
 
@@ -59,12 +61,15 @@ Two corrections prevent an over-broad “complete” claim:
 | Capability | Codex at the baseline | pi-goal now | Assessment |
 | --- | --- | --- | --- |
 | Lifecycle states | `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete` | Same six states | Ported |
+| Objective clarification on creation | Creates directly from the objective the user supplies | `/goal <raw idea>` interviews the user, drafts a title and a three-section Objective, and commits only when the confirmation editor is saved; `goal.clarifyOnCreate: false` or a UI-less host restores direct creation | Intentional default-behavior addition |
+| Goal title | No separate label; the objective is the only Goal text | Optional one-line 1–80 character title, confirmed at creation or set with `/goal:edit --title`; shown in status and structured payloads, preferred by session naming, never in events/history/metrics | Intentional addition |
 | User lifecycle controls | `/goal`, clear/edit/pause/resume through the command and TUI flows | `/goal <objective>`, bare `/goal`, and the verb commands `/goal:pause`, `/goal:resume`, `/goal:clear`, `/goal:history`, `/goal:edit`; the old space-separated spellings are refused with the command to type (ADR-0002) | Ported; command spelling differs (`/goal:pause`, …) |
-| Replacement confirmation | Confirmation for every unfinished status; no confirmation for `complete` | Same rule | Ported |
+| Creation with an unfinished Goal | Replacement confirmation for every unfinished status | **Refused** with a warning naming `/goal:clear`, before any clarification or dialog; the replacement dialog is gone, and one session works one Goal at a time (ADR-0003) | Intentional; stricter single-Goal rule |
+| Creation with a complete Goal | Allowed without a confirmation | Allowed with no replacement-confirmation dialog; default Objective clarification still interviews and confirms the new Goal before the complete record is superseded, while direct creation supersedes immediately | Single-Goal rule ported; clarified by default |
 | Durable lifecycle writes | State DB update under a Goal-state permit | Durable-before-announced session snapshots, with rollback on failed creation/replacement | Strengthened |
-| Model tools | `get_goal`, `create_goal`, `update_goal` | Same three tools; `update_goal` uses explicit actions and corroboration fields | Ported |
-| Creation intent | Tool description requires an explicit user/system request | Exact-quote, execution-scoped **Goal creation authority**, checked at execution time | Strengthened; intentionally stricter |
-| Creation with an existing Goal | Allowed when no Goal exists or the existing one is complete | Refused whenever any Goal exists; replacement and clearing remain user-owned | Intentional |
+| Model tools | `get_goal`, `create_goal`, `update_goal` | The same three tools plus `propose_goal` for Objective clarification and opt-in `update_plan`; `update_goal` uses explicit actions and corroboration fields | Ported, with `propose_goal` as a clarification-specific addition |
+| Creation intent | Tool description requires an explicit user/system request | `create_goal` uses exact-quote, execution-scoped **Goal creation authority**; clarified `/goal` uses the saved confirmation editor as its creation authority | Strengthened; intentionally stricter |
+| Creation with an existing Goal (model tool) | Allowed when no Goal exists or the existing one is complete | `create_goal` refuses whenever any Goal exists; replacement and clearing remain user-owned, and Objective clarification is not part of the tool path | Intentional |
 | Pause authority | Explicit request required by the tool contract | Exact-quote corroboration against recent human messages is also enforced | Strengthened |
 | Objective trust boundary | Objective is untrusted context; XML escaping in steering templates | Random-nonce delimiters plus JSON/Unicode escaping on every Goal message | Strengthened |
 | Automatic continuation | `on_thread_idle` starts a Goal-triggered turn if idle | One provider request at `agent_before_settle`, after Pi-owned retries, recovery, and queued work | Ported through Pi's native seam |
@@ -86,7 +91,7 @@ Two corrections prevent an over-broad “complete” claim:
 | Persistence | `thread_goals` state DB records; fork flushes in-flight progress | `goal-state` / `goal-usage` entries on the selected session branch, tombstones, superseded records, and legacy cutover | Strengthened for Pi's tree model |
 | Ephemeral sessions | Ephemeral threads reject Goals | `--no-session` refuses Goal creation | Ported |
 | Stale model transitions | `expected_goal_id` guards persistent updates | Execution binding plus identity/revision checks reject transitions from pre-replacement or otherwise stale runs | Strengthened |
-| Automated evidence | Rust unit/integration tests | 707 real-Pi RPC and unit tests at the delivery tip, including 14 provider-neutral conformance cases | Ported with host-level coverage |
+| Automated evidence | Rust unit/integration tests | 795 real-Pi RPC and unit tests at the 0.3.0 release tip, including the clarification and single-Goal suites and 14 provider-neutral conformance cases | Ported with host-level coverage |
 
 ## Per-capability comparison: host and UX integration
 

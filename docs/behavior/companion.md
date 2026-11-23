@@ -76,9 +76,9 @@ A bridged command runs pi-goal's own command handler for that name with the same
 argument text, so everything the user gets applies unchanged: an unfinished Goal
 refuses creation with the same warning (and no dialog), `goal.enabled` refuses
 creation before anything else, Token budgets and attachment paths are validated by
-the same rules, a creation that supersedes a complete Goal preserves the old
-identity's admitted work, and the kickoff is delivered through the same steering
-path. The bridge adds two things only: a structured answer, and a recording wrapper
+the same rules, a creation that supersedes a complete Goal preserves that
+complete record's already-accounted usage, and the kickoff is delivered through
+the same steering path. The bridge adds two things only: a structured answer, and a recording wrapper
 around the command's UI notifications (which still reach the user).
 
 The bridge never reads a `goal-state` entry, never writes one, and never
@@ -104,8 +104,9 @@ Success is derived from the commit, never from a message:
 
 Diagnostics are never parsed. Their **severity** is the only signal used, and only
 when nothing committed: a warning or error means `refused`; info-only means
-`declined` (the user answered "no", or there was nothing to do). Rewording a
-message can therefore never change a machine-readable outcome.
+`declined` (the command changed no Goal — for example an open Objective
+clarification, or clearing when no Goal is set). Rewording a message can
+therefore never change a machine-readable outcome.
 
 Because the bridge answers from the commit, the event stream and a bridge result
 can differ in one honest way: a creation whose snapshot committed and whose
@@ -256,8 +257,11 @@ Goal: the command refuses it with a warning that names `/goal:clear`, and the
 companion answers `ok: false`, `disposition: "refused"`, `error.code: "refused"`
 with pi-goal's own diagnostic verbatim, the id of the Goal that was kept, and
 **no** durable Goal write. There is no dialog to answer and no declined-replacement
-outcome. If the current Goal is **complete**, `set` commits: it supersedes the
-complete record exactly as `/goal <objective>` does.
+outcome. If the current Goal is **complete**, `set` follows `/goal <objective>`:
+on a direct-creation path (`goal.clarifyOnCreate: false` or no UI) it commits
+and supersedes the complete record; with clarification on it starts the
+interview and answers `declined`, and the later `propose_goal` save outside the
+bridge performs the supersede.
 
 ### Creation authority
 
@@ -339,7 +343,7 @@ can prevent that.
 | No-session guard | `test/goal56-command-bridge.test.mjs` |
 | Protocol constants agree; companion has no pi-goal import, dependency, or tool | `test/goal56-command-bridge.test.mjs` |
 | Public-protocol get/set/clear round-trip against a real Pi RPC session | `test/goal56-goal-rpc-companion.test.mjs` |
-| Replacement confirmation (decline and accept), superseded history, stale-run binding | `test/goal56-goal-rpc-companion.test.mjs` |
+| Unfinished-Goal refusal (diagnostic verbatim, Goal bytes unchanged), complete-Goal supersede history, stale-run binding | `test/goal56-goal-rpc-companion.test.mjs` |
 | Disabled admission, invalid budgets, unauthorized model creation | `test/goal56-goal-rpc-companion.test.mjs` |
 | Explicit `files`/`images` reach pi-goal's attachment materialization; a whitespace path is refused | `test/goal56-goal-rpc-companion.test.mjs` |
 | A reserved-word Objective is refused by pi-goal itself (`refused`, diagnostic verbatim, Goal bytes unchanged); an Objective beginning with `edit` is created | `test/goal56-goal-rpc-companion.test.mjs` |

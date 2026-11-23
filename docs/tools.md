@@ -34,9 +34,10 @@ host preference, not Goal state, so it is never persisted in a snapshot.
 takes `{ title, objective }` — the drafted Goal title and Objective — and opens
 the confirmation editor as one document: `Title: <text>`, a blank line, then the
 Objective body. It is accepted **only while a pending clarification exists**: a
-call from an ordinary turn is refused with `goal: null`-shaped state and changes
-nothing, and while `goal.clarifyOnCreate` is false the tool is not registered at
-all (Pi refuses the call).
+call from an ordinary turn is refused with the unchanged current Goal or
+`goal: null` and changes nothing. When `goal.clarifyOnCreate` is false at startup,
+the tool is not registered; if a later reload disables the flow while Pi retains
+the first registration, calls are still refused.
 
 The user edits either part, and **saving is the creation authority**: the
 committed Goal carries exactly the saved title (one line, 1–80 characters) and
@@ -48,12 +49,12 @@ editor is the only authority on this path, a UI-capable host that cannot registe
 the one exception, and it creates directly with a notice. A saved
 document whose first line is not the `Title:` line, or whose title breaks the
 one-line rule, is refused and the same document reopens for correction instead of
-discarding the user's Objective. Every refusal and save is validated by the same
-`validateGoalTitle` / `validateObjective` rules `/goal` and `/goal:edit` use; the
-three Objective sections are **not** validated.
+discarding the user's Objective. The saved document uses the same title and
+Objective validation as `/goal:edit`; the three Objective sections are **not**
+validated.
 
-Cancel, dismissal, and the standard dialog timeout all create nothing: no Goal
-bytes, no materialized attachment, no remote fetch, any current Goal untouched,
+Cancel, dismissal, and the standard dialog timeout all create nothing new: no
+new Goal snapshot, no materialized attachment, no remote fetch, any current Goal untouched,
 the pending clarification cleared, and a tool result telling the model that no
 Goal was created (a legitimate outcome, so it is not an error result). The clear
 is **conditional on the captured clarification still being current** and is made
@@ -99,6 +100,14 @@ work is done), `Constraints:` (hard limits, `None` when empty), and
 verification method named). With title and Objective stored as plain Goal text,
 the existing Completion audit enforces the criteria with no new audit machinery.
 
+`propose_goal` is also where the session's **single-Goal rule** meets the model:
+an unfinished Goal refuses `/goal` before any clarification starts, so the tool
+is never called for a creation the command path would reject. A **complete** Goal
+does not block; the save commits the new identity and supersedes the complete
+record without a second replacement-confirmation dialog. `create_goal` remains
+outside this flow: it never clarifies, never sets a title, and still refuses
+while any Goal exists.
+
 ## Model tool: `create_goal`
 
 `create_goal` lets the model create a Goal, but only for an **explicit user or
@@ -116,9 +125,9 @@ parameters, and extra drifted fields do not gain attachment authority. It also
 creates a **title-less** Goal: a title is a label the user confirms in an
 Objective clarification or sets with `/goal:edit --title`, never a model-supplied
 extra field. Explicit local and remote attachments can be selected only by the
-direct
-`/goal --file … --image … --remote-image …` command at creation or Replacement
-Goal time. Remote URLs are fetched only there, once, so a model cannot turn a
+user-entered `/goal --file … --image … --remote-image …` command at fresh or
+complete-to-new creation (held until confirmation when clarification is on).
+Remote URLs are fetched only there, once, so a model cannot turn a
 quoted prompt or an unquoted URL into network material. The existing 3–2000
 character Objective validation is unchanged; long supporting material belongs in
 a direct text attachment, not in a model-created Objective.
@@ -129,7 +138,13 @@ fresh creation, so it is also the tool-side path for the opt-in session name: wi
 from the Objective, exactly like `/goal <objective>`. A refused, failed, or
 rolled-back creation reports no Goal and names nothing. The name is not part of
 the tool result and not part of any Goal-updated event — see
-[lifecycle](behavior/lifecycle.md#naming-the-session-from-the-objective).
+[lifecycle](behavior/lifecycle.md#naming-the-session-from-the-goal-title-or-objective).
+
+The command path is deliberately different in two places. `/goal <objective>`
+clarifies by default (ADR-0003), and it may supersede a **complete** Goal, though
+never an **unfinished** one: that refusal names `/goal:clear` and happens before
+any clarification, dialog, or `propose_goal` call. `create_goal` does neither —
+no clarification, no title, and no replacement of any Goal.
 
 While `goal.enabled` is false the tool is refused before anything is validated:
 the result is an error carrying the unchanged current Goal (or `goal: null`), and
@@ -395,11 +410,13 @@ opaque identity says nothing useful there and is not displayed.
 
 ## Structured tool responses
 
-`get_goal`, `create_goal`, and `update_goal` all return the same structured
-`{ goal }` payload, so status, budgets, usage, and remaining capacity are
-unambiguous for programmatic callers. The opt-in `update_plan` returns a
-`{ plan }` payload of its own (see above), which is deliberately *not* a Goal
-payload: nothing in it is Goal state.
+`get_goal`, `create_goal`, `propose_goal`, and `update_goal` all return the same
+structured `{ goal }` payload, so status, budgets, usage, and remaining capacity
+are unambiguous for programmatic callers. `propose_goal` uses it for the committed
+Goal and for its refusals and cancellations (where it is the unchanged current
+Goal or `null`), so a confirmation never invents a second result shape. The
+opt-in `update_plan` returns a `{ plan }` payload of its own (see above), which is
+deliberately *not* a Goal payload: nothing in it is Goal state.
 
 ```json
 {
@@ -438,9 +455,11 @@ payload: nothing in it is Goal state.
 `remainingTokens` is `null` when the Goal has no budget and floors at zero once
 the budget is reached; `budgetExhausted` is the explicit signal. `attachments`
 is `[]` without attachments and otherwise contains metadata only, in immutable
-manifest order. The objective,
-title, identity, origin, timestamps, and revision are part of the same payload;
-`title` is `null` rather than omitted when the Goal has none.
+manifest order. The objective, title, identity, origin, timestamps, and revision
+are part of the same payload; `title` is `null` rather than omitted when the Goal
+has none. The title is label text under the Objective's privacy boundary: it is
+in the payload and the status report, and it is never in Goal-updated events,
+`goal-history` records, or metrics.
 
 While a blocked audit is open, the same payload carries its **Blocker identity**
 (`blockerId`), the latest plain-language `blocker`, and `blockedTurns`, and

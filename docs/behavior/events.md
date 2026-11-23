@@ -115,7 +115,7 @@ The stream describes lifecycle state, not accounting churn:
   untrusted Goal work messages (see [attachments](attachments.md));
 - the opt-in session name (`goal.sessionNameFromObjective`) never emits. It is
   Pi's own session metadata rather than Goal state — see
-  [lifecycle](lifecycle.md#naming-the-session-from-the-objective) — so a listener
+  [lifecycle](lifecycle.md#naming-the-session-from-the-goal-title-or-objective) — so a listener
   that wants to react to a name reads it from Pi, not from a Goal event.
 
 ## The durable history beside the stream

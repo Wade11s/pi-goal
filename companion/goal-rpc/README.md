@@ -90,8 +90,12 @@ local paths handed to pi-goal's attachment options.
 - A `set` against an unfinished Goal is refused by pi-goal — single-Goal creation
   (ADR-0003): one session works one Goal at a time. The answer is `refused` with
   pi-goal's own diagnostic, which names `/goal:clear`; nothing is replaced and no
-  dialog is opened. A `set` against a complete Goal commits, superseding the
-  complete record exactly as `/goal <objective>` does.
+  dialog is opened. A `set` against a complete Goal follows the same creation
+  path as `/goal <objective>`: with `goal.clarifyOnCreate: false` or no UI it
+  commits immediately and supersedes the complete record; with clarification on
+  (the default) it starts the interview, answers `declined` because no Goal has
+  committed yet, and the later `propose_goal` save outside the bridge performs
+  the supersede.
 - A `set` objective is pi-goal's to accept or refuse, exactly as if it had been
   typed after `/goal`. The lifecycle verbs are their own command names, which a
   `set` never sends, so no objective can become a pause, clear, resume, edit, or

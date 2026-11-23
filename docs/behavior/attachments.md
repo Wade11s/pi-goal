@@ -14,7 +14,7 @@ policy (3–2000 characters). Long supporting material — a specification, a
 transcript, a screenshot — does not belong inside that policy, and weakening the
 policy to admit it would weaken the Objective for everyone. Attachments are the
 separate, explicit channel: the user names the files or the HTTPS image URL at
-creation or Replacement Goal time, the Objective stays verbatim, and the
+fresh or complete-to-new creation, the Objective stays verbatim, and the
 extension owns everything else.
 
 This explicit flow is also the supported alternative to Codex's *composer
@@ -39,16 +39,17 @@ attachments use.
   word `--file` after its first plain word is never truncated — only a genuine
   leading flag is consumed. Local option values are whitespace-free paths;
   paths containing spaces are not representable by this parser.
-- Attachment selection exists at **creation** and **Replacement Goal** time. The
-  creation that supersedes a complete Goal validates and materializes its
-  attachments exactly as a fresh creation does; an unfinished Goal refuses the
+- Attachment selection exists at **fresh creation** and **complete-to-new
+  creation**. The creation that supersedes a complete Goal validates and
+  materializes its attachments exactly as a fresh creation does; an unfinished Goal refuses the
   creation before any attachment is validated, fetched, or materialized.
 - **Objective clarification defers attachment work.** With
   `goal.clarifyOnCreate` on, the flags are recorded as unread requests on the
   pending clarification, and nothing is read or fetched until the user saves the
-  confirmation editor. The same leading-option validation runs when `/goal` runs,
-  so a bad path or URL refuses before the interview; a cancelled or timed-out
-  clarification materializes nothing and makes no request.
+  confirmation editor. Flag syntax and URL syntax are validated when `/goal` runs,
+  so malformed options refuse before the interview; file existence, readability,
+  type, size, count limits, and the fetch are checked at the confirming save. A
+  cancelled or timed-out clarification materializes nothing and makes no request.
 - Relative paths resolve against the **session working directory** recorded in
   the session header, not against the directory the Pi process happens to be
   launched from. A session resumed from another directory therefore attaches
@@ -66,7 +67,8 @@ attachments use.
 - **Objective edit retains the manifest.** `/goal:edit <objective>` keeps the
   immutable attachment manifest verbatim; an edit that starts with
   `--file`/`--image`/`--remote-image` is refused with guidance, because changing
-  attachments requires a Replacement Goal. Editing also re-states the
+  attachments requires a new Goal (finish the current Goal or run `/goal:clear`
+  first). Editing also re-states the
   attachments in the edit message (unchanged, as data).
 - **Disabled admission is enforced first.** While `goal.enabled` is false, an
   attachment-bearing creation or replacement is refused before any clarification
@@ -78,9 +80,10 @@ attachments use.
 
 ## Remote fetching
 
-A remote image is fetched once, at creation or Replacement Goal time, into the
-same immutable store as a local image. Every later Continuation reads the stored
-bytes and never contacts the source URL again.
+A remote image is fetched once, at the creation commit (after the confirming save
+when clarification is on), into the same immutable store as a local image. Every
+later Continuation reads the stored bytes and never contacts the source URL
+again.
 
 - **HTTPS only.** HTTP, FTP, and every other scheme are refused before a
   connection. URL credentials (`user:password@`) are refused outright rather

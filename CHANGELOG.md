@@ -4,9 +4,73 @@ Notable changes to pi-goal. Version headings match the `version` field in
 `package.json`; install a release with `pi install
 git:github.com/Wade11s/pi-goal@vX.Y.Z`.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-24
 
-**Breaking** — the Goal command family is colon-namespaced (0.2.0). Pi
+**Breaking** — `/goal <objective>` now clarifies before it creates, and it no
+longer replaces an unfinished Goal. This release also first ships the
+colon-namespaced Goal command family (developed as 0.2.0, never tagged on its
+own); its breaking notes follow this one.
+
+- **`/goal <objective>` starts an interview instead of committing a Goal.** With
+  the new default `goal.clarifyOnCreate: true`, the command records a durable
+  pending clarification — the raw idea plus any `--budget`/`--no-budget` and
+  `--file`/`--image`/`--remote-image` flags — and asks the model to interview the
+  user about the objective, constraints, and acceptance criteria. The model
+  drafts a short **Goal title** and the final Objective and calls the new
+  **`propose_goal`** tool, which opens one confirmation editor (`Title: <text>`,
+  a blank line, then the Objective). Both parts are editable, and **saving is
+  the creation authority**: the saved title (1–80 characters, one line) and
+  Objective (3–2000 characters) commit, with `origin: "command"`, and work
+  starts. Cancelling, dismissing, or timing out creates nothing: no Goal bytes,
+  no materialized attachment, no remote fetch, and any current Goal is untouched.
+  Attachments stay unread and remote URLs unfetched until the confirming save.
+- **`/goal` refuses an unfinished Goal instead of offering a replacement
+  dialog.** While the current Goal is `active`, `paused`, `blocked`,
+  `usage_limited`, or `budget_limited`, `/goal <objective>` answers a warning
+  naming `/goal:clear` and mutates nothing — no dialog, no clarification, no
+  snapshot, no history record. A `complete` Goal does not block: there is no
+  replacement-confirmation dialog. With clarification on, the normal interview
+  and `propose_goal` editor still precede the supersede; direct creation
+  supersedes immediately. The old record stays in the retained superseded
+  machinery. The replacement-confirmation dialog is gone from the
+  command path, and the command bridge / RPC companion answer **`refused`** for
+  an unfinished Goal (the declined-replacement disposition no longer exists).
+  `create_goal` is unchanged: it still refuses while any Goal exists.
+- **A Goal can carry an optional title.** One line, 1–80 characters, confirmed
+  at clarification, persisted as Goal state, and editable later with
+  `/goal:edit --title <text>` (alone or with a new Objective). It appears in the
+  status report, the structured tool payloads, and session naming (which prefers
+  it over the Objective's first line), and it is **excluded** from Goal-updated
+  events, `goal-history` records, and Goal metrics, following the Objective's
+  privacy boundary. `create_goal`, a UI-less `/goal`, and
+  `goal.clarifyOnCreate: false` create a title-less Goal.
+- **The pending clarification is durable.** It survives a graceful or unclean
+  restart, reload, fork/clone, and branch navigation; a save that fails mid-commit
+  leaves a `confirming` record so the editor reopens with the user's saved draft
+  and held flags; a new `/goal` replaces it; and a Goal created, replaced, or
+  cleared after the interview started supersedes the draft (base-Goal-identity
+  anchoring), so a stale editor can never overwrite a Goal the user chose.
+- **Migration notes.** Set `goal.clarifyOnCreate: false` to restore immediate
+  creation (no interview, no title). To abandon an unfinished Goal before
+  creating another, run `/goal:clear` first; finishing it and then running
+  `/goal <objective>` supersedes it without a replacement-confirmation dialog
+  (after the normal clarification when enabled). A UI-less host (print/JSON) skips
+  clarification, creates directly, and prints a notice; a UI-capable host whose
+  `propose_goal` tool cannot be registered fails closed rather than bypassing
+  confirmation. The RPC companion is bumped to `0.3.0`: a `set` against an
+  unfinished Goal answers `refused`. On a direct-creation path
+  (`goal.clarifyOnCreate: false` or no UI), a `set` against a complete Goal
+  commits and supersedes it. With clarification on, a bridged `/goal` or `set`
+  starts the interview and answers `declined` (info-only) because the
+  confirmation runs outside the bridge — set `goal.clarifyOnCreate: false` in
+  the host's settings for immediate `set` creation.
+- Unchanged: Lifecycle statuses, Admission control, Continuation, the Blocked
+  audit, budgets, accounting, attachments, the resume prompt, session naming's
+  never-overwrite rule, the progress-plan tool, metrics, the Goal-updated event
+  stream, `create_goal`'s own creation authority (it still accepts any Objective,
+  including `clear`), and the bridge channel name. Decision record: ADR-0003.
+
+**Breaking** — the Goal command family is colon-namespaced. Pi
 registers six commands instead of one, and the old space-separated subcommands
 are refused rather than aliased. A Codex user is corrected once, with the right
 spelling in the message; nothing is silently reinterpreted.
@@ -35,7 +99,7 @@ spelling in the message; nothing is silently reinterpreted.
   `name` outside the family; the dispositions, transitions filter, once-only
   reply, busy guard, and session-control guard are unchanged.
 - **The RPC companion no longer mirrors pi-goal's parser** and is bumped to
-  `0.2.0` with the bridge. Its `thread/goal/get`, `set`, and `clear` methods,
+  `0.3.0` with the bridge. Its `thread/goal/get`, `set`, and `clear` methods,
   params, and `authority: "external-user"` rule are unchanged, but a `set` whose
   Objective is `clear` is now refused by pi-goal itself with its own diagnostic
   (returned as `refused`, verbatim, with the Goal bytes unchanged) and a `set`
