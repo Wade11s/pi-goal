@@ -398,20 +398,6 @@ test("invalid budgets are refused by pi-goal's own budget rules", async (t) => {
 	assert.match(notNumber.error.message, /params\.budget must be a finite number or null/);
 	assert.equal(await goalBytes(session), "");
 
-	// An objective that would be read as a leading option is refused rather than
-	// silently becoming a different Goal (the command surface has no quoting).
-	const flagObjective = await call(
-		session,
-		"set-flag-objective",
-		"thread/goal/set",
-		{ objective: "--no-budget do something else" },
-		"external-user",
-	);
-	assert.equal(flagObjective.ok, false);
-	assert.equal(flagObjective.error.code, "invalid-request");
-	assert.match(flagObjective.error.message, /collides with pi-goal's \/goal command surface/);
-	assert.equal(await goalBytes(session), "");
-
 	// The same command surface still accepts a valid budget afterwards: the
 	// refusals did not poison anything.
 	script([{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] }, { text: "Done." }], session);
@@ -569,21 +555,18 @@ test("the companion works without pi-goal and reports it as unavailable", async 
 	assertStepsConsumed(session, 0);
 });
 
-test("an objective the command surface would read as a lifecycle command is refused", async (t) => {
+test("a reserved-word Objective is refused by pi-goal itself, verbatim, and an Objective that begins with a verb word is created", async (t) => {
 	tempDir(t);
 	const session = await PiRpcSession.start({ extraExtensions: [COMPANION] });
 	t.after(() => session.stop());
+	// The base Goal that must survive every refusal below, then one completion for
+	// each of the four Objectives that are created afterwards.
+	const completions = 5;
 	script(
-		[
-			// The Goal that must survive every refusal below.
+		Array.from({ length: completions }, () => [
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ text: "Done." },
-			// The two ordinary objectives that merely *start* with a lifecycle word.
-			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-			{ text: "Done." },
-			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
-			{ text: "Done." },
-		],
+		]).flat(),
 		session,
 	);
 
@@ -594,35 +577,66 @@ test("an objective the command surface would read as a lifecycle command is refu
 		(snapshot) => snapshot.data.goal?.status === "complete",
 		"the base Goal to complete",
 	);
-	// `set` renders `/goal <objective>`, so these objectives would not create a Goal
-	// at all: they would clear, pause, resume, or edit the *current* one. Each must be
-	// refused before any command text exists.
+	// `set` sends `/goal <objective>`. The bare verb words are the old
+	// space-separated spelling of the Goal command family, and pi-goal's own
+	// creation path refuses them with the command to type instead — the companion
+	// holds no parser of its own any more. Each refusal is therefore pi-goal's,
+	// forwarded verbatim under the `refused` code, never the companion's own
+	// `invalid-request`.
 	const before = await goalBytes(session);
 	const beforeSnapshots = goalSnapshots(readSessionEntries(await session.sessionFile())).length;
-	const collisions = [
-		["set-clear-word", "clear", /rendered as \/goal clear/],
-		["set-pause-word", "pause", /rendered as \/goal pause/],
-		["set-history-word", "history", /rendered as \/goal history/],
-		["set-resume-word", "resume", /rendered as \/goal resume/],
-		["set-edit-word", "edit", /rendered as \/goal edit/],
-		["set-edit-objective", "edit the release notes", /rendered as \/goal edit the release notes/],
-		["set-resume-budget", "resume --budget 90000", /resume the current Goal with a new budget/],
-		["set-leading-option", "--no-budget do something else", /token as an option/],
+	const reserved = [
+		["set-clear-word", "clear", "Goal not created: `clear` is a Goal command; use /goal:clear."],
+		["set-pause-word", "pause", "Goal not created: `pause` is a Goal command; use /goal:pause."],
+		["set-history-word", "history", "Goal not created: `history` is a Goal command; use /goal:history."],
+		["set-resume-word", "resume", "Goal not created: `resume` is a Goal command; use /goal:resume."],
+		["set-edit-word", "edit", "Goal not created: `edit` is a Goal command; use /goal:edit."],
+		[
+			"set-resume-budget",
+			"resume --budget 90000",
+			"Goal not created: `resume --budget` is a Goal command; use /goal:resume --budget <new-total> (or --budget=<new-total>).",
+		],
 	];
-	for (const [id, objective, pattern] of collisions) {
+	for (const [id, objective, diagnostic] of reserved) {
 		const refused = await call(session, id, "thread/goal/set", { objective }, "external-user");
 		assert.equal(refused.ok, false, `${objective} must be refused`);
-		assert.equal(refused.disposition, "invalid-request");
-		assert.equal(refused.error.code, "invalid-request");
-		assert.match(refused.error.message, pattern);
-		assert.match(refused.error.message, /Nothing was run and no Goal was changed/);
-		assert.match(refused.error.message, /\/goal <objective>/, "the caller is told to use the command surface");
+		assert.equal(refused.disposition, "refused", `${objective}: ${JSON.stringify(refused)}`);
+		assert.equal(refused.error.code, "refused");
+		assert.deepEqual(
+			refused.diagnostics,
+			[{ level: "error", text: diagnostic }],
+			`${objective}: pi-goal's own diagnostic, verbatim`,
+		);
+		assert.equal(refused.error.message, diagnostic);
 		assert.deepEqual(refused.transitions, [], `${objective} committed no transition`);
 		assert.equal(await goalBytes(session), before, `${objective} wrote no Goal bytes`);
 	}
+	// The same Objective with creation options must be refused too: the companion
+	// renders `{ budget: null }` as `--no-budget <objective>` and `{ budget: n }`
+	// as `--budget n <objective>`, but the Objective is still the reserved word.
+	for (const [id, params, diagnostic] of [
+		["set-clear-unbounded", { objective: "clear", budget: null }, "Goal not created: `clear` is a Goal command; use /goal:clear."],
+		["set-edit-budget", { objective: "edit", budget: 90000 }, "Goal not created: `edit` is a Goal command; use /goal:edit."],
+		[
+			"set-resume-budget-option",
+			{ objective: "resume", budget: 90000 },
+			"Goal not created: `resume` is a Goal command; use /goal:resume.",
+		],
+	]) {
+		const refused = await call(session, id, "thread/goal/set", params, "external-user");
+		assert.equal(refused.ok, false, `${JSON.stringify(params)} must be refused`);
+		assert.equal(refused.disposition, "refused", `${JSON.stringify(params)}: ${JSON.stringify(refused)}`);
+		assert.deepEqual(
+			refused.diagnostics,
+			[{ level: "error", text: diagnostic }],
+			`${JSON.stringify(params)}: pi-goal's own diagnostic, verbatim`,
+		);
+		assert.deepEqual(refused.transitions, [], "the option-bearing refusal committed no transition");
+		assert.equal(await goalBytes(session), before, "the option-bearing refusal wrote no Goal bytes");
+	}
 
 	// The current Goal is untouched: same identity, same status, same durable record.
-	const survived = await call(session, "get-after-collisions", "thread/goal/get");
+	const survived = await call(session, "get-after-reserved", "thread/goal/get");
 	assert.equal(survived.ok, true);
 	assert.equal(survived.goal.id, created.goal.id);
 	assert.equal(survived.goal.status, "complete");
@@ -630,11 +644,56 @@ test("an objective the command surface would read as a lifecycle command is refu
 	assert.equal(
 		goalSnapshots(readSessionEntries(await session.sessionFile())).length,
 		beforeSnapshots,
-		"no snapshot or tombstone was appended by a refused objective",
+		"no snapshot or tombstone was appended by a reserved-word Objective",
 	);
 
-	// An objective that merely *begins* with a lifecycle word is still a create: the
-	// guard is a parse check, not a banned-word list.
+	// An Objective that begins with a verb word is an Objective, Objective rules
+	// being the same whether the text is typed or sent over RPC. `edit …` is the
+	// regression: the old parser applied it as an edit of the *current* Goal, and
+	// the old companion refused it for that reason. It is created now.
+	const edited = await call(
+		session,
+		"set-edit-objective",
+		"thread/goal/set",
+		{ objective: "edit the release notes" },
+		"external-user",
+	);
+	assert.equal(edited.ok, true, JSON.stringify(edited));
+	assert.equal(edited.disposition, "committed");
+	// The base Goal still exists (complete), so this is a replacement: no
+	// confirmation is asked for a finished Goal, and the transition kind says so.
+	assert.deepEqual(
+		edited.transitions.map((transition) => transition.kind),
+		["replaced"],
+	);
+	assert.equal(edited.goal.objective, "edit the release notes");
+	assert.equal(edited.goal.status, "active");
+	await waitForSnapshot(
+		session,
+		(snapshot) => snapshot.data.goal?.status === "complete" && snapshot.data.goal?.objective === "edit the release notes",
+		"the edit-leading Objective to complete",
+	);
+
+	// A leading option token is whatever pi-goal's creation path answers for it,
+	// forwarded verbatim: the option is consumed exactly as if the user typed it.
+	const option = await call(
+		session,
+		"set-leading-option",
+		"thread/goal/set",
+		{ objective: "--no-budget do something else" },
+		"external-user",
+	);
+	assert.equal(option.ok, true, JSON.stringify(option));
+	assert.equal(option.goal.objective, "do something else", "pi-goal's creation path consumed the leading option");
+	assert.equal(option.goal.tokenBudget, null, "--no-budget is honoured as the explicit unbounded request");
+	await waitForSnapshot(
+		session,
+		(snapshot) => snapshot.data.goal?.status === "complete" && snapshot.data.goal?.objective === "do something else",
+		"the option-leading Objective to complete",
+	);
+
+	// The parse check is gone entirely, so an Objective that merely *begins* with a
+	// verb word keeps creating, exactly as it always did.
 	for (const [id, objective] of [
 		["set-clear-sentence", "clear the cache"],
 		["set-history-sentence", "history of the release"],
@@ -651,7 +710,7 @@ test("an objective the command surface would read as a lifecycle command is refu
 	}
 
 	await call(session, "clear-final", "thread/goal/clear", undefined, "external-user");
-	assertStepsConsumed(session, 6);
+	assertStepsConsumed(session, completions * 2);
 	assertCleanRun(session);
 });
 

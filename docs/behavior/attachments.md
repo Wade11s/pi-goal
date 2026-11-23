@@ -56,7 +56,7 @@ attachments use.
   user action only, so unquoted files and images never gain Goal creation
   authority: a drifted model call naming `file` or `images` parameters finds no
   such parameters, and nothing is attached.
-- **Objective edit retains the manifest.** `/goal edit <objective>` keeps the
+- **Objective edit retains the manifest.** `/goal:edit <objective>` keeps the
   immutable attachment manifest verbatim; an edit that starts with
   `--file`/`--image`/`--remote-image` is refused with guidance, because changing
   attachments requires a Replacement Goal. Editing also re-states the
@@ -240,7 +240,7 @@ A **missing or corrupt** artifact:
   `pi-goal-store`, or replace the Goal with one that re-attaches the files);
 - **never** silently drops attachments, marks the Goal complete, or changes
   its Lifecycle status. The Goal keeps whatever status its durable snapshot
-  recorded; `/goal pause` and `/goal clear` stay available; a resume of a
+  recorded; `/goal:pause` and `/goal:clear` stay available; a resume of a
   stopped Goal is refused with the same explicit error rather than starting
   work from an incomplete Objective package.
 

@@ -22,7 +22,7 @@ So the split is:
 | --- | --- | --- |
 | Goal lifecycle | pi-goal core (`src/`) | The single lifecycle: parsing, replacement confirmation, admission, budgets, attachments, durability, events |
 | Command bridge | pi-goal core (`src/command-bridge.ts`) | Runs the *same* `/goal` command an extension asks for and reports what it did, structurally |
-| Goal RPC companion | `companion/goal-rpc/` (separate package) | Translates Codex-shaped methods into `/goal` argument text and the answers back into its own envelope |
+| Goal RPC companion | `companion/goal-rpc/` (separate package) | Translates Codex-shaped methods into a Goal command family command name plus its argument text, and the answers back into its own envelope |
 
 Removing the companion leaves pi-goal complete. Removing pi-goal leaves the
 companion loaded, answering `unavailable` instead of crashing. Neither declares a
@@ -31,34 +31,49 @@ dependency on the other.
 ## The Goal command bridge
 
 The bridge is a request/response pair on Pi's shared extension event bus, channel
-`pi-goal:command-bridge`, version `1`:
+`pi-goal:command-bridge`, version `2`:
 
 ```jsonc
 // request (emitted by a consumer on the bus)
 {
-  "version": 1,
+  "version": 2,
   "id": "caller-supplied correlation id",
-  "command": "the text a user would type after /goal (empty = the bare status read)",
+  "name": "goal",            // one of goal, goal:pause, goal:resume, goal:clear, goal:history, goal:edit
+  "args": "the text a user would type after the command (empty = the bare status read)",
   "reply": (result) => { /* called exactly once */ }
 }
 ```
 
-The result:
+The request carries Pi's own dispatch shape — the command name Pi dispatches on
+and the text after it — so the bridge never parses anything. A `name` outside the
+Goal command family is malformed and dropped, like a bad version; a version-1
+request (the old `command` string) is dropped for the same reason, so the caller's
+own timeout answers `unavailable` rather than a refusal, and pi-goal logs the
+upgrade diagnostic in its own console so the mismatch is visible to whoever reads
+that side.
+
+The result echoes `name` and `args` (so a caller correlates the answer with
+exactly what it sent) and adds:
 
 | Field | Meaning |
 | --- | --- |
 | `ok` | `true` only for `committed` and `reported`, and only when the effect is in place (and, for a mutation, durable) |
 | `disposition` | `committed` · `reported` · `declined` · `refused` · `invalid` |
-| `action` | `status` · `create` · `edit` · `pause` · `resume` · `clear` · `invalid`, or `null` when the bridge refused the request itself (`history` reports as `status`: it is another read-only rendering of the durable state) |
+| `action` | Derived from `name`: `goal` with empty `args` is `status`, with any `args` it is `create`; each verb is its own action (`pause` · `resume` · `clear` · `history` · `edit`). `invalid` only for a family name that is not a registered command at dispatch time; `null` when the bridge refused the request itself |
 | `goal` | The public Goal projection after the command (`get_goal`'s shape), or `null` |
 | `admissionEnabled` | Whether `goal.enabled` admission was on while the command ran |
 | `transitions` | The committed transitions that answer this command, in commit order |
 | `diagnostics` | Everything the command reported, verbatim, with severity |
 
+Because `action` is derived from the name and not from the argument, `/goal` with
+the argument `pause` is a `create` that pi-goal's reserved-word guard *refuses*:
+the answer is `refused` with pi-goal's diagnostic, never `invalid`. Nothing is
+"could not parse" any more.
+
 ### It is the command, not a second lifecycle
 
-A bridged command runs pi-goal's own command handler with the same argument text,
-so everything the user gets applies unchanged: replacement confirmation is a real
+A bridged command runs pi-goal's own command handler for that name with the same
+argument text, so everything the user gets applies unchanged: replacement confirmation is a real
 dialog, `goal.enabled` refuses creation *before* that dialog, Token budgets and
 attachment paths are validated by the same rules, a Replacement Goal keeps the old
 identity's admitted work, and the kickoff is delivered through the same steering
@@ -108,9 +123,13 @@ consumer that reacts to commits should keep reading the event stream.
   how "which command committed?" becomes unanswerable.
 - **No session yet.** Before `session_start`, pi-goal has no session context, so
   the bridge refuses instead of running a command against nothing.
-- **Validated envelopes.** A malformed or future-version request is dropped (it
-  has no trustworthy `reply`); an unknown `version` is refused rather than
-  guessed.
+- **Validated envelopes.** A malformed request — an unknown or old `version`, a
+  `name` outside the Goal command family, a non-string `args` — is dropped rather
+  than guessed, because it has no trustworthy `reply`; the caller's own timeout
+  covers the lost answer and pi-goal logs the refusal ("upgrade the companion or
+  pi-goal" for a version mismatch) in its console; a family `name` that Pi does
+  not list as a registered command at dispatch time is answered `invalid`
+  without running anything.
 - **No session control.** A bridged command may not start, fork, navigate, switch,
   or reload a session, and may not abort the user's run, compact its context, or
   shut Pi down. That is the whole session-control and agent/process-control
@@ -168,9 +187,9 @@ exactly `version`, `id`, `method`, `params`, and `authority`.
 
 | Method | Params | `/goal` equivalent |
 | --- | --- | --- |
-| `thread/goal/get` | none | bare `/goal` |
-| `thread/goal/set` | `objective` (required), `budget` (`number` or `null`), `files`, `images` | `/goal [--budget N\|--no-budget] [--file p] [--image p] <objective>` |
-| `thread/goal/clear` | none | `/goal clear` |
+| `thread/goal/get` | none | `{ "name": "goal", "args": "" }` — bare `/goal` |
+| `thread/goal/set` | `objective` (required), `budget` (`number` or `null`), `files`, `images` | `{ "name": "goal", "args": "[--budget N\|--no-budget] [--file p] [--image p] <objective>" }` |
+| `thread/goal/clear` | none | `{ "name": "goal:clear", "args": "" }` |
 
 Each call appends one `goal-rpc-response` session entry, which Pi also publishes
 on its RPC stream as `entry_appended`. Correlate on the echoed `id`:
@@ -195,11 +214,11 @@ on its RPC stream as `entry_appended`. Correlate on the echoed `id`:
 | Code | Meaning |
 | --- | --- |
 | `unauthorized` | The mutating call did not declare `"authority":"external-user"`, or declared `"model"` |
-| `invalid-request` | The envelope (including `version` and unknown fields), method, parameter, or translated command text was not acceptable to the companion |
+| `invalid-request` | The envelope (including `version` and unknown fields), method, or parameters were not acceptable to the companion |
 | `unavailable` | pi-goal did not answer: it is not installed (or predates the bridge), or it needed longer than the timeout. Install or upgrade pi-goal, then retry |
 | `refused` | pi-goal ran the command and refused it (disabled, not applicable, rolled back, ...), **or** did not run it because another bridged command was still in flight — retryable, and nothing changed |
 | `declined` | pi-goal ran the command, changed nothing, and reported no problem (for example a declined replacement) |
-| `invalid-command` | pi-goal could not parse the translated command text |
+| `invalid-command` | pi-goal answered that the named command was not a registered command at dispatch time, so nothing ran |
 
 A busy pi-goal is therefore `refused`, not `unavailable`: `unavailable` means the
 call never reached a working pi-goal, while a busy bridge answered and asked for a
@@ -209,30 +228,25 @@ reinstall/upgrade signal gets both cases right.
 `error.message` carries pi-goal's own diagnostics verbatim where pi-goal reported
 some, so a host can show the real reason without a second lookup.
 
-### A `set` never smuggles a lifecycle command
+### A `set` cannot smuggle a lifecycle command
 
-`set` renders `/goal <options> <objective>` and runs it, so an objective the
-command surface reads as a *subcommand* would ask for something else entirely:
-`"objective":"clear"` renders `/goal clear`, which clears the current Goal. The
-companion therefore refuses an objective whose trimmed form does not parse as a
-create, **before** any command text is rendered:
+`set` sends `{ "name": "goal", "args": "<objective>" }` and pi-goal runs `/goal`
+with that argument. An Objective is only ever the argument of `/goal` — the
+lifecycle verbs are their own command names, which `set` never sends — so there
+is no text a `set` could write that pi-goal would read as a pause, clear, resume,
+edit, or history request. The companion therefore holds no copy of pi-goal's
+parser: the one it used to keep (and its eight collision refusals) is gone.
 
-- the whole-argument subcommands `pause`, `clear`, `history`, `edit`, `resume`;
-- any objective led by `edit` (an Objective edit of the *current* Goal) or by
-  `resume --budget …` (a budget-recovering resume);
-- any objective led by an option token — `--budget`, `--no-budget`, `--file`,
-  `--image`, `--remote-image` — which the creation scanner consumes as an option.
-
-Each refusal is `invalid-request` with a message naming the collision and the
-subcommand it would have run, and stating that nothing ran. A refused objective
-never becomes a command, so a `set` can never clear, pause, resume, or edit the
-current Goal, and never commits a tombstone or a transition of its own.
-
-The check is a local mirror of pi-goal's parser (the companion must not import
-pi-goal), kept in sync by hand and pinned by tests on both sides. It is
-conservative in one direction only: an objective that merely *begins* with one of
-those words but keeps going is a create on both sides, so `clear the cache`,
-`history of the release`, and `resume the migration` stay accepted.
+The one case that still needs a rule is the old space-separated spelling: an
+Objective that is the bare word `clear` lands after `/goal ` with a space, which
+0.1.x read as the clear command. pi-goal's own creation path refuses it — *"Goal not created:
+`clear` is a Goal command; use /goal:clear."* — and that refusal comes back
+through the bridge as `refused` with the diagnostic verbatim and no durable Goal
+write. The rule has one source of truth, and Objective rules are identical
+whether the text is typed or sent over RPC: an Objective that merely *begins*
+with a verb word (`clear the cache`, `history of the release`, and `edit the
+release notes`) is created. A leading option token in an Objective is consumed by
+pi-goal's creation path exactly as if the user had typed it.
 
 ### A `set` on an unfinished Goal is a decision, not a replacement
 
@@ -282,11 +296,10 @@ can prevent that.
   `images` because the command surface does, but nothing here infers a composer
   draft.
 - **Path and text constraints come from the command surface.** A `files`/`images`
-  path containing whitespace is refused (the command parser has no quoting), and an
-  objective led by `--budget`, `--no-budget`, `--file`, `--image`, or
-  `--remote-image`, or read as a lifecycle subcommand (`clear`, `pause`, `resume`,
-  `edit`, `history`), is refused (it would be read as an option or a subcommand).
-  Both are stated refusals, not silent reinterpretations.
+  path containing whitespace is refused (the command surface has no quoting). An
+  Objective is not interpreted here at all: a reserved word is refused by
+  pi-goal's creation path with pi-goal's own message, and a leading option token
+  is consumed by pi-goal as the option the user typed.
 - **The envelope is strict and versioned.** `version: 1` is required; an unknown
   version, an unknown top-level field, an unknown parameter, or an unknown method
   is refused rather than ignored.
@@ -308,7 +321,7 @@ can prevent that.
 
 | Guarantee | Test |
 | --- | --- |
-| Outcome classifier never claims unproven success; transition filtering; request validation | `test/goal56-command-bridge.test.mjs` |
+| Outcome classifier never claims unproven success; transition filtering; strict v2 request validation (name in the family, string args, version-1 dropped with the upgrade diagnostic); action derived from the name for all six commands; a family name not registered at dispatch time answers `invalid` and runs nothing | `test/goal56-command-bridge.test.mjs` |
 | Bridged status/create/clear run the user command surface (`origin: "command"`) | `test/goal56-command-bridge.test.mjs` |
 | A creation that fails its durability poll answers `refused` and writes nothing | `test/goal56-command-bridge.test.mjs` |
 | Busy guard, declined replacement leaves Goal bytes identical | `test/goal56-command-bridge.test.mjs` |
@@ -318,5 +331,6 @@ can prevent that.
 | Replacement confirmation (decline and accept), superseded history, stale-run binding | `test/goal56-goal-rpc-companion.test.mjs` |
 | Disabled admission, invalid budgets, unauthorized model creation | `test/goal56-goal-rpc-companion.test.mjs` |
 | Explicit `files`/`images` reach pi-goal's attachment materialization; a whitespace path is refused | `test/goal56-goal-rpc-companion.test.mjs` |
+| A reserved-word Objective is refused by pi-goal itself (`refused`, diagnostic verbatim, Goal bytes unchanged); an Objective beginning with `edit` is created | `test/goal56-goal-rpc-companion.test.mjs` |
 | Envelope validation (unknown parameter, malformed JSON) answers `invalid-request`, even with no pi-goal | `test/goal56-goal-rpc-companion.test.mjs` |
 | `unavailable` when pi-goal is not installed; the documented `pi install` path works standalone | `test/goal56-goal-rpc-companion.test.mjs`, `test/goal56-command-bridge.test.mjs` |

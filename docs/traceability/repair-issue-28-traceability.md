@@ -41,7 +41,7 @@ pre-repair failure captures:
 | #17 Active elapsed time | Only live active segments accrue; live and replay converge | `test/goal6.test.mjs`; `test/store.test.mjs`; `test/accounting.test.mjs`; `test/goal34-active-time-stop.test.mjs`; `test/goal34-active-time-stop-store.test.mjs` | #29, #35 |
 | #18 Creation authority | `create_goal` requires a verbatim, affirmative, currently authoritative request; fail-closed otherwise | `test/goal12-creation-authority.test.mjs`; `test/goal12-creation-authority-store.test.mjs`; `test/goal12-pause-corroboration.test.mjs` | #33 |
 | #18 Pause corroboration | Model pause requires an explicit user request, quoted and corroborated | `test/goal12-pause-corroboration.test.mjs`; `test/goal12-creation-authority.test.mjs` | #33 |
-| #19 Budget recovery | Only `/goal resume --budget <new-total>` resumes a `budget_limited` Goal; absolute cumulative ceiling; positive headroom; configured maximum | `test/goal10-budget-recovery.test.mjs`; `test/goal10-budget-recovery-store.test.mjs`; `test/accounting.test.mjs` | #31 |
+| #19 Budget recovery | Only `/goal:resume --budget <new-total>` resumes a `budget_limited` Goal; absolute cumulative ceiling; positive headroom; configured maximum | `test/goal10-budget-recovery.test.mjs`; `test/goal10-budget-recovery-store.test.mjs`; `test/accounting.test.mjs` | #31 |
 | #19 Per-episode wrap-ups | Exactly one bounded wrap-up per exhaustion episode; a raise cancels an undelivered one; an in-flight one stays charged | `test/goal10-budget-recovery.test.mjs`; `test/goal10-budget-recovery-store.test.mjs`; `test/goal9-legacy.test.mjs` (legacy pending wrap-up) | #31 |
 | #20 Blocker identity | Opaque, extension-issued identity; reworded reuse advances; omission starts fresh; unknown ID refused without mutation | `test/goal11-blocker-identity.test.mjs`; `test/goal11-blocker-identity-store.test.mjs`; `test/goal5.test.mjs` | #32 |
 | #20 Conservative stopping | Deterministic activity-free and execution-unavailable bounds; provider-failure classification | `test/goal5.test.mjs`; `test/goal5-provider-failures.test.mjs`; ADR-0001 | #32 (audit contract) |
@@ -253,14 +253,14 @@ Checklist results (real provider, one persisted session per phase):
 | C04 | Automatic continuation at settlement | PASS — 2 `goal-continuation` entries |
 | C05 | Evidence-based completion with verified artifacts | PASS — `complete`, revision 1, 20,731 accounted tokens, all three files written |
 | C06 | Accurate `/goal` report | PASS — objective, revision 1, usage, Active time |
-| C07 | `/goal clear` and durable tombstone | PASS — tombstone snapshot; bare `/goal` reports none |
+| C07 | `/goal:clear` and durable tombstone | PASS — tombstone snapshot; bare `/goal` reports none |
 | C08 | Bare `/goal` after clear | PASS |
-| C09 | Bare `/goal edit` prefilled editor | PASS — prefill equals the current objective; revision 0 → 1; usage preserved |
-| C10 | `/goal pause` stops continuation | PASS — continuations 2→2 and runs 4→4 over 8 s idle; status `paused` |
-| C11 | `/goal resume` restarts work | PASS — "resumed (revision 3)… Work steered into the running work" |
+| C09 | Bare `/goal:edit` prefilled editor | PASS — prefill equals the current objective; revision 0 → 1; usage preserved |
+| C10 | `/goal:pause` stops continuation | PASS — continuations 2→2 and runs 4→4 over 8 s idle; status `paused` |
+| C11 | `/goal:resume` restarts work | PASS — "resumed (revision 3)… Work steered into the running work" |
 | C11b | Replacement confirmation answered No | PASS — "Replacement cancelled"; the Goal identity, objective, and revision unchanged |
 | C12 | Budget exhaustion and one wrap-up | PASS — `budget_limited`, 784 accounted tokens, exactly 1 `goal-budget-wrapup` |
-| C13 | Bare `/goal resume` of `budget_limited` refused | PASS — guidance names `/goal resume --budget <new-total>` |
+| C13 | Bare `/goal:resume` of `budget_limited` refused | PASS — guidance names `/goal:resume --budget <new-total>` |
 | C14 | No-headroom raise refused | PASS — positive-headroom reason; still `budget_limited` |
 | C15 | Cumulative `--budget=100000` recovery preserves usage | PASS — ceiling 1 → 100000, usage 784 → 784, status `active` |
 | C16 | Restart persistence | PASS — "restored (active)", budget and usage intact, **0 runs on load** |
@@ -367,7 +367,7 @@ not an independent edit to the pause rules.
    imperative or passive pause shape containing the quoted words, so mentions,
    questions, hypotheticals, deferrals, and keep-working instructions are still
    refused. Occurrence of the words alone never grants pause authority, and
-   `/goal pause` remains available to the user.
+   `/goal:pause` remains available to the user.
 3. **It is tested on the pause path, and those tests are kept.** Both pause-path
    rows are asserted in `test/goal12-pause-corroboration.test.mjs` and are listed
    in the batch-4 matrix. No pause test was removed, skipped, or weakened, and no

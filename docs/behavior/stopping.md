@@ -31,7 +31,7 @@ evaluated at the settlement boundary, which is the only place a Goal turn is kno
 to be over.
 
 - A **blocked** or **usage_limited** Goal never continues automatically. Only the
-  user can resume one, with `/goal resume`, which restarts it with a fresh audit;
+  user can resume one, with `/goal:resume`, which restarts it with a fresh audit;
   a complete Goal is never resumed, only replaced.
 - An **ordinary command failure** — the command ran and exited non-zero, timed
   out, died without an exit code, or was aborted — is normal work. It never counts
@@ -111,7 +111,7 @@ to be over.
 - Every stop is explained to the user through a notification and recorded on the
   Goal, so `get_goal` and bare `/goal` report the blocker and the audit count.
   While `goal.enabled` is false the usage-limit notice names the admission
-  condition as well: the stop still lands, but the `/goal resume` it names is
+  condition as well: the stop still lands, but the `/goal:resume` it names is
   refused until the setting is re-enabled.
 - **User actions reset the counters.** A prompt the user types (including one
   queued while the agent is busy) and an abort both restart the blocked audit and

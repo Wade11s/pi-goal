@@ -152,7 +152,7 @@ test("an old run's follow-up turn cannot complete a Goal created after Clear", a
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 1);
 
-		const cleared = await session.prompt("/goal clear");
+		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
@@ -310,7 +310,7 @@ test("an old run's follow-up turn cannot report a blocker against a Goal created
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 1);
 
-		const cleared = await session.prompt("/goal clear");
+		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
@@ -384,7 +384,7 @@ test("an old run's follow-up turn cannot pause a Goal created after Clear", asyn
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 2);
 
-		const cleared = await session.prompt("/goal clear");
+		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
@@ -538,7 +538,7 @@ test("a Pi retry of a run whose Goal was cleared keeps its old binding", async (
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 1);
 
-		const cleared = await session.prompt("/goal clear");
+		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
@@ -626,7 +626,7 @@ test("a compaction retry of a run whose Goal was cleared keeps its old binding",
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 1);
 
-		const cleared = await session.prompt("/goal clear");
+		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
@@ -750,7 +750,7 @@ test("a model completion stays legitimate in a Pi retry after the user revised t
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 1);
 
-		const edited = await session.prompt(`/goal edit ${NEW_OBJECTIVE}`);
+		const edited = await session.prompt(`/goal:edit ${NEW_OBJECTIVE}`);
 		assert.equal(edited.data.disposition, "handled");
 		const revision = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(revision.message, /revision 1/);

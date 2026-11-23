@@ -408,7 +408,7 @@ test("an Objective edit never renames the session", async () => {
 			records.filter((r) => r.type === "agent_start").length >= 2 ? true : undefined,
 		);
 		const mark = session.records.length;
-		const edit = await session.prompt(`/goal edit ${EDITED_OBJECTIVE}`);
+		const edit = await session.prompt(`/goal:edit ${EDITED_OBJECTIVE}`);
 		assert.equal(edit.data.disposition, "handled");
 		const notice = await session.notifyAfter(mark, (r) => r.message.includes("objective updated"));
 		assert.match(notice.message, /revision 1/);
@@ -516,7 +516,7 @@ test("a rolled-back creation never names the session", async () => {
  *
  * This is the one post-commit failure a writable session can reach: the /goal
  * command commits the snapshot, waits for the current run to finish, and a
- * `/goal clear` that lands during that wait removes the Goal it created. The
+ * `/goal:clear` that lands during that wait removes the Goal it created. The
  * command reports that instead of claiming success, so the naming — which belongs
  * to a creation that stands — must not happen either.
  */
@@ -536,7 +536,7 @@ test("a creation cleared while it waited never names the session", async () => {
 
 		// Clear the Goal while the creation is still waiting, then release the run so
 		// the wait ends and the command sees what happened.
-		const clearPromise = submitCommand(session, "req-clear-while-waiting", "/goal clear");
+		const clearPromise = submitCommand(session, "req-clear-while-waiting", "/goal:clear");
 		await session.sendSimple("abort");
 		await session.waitForSettled(1);
 		assert.equal((await createPromise).data.disposition, "handled");

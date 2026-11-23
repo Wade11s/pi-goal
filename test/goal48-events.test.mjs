@@ -235,7 +235,7 @@ test("below-threshold blocker reports emit nothing; the threshold stop, resume, 
 		assertEventMatchesSnapshot(eventLog(entries)[1], snapshotAtRevision(entries, id, 3), "blocked");
 
 		// A user resume of a blocked Goal is its own committed transition.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForSettled(2);
 		entries = readSessionEntries(await session.sessionFile());
 		assert.deepEqual(eventKinds(entries), ["created", "blocked", "resumed", "completed"]);
@@ -294,7 +294,7 @@ test("budget exhaustion emits once at its durable boundary; wrap-up and accounti
 			"wrap-up delivery and consumption emit nothing",
 		);
 
-		await session.prompt("/goal resume --budget 500");
+		await session.prompt("/goal:resume --budget 500");
 		await session.waitFor("the resumed run started", (records) =>
 			records.filter((r) => r.type === "agent_start").length >= 4 ? true : undefined,
 		);
@@ -419,7 +419,7 @@ test("a Replacement Goal emits for the new identity; a declined replacement emit
 		);
 
 		// Clearing names the Goal that was cleared — the replacement — and no other.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		const finalEntries = readSessionEntries(await session.sessionFile());
 		assert.deepEqual(eventKinds(finalEntries), ["created", "replaced", "completed", "cleared"]);
@@ -454,7 +454,7 @@ test("a throwing listener cannot roll back a committed transition and surfaces d
 		// Arm the peer's injected failure for the paused transition, then pause.
 		await session.prompt("/eventsfail paused");
 		await session.waitForNotify((r) => r.message.includes("eventsfail armed"));
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 
 		// The transition committed and was reported as a success: the durable
 		// snapshot exists, the command announced the pause, and no extension error
@@ -482,7 +482,7 @@ test("a throwing listener cannot roll back a committed transition and surfaces d
 		// Disarmed, the very next transition announces normally again.
 		await session.prompt("/eventsfail");
 		await session.waitForNotify((r) => r.message.includes("eventsfail disarmed"));
-		await session.prompt(`/goal edit ${EDITED}`);
+		await session.prompt(`/goal:edit ${EDITED}`);
 		await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.deepEqual(eventKinds(readSessionEntries(await session.sessionFile())), [
 			"created",
@@ -517,40 +517,40 @@ test("user lifecycle commands emit paused, objective-edited, resumed, and cleare
 		const id = goalSnapshots(readSessionEntries(await session.sessionFile()))[0].data.goal.id;
 
 		// Pause from idle: one durable transition, one event.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused"));
 		assert.deepEqual(eventKinds(readSessionEntries(await session.sessionFile())), ["created", "paused"]);
 
 		// Pausing again is an idempotent refusal: no new durable write, no event.
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("already paused"));
 		assert.deepEqual(eventKinds(readSessionEntries(await session.sessionFile())), ["created", "paused"]);
 
 		// Editing a paused Goal changes the objective without starting work.
 		const runsAtPause = runCount(session);
-		await session.prompt(`/goal edit ${EDITED}`);
+		await session.prompt(`/goal:edit ${EDITED}`);
 		await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.equal(runCount(session), runsAtPause, "editing a paused Goal starts no run");
 
 		// Resume restarts work; the resumed run is held at the gate, so a resume
 		// attempt while provably active is the refusal path.
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed"));
 		await session.waitFor("resumed run started", (records) =>
 			records.filter((r) => r.type === "agent_start").length >= 3 ? true : undefined,
 		);
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("already active"));
 
 		writeFileSync(gate, "", "utf8");
 		await session.waitForSettled(2);
 
 		// Clear from complete: the tombstone is the last durable transition.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 
 		// Clearing with no Goal is a refusal, not a transition.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("No Goal is set"));
 
 		const entries = readSessionEntries(await session.sessionFile());

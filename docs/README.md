@@ -12,8 +12,10 @@ procedure, and the historical evidence behind the V1 repair programme.
   honest edges.
 - **Changing behavior** — [ADR-0001](adr/0001-conservative-stopping.md) →
   [continuation](behavior/continuation.md) → [stopping](behavior/stopping.md) →
-  [accounting](behavior/accounting.md). The
-  [glossary](../GLOSSARY.md) fixes the vocabulary these docs use.
+  [accounting](behavior/accounting.md). For the user command surface,
+  [ADR-0002](adr/0002-colon-namespaced-goal-command-family.md) →
+  [lifecycle](behavior/lifecycle.md). The [glossary](../GLOSSARY.md) fixes the
+  vocabulary these docs use.
 - **Verifying a change** — [testing](testing.md) → [smoke test](smoke-test.md) →
   the relevant [traceability](#traceability) matrix.
 
@@ -34,7 +36,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | [behavior/metrics.md](behavior/metrics.md) | The privacy-safe `pi-goal:metrics` projection, its allowlist, the local consumer seam, and the on-demand hosted companion's consent, redaction, retry, and credential rules |
 | [behavior/companion.md](behavior/companion.md) | The optional Codex-shaped Goal RPC companion and the generic `pi-goal:command-bridge` seam it is built on: install, protocol, creation authority, durability proof, and the intentional difference from Codex's private app-server methods |
 
-| [behavior/history.md](behavior/history.md) | The non-authoritative durable audit history: `/goal history`, what is recorded, the documented crash gap, and malformed-entry handling |
+| [behavior/history.md](behavior/history.md) | The non-authoritative durable audit history: `/goal:history`, what is recorded, the documented crash gap, and malformed-entry handling |
 
 ## Reference
 
@@ -57,6 +59,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | Doc | Covers |
 | --- | --- |
 | [adr/0001-conservative-stopping.md](adr/0001-conservative-stopping.md) | Why stopping is deterministic and extension-owned |
+| [adr/0002-colon-namespaced-goal-command-family.md](adr/0002-colon-namespaced-goal-command-family.md) | Why the Goal command family is colon-namespaced and the old spellings are refused |
 | [agents/domain.md](agents/domain.md) | How agents consume the glossary and ADRs |
 | [agents/issue-tracker.md](agents/issue-tracker.md) | GitHub issue conventions |
 | [agents/triage-labels.md](agents/triage-labels.md) | Triage roles and label strings |

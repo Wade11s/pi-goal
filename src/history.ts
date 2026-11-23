@@ -31,7 +31,7 @@
  *
  * History is intentionally **not** a mutation surface. There is no command that
  * applies, replays, or reverts a history record: the only reader is the read-only
- * `/goal history` rendering, and the only writer is the committed-transition seam.
+ * `/goal:history` rendering, and the only writer is the committed-transition seam.
  */
 import { GOAL_TRANSITION_KINDS, type GoalTransitionKind } from "./events.ts";
 import type { GoalEventAttachment, GoalEventUsage, GoalUpdatedEvent } from "./events.ts";

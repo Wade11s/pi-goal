@@ -69,7 +69,7 @@ async function createPausedGoal(session) {
 	await session.prompt(`/goal ${OBJECTIVE}`);
 	await session.waitForNotify((r) => r.message.includes("created and activated"));
 	await abortActiveLoop(session, 2);
-	await session.prompt("/goal pause");
+	await session.prompt("/goal:pause");
 	await session.waitForNotify((r) => r.message.includes("paused"));
 }
 
@@ -98,7 +98,7 @@ test("a held completion cannot complete the Goal a user edited while it was in f
 		await waitForTurns(session, 2);
 		const before = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 
-		const editResponse = await session.prompt("/goal edit Verify a completely different new objective");
+		const editResponse = await session.prompt("/goal:edit Verify a completely different new objective");
 		assert.equal(editResponse.data.disposition, "handled");
 		const edited = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(edited.message, /revision 1/);
@@ -209,9 +209,9 @@ test("a held completion cannot undo pause then resume", async () => {
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 2);
 
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		const paused = await session.waitForNotify((r) => r.message.includes("paused") && r.message.includes("revision 1"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const resumed = await session.waitForNotify((r) => r.message.includes("resumed") && r.message.includes("revision 2"));
 		assert.match(resumed.message, /retained progress/);
 
@@ -257,7 +257,7 @@ test("a held model pause cannot pause the Goal a user edited while it was in fli
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForTurns(session, 3);
 
-		await session.prompt("/goal edit A revised objective");
+		await session.prompt("/goal:edit A revised objective");
 		const edited = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(edited.message, /revision 1/);
 
@@ -293,7 +293,7 @@ test("replacing after a clear in the confirmation consults the cleared state, fo
 				records.find((r) => r.type === "extension_ui_request" && r.method === "confirm"),
 			);
 
-			const cleared = await session.prompt("/goal clear");
+			const cleared = await session.prompt("/goal:clear");
 			assert.equal(cleared.data.disposition, "handled");
 			const clearedNotify = await session.waitForNotify((r) => r.message.includes("cleared"));
 			assert.equal(clearedNotify.notifyType, "info");
@@ -334,7 +334,7 @@ test("replacing after an edit in the confirmation still describes and acts on th
 		);
 		assert.match(String(dialog.message), new RegExp(OBJECTIVE));
 
-		const edited = await session.prompt("/goal edit The revised objective");
+		const edited = await session.prompt("/goal:edit The revised objective");
 		assert.equal(edited.data.disposition, "handled");
 		const editNotify = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(editNotify.message, /revision 2/);
@@ -383,7 +383,7 @@ test("a clear issued while initial creation waits for idle wins over the queued 
 			"staged creation",
 		);
 
-		const cleared = await session.prompt("/goal clear");
+		const cleared = await session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		const clearedNotify = await session.waitForNotify((r) => r.message.includes(`Goal ${staged.id} cleared`));
 		assert.equal(clearedNotify.notifyType, "info");
@@ -423,7 +423,7 @@ test("an edit issued while initial creation waits for idle wins and suppresses t
 			"staged creation",
 		);
 
-		const edited = await session.prompt("/goal edit The objective the user chose instead");
+		const edited = await session.prompt("/goal:edit The objective the user chose instead");
 		assert.equal(edited.data.disposition, "handled");
 		const editNotify = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(editNotify.message, /revision 1/);
@@ -474,7 +474,7 @@ test("a pause issued while initial creation waits for idle leaves the Goal pause
 			"staged creation",
 		);
 
-		const paused = await session.prompt("/goal pause");
+		const paused = await session.prompt("/goal:pause");
 		assert.equal(paused.data.disposition, "handled");
 		const pauseNotify = await session.waitForNotify((r) => r.message.includes("paused") && r.message.includes("revision 1"));
 		assert.equal(pauseNotify.notifyType, "info");
@@ -733,7 +733,7 @@ test("an edit while initial creation waits ends naturally instead of adopting th
 			(goal) => goal.objective === "Creation that must not adopt the run" && goal.status === "active",
 			"staged creation",
 		);
-		const edited = await session.prompt("/goal edit Edited while creation waited");
+		const edited = await session.prompt("/goal:edit Edited while creation waited");
 		assert.equal(edited.data.disposition, "handled");
 		const editNotify = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(editNotify.message, /revision 1/);

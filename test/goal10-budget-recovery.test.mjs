@@ -114,7 +114,7 @@ async function reachPendingWrapUp(session) {
 	return snapshot.data.goal;
 }
 
-test("/goal resume --budget <new-total> resumes a budget_limited Goal, cancels the pending wrap-up, and preserves identity and usage", async (t) => {
+test("/goal:resume --budget <new-total> resumes a budget_limited Goal, cancels the pending wrap-up, and preserves identity and usage", async (t) => {
 	const session = await PiRpcSession.start();
 	t.after(async () => {
 		await session.stop();
@@ -133,7 +133,7 @@ test("/goal resume --budget <new-total> resumes a budget_limited Goal, cancels t
 		session,
 	);
 
-	await session.prompt("/goal resume --budget 200");
+	await session.prompt("/goal:resume --budget 200");
 	const resumed = await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 	assert.match(resumed.message, /cumulative token ceiling is now 200 tokens/);
 	assert.match(resumed.message, /115 tokens already accounted/);
@@ -192,7 +192,7 @@ test("/goal resume --budget <new-total> resumes a budget_limited Goal, cancels t
 	assertOnlyFailures(session, [{ stopReason: "error", errorMessage: "invalid api key" }]);
 });
 
-test("/goal resume --budget=<new-total> is an absolute ceiling: resumed work that immediately crosses it earns exactly one fresh wrap-up", async (t) => {
+test("/goal:resume --budget=<new-total> is an absolute ceiling: resumed work that immediately crosses it earns exactly one fresh wrap-up", async (t) => {
 	const session = await PiRpcSession.start();
 	t.after(async () => {
 		await session.stop();
@@ -209,7 +209,7 @@ test("/goal resume --budget=<new-total> is an absolute ceiling: resumed work tha
 	);
 
 	// 115 accounted, new ceiling 120: only 5 tokens of headroom.
-	await session.prompt("/goal resume --budget=120");
+	await session.prompt("/goal:resume --budget=120");
 	await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 
 	// The resumed run's first response (30 tokens) immediately exhausts 120.
@@ -263,7 +263,7 @@ test("a budget-raising resume validates positive headroom and the configured max
 	// No headroom: 115 accounted, so 115 and 100 are refused even though a 5000
 	// default is configured.
 	for (const requested of [115, 100]) {
-		await session.prompt(`/goal resume --budget ${requested}`);
+		await session.prompt(`/goal:resume --budget ${requested}`);
 		const refused = await session.waitForNotify((r) => r.message.includes("strictly greater than"));
 		assert.match(refused.message, /115 tokens/);
 		const snapshot = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
@@ -274,7 +274,7 @@ test("a budget-raising resume validates positive headroom and the configured max
 	}
 
 	// Above the configured maximum: refused, never clamped to 200.
-	await session.prompt("/goal resume --budget 250");
+	await session.prompt("/goal:resume --budget 250");
 	const aboveMax = await session.waitForNotify((r) => r.message.includes("exceeds the configured maximum of 200"));
 	assert.match(aboveMax.message, /Raise goal\.maxTokenBudget/);
 	let snapshot = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
@@ -282,7 +282,7 @@ test("a budget-raising resume validates positive headroom and the configured max
 	assert.equal(snapshot.revision, revisionBefore, "the refused raise writes nothing");
 
 	// Exactly at the maximum is accepted, and the default (5000) is not applied.
-	await session.prompt("/goal resume --budget=200");
+	await session.prompt("/goal:resume --budget=200");
 	await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 	const entriesAfterResume = readSessionEntries(await session.sessionFile());
 	snapshot = findGoalSnapshot(entriesAfterResume, (g) => g?.status === "active" && g?.tokenBudget === 200);
@@ -318,11 +318,11 @@ test("malformed budget resume arguments are refused with guidance and change not
 	);
 
 	for (const [command, pattern] of [
-		["/goal resume --budget", /needs a new total/],
-		["/goal resume --budget abc", /not a number/],
-		["/goal resume --budget 12.5", /whole number/],
-		["/goal resume --budget 200 extra", /unexpected argument/],
-		["/goal resume --budget 200 --budget 300", /unexpected argument/],
+		["/goal:resume --budget", /needs a new total/],
+		["/goal:resume --budget abc", /not a number/],
+		["/goal:resume --budget 12.5", /whole number/],
+		["/goal:resume --budget 200 extra", /unexpected argument/],
+		["/goal:resume --budget 200 --budget 300", /unexpected argument/],
 	]) {
 		const mark = session.records.length;
 		await session.prompt(command);
@@ -342,7 +342,7 @@ test("malformed budget resume arguments are refused with guidance and change not
 	assert.equal(snapshot.revision, before.revision);
 
 	// A valid resume still works afterwards.
-	await session.prompt("/goal resume --budget 200");
+	await session.prompt("/goal:resume --budget 200");
 	await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 	await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the resumed Goal to complete");
 	assertStepsConsumed(session, 4, [{ stopReason: "error", errorMessage: "invalid api key" }]);
@@ -358,7 +358,7 @@ test("a bare resume of a budget_limited Goal is guidance, and the budget option 
 			await session.stop();
 		});
 		const before = await reachPendingWrapUp(session);
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		const guidance = await session.waitForNotify((r) => r.message.includes("higher cumulative total"));
 		assert.match(guidance.message, /budget_limited/);
 		assert.match(guidance.message, /--budget <new-total>/);
@@ -389,12 +389,12 @@ test("a bare resume of a budget_limited Goal is guidance, and the budget option 
 		await session.waitFor("the kickoff run started", (records) =>
 			records.filter((r) => r.type === "agent_start").length >= 1 ? true : undefined,
 		);
-		await session.prompt("/goal resume --budget 100");
+		await session.prompt("/goal:resume --budget 100");
 		const refused = await session.waitForNotify((r) =>
 			r.message.includes("--budget option only resumes a budget_limited Goal"),
 		);
 		assert.match(refused.message, /\bactive\b/);
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("already active"));
 		writeFileSync(gate, "release");
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the Goal to complete");
@@ -424,11 +424,11 @@ test("a bare resume of a budget_limited Goal is guidance, and the budget option 
 		await session.waitFor("the kickoff run started", (records) =>
 			records.filter((r) => r.type === "agent_start").length >= 1 ? true : undefined,
 		);
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused (revision"));
-		await session.prompt("/goal resume --budget 100");
+		await session.prompt("/goal:resume --budget 100");
 		await session.waitForNotify((r) => r.message.includes("--budget option only resumes a budget_limited Goal"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 		writeFileSync(gate, "release");
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the resumed Goal to complete");
@@ -464,9 +464,9 @@ test("a bare resume of a budget_limited Goal is guidance, and the budget option 
 		writeFileSync(session.scriptPath, JSON.stringify(chained(issued)), "utf8");
 		writeFileSync(gate, "", "utf8");
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "blocked", "the blocked Goal");
-		await session.prompt("/goal resume --budget 100");
+		await session.prompt("/goal:resume --budget 100");
 		await session.waitForNotify((r) => r.message.includes("--budget option only resumes a budget_limited Goal"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the resumed Goal to complete");
 		assertStepsConsumed(session, 9);
@@ -493,9 +493,9 @@ test("a bare resume of a budget_limited Goal is guidance, and the budget option 
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "usage_limited", "the usage-limited Goal");
-		await session.prompt("/goal resume --budget 100");
+		await session.prompt("/goal:resume --budget 100");
 		await session.waitForNotify((r) => r.message.includes("--budget option only resumes a budget_limited Goal"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the resumed Goal to complete");
 		assertStepsConsumed(session, 5, [{ stopReason: "error", errorMessage: "insufficient_quota" }]);
@@ -519,9 +519,9 @@ test("a bare resume of a budget_limited Goal is guidance, and the budget option 
 		await session.prompt(`/goal ${OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
 		await waitForSnapshot(session, (s) => s.data.goal?.status === "complete", "the completed Goal");
-		await session.prompt("/goal resume --budget 100");
+		await session.prompt("/goal:resume --budget 100");
 		await session.waitForNotify((r) => r.message.includes("--budget option only resumes a budget_limited Goal"));
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("cannot be resumed"));
 		assertStepsConsumed(session, 2);
 		assert.equal(session.extensionErrors().length, 0);
@@ -537,7 +537,7 @@ test("an objective edit without a resume preserves budget_limited and the owed w
 	const before = await reachPendingWrapUp(session);
 	const runsBefore = runCount(session);
 
-	await session.prompt(`/goal edit ${EDITED_OBJECTIVE}`);
+	await session.prompt(`/goal:edit ${EDITED_OBJECTIVE}`);
 	const edited = await session.waitForNotify((r) => r.message.includes("objective updated"));
 	assert.match(edited.message, /stays budget_limited/);
 	assert.match(edited.message, /--budget <new-total>/);
@@ -610,7 +610,7 @@ test("an in-flight old-episode wrap-up stays charged, the gate lifts only after 
 
 	// Resume while the old wrap-up is still in flight. The durable raise lands
 	// before the steered resume message, and the gate lifts only then.
-	await session.prompt("/goal resume --budget 200");
+	await session.prompt("/goal:resume --budget 200");
 	await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 	const resumed = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
 	assert.equal(resumed.status, "active");
@@ -665,7 +665,7 @@ test("an in-flight old wrap-up can immediately exhaust the new ceiling, and the 
 	);
 
 	// 115 accounted, new ceiling 120: the in-flight wrap-up's 15 tokens cross it.
-	await session.prompt("/goal resume --budget 120");
+	await session.prompt("/goal:resume --budget 120");
 	await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 	writeFileSync(gate, "release");
 
@@ -723,7 +723,7 @@ test("a completed old-episode wrap-up is not reused when the new ceiling is late
 	assert.equal(wrapUpEntries(readSessionEntries(await session.sessionFile())).length, 1, "one wrap-up for the first episode");
 
 	// Resume with a higher ceiling; the completed wrap-up is not reused.
-	await session.prompt("/goal resume --budget 300");
+	await session.prompt("/goal:resume --budget 300");
 	await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 
 	// The resumed work later exhausts 300, earning exactly one fresh wrap-up.
@@ -845,7 +845,7 @@ test("a migrated exhausted legacy Goal recovers with positive headroom, and no r
 			assert.equal(cutovered.usage.totalTokens, 110, "the legacy reconstructed total is preserved");
 			assert.equal(cutovers(readSessionEntries(sessionFile)).length, 1, "the branch is cut over");
 
-			await session.prompt("/goal resume --budget 200");
+			await session.prompt("/goal:resume --budget 200");
 			await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 			const resumed = lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal;
 			assert.equal(resumed.status, "active");
@@ -888,9 +888,9 @@ test("a migrated exhausted legacy Goal recovers with positive headroom, and no r
 			assert.equal(migrated.usage.totalTokens, 110);
 			const revision = migrated.revision;
 
-			await first.prompt("/goal resume --budget 110");
+			await first.prompt("/goal:resume --budget 110");
 			await first.waitForNotify((r) => r.message.includes("strictly greater than"));
-			await first.prompt("/goal resume --budget 115");
+			await first.prompt("/goal:resume --budget 115");
 			await first.waitForNotify((r) => r.message.includes("exceeds the configured maximum of 110"));
 			const still = lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal;
 			assert.equal(still.status, "budget_limited");
@@ -917,7 +917,7 @@ test("a migrated exhausted legacy Goal recovers with positive headroom, and no r
 		);
 		try {
 			await second.waitForNotify((r) => r.message.includes("restored (budget_limited)"));
-			await second.prompt("/goal resume --budget 150");
+			await second.prompt("/goal:resume --budget 150");
 			await second.waitForNotify((r) => r.message.includes("resumed (revision"));
 			const resumed = lastGoalSnapshot(readSessionEntries(sessionFile)).data.goal;
 			assert.equal(resumed.status, "active");

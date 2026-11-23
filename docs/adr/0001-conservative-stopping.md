@@ -182,7 +182,7 @@ and the audit could not recognize a reworded report at all.
 
 Batch 2 (issue #25) repairs how a `budget_limited` Goal resumes. The old budget
 is a cumulative ceiling, so an explicit raise — and only an explicit raise — can
-restart the same identity: `/goal resume --budget <new-total>` (or
+restart the same identity: `/goal:resume --budget <new-total>` (or
 `--budget=<new-total>`). The value is the new absolute total, not an increment;
 it must be strictly greater than the accounted usage so the resumed Goal has
 positive headroom, and at most the configured `goal.maxTokenBudget`, which is
@@ -204,7 +204,7 @@ immediately exhaust the new ceiling, in which case the Goal becomes
 `budget_limited` again and earns the new episode's one wrap-up. Editing the
 objective without resuming does not cancel an owed wrap-up: an undelivered
 wrap-up uses the latest durable objective, and an in-flight or completed one is
-never duplicated. `/goal edit` stays independent, so changing both the
+never duplicated. `/goal:edit` stays independent, so changing both the
 objective and the budget is edit first, then a budget-raising resume.
 
 This batch does not change any threshold or reset rule in this ADR. The
@@ -269,7 +269,7 @@ landing unit.
   retried empty would never reach an anti-loop bound.
 - A Goal that stops is never silently restarted. `blocked` and `usage_limited` are
   terminal for continuation, and only a user decision resumes them — which is why
-  resume is deliberately not a model tool. That decision is `/goal resume`, the same
+  resume is deliberately not a model tool. That decision is `/goal:resume`, the same
   command that restarts a paused Goal, so all three non-continuing states end the
   same way: the identity, creation time, and history are kept, the audit that
   described the stop is dropped, and a fresh blocked audit starts from one. A

@@ -30,11 +30,11 @@ reworded report at all.
 | Exact third-turn transition | Only the third consecutive Goal turn transitions; several calls in one turn cannot satisfy the threshold | `test/goal11-blocker-identity.test.mjs` ("only the third consecutive Goal turn transitions…"; "the first report issues an opaque identity…"); `test/goal5.test.mjs` ("update_goal(blocked) needs the same blocker for three consecutive Goal turns"); `test/goal11-blocker-identity-store.test.mjs` ("only the third consecutive Goal turn transitions…") |
 | Reset: no-report turn | A Goal turn that makes progress, verifies a wait, or reports no blocker breaks the chain durably | `test/goal5.test.mjs` ("a Goal turn without a blocker report breaks the blocked audit"; "a durable audit reset survives a restart…"); `test/goal11-blocker-identity-store.test.mjs` ("every reset drops the identity durably…") |
 | Reset: user action | A prompt the user types and an abort reset the audit durably | `test/goal5.test.mjs` ("a queued user prompt restarts the blocked audit at one"; "an abort resets the anti-loop counters…"); `test/goal11-blocker-identity.test.mjs` ("the legacy handoff grants no extra unattended turns…") |
-| Reset: resume | `/goal resume` clears the audit that described the stop and starts a fresh one | `test/goal5.test.mjs` ("/goal resume restarts a blocked Goal with a fresh audit"; "/goal resume restarts a blocked Goal with a budget…"); `test/goal11-blocker-identity-store.test.mjs` ("every reset drops the identity durably…") |
+| Reset: resume | `/goal:resume` clears the audit that described the stop and starts a fresh one | `test/goal5.test.mjs` ("/goal:resume restarts a blocked Goal with a fresh audit"; "/goal:resume restarts a blocked Goal with a budget…"); `test/goal11-blocker-identity-store.test.mjs` ("every reset drops the identity durably…") |
 | Reset: Replacement Goal | A Replacement Goal is a new identity and inherits no chain | `test/goal11-blocker-identity.test.mjs` ("a Replacement Goal starts a fresh audit and inherits no chain") |
 | Durable partial chain | A partial audit survives a hard kill and a restart, with its identity | `test/goal5.test.mjs` ("a partial blocked audit survives a restart"); `test/goal11-blocker-identity-store.test.mjs` ("a legacy audit keeps its identity across a reload…") |
 | Compaction | A Goal turn Pi compacts and retries is one Goal turn, so the chain is neither advanced nor broken by it | `test/goal11-blocker-identity.test.mjs` ("a compacted Goal turn keeps the audit chain…") |
-| Replay / tree navigation | The audit and its identity reconstruct from the selected branch alone, and `/goal resume` clears them | `test/goal7.test.mjs` ("a blocked Goal reconstructed from a branch keeps its audit, and /goal resume clears it") |
+| Replay / tree navigation | The audit and its identity reconstruct from the selected branch alone, and `/goal:resume` clears them | `test/goal7.test.mjs` ("a blocked Goal reconstructed from a branch keeps its audit, and /goal:resume clears it") |
 | Structured tool responses | `update_goal` and `get_goal` publish the open audit's ID, latest description, and count | `test/goal11-blocker-identity.test.mjs` ("the first report issues an opaque identity…"; "the Continuation restates the open audit…"); `test/goal11-blocker-identity-store.test.mjs` ("the first report of a condition issues…") |
 | Continuation restatement | Every Continuation restates the open audit's identity, latest description, and count | `test/goal11-blocker-identity.test.mjs` ("the Continuation restates the open audit…") |
 | Human status synchronization | Human-facing status shows the description and the count and never the opaque ID | `test/goal11-blocker-identity.test.mjs` ("the human status shows the description and the count but never the opaque identity") |
@@ -53,8 +53,8 @@ reworded report at all.
 
 Real RPC cannot drive a representative legacy same-condition Goal turn. After
 loading a 0.1.0 session, the first run can only be started by a typed prompt (a
-user action that durably resets the audit before any report) or `/goal resume`
-(which drops the audit); the one promptless seam, `/goal edit` on an idle active
+user action that durably resets the audit before any report) or `/goal:resume`
+(which drops the audit); the one promptless seam, `/goal:edit` on an idle active
 Goal, classifies its run as `user`-kind rather than as a representative Goal
 turn. The store seam therefore carries this row under #21's "impractical through
 RPC" allowance. Identity survival across reconstruction is separately covered

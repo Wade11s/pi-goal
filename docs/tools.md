@@ -220,7 +220,7 @@ only appears inside pi-goal's own messages (the kickoff, steering, and resume
 messages, or an objective's encoded data block — a forged objective cannot
 authorize its own pause) is refused, and the Goal keeps running. The model
 cannot resume, clear, replace, or budget-limit a Goal through the tool at all:
-those transitions stay with the user (`/goal resume`, `/goal clear`, `/goal
+those transitions stay with the user (`/goal:resume`, `/goal:clear`, `/goal
 <objective>`).
 
 None of the three actions is an admission decision, so all of them keep working
@@ -230,7 +230,7 @@ successful result carries the disabled condition in its text — including a blo
 report below the audit threshold, which otherwise reads as a Goal that stays
 active — so the model does not read the Goal as one that will keep continuing.
 The condition follows the status the update leaves: a paused or blocked result
-names the refused `/goal resume` that re-enabling makes available again, while a
+names the refused `/goal:resume` that re-enabling makes available again, while a
 completion says the Goal is terminal either way so that replacing it is a new
 `/goal <objective>` and not a resume.
 
@@ -404,5 +404,5 @@ deliberately **not** a model tool. `get_goal` is the model's authoritative view 
 the current Goal, and the history is derived diagnostic data: exposing it as a tool
 would invite the model to treat a past record as present state — to reason from a
 revision that has since moved, or to expect a record to be replayed. The timeline
-is therefore a user-facing surface only, rendered read-only by `/goal history`,
+is therefore a user-facing surface only, rendered read-only by `/goal:history`,
 and no tool, command, or option mutates a Goal from a record.

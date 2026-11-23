@@ -166,7 +166,7 @@ test("the documented launch arguments produce a read-only real Pi session, leavi
 	script([{ text: "On it." }, { hang: true }], parent);
 	await parent.prompt("/goal --no-budget Keep the parent Goal state intact");
 	await waitForSnapshot(parent, (snapshot) => snapshot.data.goal?.status === "active", "the parent Goal creation");
-	await parent.prompt("/goal pause");
+	await parent.prompt("/goal:pause");
 	const parentFile = await parent.sessionFile();
 	const beforeSnapshot = await waitForSnapshot(parent, (snapshot) => snapshot.data.goal?.status === "paused", "the parent pause");
 	const before = readFileSync(parentFile);
@@ -215,7 +215,7 @@ test("an accidental Goal-tool call in the review child is refused and writes not
 	script([{ text: "On it." }, { hang: true }], parent);
 	await parent.prompt("/goal --no-budget Preserve this parent Goal");
 	await waitForSnapshot(parent, (snapshot) => snapshot.data.goal?.status === "active", "the parent Goal creation");
-	await parent.prompt("/goal pause");
+	await parent.prompt("/goal:pause");
 	const parentFile = await parent.sessionFile();
 	await waitForSnapshot(parent, (snapshot) => snapshot.data.goal?.status === "paused", "the parent paused Goal");
 	const parentBefore = readFileSync(parentFile);

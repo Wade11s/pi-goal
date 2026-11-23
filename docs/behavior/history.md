@@ -11,11 +11,11 @@ See also [events](events.md) · [persistence](persistence.md) ·
 
 Every meaningful durable Goal transition — the same set the local
 `pi-goal:updated` event stream covers — is also appended to the session branch as
-a `goal-history` custom entry. `/goal history` renders those entries as a readable
+a `goal-history` custom entry. `/goal:history` renders those entries as a readable
 timeline:
 
 ```
-/goal history
+/goal:history
 ```
 
 ```
@@ -44,7 +44,7 @@ shaped so that it cannot become a second one:
 | Rule | Why |
 | --- | --- |
 | Nothing reconstructs from history. | Reconstruction reads `goal-state` alone. A missing, truncated, or malformed `goal-history` entry cannot resurrect, clear, replace, or otherwise change the current Goal — the worst it can do is make the timeline harder to read. |
-| No command mutates from history. | `/goal history` only reads and renders. There is no command, tool, or option that applies, replays, or reverts a history record, so the timeline is not a mutation interface. |
+| No command mutates from history. | `/goal:history` only reads and renders. There is no command, tool, or option that applies, replays, or reverts a history record, so the timeline is not a mutation interface. |
 | No record is written before its transition is durable. | The append happens in the store's committed-transition seam — the same seam that publishes the event — after the snapshot or tombstone has been written through. A refused or failed transition writes nothing; a retraction appends nothing further, while the `created` record its earlier commit wrote survives as the documented accepted corner below. |
 | History is projected from the event payload. | Each record is derived from the `pi-goal:updated` payload of its transition rather than re-projected from the Goal record, so the timeline and the public event stream cannot disagree about what happened. |
 | No attachment contents, ever. | The record carries the manifest's metadata (hash, media type, byte size, label), exactly as the event does. The bytes live once, in the extension-owned artifact store. |
@@ -89,7 +89,7 @@ accepts, and it is bounded:
   reconstruction pass that would have to invent the missing entry;
 - the next transition appends normally, so the gap never propagates.
 
-`/goal history` makes no claim about a record that is not there: it renders the
+`/goal:history` makes no claim about a record that is not there: it renders the
 records the branch holds, and it says so explicitly when an entry is present but
 unreadable.
 

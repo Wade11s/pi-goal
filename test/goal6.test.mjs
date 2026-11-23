@@ -838,7 +838,7 @@ test("a budget-limited Goal can be edited, keeps its accounted usage, and never 
 
 		// Refining the finish line of an exhausted Goal is allowed (only a complete
 		// Goal is finished), and it preserves the identity and the usage history.
-		await session.prompt(`/goal edit ${EDITED_OBJECTIVE}`);
+		await session.prompt(`/goal:edit ${EDITED_OBJECTIVE}`);
 		const edited = await session.waitForNotify((r) => r.message.includes("objective updated"));
 		assert.match(edited.message, /The Goal stays budget_limited/);
 

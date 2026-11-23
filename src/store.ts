@@ -1076,7 +1076,7 @@ export class GoalStore {
 	 * the session file until the session has a user or assistant message, so a
 	 * staged snapshot on a fresh session is in memory only until the kickoff's
 	 * user message flushes the file. Matching "this id occurs somewhere in the
-	 * file" would not do: a later tombstone (a `/goal clear` that landed during
+	 * file" would not do: a later tombstone (a `/goal:clear` that landed during
 	 * the durability wait) must count as *not* durable.
 	 */
 	isDurable(ctx: ExtensionContext, goalId: string): boolean {
@@ -1916,7 +1916,7 @@ export class GoalStore {
 					reason: "not-eligible",
 					message:
 						"a budget_limited Goal can only be resumed with a higher cumulative token budget " +
-						"(/goal resume --budget <new-total>)",
+						"(/goal:resume --budget <new-total>)",
 				};
 			}
 			const requested = options.tokenBudget!;
@@ -1951,7 +1951,7 @@ export class GoalStore {
 				reason: "not-eligible",
 				message:
 					`the --budget option only resumes a budget_limited Goal (current status: ${current.status}); ` +
-					"use /goal resume without --budget",
+					"use /goal:resume without --budget",
 			};
 		}
 		if (current.status !== "paused" && current.status !== "blocked" && current.status !== "usage_limited") {
@@ -2295,7 +2295,7 @@ export class GoalStore {
 		// a different identity is still one audit step rather than a new chain.
 		//
 		// The revision the counted report wrote is what keeps that sound. A Goal can
-		// advance for a reason that has nothing to do with the report — `/goal edit`
+		// advance for a reason that has nothing to do with the report — `/goal:edit`
 		// runs immediately while the run is busy — and then the repeat is *not* the
 		// same audit step: the model is reporting a blocker against an objective it
 		// can no longer see. It falls through to the stale check below instead of

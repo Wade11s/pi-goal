@@ -75,11 +75,11 @@ test("the compact status line follows create, pause, resume, complete, and clear
 			records.filter((r) => r.type === "agent_start").length >= 1 ? true : undefined,
 		);
 
-		await session.prompt("/goal pause");
+		await session.prompt("/goal:pause");
 		await session.waitForNotify((r) => r.message.includes("paused (revision"));
 		assert.match(statusText(session) ?? "", /\bpaused\b/);
 
-		await session.prompt("/goal resume");
+		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed (revision"));
 		assert.match(statusText(session) ?? "", /\bactive\b/);
 
@@ -88,7 +88,7 @@ test("the compact status line follows create, pause, resume, complete, and clear
 		await session.waitForToolResult("update_goal", 1);
 		assert.match(statusText(session) ?? "", /\bcomplete\b/);
 
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared (was complete)"));
 		const cleared = lastStatus(session);
 		assert.ok(cleared, "a final status update was published");
@@ -185,7 +185,7 @@ test("the status line reports usage_limited after a provider usage-limit failure
 	}
 });
 
-test("bare /goal edit opens an RPC editor dialog prefilled with the objective", async () => {
+test("bare /goal:edit opens an RPC editor dialog prefilled with the objective", async () => {
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "kickoff-gate");
 	script(
@@ -206,9 +206,9 @@ test("bare /goal edit opens an RPC editor dialog prefilled with the objective", 
 			records.filter((r) => r.type === "agent_start").length >= 1 ? true : undefined,
 		);
 
-		// Bare /goal edit opens the editor through the RPC extension-UI
+		// Bare /goal:edit opens the editor through the RPC extension-UI
 		// subprotocol; the host answers it exactly like an interactive user.
-		const editPrompt = session.prompt("/goal edit");
+		const editPrompt = session.prompt("/goal:edit");
 		const request = await session.respondToEditor(() => true, EDITED_OBJECTIVE);
 		assert.equal(request.title, "Edit Goal objective");
 		assert.equal(request.prefill, OBJECTIVE);

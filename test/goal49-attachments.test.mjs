@@ -417,7 +417,7 @@ test("an objective edit retains the immutable manifest; changing attachments req
 		const creation = goalSnapshots(readSessionEntries(sessionFile))[0];
 
 		// An edit cannot select attachments.
-		const refused = await session.prompt(`/goal edit --file ${join(dirs.workDir, "other.md")} New objective`);
+		const refused = await session.prompt(`/goal:edit --file ${join(dirs.workDir, "other.md")} New objective`);
 		assert.equal(refused.data.disposition, "handled");
 		const guidance = await session.waitForNotify((r) => r.message.includes("Goal not edited:"));
 		assert.match(guidance.message, /keeps the Goal's immutable attachment manifest/);
@@ -429,7 +429,7 @@ test("an objective edit retains the immutable manifest; changing attachments req
 		);
 
 		// A real edit keeps the manifest verbatim and re-states it in the message.
-		await session.prompt("/goal edit Steer toward the refined release");
+		await session.prompt("/goal:edit Steer toward the refined release");
 		await session.waitForNotify((r) => r.message.includes("objective updated"));
 		const entries = await waitForEntries(
 			sessionFile,
@@ -492,7 +492,7 @@ test("a Replacement Goal selects new attachments and retains the replaced Goal's
 
 		// Clearing the replacement retains every committed artifact, because
 		// another selected branch may still reference them.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		assert.deepEqual(storedGoalIds(root).sort(), [first.id, replacement.id].sort());
 
@@ -741,9 +741,9 @@ test("a missing artifact suppresses automatic continuation and surfaces the expl
 		// Pausing stays available (it is not work-admitting), and a resume of the
 		// stopped Goal is refused with the same explicit error rather than silently
 		// dropping the missing attachment from the resumed context.
-		await second.prompt("/goal pause");
+		await second.prompt("/goal:pause");
 		await second.waitForNotify((r) => r.message.includes("paused (revision"));
-		await second.prompt("/goal resume");
+		await second.prompt("/goal:resume");
 		const resumeRefusal = await second.waitForNotify(
 			(r) => r.message.includes("could not verify the attachments") && r.message.includes(`Goal ${goal.id}`),
 		);
@@ -1033,7 +1033,7 @@ test("a resume whose artifact fails to load leaves the Goal paused and names a r
 		await first.prompt(`/goal --file ${spec} ${OBJECTIVE}`);
 		await abortActiveLoop(first, 2);
 		sessionFile = await first.sessionFile();
-		await first.prompt("/goal pause");
+		await first.prompt("/goal:pause");
 		await first.waitForNotify((r) => r.message.includes("paused (revision"));
 		pausedGoal = goalSnapshots(readSessionEntries(sessionFile)).at(-1).data.goal;
 		assert.equal(pausedGoal.status, "paused");
@@ -1064,7 +1064,7 @@ test("a resume whose artifact fails to load leaves the Goal paused and names a r
 		const continuationsBefore = continuationEntries(beforeEntries).length;
 		const snapshotsBefore = goalSnapshots(beforeEntries).length;
 
-		await second.prompt("/goal resume");
+		await second.prompt("/goal:resume");
 		const failure = await second.notifyAfter(mark, (r) =>
 			r.message.includes("could not verify the attachments"),
 		);
@@ -1073,7 +1073,7 @@ test("a resume whose artifact fails to load leaves the Goal paused and names a r
 		assert.match(failure.message, /replace the Goal/);
 		assert.doesNotMatch(
 			failure.message,
-			/restart the work with \/goal resume/,
+			/restart the work with \/goal:resume/,
 			"a failed resume must not claim the Goal was resumed or suggest a no-op retry",
 		);
 

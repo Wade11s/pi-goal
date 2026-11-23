@@ -1,6 +1,6 @@
 {
 	"name": "pi-goal-rpc-companion",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Optional Codex-shaped Goal get/set/clear adapter for pi-goal, mapped onto pi-goal's user command surface through its in-process command bridge",
 	"type": "module",
 	"license": "MIT",

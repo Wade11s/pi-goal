@@ -184,8 +184,8 @@ test("the status report surfaces the disabled condition without touching the sta
 	assert.match(disabled, /Admission disabled: goal\.enabled is false/);
 	assert.match(disabled, /not a Lifecycle status and not a pause/);
 	assert.match(disabled, /keeps accruing active time/);
-	assert.match(disabled, /\/goal pause/);
-	assert.match(disabled, /\/goal clear/);
+	assert.match(disabled, /\/goal:pause/);
+	assert.match(disabled, /\/goal:clear/);
 	// Every enabled rendering is a strict subset of the disabled one.
 	assert.ok(disabled.includes(enabled), "the disabled report adds to the ordinary report");
 });
@@ -203,7 +203,7 @@ test("the compact status line marks admission off without losing the status or u
 test("the disabled block is status-aware about the clock and about resume", () => {
 	// Only an active Goal is still running its clock; every other status already
 	// stopped it, so the block may not say it keeps accruing or that the refused
-	// /goal resume would restart work.
+	// /goal:resume would restart work.
 	const active = formatGoalSummary(toPublicState(record({ usage: usage() })), { admissionEnabled: false });
 	assert.match(active, /keeps accruing active time/);
 	for (const status of ["paused", "complete", "blocked", "usage_limited", "budget_limited"]) {
@@ -221,7 +221,7 @@ test("the disabled block is status-aware about the clock and about resume", () =
 			disabled,
 			new RegExp(`this Goal is already ${status}, so its active time has already stopped`),
 		);
-		assert.match(disabled, /no \/goal resume/, `${status} must say resume is not admitted`);
+		assert.match(disabled, /no \/goal:resume/, `${status} must say resume is not admitted`);
 		if (status !== "complete") {
 			// Its status hint names a resume, so the hint has to say it is refused too.
 			assert.match(disabled, /is refused while pi-goal is disabled/, `${status}: ${disabled}`);
@@ -365,7 +365,7 @@ test("a disabled extension refuses a work-admitting objective edit", async () =>
 	const context = await activeGoalSession({ goal: { enabled: false } });
 	try {
 		const mark = context.session.records.length;
-		const response = await context.session.prompt(`/goal edit Ship the migration notes page instead`);
+		const response = await context.session.prompt(`/goal:edit Ship the migration notes page instead`);
 		assert.equal(response.data.disposition, "handled");
 		const refusal = await context.session.notifyAfter(mark, (r) => /Goal not edited:/.test(r.message));
 		assert.match(refusal.message, /Goal not edited:/);
@@ -388,13 +388,13 @@ test("a disabled extension still permits an objective edit that admits no work",
 	script([{ text: "Nothing to do while paused." }], context.session);
 	try {
 		// Pausing is available while disabled, and it is what stops the clock.
-		const paused = await context.session.prompt("/goal pause");
+		const paused = await context.session.prompt("/goal:pause");
 		assert.equal(paused.data.disposition, "handled");
 		await context.session.waitForNotify((r) => r.message.includes("paused"));
 
 		// An edit of a non-active Goal admits no work, so it stays available.
 		const editMark = context.session.records.length;
-		const edited = await context.session.prompt("/goal edit Ship the migration notes page instead");
+		const edited = await context.session.prompt("/goal:edit Ship the migration notes page instead");
 		assert.equal(edited.data.disposition, "handled");
 		const notice = await context.session.notifyAfter(editMark, (r) =>
 			r.message.includes("objective updated"),
@@ -412,7 +412,7 @@ test("a disabled extension still permits an objective edit that admits no work",
 
 		// Resume is refused while disabled: it would admit new Goal work.
 		const resumeMark = context.session.records.length;
-		const resumed = await context.session.prompt("/goal resume");
+		const resumed = await context.session.prompt("/goal:resume");
 		assert.equal(resumed.data.disposition, "handled");
 		const refusal = await context.session.notifyAfter(resumeMark, (r) => /Goal not resumed:/.test(r.message));
 		assert.match(refusal.message, /Goal not resumed: pi-goal is disabled \(goal\.enabled is false\)/);
@@ -452,7 +452,7 @@ test("a disabled extension keeps pause, clear, and inspection available", async 
 		await context.session.waitForSettled(1);
 
 		// Clear is available while disabled: the user keeps full stopping control.
-		const cleared = await context.session.prompt("/goal clear");
+		const cleared = await context.session.prompt("/goal:clear");
 		assert.equal(cleared.data.disposition, "handled");
 		await context.session.waitForNotify((r) => r.message.includes("cleared"));
 		const entries = readSessionEntries(context.sessionFile);
@@ -499,7 +499,7 @@ test("an active-but-disabled Goal keeps its status and its clock and continues n
 		const suppressed = await context.session.notifyAfter(mark, (r) => /no continuation was/.test(r.message));
 		assert.match(suppressed.message, /Goal goal_[0-9a-f]+ is active, but pi-goal is disabled/);
 		assert.match(suppressed.message, /keeps accruing active time/);
-		assert.match(suppressed.message, /\/goal pause, not disabling the extension, stops that clock/);
+		assert.match(suppressed.message, /\/goal:pause, not disabling the extension, stops that clock/);
 
 		const entries = readSessionEntries(context.sessionFile);
 		assert.equal(continuationEntries(entries).length, 2, "only the continuations written before the restart");
@@ -567,13 +567,13 @@ test("an in-flight run still reports its terminal update while disabled", async 
 		assert.equal(completion.isError, false, "a terminal update from in-flight work still works while disabled");
 		assert.equal(structuredGoal(completion.result).status, "complete");
 		// The result carries the disabled condition, and it must not imply that
-		// re-enabling makes `/goal resume` work: a complete Goal is terminal for its
+		// re-enabling makes `/goal:resume` work: a complete Goal is terminal for its
 		// identity, so replacing it is a new Goal.
 		assert.match(toolText(completion.result), /pi-goal is disabled \(goal\.enabled is false\)/);
 		assert.match(toolText(completion.result), /a complete Goal is terminal either way/);
 		assert.match(toolText(completion.result), /not a resume/);
 		assert.ok(
-			!/no \/goal resume/.test(toolText(completion.result)),
+			!/no \/goal:resume/.test(toolText(completion.result)),
 			`the completion promises a resume it can never have: ${toolText(completion.result)}`,
 		);
 		await second.waitForSettled(1);
@@ -607,7 +607,7 @@ test("an in-flight provider usage-limit stop still lands while disabled", async 
 		assert.match(limited.message, /insufficient_quota/);
 		// The stop keeps its own text, but it names the admission condition instead of
 		// promising a resume the disabled extension refuses.
-		assert.match(limited.message, /\/goal resume restarts it once the limit is resolved/);
+		assert.match(limited.message, /\/goal:resume restarts it once the limit is resolved/);
 		assert.match(limited.message, /so that resume is refused until the setting is re-enabled/);
 		assert.match(limited.message, /never continues on its own/);
 

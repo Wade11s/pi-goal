@@ -310,7 +310,7 @@ not steal the replacement's own open segment.
 ## Review follow-up: the Clear boundary
 
 The re-review by subagent 7d3961 at `282b9c7` found that the documented Clear
-residual was a contract violation: a `/goal clear` issued after a replacement but
+residual was a contract violation: a `/goal:clear` issued after a replacement but
 before the old identity's in-flight response was accounted charged that response
 to nobody, and a failed freeze at Clear silently discarded already-accounted work.
 It also found that the README and GLOSSARY called the initial preserve snapshot

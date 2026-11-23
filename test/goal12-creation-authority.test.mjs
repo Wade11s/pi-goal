@@ -680,7 +680,7 @@ test("a direct Goal lifecycle operation clears creation authority", async () => 
 		);
 		// A direct lifecycle command lands while the run is in flight and clears
 		// the model-held authority.
-		await session.prompt("/goal clear");
+		await session.prompt("/goal:clear");
 		writeFileSync(gate, "", "utf8");
 		await session.waitForToolResult("create_goal", 1);
 		await session.waitForSettled(1);

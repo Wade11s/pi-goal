@@ -1,20 +1,29 @@
 /**
- * The in-process Goal command bridge (issue #56).
+ * The in-process Goal command bridge (issue #56; request shape revised in #79).
  *
- * pi-goal's `/goal` command is the *user* command surface: it owns replacement
- * confirmation, `goal.enabled` admission, Token-budget validation, attachment
- * materialization, the on-disk durability gate, and the durable-before-announced
- * announcement order. A host integration (a Codex-shaped RPC client, an IDE, a
- * companion package) that re-implemented any of that would be a second lifecycle
- * path, and the second path is always the one that forgets a safety rule.
+ * pi-goal's Goal command family is the *user* command surface: it owns
+ * replacement confirmation, `goal.enabled` admission, Token-budget validation,
+ * attachment materialization, the on-disk durability gate, and the
+ * durable-before-announced announcement order. A host integration (a
+ * Codex-shaped RPC client, an IDE, a companion package) that re-implemented any
+ * of that would be a second lifecycle path, and the second path is always the
+ * one that forgets a safety rule.
  *
- * So the bridge is deliberately not a lifecycle API. It carries **the same text a
- * user types after `/goal`** to the same handler, and returns a structured
- * description of what that handler did: the committed transitions it announced,
- * the diagnostics it reported, the public state afterwards, and whether the
- * requested effect is still in place and durable. Nothing here reads or writes a
- * snapshot, a tombstone, or a `goal-usage` checkpoint; the only writer is the
+ * So the bridge is deliberately not a lifecycle API. It carries **the same
+ * dispatch Pi performs for a typed command** — a command name and the text
+ * typed after it — to the same handler, and returns a structured description of
+ * what that handler did: the committed transitions it announced, the
+ * diagnostics it reported, the public state afterwards, and whether the
+ * requested effect is still in place and durable. Nothing here reads or writes
+ * a snapshot, a tombstone, or a `goal-usage` checkpoint; the only writer is the
  * store behind the command handler.
+ *
+ * Carrying Pi's own dispatch shape rather than "the text after `/goal`" is what
+ * lets the bridge stay free of a parser: a request names `/goal:pause`, it does
+ * not spell `pause` after `/goal` and hope both sides parse it the same way. The
+ * companion that used to mirror pi-goal's parser so that a `set` could never
+ * render the clear command therefore no longer needs a mirror at all — an
+ * Objective is only ever the argument of `/goal`.
  *
  * Two properties keep the result honest:
  *
@@ -46,17 +55,31 @@ import type { GoalPublicState } from "./goal.ts";
 /** Channel on Pi's shared extension event bus carrying a {@link GoalCommandBridgeRequest}. */
 export const GOAL_COMMAND_BRIDGE = "pi-goal:command-bridge";
 
-/** Bumps only if the request or result shape itself changes. */
-export const GOAL_COMMAND_BRIDGE_VERSION = 1;
+/** Bumps only if the request or result shape itself changes. Version 2 carries a command name plus argument text. */
+export const GOAL_COMMAND_BRIDGE_VERSION = 2;
 
 /**
- * The command family a `/goal` argument string belongs to.
+ * The Goal command family: the only command names a bridge request may carry.
  *
- * Deliberately coarser than the parsed command: the bridge only needs to know
- * which durable transitions could be the *answer* to a request, so an unknown or
- * malformed argument string is its own family (`invalid`) rather than a guess.
+ * The same list the extension registers, in `/` menu order. A request naming
+ * anything else is malformed, like a bad version, because the bridge has no
+ * handler to run for it and will not guess which one was meant.
  */
-export type GoalBridgeAction = "status" | "create" | "edit" | "pause" | "resume" | "clear" | "invalid";
+export const GOAL_COMMAND_NAMES = ["goal", "goal:pause", "goal:resume", "goal:clear", "goal:history", "goal:edit"] as const;
+
+export type GoalCommandName = (typeof GOAL_COMMAND_NAMES)[number];
+
+/**
+ * The action a request asks for, derived from its command name — and, for
+ * `/goal` itself, from whether it carries an Objective.
+ *
+ * Deliberately coarser than any handler internals: the bridge only needs to know
+ * which durable transitions could be the *answer* to a request. `invalid` is
+ * never produced from the request text (nothing is parsed); it is reserved for a
+ * name that is valid for the protocol but is not a registered command at
+ * dispatch time.
+ */
+export type GoalBridgeAction = "status" | "create" | "edit" | "pause" | "resume" | "clear" | "history" | "invalid";
 
 /**
  * The transitions that can legitimately answer each mutating action.
@@ -66,7 +89,7 @@ export type GoalBridgeAction = "status" | "create" | "edit" | "pause" | "resume"
  * reported as the outcome of this request. A transition outside the set is
  * simply not this command's answer.
  */
-const COMMITTING_KINDS: Record<Exclude<GoalBridgeAction, "status" | "invalid">, readonly GoalTransitionKind[]> = {
+const COMMITTING_KINDS: Record<Exclude<GoalBridgeAction, "status" | "history" | "invalid">, readonly GoalTransitionKind[]> = {
 	create: ["created", "replaced"],
 	edit: ["objective-edited"],
 	pause: ["paused"],
@@ -76,7 +99,7 @@ const COMMITTING_KINDS: Record<Exclude<GoalBridgeAction, "status" | "invalid">, 
 
 /** The transition kinds that answer `action`; empty for a read or an invalid command. */
 export function committedKindsFor(action: GoalBridgeAction): readonly GoalTransitionKind[] {
-	if (action === "status" || action === "invalid") return [];
+	if (action === "status" || action === "history" || action === "invalid") return [];
 	return COMMITTING_KINDS[action];
 }
 
@@ -84,13 +107,13 @@ export function committedKindsFor(action: GoalBridgeAction): readonly GoalTransi
 export type GoalBridgeDisposition =
 	/** A durable transition committed and is still the current state. */
 	| "committed"
-	/** A read-only status query answered (there is nothing to commit). */
+	/** A read-only query answered (there is nothing to commit). */
 	| "reported"
 	/** Nothing committed, and the command reported no problem: the user said no, or there was nothing to do. */
 	| "declined"
 	/** Nothing committed, and the command reported a warning or error. */
 	| "refused"
-	/** The argument string was not a valid `/goal` command. */
+	/** The named command is not one the bridge can run: it is not registered at dispatch time. */
 	| "invalid";
 
 /** One notification the command handler reported, in order, with its severity. */
@@ -105,18 +128,26 @@ export interface GoalBridgeTransition {
 	goal: GoalPublicState;
 }
 
-/** A bridge request: the `/goal` argument text, plus where to answer. */
+/** A bridge request: one Goal command family command name and its argument text, plus where to answer. */
 export interface GoalCommandBridgeRequest {
 	version: typeof GOAL_COMMAND_BRIDGE_VERSION;
 	/** Correlation id, echoed in the result. Never interpreted. */
 	id: string;
 	/**
-	 * The exact text a user would type after `/goal`. An empty string is the bare
-	 * status report; `clear`, `pause`, `resume --budget 150`, `edit <objective>`,
-	 * and `<objective>` mean exactly what they mean on the command line, including
-	 * their leading `--budget` / `--no-budget` / `--file` / `--image` options.
+	 * The command the user would type, without the leading slash: one of
+	 * {@link GOAL_COMMAND_NAMES}. The verbs are reached by their own names, never
+	 * spelled into `/goal`'s argument.
 	 */
-	command: string;
+	name: GoalCommandName;
+	/**
+	 * The exact text a user would type after the command name. For `goal` an empty
+	 * string is the bare status report and anything else is a creation (with its
+	 * leading `--budget` / `--no-budget` / `--file` / `--image` / `--remote-image`
+	 * options); for `goal:resume` it is empty or `--budget <new-total>`; for
+	 * `goal:edit` it is the new objective or empty for the editor; the other verbs
+	 * take nothing.
+	 */
+	args: string;
 	/** Where the result is delivered. Called exactly once. */
 	reply: (result: GoalCommandBridgeResult) => void;
 }
@@ -125,11 +156,14 @@ export interface GoalCommandBridgeRequest {
 export interface GoalCommandBridgeResult {
 	version: typeof GOAL_COMMAND_BRIDGE_VERSION;
 	id: string;
-	command: string;
+	/** The request's command name, echoed. */
+	name: GoalCommandName;
+	/** The request's argument text, echoed. */
+	args: string;
 	/** True only for `committed` and `reported`: the requested effect is in place. */
 	ok: boolean;
 	disposition: GoalBridgeDisposition;
-	/** The command family the text parsed into, or null when it could not be parsed. */
+	/** The action the command name (and, for `goal`, its argument) asks for, or `invalid` for a name not registered at dispatch time. */
 	action: GoalBridgeAction | null;
 	/** The public state after the command; null when no Goal is current. */
 	goal: GoalPublicState | null;
@@ -146,8 +180,8 @@ export type GoalCommandBridgeParse =
 	| { ok: true; request: GoalCommandBridgeRequest }
 	| { ok: false; message: string };
 
-/** Bound on the accepted command text, matching nothing in particular but not unbounded. */
-const MAX_BRIDGE_COMMAND_LENGTH = 100_000;
+/** Bound on the accepted argument text, matching nothing in particular but not unbounded. */
+const MAX_BRIDGE_ARGS_LENGTH = 100_000;
 
 /**
  * Validate an inbound bridge payload.
@@ -156,7 +190,8 @@ const MAX_BRIDGE_COMMAND_LENGTH = 100_000;
  * bridge drops it and says why instead of half-executing a request. A request
  * from a *future* version is refused for the same reason — an unknown field could
  * mean anything, and guessing is how a compatibility shim becomes a lifecycle
- * path.
+ * path. A `name` outside the Goal command family is malformed for the same
+ * reason again: there is no such command to run.
  */
 export function parseGoalCommandBridgeRequest(payload: unknown): GoalCommandBridgeParse {
 	if (payload === null || typeof payload !== "object") {
@@ -174,11 +209,19 @@ export function parseGoalCommandBridgeRequest(payload: unknown): GoalCommandBrid
 	if (typeof candidate.id !== "string" || candidate.id.length === 0) {
 		return { ok: false, message: "the bridge request must carry a non-empty string id" };
 	}
-	if (typeof candidate.command !== "string") {
-		return { ok: false, message: "the bridge request must carry a string command" };
+	if (typeof candidate.name !== "string" || !(GOAL_COMMAND_NAMES as readonly string[]).includes(candidate.name)) {
+		return {
+			ok: false,
+			message:
+				`the bridge request must carry a string name that is one of the Goal command family (${GOAL_COMMAND_NAMES.join(", ")}); ` +
+				`got ${JSON.stringify(candidate.name)}`,
+		};
 	}
-	if (candidate.command.length > MAX_BRIDGE_COMMAND_LENGTH) {
-		return { ok: false, message: `the bridge request command exceeds ${MAX_BRIDGE_COMMAND_LENGTH} characters` };
+	if (typeof candidate.args !== "string") {
+		return { ok: false, message: "the bridge request must carry a string args" };
+	}
+	if (candidate.args.length > MAX_BRIDGE_ARGS_LENGTH) {
+		return { ok: false, message: `the bridge request args exceed ${MAX_BRIDGE_ARGS_LENGTH} characters` };
 	}
 	if (typeof candidate.reply !== "function") {
 		return { ok: false, message: "the bridge request must carry a reply function" };
@@ -188,10 +231,37 @@ export function parseGoalCommandBridgeRequest(payload: unknown): GoalCommandBrid
 		request: {
 			version: GOAL_COMMAND_BRIDGE_VERSION,
 			id: candidate.id,
-			command: candidate.command,
+			name: candidate.name as GoalCommandName,
+			args: candidate.args,
 			reply: candidate.reply as GoalCommandBridgeRequest["reply"],
 		},
 	};
+}
+
+/**
+ * The action a well-formed request asks for, from its command name alone.
+ *
+ * `/goal` is the one command with two meanings: an empty (or whitespace) argument
+ * is the status report, anything else is a creation — including an argument the
+ * creation path then refuses, because a refusal is still the create action's
+ * answer and must be reported as `refused`, never as `invalid`. Every verb is
+ * its own action whatever its argument says.
+ */
+export function goalBridgeActionFor(name: GoalCommandName, args: string): Exclude<GoalBridgeAction, "invalid"> {
+	switch (name) {
+		case "goal":
+			return args.trim() === "" ? "status" : "create";
+		case "goal:pause":
+			return "pause";
+		case "goal:resume":
+			return "resume";
+		case "goal:clear":
+			return "clear";
+		case "goal:history":
+			return "history";
+		case "goal:edit":
+			return "edit";
+	}
 }
 
 /** Inputs the classifier needs, all of them facts about what already happened. */
@@ -207,8 +277,8 @@ export interface GoalBridgeOutcomeInput {
 /**
  * Classify an executed command.
  *
- * Order matters and is the whole contract: a status read reports, an invalid
- * command is invalid, a recorded transition decides on its own (committed when it
+ * Order matters and is the whole contract: a read reports, an unregistered name
+ * is invalid, a recorded transition decides on its own (committed when it
  * landed, refused when it was rolled back), and only with no transition at all do
  * the diagnostics' severities decide between declined and refused.
  */
@@ -217,9 +287,9 @@ export function classifyGoalBridgeOutcome(input: GoalBridgeOutcomeInput): {
 	disposition: GoalBridgeDisposition;
 } {
 	if (input.action === "invalid") return { ok: false, disposition: "invalid" };
-	if (input.action === "status") {
-		// A status read has nothing to commit, so there is no durable proof to wait
-		// for — but a read that reported a problem did not answer either, and calling
+	if (input.action === "status" || input.action === "history") {
+		// A read has nothing to commit, so there is no durable proof to wait for —
+		// but a read that reported a problem did not answer either, and calling
 		// that "reported" would be a success claim the caller cannot afford.
 		const failed = input.diagnostics.some((diagnostic) => diagnostic.level !== "info");
 		return { ok: !failed, disposition: failed ? "refused" : "reported" };
@@ -231,10 +301,17 @@ export function classifyGoalBridgeOutcome(input: GoalBridgeOutcomeInput): {
 	return { ok: false, disposition: reported ? "refused" : "declined" };
 }
 
-/** A refusal the bridge produced itself: no command ran, so nothing committed. */
+/**
+ * A refusal the bridge produced itself: no command ran, so nothing committed.
+ *
+ * `action` is null because no action was ever derived — the request never reached
+ * a handler — and the request's name and argument are echoed so the caller can
+ * correlate the answer with what it sent.
+ */
 export function goalBridgeRefusal(input: {
 	id: string;
-	command: string;
+	name: GoalCommandName;
+	args: string;
 	message: string;
 	goal: GoalPublicState | null;
 	admissionEnabled: boolean;
@@ -242,7 +319,8 @@ export function goalBridgeRefusal(input: {
 	return {
 		version: GOAL_COMMAND_BRIDGE_VERSION,
 		id: input.id,
-		command: input.command,
+		name: input.name,
+		args: input.args,
 		ok: false,
 		disposition: "refused",
 		action: null,
@@ -253,6 +331,37 @@ export function goalBridgeRefusal(input: {
 	};
 }
 
+/**
+ * The answer to a request whose `name` is valid for the protocol but is not a
+ * registered command when the request is dispatched. Nothing ran, so nothing
+ * committed; the disposition is `invalid` because the fault is in what was asked
+ * for, not in what the Goal state allowed.
+ */
+export function goalBridgeUnregisteredCommand(
+	request: Pick<GoalCommandBridgeRequest, "id" | "name" | "args">,
+	goal: GoalPublicState | null,
+	admissionEnabled: boolean,
+): GoalCommandBridgeResult {
+	return {
+		version: GOAL_COMMAND_BRIDGE_VERSION,
+		id: request.id,
+		name: request.name,
+		args: request.args,
+		ok: false,
+		disposition: "invalid",
+		action: "invalid",
+		goal,
+		admissionEnabled,
+		transitions: [],
+		diagnostics: [
+			{
+				level: "error",
+				text: `Goal command not run: /${request.name} is not a registered command, so there is nothing to run. Nothing was changed.`,
+			},
+		],
+	};
+}
+
 /** Poll interval for the synthesized `waitForIdle`, in milliseconds. */
 const IDLE_POLL_MS = 15;
 
@@ -260,7 +369,7 @@ const IDLE_POLL_MS = 15;
  * Build the command-capable view of a plain extension context.
  *
  * Pi hands a full {@link ExtensionCommandContext} only to a command handler, while
- * a bridge request arrives from an event-bus listener. The `/goal` handlers need
+ * a bridge request arrives from an event-bus listener. The Goal command handlers need
  * exactly one capability the base context lacks — `waitForIdle()` — and Pi's own
  * implementation is "resolve once the session is idle, where idle means no agent
  * run is active and no compaction is running". `ctx.isIdle()` is bound to that
@@ -271,8 +380,8 @@ const IDLE_POLL_MS = 15;
  * hands a command handler session control (`newSession`, `fork`, `navigateTree`,
  * `switchSession`, `reload`) and agent/process control (`abort`, `shutdown`,
  * `compact`), while a bridged command is one Goal command on behalf of an
- * external client. `/goal` uses none of them, so they are present but throw:
- * a future change that started to would fail loudly instead of silently
+ * external client. The Goal command family uses none of them, so they are present
+ * but throw: a future change that started to would fail loudly instead of silently
  * switching, compacting, aborting, or shutting down a user's session out from
  * under an external caller. That is the whole session-control surface of
  * {@link ExtensionCommandContext}/{@link ExtensionContext}, so "no session
@@ -284,7 +393,7 @@ export function commandContextForBridge(ctx: ExtensionContext): ExtensionCommand
 	const base = ctx as ExtensionContext & Partial<ExtensionCommandContext>;
 	const forbidden = (name: string) => (): never => {
 		throw new Error(
-			`a bridged /goal command may not call ${name}(): the bridge runs one Goal command and never changes the session`,
+			`a bridged Goal command may not call ${name}(): the bridge runs one Goal command and never changes the session`,
 		);
 	};
 	const view = new Proxy(ctx, {
@@ -312,7 +421,7 @@ export function commandContextForBridge(ctx: ExtensionContext): ExtensionCommand
 				case "getSystemPromptOptions":
 					if (typeof base.getSystemPromptOptions === "function") return base.getSystemPromptOptions.bind(ctx);
 					return () => {
-						throw new Error("system-prompt options are not available to a bridged /goal command");
+						throw new Error("system-prompt options are not available to a bridged Goal command");
 					};
 				default:
 					return Reflect.get(target, property, receiver ?? target);
