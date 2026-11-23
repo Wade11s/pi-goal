@@ -14,7 +14,7 @@ spelled the way Pi spells every other namespace (`/skill:name`):
 
 | Command | Meaning |
 | --- | --- |
-| `/goal` | bare: inspect the current Goal; with an Objective: create (refused while an unfinished Goal exists; supersedes a complete one) |
+| `/goal` | bare: inspect the current Goal; with an Objective: clarify and create (or create directly with `goal.clarifyOnCreate: false` or no UI). Refused while an unfinished Goal exists; supersedes a complete one |
 | `/goal:pause` | stop admission of further automatic runs, keep the Goal |
 | `/goal:resume [--budget N \| --budget=N]` | restart eligible work with a fresh Blocked audit; raise a `budget_limited` Goal's ceiling |
 | `/goal:clear` | durable tombstone, no resurrection |
@@ -55,16 +55,67 @@ word, so `Clear the lint errors`, `Resume work on X`, and
 /goal Make the full test suite pass in this repository
 ```
 
+By default this does **not** commit a Goal immediately: it starts **Objective
+clarification** (ADR-0003). `/goal <raw idea>` records a durable **pending
+clarification** — the raw idea plus any budget and attachment flags — and sends
+the model an interview instruction instead of a kickoff. The model asks about the
+objective, the hard constraints, and how completion will be verified, then drafts
+the final Objective (English `Objective:` / `Constraints:` / `Acceptance
+criteria:` template) and a Goal title, and calls `propose_goal`. That tool opens
+one confirmation editor:
+
+```
+Title: Onboarding cleanup
+
+Objective: A new user reaches a working sample project in two steps.
+
+Constraints: None
+
+Acceptance criteria:
+1. The onboarding page shows one next action, verified by opening it.
+2. A fresh account completes the sample project, verified by the acceptance script.
+```
+
+Both the title line and the Objective body are editable, and **saving is the
+creation authority**: exactly the saved title (one line, 1–80 characters) and
+Objective (3–2000 characters) commit, with `origin: "command"`, through the same
+creation path a typed `/goal` uses. The three-section template is a drafting
+convention, never a validation rule — an Objective without the sections is still
+a valid Objective. **Cancelling or a dialog timeout creates nothing**: no Goal, no
+attachment materialization, no remote fetch, and any current Goal is untouched.
+The pending entry is cleared, and the model is told no Goal was created.
+
+What the raw idea is held with matters:
+
+- `--budget <n>` and `--no-budget` ride the pending clarification and resolve to
+  the committed Goal's Token budget only at the save.
+- `--file`, `--image`, and `--remote-image <https URL>` ride it too, and are read
+  or fetched **only after the confirming save**. A cancelled clarification makes
+  no network request and leaves no artifact behind.
+- The flags are validated when `/goal` runs, so a bad path or budget refuses before
+  the interview rather than after it.
+
+`goal.clarifyOnCreate: false` restores immediate creation (below). A host without
+a dialog-capable UI — print and JSON modes — skips clarification, creates directly
+from the raw idea, and prints a notice saying so; there is no interview it could
+confirm. `goal.enabled: false` refuses before any clarification starts.
+
+### Direct creation
+
+Every creation path that does not clarify is unchanged:
+
 - Validates the objective (3–2000 characters after trimming).
-- Creates a **title-less** Goal: a title is optional Goal state, set later with
-  `/goal:edit --title <text>` (the Objective-clarification creation flow is what
-  will confirm one at creation time).
+- May be **title-less**: `create_goal`, a UI-less `/goal`, and a
+  `goal.clarifyOnCreate: false` `/goal` carry no title. One is set later with
+  `/goal:edit --title <text>`.
 - Stores an **active** Goal as durable session state and confirms it is on disk
   before announcing success.
 - Sends the objective into the model context as a user message and starts initial
   work immediately.
 - Refuses while an **unfinished** Goal already exists, naming `/goal:clear`
-  (see *One Goal at a time* below).
+  (see *One Goal at a time* below). This is the outermost creation check: it
+  applies before any clarification starts, and clarifying does not make an
+  unfinished Goal replaceable.
 - Accepts any valid Objective text — including one that begins with a verb word
   such as "clear the lint errors" or "Edit the README" — except the bare
   reserved words of the old spelling, which are refused with the Goal command
@@ -76,11 +127,12 @@ Explicit local text/images and remote images use the same creation path:
 /goal --file spec.md --image screenshot.png --remote-image https://example.com/diagram.png Ship the attached requirements
 ```
 
-The repeatable leading options validate and materialize every artifact before
-the snapshot commits; a remote image is fetched once through the HTTPS-only,
-public-destination, bounded-read policy. Disabled admission, and the refusal that
-an unfinished Goal produces, both come before any fetch or any materialization;
-plain Objective arguments stay text. See [Objective attachments](attachments.md) for types,
+The repeatable leading options validate when `/goal` runs and materialize every
+artifact before the snapshot commits (for a clarified creation: at the confirmed
+save). A remote image is fetched once through the HTTPS-only, public-destination,
+bounded-read policy. Disabled admission, and the refusal that an unfinished Goal
+produces, both come before any fetch or any materialization; plain Objective
+arguments stay text. See [Objective attachments](attachments.md) for types,
 limits, fetch security, trust framing, and failure atomicity.
 
 ## One Goal at a time
@@ -397,7 +449,7 @@ new Goal work:
 
 | Refused while disabled | Why |
 | --- | --- |
-| `/goal <objective>` — creation, and the creation that supersedes a complete Goal | Both open a new Goal identity and start work. The refusal comes before any attachment is materialized, so no dialog or artifact promises a creation that will not happen. |
+| `/goal <objective>` — creation, and the creation that supersedes a complete Goal | Both open a new Goal identity and start work. The refusal comes before any Objective clarification, dialog, or attachment materialization, so nothing promises a creation that will not happen. |
 | `create_goal` | Same admission, from the model side. The refusal reports `goal: null` (or the unchanged current Goal) and leaves the one-shot creation authority intact, so a corrected call can retry after re-enabling. |
 | `/goal:edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. A title-only `/goal:edit --title` is a label change and stays available. |
 | `/goal:resume` | The resume message restarts the loop. |
@@ -436,9 +488,9 @@ session from the Goal, so a Goal is easier to find later in a session list.
 
 - The name is the Goal **title** when the Goal has one, falling back to the
   Objective's **first line**; the chosen text is whitespace-collapsed and capped at
-  **80 characters**. A title is already one line of at most 80 characters, so any
-  future clarified creation (which confirms a title) gets a name from the label the
-  user actually approved instead of a truncated objective. Truncation is silent —
+  **80 characters**. A title is already one line of at most 80 characters, so a
+  clarified creation (which confirms a title) gets a name from the label the user
+  actually approved instead of a truncated objective. Truncation is silent —
   no ellipsis — because a session name is a label in a selector, and the Goal text
   stays authoritative. Only the Goal title and Objective text contribute:
   attachment contents are supporting material with their own trust boundary and

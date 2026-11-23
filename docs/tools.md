@@ -1,8 +1,8 @@
 # Model tools
 
-`get_goal`, `create_goal`, `update_goal`, and the opt-in `update_plan`: the
-structured state they return, the authority each transition requires, and the
-objective's trust boundary.
+`get_goal`, `create_goal`, `update_goal`, `propose_goal`, and the opt-in
+`update_plan`: the structured state they return, the authority each transition
+requires, and the objective's trust boundary.
 
 [← README](../README.md) · See also [lifecycle](behavior/lifecycle.md) ·
 [attachments](behavior/attachments.md) · [stopping](behavior/stopping.md)
@@ -13,8 +13,10 @@ The model can call `get_goal` at any time to retrieve the same structured state
 the command reports (or `goal: null` when no Goal is set). Use it whenever the
 objective is absent or truncated in context. The payload's `title` is the Goal's
 optional one-line label (`null` when it has none), so the model can refer to the
-work by the label the user confirmed. A Goal created by `/goal` or `create_goal`
-has no title; it is set with `/goal:edit --title`.
+work by the label the user confirmed. A Goal created through Objective
+clarification carries the confirmed title; `create_goal`, a UI-less `/goal`, and a
+`goal.clarifyOnCreate: false` creation have none until `/goal:edit --title` gives
+them one.
 
 While `goal.enabled` is false the tool's text adds an `Admission disabled:` block:
 the Goal's Lifecycle status is untouched, no new Goal work is admitted, and
@@ -25,6 +27,42 @@ contents; the model receives those contents in the framed Goal work messages.
 With no Goal set, the text says the same thing about `/goal <objective>` and
 `create_goal`. The structured `{ goal }` payload is unchanged — admission is a
 host preference, not Goal state, so it is never persisted in a snapshot.
+
+## Model tool: `propose_goal`
+
+`propose_goal` is the model's half of **Objective clarification** (ADR-0003). It
+takes `{ title, objective }` — the drafted Goal title and Objective — and opens
+the confirmation editor as one document: `Title: <text>`, a blank line, then the
+Objective body. It is accepted **only while a pending clarification exists**: a
+call from an ordinary turn is refused with `goal: null`-shaped state and changes
+nothing, and while `goal.clarifyOnCreate` is false the tool is not registered at
+all (Pi refuses the call).
+
+The user edits either part, and **saving is the creation authority**: the
+committed Goal carries exactly the saved title (one line, 1–80 characters) and
+Objective (3–2000 characters), with `origin: "command"`, through the same commit
+a typed `/goal` uses. The model's arguments are only the prefill. A saved
+document whose first line is not the `Title:` line, or whose title breaks the
+one-line rule, is refused and the same document reopens for correction instead of
+discarding the user's Objective. Every refusal and save is validated by the same
+`validateGoalTitle` / `validateObjective` rules `/goal` and `/goal:edit` use; the
+three Objective sections are **not** validated.
+
+Cancel, dismissal, and the standard dialog timeout all create nothing: no Goal
+bytes, no materialized attachment, no remote fetch, any current Goal untouched,
+the pending clarification cleared, and a tool result telling the model that no
+Goal was created (a legitimate outcome, so it is not an error result). A save
+opens no second path either: the held `--budget`/`--no-budget` and
+`--file`/`--image`/`--remote-image` flags resolve and materialize only inside that
+commit. If an **unfinished** Goal appeared while the editor was open, the save is
+refused exactly like a typed `/goal` and the pending entry is gone.
+
+The model-facing description and prompt guidelines carry the drafting template as
+a **convention**: `Objective:` (one sentence stating what is different when the
+work is done), `Constraints:` (hard limits, `None` when empty), and
+`Acceptance criteria:` (numbered, each independently verifiable with its
+verification method named). With title and Objective stored as plain Goal text,
+the existing Completion audit enforces the criteria with no new audit machinery.
 
 ## Model tool: `create_goal`
 
@@ -40,8 +78,8 @@ picks the Goal up at the next settlement.
 
 `create_goal` is deliberately **text-only**. It has no file, image, path, or URL
 parameters, and extra drifted fields do not gain attachment authority. It also
-creates a **title-less** Goal: a title is a label the user confirms through a
-later creation flow or sets with `/goal:edit --title`, never a model-supplied
+creates a **title-less** Goal: a title is a label the user confirms in an
+Objective clarification or sets with `/goal:edit --title`, never a model-supplied
 extra field. Explicit local and remote attachments can be selected only by the
 direct
 `/goal --file … --image … --remote-image …` command at creation or Replacement

@@ -266,10 +266,11 @@ export interface CreateGoalOptions {
 	/** Explicit token budget; undefined means "use the configured default". */
 	tokenBudget?: number;
 	/**
-	 * A validated Goal title (one line, 1–80 characters). No creation path sets one
-	 * yet: a title arrives through `/goal:edit --title` today and through the
-	 * confirmed Objective clarification later. Leaving it undefined is what keeps
-	 * every existing creation title-less.
+	 * A validated Goal title (one line, 1–80 characters). Only the confirmed
+	 * Objective clarification sets one at creation (issue #84); `/goal:edit
+	 * --title` sets or changes it later. Leaving it undefined is what keeps every
+	 * other creation — `create_goal`, a UI-less `/goal`, and
+	 * `goal.clarifyOnCreate: false` — title-less.
 	 */
 	title?: string;
 }
@@ -2648,17 +2649,24 @@ const TITLE_LINE_TERMINATOR = /[\r\n\u0085\u2028\u2029]/;
  * counts them: a title is a human label, and an emoji-heavy 40-character title
  * must not be refused as if it were 80. The trimmed title is what is persisted.
  *
- * Validation lives here rather than in the command handler so the command, a
- * future clarified creation, and reconstruction's sanitizer all apply the exact
- * same rule. A refused title is reported to the user and mutates nothing.
+ * Validation lives here rather than in the command handler so the command, the
+ * confirmed Objective clarification, and reconstruction's sanitizer all apply the
+ * exact same rule. A refused title is reported to the user and mutates nothing.
+ *
+ * `action` only changes the refusal's first words — "edited" for `/goal:edit`,
+ * "created" for a creation — so a clarified creation does not describe itself as
+ * an edit while the rule stays single-sourced.
  */
-export function validateGoalTitle(raw: string): { ok: true; title: string } | { ok: false; error: string } {
+export function validateGoalTitle(
+	raw: string,
+	action: "edited" | "created" = "edited",
+): { ok: true; title: string } | { ok: false; error: string } {
 	// Before trimming: a title with a leading or trailing terminator is not one
 	// line, and the trim below must not be able to hide that.
 	if (TITLE_LINE_TERMINATOR.test(raw)) {
 		return {
 			ok: false,
-			error: "Goal not edited: the title must be one line; line breaks are not allowed.",
+			error: `Goal not ${action}: the title must be one line; line breaks are not allowed.`,
 		};
 	}
 	const title = raw.trim();
@@ -2667,7 +2675,7 @@ export function validateGoalTitle(raw: string): { ok: true; title: string } | { 
 		return {
 			ok: false,
 			error:
-				`Goal not edited: the title must be ${MIN_TITLE_LENGTH} to ${MAX_TITLE_LENGTH} characters after ` +
+				`Goal not ${action}: the title must be ${MIN_TITLE_LENGTH} to ${MAX_TITLE_LENGTH} characters after ` +
 				"trimming, on one line.",
 		};
 	}

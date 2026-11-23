@@ -42,7 +42,10 @@ function fakePi(sessionFile) {
 			commands.set(name, { name, ...definition });
 		},
 		getSettings() {
-			return {};
+			// The fake stands in for a host that opted out of Objective clarification, so
+			// these command-surface tests keep the direct-creation path; the clarification
+			// unit seam supplies its own settings instead.
+			return { goal: { clarifyOnCreate: false } };
 		},
 		appendEntry(customType, data) {
 			if (customType === "goal-state") {

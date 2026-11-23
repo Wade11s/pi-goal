@@ -43,6 +43,12 @@ attachments use.
   creation that supersedes a complete Goal validates and materializes its
   attachments exactly as a fresh creation does; an unfinished Goal refuses the
   creation before any attachment is validated, fetched, or materialized.
+- **Objective clarification defers attachment work.** With
+  `goal.clarifyOnCreate` on, the flags are recorded as unread requests on the
+  pending clarification, and nothing is read or fetched until the user saves the
+  confirmation editor. The same leading-option validation runs when `/goal` runs,
+  so a bad path or URL refuses before the interview; a cancelled or timed-out
+  clarification materializes nothing and makes no request.
 - Relative paths resolve against the **session working directory** recorded in
   the session header, not against the directory the Pi process happens to be
   launched from. A session resumed from another directory therefore attaches
@@ -63,8 +69,8 @@ attachments use.
   attachments requires a Replacement Goal. Editing also re-states the
   attachments in the edit message (unchanged, as data).
 - **Disabled admission is enforced first.** While `goal.enabled` is false, an
-  attachment-bearing creation or replacement is refused before the replacement
-  dialog and before any byte is materialized.
+  attachment-bearing creation or replacement is refused before any clarification
+  or dialog starts and before any byte is materialized.
 - **Remote images are explicit.** `--image https://…` is refused: use
   `--remote-image <https-url>` so the user unambiguously selected a fetch.
   Remote fetching is never inferred from plain text, a model call, or a composer

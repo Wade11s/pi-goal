@@ -45,6 +45,15 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   display label must not cost the user the Goal it describes. A title-only
   `/goal:edit --title` writes the next snapshot with the same identity and the
   next revision, so replay and a restart see exactly the committed label.
+- A pending Objective clarification is a **`goal-clarification`** custom entry,
+  separate from `goal-state` and written before any Goal exists: it carries the raw
+  idea and the leading `--budget` / `--no-budget` / `--file` / `--image` /
+  `--remote-image` flags, and a later `pending: null` entry records that the
+  clarification ended (saved, cancelled, or timed out). It is not Goal state —
+  nothing is reconstructed from it, no Goal snapshot or event is written beside it,
+  and its attachments stay unread flags rather than a manifest. Restart
+  reconstruction of a pending clarification is issue #85: today a restart starts
+  with none, and `propose_goal` refuses until the user runs `/goal` again.
 - The kickoff is delivered as a **user message** carrying the user's own
   objective (attributed as user-provided Goal data). As the session's first
   conversation entry it also makes Pi create and flush the session file, which
@@ -103,9 +112,9 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   lose the Goal: the snapshot and kickoff are already on disk and are restored
   by the next session.
 - Concurrent `/goal` commands (for example two issued while Pi is busy with a
-  run) are serialized: the Goal slot is decided exclusively, and a second
-  command that would replace an unfinished Goal has to be confirmed before
-  anything is discarded — a silent replacement cannot happen.
+  run) are serialized: the Goal slot is decided exclusively, so a second command
+  always sees the first's committed Goal — and refuses it when it is unfinished.
+  A silent replacement of an unfinished Goal cannot happen.
 - Lifecycle transitions (pause, resume, clear, edit) append their snapshot
   through the same write-through path, so a transition is on disk before its
   notification is emitted, and a failed write leaves the previous state in

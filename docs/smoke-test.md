@@ -57,11 +57,31 @@ a Goal exists.
 /goal Write a haiku about persistent sessions in a file called haiku.txt
 ```
 
-Expect:
+With the default `goal.clarifyOnCreate: true` this starts Objective
+clarification:
+
+- an `Objective clarification started: no Goal is committed yet.` notification;
+- the model asks about the objective, constraints, and acceptance criteria — no
+  Goal exists yet, so `/goal` still reports "No Goal is set";
+- once you answer, the model calls `propose_goal` and a confirmation editor opens
+  with `Title: <draft title>`, a blank line, then the drafted Objective (the
+  English three sections). Edit either part and save.
+
+Expect after saving:
 
 - a `Goal ... created and activated` notification;
-- the status indicator `goal_<id> · active · <tokens> tok · <remaining> left · <active time>`;
+- the status indicator `goal_<id> · active · <tokens> tok · <remaining> left · <active time>`, and bare `/goal` shows the title you saved;
+- the status uses exactly the title and Objective you left in the editor;
 - the agent starts working immediately.
+
+Try cancelling a second clarification (`/goal Add a second haiku`) instead of
+saving: no Goal is created, nothing is written, and `/goal` still reports the
+first Goal unchanged (or "No Goal is set" if you cleared it first).
+
+To verify the escape hatches, add `{ "goal": { "clarifyOnCreate": false } }` to
+`~/.pi/agent/settings.json` and restart: `/goal <objective>` creates immediately
+with no editor and no title. A UI-less host (`pi -p`, JSON/RPC without a
+dialog-capable client) skips clarification with a notice.
 
 ## 4. Inspect status
 
@@ -136,15 +156,21 @@ Expect `paused` with the paused-state hint line.
 Expect a `Goal ... resumed` notification, the status indicator returns to
 `active`, and work restarts from retained progress with a fresh blocked audit.
 
-## 10. Replacement confirmation
+## 10. One Goal at a time
 
 ```
 /goal Write a sonnet instead
 ```
 
-Expect a confirmation dialog describing the current Goal. Answer **No**. Expect
-`Replacement cancelled` and the current Goal unchanged. Answer **Yes** on a
-second attempt and the old Goal is replaced by a new identity.
+While the current Goal is unfinished — `active`, `paused`, `blocked`,
+`usage_limited`, or `budget_limited` — expect a warning that an unfinished Goal is
+already set and that `/goal:clear` is the way out. No dialog opens, no
+clarification starts, and the current Goal is unchanged.
+
+Finish the current Goal (`update_goal` with `action: "complete"`, or let the
+agent complete it) and run the same command: a complete Goal does not block, so
+the creation proceeds (after the confirmation editor with clarification on) with
+a new identity, and the complete record is superseded in `/goal:history`.
 
 ## 11. Restart persistence
 
@@ -345,9 +371,11 @@ earns no further Continuation or Budget wrap-up.
 **A stale execution cannot drive the new Goal's lifecycle.**
 
 1. Create a Goal whose single run keeps taking turns and ends with an
-   `update_goal { action: "complete" }` call; let its first turn land.
-2. `/goal <new objective>` while that run is in flight and answer **Yes** to the
-   replacement confirmation.
+   `update_goal { action: "complete" }` call; let that call land while the run is
+   still streaming its final response.
+2. `/goal <new objective>` while that completed Goal's run is still in flight (no
+   replacement dialog exists; a complete Goal is superseded silently, after the
+   confirmation editor if clarification is on).
 
 Expect the replacement to commit, the old execution's later
 `update_goal` call to be refused (the execution is bound to the identity it was
@@ -571,7 +599,7 @@ behave as a namespace and that the old spelling has no side effects.
    `/goal resume --budget=150`. Each answers an error notification of the form
    *"Goal not created: `pause` is a Goal command; use /goal:pause."* (the resume
    cases name `/goal:resume --budget <new-total> (or --budget=<new-total>)`). No
-   replacement confirmation opens, no run starts, and `/goal` plus
+   confirmation opens, no run starts, and `/goal` plus
    `/goal:history` show exactly the state and timeline you noted: no snapshot, no
    transition, no history record.
 5. Try the stray-argument usage errors: `/goal:pause foo`, `/goal:clear the lint

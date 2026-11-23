@@ -91,9 +91,17 @@ export class PiRpcSession {
 	}
 
 	start() {
-		if (this.settings) {
-			writeFileSync(join(this.agentDir, "settings.json"), JSON.stringify(this.settings), "utf8");
-		}
+		// Every spawned session gets a settings file, even when a test supplies none:
+		// Objective clarification (`goal.clarifyOnCreate`, default true in production)
+		// is switched off here so the existing suites keep the direct-creation path
+		// they were written for. The clarification suite opts back in explicitly with
+		// `settings: { goal: { clarifyOnCreate: true } }` and owns the default-on
+		// coverage; the production default itself is pinned by the unit seam.
+		const settings = {
+			...(this.settings ?? {}),
+			goal: { clarifyOnCreate: false, ...(this.settings?.goal ?? {}) },
+		};
+		writeFileSync(join(this.agentDir, "settings.json"), JSON.stringify(settings), "utf8");
 		const args = ["--mode", "rpc"];
 		for (const extension of this.preExtensions) args.push("-e", extension);
 		if (this.loadPiGoal) args.push("-e", join(repoRoot)); // load pi-goal via its package.json pi manifest

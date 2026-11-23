@@ -406,7 +406,9 @@ function commandFixture(settings = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-title-command-"));
 	const sessionFile = join(dir, "session.jsonl");
 	const state = {
-		settings,
+		// Objective clarification is off by default, matching the real-Pi harness, so
+		// these title cases exercise the direct-creation path.
+		settings: { ...settings, goal: { clarifyOnCreate: false, ...(settings.goal ?? {}) } },
 		notifications: [],
 		messages: [],
 		sessionName: undefined,

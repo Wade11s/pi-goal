@@ -9,12 +9,12 @@ or terminal failure stops the run, a conservative anti-loop bound is reached, th
 run is aborted, the lifecycle changes, or the Goal's token budget runs out.
 
 The extension adds the Goal command family — six commands sharing the `goal`
-namespace, spelled after Pi's own `/skill:name` convention — and three model
+namespace, spelled after Pi's own `/skill:name` convention — and four model
 tools. It uses only public extension APIs and does not patch Pi core.
 
 | Surface | Purpose |
 | --- | --- |
-| `/goal <objective>` | Create a Goal and start work immediately |
+| `/goal <objective>` | Clarify the Objective (title + Objective confirmation), then create the Goal and start work |
 | `/goal` | Report title (when present), objective, status, identity, usage, and remaining capacity |
 | `/goal:history` | Read-only timeline of the branch's committed Goal transitions |
 | `/goal:edit [--title <text>] [objective]` | Change the objective and/or the Goal title in place, keeping identity and history |
@@ -24,6 +24,7 @@ tools. It uses only public extension APIs and does not patch Pi core.
 | `/goal:resume --budget <new-total>` | Raise a `budget_limited` Goal's cumulative ceiling |
 | `get_goal` | Structured Goal state for the model |
 | `create_goal` | Model-created Goal, only on an explicit user request |
+| `propose_goal` | Opens the Objective-confirmation editor during `/goal` clarification; saving creates the Goal |
 | `update_goal` | Complete, report a blocker, or pause on an explicit request |
 
 Requires **Pi 1.5.1 or newer**.
@@ -99,13 +100,20 @@ uses Pi's host-provided packages (`peerDependencies` only).
 /goal Make the full test suite pass in this repository
 ```
 
-- The objective is validated (3–2000 characters after trimming), stored as
-  durable session state, and confirmed on disk before success is announced.
-- The objective is then sent into the model context as a user message, and
-  initial work starts immediately.
-- When an **unfinished** Goal already exists, `/goal <objective>` asks for
-  confirmation before replacing it; a declined, timed-out, or dismissed dialog
-  keeps the current Goal untouched.
+- With the default `goal.clarifyOnCreate: true`, `/goal <raw idea>` starts
+  **Objective clarification**: the model interviews you about the objective,
+  constraints, and acceptance criteria, drafts a Goal title and Objective, and
+  opens a confirmation editor (`Title: <text>`, a blank line, then the Objective).
+  Saving it creates the Goal with exactly the text you left there — including the
+  title — and starts work. Cancelling or a timeout creates nothing.
+- `--budget` / `--no-budget` and `--file` / `--image` / `--remote-image` flags ride
+  the clarification: attachments are read or fetched only after the confirmed
+  save, so a cancelled draft has no side effects.
+- Set `goal.clarifyOnCreate: false` to restore immediate creation. A UI-less host
+  (print/JSON mode) skips clarification, creates directly, and says so.
+- When an **unfinished** Goal already exists, `/goal <objective>` refuses with a
+  warning naming `/goal:clear` (before any clarification); a **complete** Goal is
+  superseded without a dialog.
 
 Add explicit supporting material without changing the Objective's length
 policy:
@@ -426,7 +434,7 @@ credentials.
 A host that needs Codex-shaped Goal `get`/`set`/`clear` methods can install the
 companion package in [`companion/goal-rpc`](companion/goal-rpc). It maps each
 method onto the *user* command surface through pi-goal's generic in-process
-command bridge, so replacement confirmation, `goal.enabled` admission, Token-budget
+command bridge, so the single-Goal refusal, `goal.enabled` admission, Token-budget
 and attachment validation, and durable-before-announced ordering stay in one place.
 Every answer is a structured outcome: `ok` is true only after a durable commit, and
 a refused, declined, disabled, unauthorized, or rolled-back call returns a named
@@ -576,7 +584,7 @@ retention and restore verification.
 | [Goal-updated events](docs/behavior/events.md) | Committed local transitions and metadata-only attachment manifests |
 | [Metrics and the exporter seam](docs/behavior/metrics.md) | Privacy-safe `pi-goal:metrics`, what is never projected, local consumers, and the on-demand hosted companion |
 | [Goal RPC companion](docs/behavior/companion.md) | The optional Codex-shaped `get`/`set`/`clear` companion, the `pi-goal:command-bridge` seam, and the intentional app-server difference |
-| [Model tools](docs/tools.md) | `get_goal`, `create_goal` (and creation authority), `update_goal`, trust boundary, structured responses |
+| [Model tools](docs/tools.md) | `get_goal`, `create_goal` (and creation authority), `update_goal`, `propose_goal` (Objective confirmation), trust boundary, structured responses |
 | [Limitations](docs/limitations.md) | Known boundaries of the current model |
 | [Codex migration status](docs/codex-migration.md) | Per-capability comparison and Pi-feasible follow-ups |
 | [Subagent usage reporting](docs/subagent-usage.md) | Proposed plugin-neutral provider contract for subagent token accounting |
