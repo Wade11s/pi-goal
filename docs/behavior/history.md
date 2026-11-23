@@ -48,6 +48,7 @@ shaped so that it cannot become a second one:
 | No record is written before its transition is durable. | The append happens in the store's committed-transition seam — the same seam that publishes the event — after the snapshot or tombstone has been written through. A refused or failed transition writes nothing; a retraction appends nothing further, while the `created` record its earlier commit wrote survives as the documented accepted corner below. |
 | History is projected from the event payload. | Each record is derived from the `pi-goal:updated` payload of its transition rather than re-projected from the Goal record, so the timeline and the public event stream cannot disagree about what happened. |
 | No attachment contents, ever. | The record carries the manifest's metadata (hash, media type, byte size, label), exactly as the event does. The bytes live once, in the extension-owned artifact store. |
+| No Goal title text. | Like the Objective's text, the title follows the Objective's privacy boundary; the record is projected from an event that never carries the label. A title-only edit still appears as the in-place `objective-edited` record, without its text. |
 | No objective text, either. | The timeline names identities, revisions, statuses, and numbers. The objective is durable Goal state on `goal-state` and in the delimited data blocks of Goal messages; it never reaches a diagnostic surface. |
 
 ## What is recorded, and what is not

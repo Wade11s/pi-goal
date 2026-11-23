@@ -22,7 +22,9 @@
  * machine-consumed by any loaded extension and is therefore the same trust and
  * privacy surface as a log line, while the verbatim objective stays where its
  * trust boundary already lives (the durable snapshot and the delimited data
- * block in Goal messages).
+ * block in Goal messages). The Goal title is not carried here at all: it is
+ * label text under the same privacy boundary, so a title-only edit commits a
+ * transition whose payload describes the Goal without repeating the label.
  */
 import { normalizeUsage } from "./accounting.ts";
 import type { GoalOrigin, GoalRecord, GoalStatus } from "./goal.ts";
@@ -100,7 +102,14 @@ export interface GoalEventAttachment {
 	label: string;
 }
 
-/** The committed Goal identity and state the event describes. */
+/**
+ * The committed Goal identity and state the event describes.
+ *
+ * The Goal title is deliberately **absent**: like the objective's text, it is
+ * Goal content under the Objective's privacy boundary. A title-only edit still
+ * commits a transition (it is an in-place Goal text edit, reported as
+ * `objective-edited`), but this payload never repeats the label.
+ */
 export interface GoalUpdatedGoal {
 	id: string;
 	/** Revision as committed by this transition (the clear event keeps the cleared Goal's last revision). */

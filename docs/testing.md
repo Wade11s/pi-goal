@@ -168,6 +168,24 @@ those rules through a real session, including the two failure paths a name must
 not survive — a durable write that fails and rolls the creation back, and a
 creation cleared while it waited for the current run.
 
+The optional Goal title (issue #82) is covered at both seams.
+`test/goal82-goal-title.test.mjs` drives a real `pi --mode rpc` session with
+`events-peer.ts` and `metrics-peer.ts` loaded alongside pi-goal: it proves that
+`/goal:edit --title` commits the same identity at the next revision, that `/goal`
+and the `get_goal`/`update_goal` structured payloads carry the title, that an
+objective and a title can change in one revision, that invalid titles leave the
+snapshot bytes unchanged, and — with the peer logs read back from the session
+file — that the title text appears in none of the `goal-history`,
+`goal-events-log`, or `goal-metrics-log` entries. `test/goal82-goal-title-store.test.mjs`
+pins the cheaper matrix against a fake Pi API: the one-line 1–80 code-point
+validation, a title-less creation on every path, in-place and combined edits, the
+complete-Goal asymmetry (objective frozen, title relabel admitted), legacy
+snapshots without a title reconstructing unchanged (and a malformed title dropped
+without losing the Goal), the metadata-only event/history/metrics projections, the
+naming preference for a title over the Objective's first line with the
+never-overwrite and write-failure rules unchanged, and the command surface
+(`--title` alone, combined, refused, and completing `--title`).
+
 The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
 surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
 durable Lifecycle status, is stopped, and is reopened from a copy of its session
@@ -414,6 +432,10 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] `/goal ` completes `--budget`, `--no-budget`, `--file`, `--image`, and
       `--remote-image`; `/goal:resume ` completes `--budget`
 - [ ] bare `/goal:edit` interactive editing
+- [ ] `/goal:edit --title <text>` sets a title that `/goal` and `get_goal` report,
+      alone or together with a new objective; an invalid title, a missing value,
+      and a title edit that tries to change attachments are refused and change
+      nothing; a title-only edit starts no work and never renames the session
 - [ ] `/goal:pause`, `/goal:resume`, and `/goal:clear`
 - [ ] the old space-separated spellings (`/goal` followed by a space and a bare
       verb word, or `resume --budget N`) are refused with the command to type

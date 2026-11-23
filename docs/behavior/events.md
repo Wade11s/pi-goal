@@ -40,7 +40,7 @@ One JSON object per event, versioned as a whole:
 | `goal.id` | The committed Goal identity the transition belongs to. |
 | `goal.revision` | The revision this transition committed. A clear keeps the cleared Goal's last revision. |
 | `goal.status` | The Lifecycle status as committed. A clear reports the status the Goal had when cleared. |
-| `goal.objective` | Metadata only: `{ length, origin }`. The verbatim objective stays in the durable snapshot and the delimited data block; the event is machine-consumed by any loaded extension, which makes it the same surface as a log line. |
+| `goal.objective` | Metadata only: `{ length, origin }`. The verbatim objective stays in the durable snapshot and the delimited data block; the event is machine-consumed by any loaded extension, which makes it the same surface as a log line. The Goal **title** is not carried at all (no field, no text): it follows the Objective's privacy boundary, so even a title-only edit sends only an in-place edit transition. |
 | `goal.tokenBudget` | The cumulative token ceiling, or `null` when unbounded. |
 | `goal.attachments` | The immutable attachment manifest's metadata — one `{ hash, mediaType, bytes, label }` entry per attachment, in manifest order, `[]` for a Goal without attachments. Never contents, local source paths, or remote source URLs: attachment text and image bytes stay in the artifact store and the delimited data blocks, for the same privacy reason `goal.objective` is metadata only. |
 | `goal.usage` | The committed usage summary — the same projection `get_goal` reports: `totalTokens` (input + output + cache writes), the components, cached reads excluded as reuse, nested work counted once, and `activeSeconds`. |
@@ -55,7 +55,7 @@ snapshot it follows can never disagree.
 | --- | --- |
 | `created` | `/goal <objective>` or an authorized `create_goal` committing a Goal into a free slot. |
 | `replaced` | `/goal <objective>` taking the session's Goal slot from an existing Goal — immediately when that Goal is already `complete`, otherwise once the user confirms the replacement. The event names the **replacement** identity; the replaced identity keeps its own durable superseded record and is never re-announced. |
-| `objective-edited` | `/goal:edit` committing a new objective for the same identity. |
+| `objective-edited` | `/goal:edit` committing an in-place Goal edit for the same identity: a new objective, a new title, or both. The payload carries neither text; a title-only edit is this kind because it is still an in-place content edit of the same Goal. |
 | `paused` | `/goal:pause`, or `update_goal action:"pause"` after pause corroboration. |
 | `resumed` | `/goal:resume` restarting a paused, blocked, or usage-limited Goal. |
 | `budget-recovered` | `/goal:resume --budget <new-total>` — the one resume that changes the cumulative ceiling. |

@@ -1,5 +1,5 @@
 /**
- * Opt-in session naming from the Objective (issue #52).
+ * Opt-in session naming from the Goal title or Objective (issues #52, #82).
  *
  * Pi owns the session name. It is a `session_info` entry in the session file that
  * the session selector and the interactive footer read, and its only public seams
@@ -23,16 +23,32 @@
  * event stream. The name is a best-effort host write, so a failure to name is
  * reported as a warning and can never be mistaken for a failed creation.
  *
- * The name is derived from the Objective text and from nothing else. Attachments
- * are supporting material with their own trust boundary and lifetime, so their
- * contents never contribute to a name; the derivation takes a single string and
- * has no attachment input at all, which is what keeps that rule true by
- * construction rather than by a filter that a future caller could forget.
+ * The name prefers the Goal title (issue #82) and falls back to the Objective's
+ * first line. Both are Goal text the user confirmed, and neither is attachment
+ * material: attachments have their own trust boundary and lifetime, so their
+ * contents never contribute to a name. The derivation takes the two text fields
+ * and has no attachment input at all, which keeps that rule true by construction
+ * rather than by a filter a future caller could forget.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-/** Longest session name pi-goal will set from an Objective. */
+/** Longest session name pi-goal will set from a Goal title or Objective. */
 export const MAX_SESSION_NAME_LENGTH = 80;
+
+/**
+ * The Goal text a session name may come from.
+ *
+ * Both fields are plain Goal text, never attachment content. The title is
+ * preferred when present, because the user confirmed it as the Goal's label;
+ * the Objective's first line is the fallback for every title-less Goal (which,
+ * before Objective clarification, is every Goal).
+ */
+export interface SessionNameSource {
+	/** The Goal title, when the Goal has one. */
+	title?: string;
+	/** The Goal's Objective, used for its first line when there is no title. */
+	objective: string;
+}
 
 /**
  * Extension-level session-naming configuration, read from Pi's effective settings
@@ -104,27 +120,20 @@ export function parseSessionNamingSettings(settings: unknown): SessionNamingSett
 }
 
 /**
- * Derive a session name from an Objective: its **first line**, whitespace-collapsed,
- * capped at {@link MAX_SESSION_NAME_LENGTH} code points.
+ * Collapse whitespace and cap a one-line label at the session-name width.
  *
- * The first line is taken before anything is collapsed, so a multi-line Objective
- * contributes only its opening line and never a run-on of every line it has. The
- * cap is a hard truncation with no ellipsis: a session name is a label in a
+ * The cap is a hard truncation with no ellipsis: a session name is a label in a
  * selector, so a predictable width matters more than signalling that text was
- * dropped, and the Objective itself remains the authoritative text.
+ * dropped, and the Goal text itself remains authoritative.
  *
  * The cap counts *code points*, not UTF-16 code units, because a name is persisted
  * verbatim into the session file: slicing code units could cut a surrogate pair in
  * half and store a lone surrogate, and it would also hold astral-heavy text to half
  * the intended width. `Array.from` iterates code points, so a truncation can never
  * land inside a pair.
- *
- * The input is the Objective alone. Attachment contents are not a parameter, so
- * they cannot reach a name.
  */
-export function deriveSessionName(objective: string): string {
-	const firstLine = objective.split(/\r\n|\r|\n/, 1)[0] ?? "";
-	const collapsed = firstLine.replace(/\s+/g, " ").trim();
+function capSessionName(line: string): string {
+	const collapsed = line.replace(/\s+/g, " ").trim();
 	const codePoints = Array.from(collapsed);
 	return codePoints.length > MAX_SESSION_NAME_LENGTH
 		? codePoints.slice(0, MAX_SESSION_NAME_LENGTH).join("").trimEnd()
@@ -132,8 +141,39 @@ export function deriveSessionName(objective: string): string {
 }
 
 /**
- * Name the session from a freshly created Goal's Objective, when the user opted in
- * and the session has no name yet.
+ * Derive a session name from an Objective: its **first line**, whitespace-collapsed,
+ * capped at {@link MAX_SESSION_NAME_LENGTH} code points.
+ *
+ * The first line is taken before anything is collapsed, so a multi-line Objective
+ * contributes only its opening line and never a run-on of every line it has.
+ *
+ * The input is the Objective alone. Attachment contents are not a parameter, so
+ * they cannot reach a name.
+ */
+export function deriveSessionName(objective: string): string {
+	const firstLine = objective.split(/\r\n|\r|\n/, 1)[0] ?? "";
+	return capSessionName(firstLine);
+}
+
+/**
+ * Derive a session name from a Goal: its title when present, else the Objective's
+ * first line.
+ *
+ * A title is already validated as one line of at most
+ * {@link MAX_SESSION_NAME_LENGTH} code points, so in practice it passes through
+ * unchanged; the same whitespace folding and cap are applied anyway, because a
+ * hand-edited or future-version snapshot must never be able to write a multi-line
+ * or over-wide name into the session file. A blank title falls back to the
+ * Objective rather than naming the session from nothing.
+ */
+export function deriveSessionNameFromGoal(source: SessionNameSource): string {
+	const title = source.title ?? "";
+	return title.trim() === "" ? deriveSessionName(source.objective) : capSessionName(title);
+}
+
+/**
+ * Name the session from a freshly created Goal's title or Objective, when the user
+ * opted in and the session has no name yet.
  *
  * The order is deliberate: the setting is checked first (an opted-out session is
  * not even read), then the existing name, then the derivation, and only then the
@@ -144,9 +184,9 @@ export function deriveSessionName(objective: string): string {
  * `enabled` is passed in rather than read from module state so the decision stays
  * a pure function of its arguments and is unit-testable without a session.
  */
-export function applySessionNameFromObjective(
+export function applySessionNameFromGoal(
 	session: SessionNameSurface,
-	objective: string,
+	source: SessionNameSource,
 	enabled: boolean,
 ): SessionNamingOutcome {
 	if (!enabled) return { kind: "off" };
@@ -161,7 +201,7 @@ export function applySessionNameFromObjective(
 	// reading as a real one.
 	const existing = current?.trim();
 	if (existing) return { kind: "already-named", name: existing };
-	const name = deriveSessionName(objective);
+	const name = deriveSessionNameFromGoal(source);
 	if (name === "") return { kind: "empty" };
 	try {
 		session.setSessionName(name);

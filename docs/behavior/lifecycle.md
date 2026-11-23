@@ -19,7 +19,7 @@ spelled the way Pi spells every other namespace (`/skill:name`):
 | `/goal:resume [--budget N \| --budget=N]` | restart eligible work with a fresh Blocked audit; raise a `budget_limited` Goal's ceiling |
 | `/goal:clear` | durable tombstone, no resurrection |
 | `/goal:history` | read-only rendering of the Goal audit history |
-| `/goal:edit` | bare: the prefilled editor dialog; with an Objective: the typed edit |
+| `/goal:edit [--title <text>] [<objective>]` | bare: the prefilled editor dialog; with an Objective and/or a leading `--title` option: the typed in-place edit |
 
 Each verb is its own line in the `/` menu with its own description. There is no
 `/goal:status` and no `/goal:create`: bare `/goal` already is the status report
@@ -30,8 +30,8 @@ the README to add X` creates a Goal, and so does `/goal Clear the lint errors`.
 `/goal:pause`, `/goal:clear`, and `/goal:history` take no argument; `/goal:resume`
 takes only `--budget`. A stray argument is a usage error (`/goal:pause takes no
 argument.`) that touches no Goal. `/goal ` completes its creation flags
-(`--budget`, `--no-budget`, `--file`, `--image`, `--remote-image`) and
-`/goal:resume ` completes `--budget`.
+(`--budget`, `--no-budget`, `--file`, `--image`, `--remote-image`),
+`/goal:resume ` completes `--budget`, and `/goal:edit ` completes `--title`.
 
 **The old space-separated spellings are refused, not aliased.** 0.1.x spelled the
 verbs as subcommands of one command, after Codex — `/goal`, a space, then `pause`,
@@ -56,6 +56,9 @@ word, so `Clear the lint errors`, `Resume work on X`, and
 ```
 
 - Validates the objective (3–2000 characters after trimming).
+- Creates a **title-less** Goal: a title is optional Goal state, set later with
+  `/goal:edit --title <text>` (the Objective-clarification creation flow is what
+  will confirm one at creation time).
 - Stores an **active** Goal as durable session state and confirms it is on disk
   before announcing success.
 - Sends the objective into the model context as a user message and starts initial
@@ -157,12 +160,47 @@ guidance to use the typed form instead of blocking on a terminal-only dialog.
 Pi's editor dialog has no timeout option, so pi-goal auto-cancels the command
 after 120 seconds if the host never answers; the objective is unchanged.
 
+### Edit the Goal title
+
+```
+/goal:edit --title "Release prep"
+/goal:edit --title "Release prep" Ship the migration notes page instead
+```
+
+A Goal carries an optional **title**: one line, 1–80 characters, whitespace-trimmed
+and persisted as Goal state (code points are counted, so an emoji-heavy label is
+not refused). `--title` is a *leading* option, like `/goal`'s creation flags, so
+an objective that merely contains the word `--title` is never truncated. The
+value is one quoted string or one unquoted token; both `--title "two words"` and
+`--title="two words"` work.
+
+- `--title` alone changes **only** the title: same identity, same objective, next
+  revision. A title is a label, so a title-only edit is not work-admitting — it
+  starts or steers no work, is admitted while `goal.enabled` is false, and still
+  applies to a **complete** Goal (relabeling a finished Goal reopens nothing).
+- `--title` together with an objective changes **both** in the same next
+  revision, and the objective half follows every rule below.
+- An invalid title is refused with no Goal mutation: empty or whitespace-only,
+  more than 80 characters, or containing a line break (including U+2028 and
+  U+0085). The same refusal covers a missing value, an unterminated quote, and a
+  duplicate `--title`.
+- Title text follows the Objective's privacy boundary: it is durable Goal state
+  and appears in the status report, the structured tool payloads, session naming,
+  and the RPC companion's get response, but never in Goal-updated events,
+  `goal-history` records, or metrics. A title-only edit still commits a normal
+  transition (reported as the in-place `objective-edited` kind) whose payloads
+  carry no label text.
+
+While `goal.enabled` is false, a title-only edit stays available, because it
+admits no new Goal work.
+
 While `goal.enabled` is false, editing the objective of an **active** Goal is
 refused: the edit would steer a new objective into the running work, which is new
 Goal work. The refusal happens before the editor dialog opens. Editing a Goal
 that is already stopped (`paused`, `blocked`, `usage_limited`, `budget_limited`)
 changes only durable state, so it stays available, and its notice says that no
-work was started because admission is off.
+work was started because admission is off. A title-only edit is not
+work-admitting at all, so it is admitted for every status, including `active`.
 
 ## Inspect the current Goal
 
@@ -176,6 +214,7 @@ the remaining capacity:
 
 ```
 Goal goal_1a2b3c4d — active
+Title: Release prep
 Objective: Make the full test suite pass in this repository
 Created by: the user (/goal)
 Created: 2026-01-01T00:00:00.000Z
@@ -189,6 +228,9 @@ Attachments: 2 — spec.md (text/plain, 12.4 KB); screenshot.png (image/png, 84.
 Remaining capacity: 201790 tokens
 ```
 
+The `Title:` line is present only for a Goal that has a title; a title-less Goal
+reports exactly what it always did. The same summary is what `get_goal` returns as
+text, and the structured `{ goal }` payload carries `title` (`null` when absent).
 The `Attachments:` line is present only for a Goal with attachments and exposes
 manifest metadata, never contents.
 
@@ -344,7 +386,7 @@ new Goal work:
 | --- | --- |
 | `/goal <objective>` — creation **and** replacement | Both open a new Goal identity and start work. The refusal comes before the replacement confirmation and before any attachment is materialized, so no dialog or artifact promises a replacement that will not happen. |
 | `create_goal` | Same admission, from the model side. The refusal reports `goal: null` (or the unchanged current Goal) and leaves the one-shot creation authority intact, so a corrected call can retry after re-enabling. |
-| `/goal:edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. |
+| `/goal:edit <objective>` of an **active** Goal | An edit of an active Goal steers a new objective into the running work, so it is work-admitting. A title-only `/goal:edit --title` is a label change and stays available. |
 | `/goal:resume` | The resume message restarts the loop. |
 | The automatic Continuation, and an owed Budget wrap-up | Both are unattended Goal work. A pending wrap-up is **deferred, not lost**: it is delivered at the first settlement after re-enabling. |
 | The opt-in resume prompt (`goal.resumePrompt`) | The dialog would only offer a resume that admission refuses, so it is not opened; the restore notice says why. |
@@ -364,10 +406,12 @@ active-but-disabled Goal is never mistaken for one that keeps continuing.
 
 An edit of a Goal that is *already stopped* is not work-admitting — it changes
 only durable state — so it stays available while disabled, and its notice says
-that no work was started. Re-enabling restores admission, and an active Goal
-continues only at Pi's normal settlement seam.
+that no work was started. The same is true for a title-only edit of any Goal. A
+work-admitting objective edit is the only edit admission refuses. Re-enabling
+restores admission, and an active Goal continues only at Pi's normal settlement
+seam.
 
-## Naming the session from the Objective
+## Naming the session from the Goal title or Objective
 
 ```json
 { "goal": { "sessionNameFromObjective": true } }
@@ -375,13 +419,17 @@ continues only at Pi's normal settlement seam.
 
 `goal.sessionNameFromObjective` (Pi settings, default `false`) is an opt-in
 convenience: after a successful creation, pi-goal may name an otherwise unnamed
-session from the Objective, so a Goal is easier to find later in a session list.
+session from the Goal, so a Goal is easier to find later in a session list.
 
-- The name is the Objective's **first line**, whitespace-collapsed and capped at
-  **80 characters**. Truncation is silent — no ellipsis — because a session name is
-  a label in a selector, and the Objective stays the authoritative text. Only the
-  Objective text contributes: attachment contents are supporting material with
-  their own trust boundary and never reach a name.
+- The name is the Goal **title** when the Goal has one, falling back to the
+  Objective's **first line**; the chosen text is whitespace-collapsed and capped at
+  **80 characters**. A title is already one line of at most 80 characters, so any
+  future clarified creation (which confirms a title) gets a name from the label the
+  user actually approved instead of a truncated objective. Truncation is silent —
+  no ellipsis — because a session name is a label in a selector, and the Goal text
+  stays authoritative. Only the Goal title and Objective text contribute:
+  attachment contents are supporting material with their own trust boundary and
+  never reach a name.
 - The name is written through Pi's own seam, so it is a `session_info` entry in the
   session file. It is **host metadata, not Goal state**: it is never persisted in a
   snapshot, never reconstructed from a branch, never part of a `pi-goal:updated`
@@ -397,7 +445,7 @@ What it never does:
 | --- | --- |
 | The setting is absent or `false` (the default) | Nothing is read and nothing is written. A non-boolean value is reported once and ignored, which keeps sessions unnamed exactly as an unset value does. |
 | The session already has a name — whether the user typed it or an earlier Goal wrote it | Left alone. A name that exists is never overwritten. |
-| An Objective edit | Never renames. The edit changes the Goal in place, not the session. |
+| An Objective edit, or a title-only edit | Never renames. The edit changes the Goal in place, not the session. |
 | A Replacement Goal | Never renames. A replacement is a new Goal in a session that already has Goal history, so naming it would relabel a session the user may already recognize. |
 | A refused, failed, or rolled-back creation | Never names. The write sits after the durable commit, so a creation that did not stand leaves no name behind. |
 | A creation cleared while it waited for the current run | Never names. The command reports that the Goal was cleared instead of claiming success, and the naming goes with the success it never had. |

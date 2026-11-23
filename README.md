@@ -15,9 +15,9 @@ tools. It uses only public extension APIs and does not patch Pi core.
 | Surface | Purpose |
 | --- | --- |
 | `/goal <objective>` | Create a Goal and start work immediately |
-| `/goal` | Report objective, status, identity, usage, and remaining capacity |
+| `/goal` | Report title (when present), objective, status, identity, usage, and remaining capacity |
 | `/goal:history` | Read-only timeline of the branch's committed Goal transitions |
-| `/goal:edit [objective]` | Change the objective in place, keeping identity and history |
+| `/goal:edit [--title <text>] [objective]` | Change the objective and/or the Goal title in place, keeping identity and history |
 | `/goal:pause` · `/goal:resume` · `/goal:clear` | Stop admission, restart work, or remove the Goal |
 | `/goal --budget <n>` · `/goal --no-budget` | Bound unattended usage at creation |
 | `/goal --file <path>` · `/goal --image <path>` · `/goal --remote-image <url>` | Attach explicit local text files, local images, or fetch a remote image once (repeatable leading options) |
@@ -128,20 +128,28 @@ With a UI, a compact indicator tracks the Goal:
 goal_1a2b3c4d · active · 48210 tok · 201790 left · 5m 12s
 ```
 
-Bare `/goal` prints the full breakdown: objective, lifecycle status, identity,
-timestamps, revision, token budget, accounted usage, active time, and remaining
-capacity. A Goal restored on session start is announced with a
-`Goal ... restored (active)` notification.
+Bare `/goal` prints the full breakdown: title (when the Goal has one), objective,
+lifecycle status, identity, timestamps, revision, token budget, accounted usage,
+active time, and remaining capacity. A Goal restored on session start is announced
+with a `Goal ... restored (active)` notification.
 
 ```sh
-/goal:edit Ship the release notes page instead   # edit in place
+/goal:edit --title "Release prep"              # set or change the Goal title
+/goal:edit Ship the release notes page instead   # edit the objective in place
+/goal:edit --title "Release prep" Ship the migration notes page instead  # both, one revision
 /goal:pause                                      # stop admission, keep the Goal
 /goal:resume                                     # restart work with a fresh audit
 /goal:clear                                      # durable tombstone, no resurrection
 ```
 
+A Goal title is one line of 1–80 characters and is durable Goal state; a
+title-only edit starts no work and is admitted even for a complete Goal. `--title`
+is a leading option, so an objective that merely contains `--title` is never
+truncated. Title text never reaches Goal-updated events, history, or metrics.
+
 Each verb is its own line in the `/` menu, `/goal ` completes its creation flags,
-and `/goal:resume ` completes `--budget`. An Objective is only ever the argument
+`/goal:resume ` completes `--budget`, and `/goal:edit ` completes `--title`. An
+Objective is only ever the argument
 of `/goal`, so `/goal Edit the README` and `/goal Clear the lint errors` create
 Goals. The 0.1.x space-separated spellings (`/goal` followed by a bare verb
 word) are refused with the command to type instead — *"Goal not created: `pause`
@@ -293,24 +301,25 @@ pi-goal admits no new Goal work, so nothing unattended starts.
 
 → [Goal lifecycle](docs/behavior/lifecycle.md)
 
-### Naming the session from the Objective
+### Naming the session from the Goal title or Objective
 
 ```json
 { "goal": { "sessionNameFromObjective": true } }
 ```
 
 `goal.sessionNameFromObjective` (default `false`) is an opt-in convenience: after a
-successful creation, pi-goal may name an otherwise unnamed session from the
-Objective, so a Goal is easier to find later in a session list.
+successful creation, pi-goal may name an otherwise unnamed session from the Goal,
+so a Goal is easier to find later in a session list.
 
-- The name is the Objective's **first line**, whitespace-collapsed and capped at
-  **80 characters**. Attachment contents never contribute: only the Objective text
-  does.
+- The name is the Goal **title** when present, falling back to the Objective's
+  **first line**; the chosen text is whitespace-collapsed and capped at
+  **80 characters**. Attachment contents never contribute: only the Goal title and
+  Objective text do.
 - **A name you provided is never overwritten.** If the session already has a name,
   pi-goal leaves it alone.
-- **An Objective edit and a Replacement Goal never rename anything**, and a
-  creation that failed, was rolled back, or was cleared while it waited names
-  nothing.
+- **An Objective edit, a title edit, and a Replacement Goal never rename anything**,
+  and a creation that failed, was rolled back, or was cleared while it waited
+  names nothing.
 - The name is Pi's own session metadata, not Goal state: it is not part of the
   Lifecycle, of accounting, or of the `pi-goal:updated` event stream, and it
   survives a restart because Pi persists it.

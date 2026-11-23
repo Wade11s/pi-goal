@@ -11,7 +11,10 @@ objective's trust boundary.
 
 The model can call `get_goal` at any time to retrieve the same structured state
 the command reports (or `goal: null` when no Goal is set). Use it whenever the
-objective is absent or truncated in context.
+objective is absent or truncated in context. The payload's `title` is the Goal's
+optional one-line label (`null` when it has none), so the model can refer to the
+work by the label the user confirmed. A Goal created by `/goal` or `create_goal`
+has no title; it is set with `/goal:edit --title`.
 
 While `goal.enabled` is false the tool's text adds an `Admission disabled:` block:
 the Goal's Lifecycle status is untouched, no new Goal work is admitted, and
@@ -36,8 +39,11 @@ send a kickoff message: the model is already mid-run, and the continuation seam
 picks the Goal up at the next settlement.
 
 `create_goal` is deliberately **text-only**. It has no file, image, path, or URL
-parameters, and extra drifted fields do not gain attachment authority. Explicit
-local and remote attachments can be selected only by the direct
+parameters, and extra drifted fields do not gain attachment authority. It also
+creates a **title-less** Goal: a title is a label the user confirms through a
+later creation flow or sets with `/goal:edit --title`, never a model-supplied
+extra field. Explicit local and remote attachments can be selected only by the
+direct
 `/goal --file … --image … --remote-image …` command at creation or Replacement
 Goal time. Remote URLs are fetched only there, once, so a model cannot turn a
 quoted prompt or an unquoted URL into network material. The existing 3–2000
@@ -326,6 +332,7 @@ payload: nothing in it is Goal state.
 {
   "goal": {
     "id": "goal_1a2b3c4d",
+    "title": "Release prep",
     "status": "active",
     "blocker": "the upstream release API token has not been issued yet",
     "blockerId": "blocker_9f2c1a77",
@@ -359,7 +366,8 @@ payload: nothing in it is Goal state.
 the budget is reached; `budgetExhausted` is the explicit signal. `attachments`
 is `[]` without attachments and otherwise contains metadata only, in immutable
 manifest order. The objective,
-identity, origin, timestamps, and revision are part of the same payload.
+title, identity, origin, timestamps, and revision are part of the same payload;
+`title` is `null` rather than omitted when the Goal has none.
 
 While a blocked audit is open, the same payload carries its **Blocker identity**
 (`blockerId`), the latest plain-language `blocker`, and `blockedTurns`, and

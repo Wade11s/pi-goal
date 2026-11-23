@@ -120,7 +120,14 @@ import {
 	toPublicState,
 	updateGoalOutputSchema,
 } from "./goal.ts";
-import { GoalStore, validateBlocker, validateObjective, type GoalMutationFailure } from "./store.ts";
+import {
+	GoalStore,
+	validateBlocker,
+	validateGoalTitle,
+	validateObjective,
+	type GoalEditChanges,
+	type GoalMutationFailure,
+} from "./store.ts";
 import { GOAL_UPDATED_EVENT, toGoalUpdatedEvent, type GoalUpdatedEvent } from "./events.ts";
 import { GOAL_METRICS_CHANNEL, createGoalMetricsPublisher } from "./metrics.ts";
 import { formatGoalHistory, HISTORY_ENTRY_TYPE, toGoalHistoryRecord } from "./history.ts";
@@ -155,7 +162,7 @@ import {
 import { validateRemoteImageUrl, type RemoteImageFetchOptions } from "./remote-image.ts";
 import type { AttachmentContent, GoalMessageContent } from "./goal.ts";
 import {
-	applySessionNameFromObjective,
+	applySessionNameFromGoal,
 	parseSessionNamingSettings,
 	sessionNameSurface,
 	type SessionNamingSettings,
@@ -344,6 +351,140 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 		};
 	}
 	return { kind: "value", value };
+}
+
+/**
+ * Guidance for an edit that tries to change attachments.
+ *
+ * Extracted so the typed form, the interactive form, and the `/goal:edit` argument
+ * parser all refuse with the same words.
+ */
+const EDIT_ATTACHMENT_GUIDANCE =
+	"Goal not edited: /goal:edit changes only the objective and title and keeps the Goal's immutable " +
+	"attachment manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
+	"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).";
+
+/** Where a parsed `/goal:edit` title option ends and the objective begins. */
+interface GoalEditTitleOption {
+	/** The raw title text, before validation (empty when the option had no value). */
+	value: string;
+	/** The remaining text, which is the objective (empty when there is none). */
+	rest: string;
+}
+
+/**
+ * Read a leading `--title <text>` / `--title=<text>` option from a `/goal:edit` argument.
+ *
+ * Only a *leading* option is recognized, exactly like `/goal`'s creation flags: an
+ * objective that merely contains the word `--title` is never truncated into a
+ * title. The value is either an unquoted token or one quoted string (`"..."` or
+ * `'...'`, with `\\` and matching-quote escapes), which is what lets a title contain
+ * spaces without turning the rest of the argument into it. `--titlex` is not this
+ * option; it is ordinary objective text.
+ */
+function readGoalEditTitleOption(
+	text: string,
+): { kind: "none" } | { kind: "option"; option: GoalEditTitleOption } | { kind: "error"; message: string } {
+	if (!text.startsWith("--title")) return { kind: "none" };
+	const afterFlag = text.slice("--title".length);
+	// `--titlex` (or `--title-text`) is not the option: its next character is not a
+	// separator, so the whole argument is the objective.
+	if (afterFlag !== "" && !/^[=\s]/.test(afterFlag)) return { kind: "none" };
+	let rest = afterFlag.startsWith("=") ? afterFlag.slice(1) : afterFlag;
+	const leading = /^\s*/.exec(rest)![0];
+	rest = rest.slice(leading.length);
+	if (rest === "") {
+		return {
+			kind: "error",
+			message:
+				'Goal not edited: --title needs a title, for example /goal:edit --title "Ship the release notes".',
+		};
+	}
+	const quote = rest[0];
+	if (quote === '"' || quote === "'") {
+		let index = 1;
+		let value = "";
+		let closed = false;
+		while (index < rest.length) {
+			const char = rest[index]!;
+			if (char === "\\" && (rest[index + 1] === quote || rest[index + 1] === "\\")) {
+				value += rest[index + 1];
+				index += 2;
+				continue;
+			}
+			if (char === quote) {
+				closed = true;
+				index += 1;
+				break;
+			}
+			value += char;
+			index += 1;
+		}
+		if (!closed) {
+			return {
+				kind: "error",
+				message: "Goal not edited: the title's opening quote is not closed. Use /goal:edit --title \"<text>\".",
+			};
+		}
+		if (index < rest.length && !/\s/.test(rest[index]!)) {
+			return {
+				kind: "error",
+				message: "Goal not edited: put a space between the quoted title and the objective.",
+			};
+		}
+		return { kind: "option", option: { value, rest: rest.slice(index).trim() } };
+	}
+	const token = /^(\S+)/.exec(rest);
+	if (!token) {
+		return {
+			kind: "error",
+			message:
+				'Goal not edited: --title needs a title, for example /goal:edit --title "Ship the release notes".',
+		};
+	}
+	return { kind: "option", option: { value: token[1]!, rest: rest.slice(token[0].length).trim() } };
+}
+
+/**
+ * Parsed `/goal:edit` request.
+ *
+ * `editor` is the bare command (the prefilled objective editor); `edit` carries
+ * the title and/or objective exactly as typed, for the one validation point in
+ * `editGoal`; `refused` is a usage error that touches no Goal.
+ */
+type ParsedGoalEdit =
+	| { kind: "editor" }
+	| { kind: "edit"; title?: string; objective?: string }
+	| { kind: "refused"; message: string };
+
+/**
+ * Parse `/goal:edit` arguments: a leading `--title` option and/or the objective.
+ *
+ * `--title` alone changes only the title; `--title` plus an objective changes both
+ * in one revision; no argument opens the editor. An attachment option anywhere a
+ * flag could start is refused with the Replacement Goal guidance rather than being
+ * folded into the objective (the historical behavior, now also after `--title`).
+ */
+function parseGoalEditArgs(raw: string): ParsedGoalEdit {
+	const text = raw.trim();
+	if (text === "") return { kind: "editor" };
+	if (GOAL_ATTACHMENT_OPTION_SCANNER.test(text)) {
+		return { kind: "refused", message: EDIT_ATTACHMENT_GUIDANCE };
+	}
+	const title = readGoalEditTitleOption(text);
+	if (title.kind === "error") return { kind: "refused", message: title.message };
+	if (title.kind === "none") return { kind: "edit", objective: text };
+	if (readGoalEditTitleOption(title.option.rest).kind !== "none") {
+		return { kind: "refused", message: "Goal not edited: --title may be given only once." };
+	}
+	if (GOAL_ATTACHMENT_OPTION_SCANNER.test(title.option.rest)) {
+		return { kind: "refused", message: EDIT_ATTACHMENT_GUIDANCE };
+	}
+	return {
+		kind: "edit",
+		title: title.option.value,
+		...(title.option.rest === "" ? {} : { objective: title.option.rest }),
+	};
 }
 
 function parseGoalArgs(raw: string): ParsedGoalArgs {
@@ -856,7 +997,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let sessionNaming: SessionNamingSettings = { nameFromObjective: false, problems: [] };
 
 	/**
-	 * Name the session from a freshly created Goal's Objective, when the user opted in.
+	 * Name the session from a freshly created Goal's title or Objective, when the user
+	 * opted in.
 	 *
 	 * Called only from the two creation paths, and only after their durable commit
 	 * succeeded: a refused, failed, or rolled-back creation never reaches it, so a
@@ -864,16 +1006,21 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * host failure is reported as a warning, never as a creation failure, because the
 	 * Goal is already durable and the name is metadata about the session.
 	 *
-	 * The Objective is the only source. Attachment contents have their own trust
-	 * boundary and are never folded into a name (see `./session-naming.ts`).
+	 * The Goal title is the preferred source and the Objective's first line is the
+	 * fallback. Attachment contents have their own trust boundary and are never
+	 * folded into a name (see `./session-naming.ts`).
 	 */
-	function nameSessionFromObjective(ctx: ExtensionContext, objective: string): void {
-		const outcome = applySessionNameFromObjective(sessionNameSurface(pi), objective, sessionNaming.nameFromObjective);
+	function nameSessionFromGoal(ctx: ExtensionContext, goal: GoalRecord): void {
+		const outcome = applySessionNameFromGoal(
+			sessionNameSurface(pi),
+			{ title: goal.title, objective: goal.objective },
+			sessionNaming.nameFromObjective,
+		);
 		if (outcome.kind === "failed") {
 			notify(
 				ctx,
-				`Session not named: pi-goal could not name the session from the Objective (${outcome.reason}). ` +
-					"The Goal itself is unchanged; rename the session yourself if you want a name.",
+				`Session not named: pi-goal could not name the session from the Goal title or Objective ` +
+					`(${outcome.reason}). The Goal itself is unchanged; rename the session yourself if you want a name.`,
 				"warning",
 			);
 		}
@@ -2208,12 +2355,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		name: "get_goal",
 		label: "Get Goal",
 		description:
-			"Get the current session Goal: objective, lifecycle status, revision, token budget, accounted " +
+			"Get the current session Goal: objective, title, lifecycle status, revision, token budget, accounted " +
 			"usage, remaining capacity, active time, and the open blocked audit's Blocker identity, latest " +
 			"description, and count. Returns goal: null when no Goal is set.",
 		parameters: Type.Object({}),
 		outputSchema: getGoalOutputSchema,
-		promptSnippet: "Fetch the current session Goal objective, lifecycle status, and budget",
+		promptSnippet: "Fetch the current session Goal objective, title, lifecycle status, and budget",
 		promptGuidelines: [
 			"Use get_goal when the session Goal objective or its lifecycle status is absent or truncated in the current context.",
 			"Check get_goal's usage.remainingTokens before starting expensive work: a Goal that reaches its token budget becomes budget_limited and stops continuing.",
@@ -2398,7 +2545,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// exists — so a committed creation may name an unnamed session here too,
 			// exactly like the command's. The failure paths above returned before this
 			// point, so a rolled-back creation never names anything.
-			nameSessionFromObjective(ctx, goal.objective);
+			nameSessionFromGoal(ctx, goal);
 			// No separate durability poll is needed here, unlike the /goal command whose
 			// kickoff is what creates the session file: a tool call implies a running
 			// session whose file already exists, and appendEntry writes synchronously
@@ -2892,32 +3039,29 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	/**
 	 * `/goal:edit`: the typed edit with an argument, the prefilled editor without.
 	 *
-	 * An edit cannot change attachments: an Objective edit keeps the immutable
-	 * attachment manifest, and changing attachments requires a Replacement Goal,
-	 * so an edit whose argument starts with `--file`/`--image`/`--remote-image` is
-	 * refused with that guidance instead of silently becoming part of the objective.
+	 * The argument is an optional leading `--title <text>` option and/or the new
+	 * objective. A title-only edit changes just the Goal's label; adding an
+	 * objective changes both in the same revision. An edit cannot change
+	 * attachments: the immutable manifest is retained, so an argument whose flag
+	 * position could start an attachment option is refused with Replacement Goal
+	 * guidance instead of silently becoming part of the objective or title.
 	 */
 	async function handleGoalEditCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-		const trimmed = args.trim();
-		if (GOAL_ATTACHMENT_OPTION_SCANNER.test(trimmed)) {
-			ctx.ui.notify(
-				"Goal not edited: /goal:edit changes only the objective and keeps the Goal's immutable attachment " +
-					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
-					"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).",
-				"error",
-			);
+		const parsed = parseGoalEditArgs(args);
+		if (parsed.kind === "refused") {
+			ctx.ui.notify(parsed.message, "error");
 			return;
 		}
 		// An edit is a user decision that supersedes any model-held creation authority.
 		clearCreationAuthority();
-		if (trimmed === "") {
+		if (parsed.kind === "editor") {
 			// Bare `/goal:edit` opens Pi's multi-line editor prefilled with the
 			// current objective. The typed form stays available for headless modes
 			// and for hosts without a dialog-capable UI.
 			await editGoalInteractively(ctx);
 			return;
 		}
-		editGoal(trimmed, ctx);
+		editGoal(parsed, ctx);
 	}
 
 	/** Every command of the Goal command family, by the name Pi dispatches it under. */
@@ -3000,7 +3144,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 	pi.registerCommand("goal:edit", {
 		description:
-			"Edit the session Goal's objective in place: /goal:edit <objective>, or bare /goal:edit for the editor",
+			"Edit the session Goal in place: /goal:edit <objective>, /goal:edit --title <text>, or bare /goal:edit for the editor",
+		getArgumentCompletions: (prefix) => completeGoalFlags(["--title"], prefix),
 		handler: (args, ctx) => runGoalCommand("goal:edit", args, ctx),
 	});
 
@@ -3721,34 +3866,65 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Goal ${goal.id} objective edit cancelled; the current objective is unchanged.`, "info");
 			return;
 		}
-		editGoal(edited, ctx);
+		editGoal({ objective: edited }, ctx);
 	}
 
-	function editGoal(rawObjective: string, ctx: ExtensionCommandContext): void {
-		const validation = validateObjective(rawObjective);
-		if (!validation.ok) {
-			ctx.ui.notify(validation.error, "error");
-			return;
+	/**
+	 * Apply one in-place Goal edit: the objective, the title, or both in one revision.
+	 *
+	 * Both fields are validated before anything is read or written, so an invalid
+	 * objective or title refuses the whole edit and mutates nothing. The two kinds
+	 * of change differ deliberately after validation:
+	 *
+	 * - an **objective** edit keeps every existing rule. It is work-admitting for an
+	 *   active Goal, so it is refused while `goal.enabled` is false; its immutable
+	 *   attachment manifest is verified before the edit steers new work; and a
+	 *   complete Goal refuses it (use `/goal <objective>` for a new identity).
+	 * - a **title-only** edit changes a label. It reopens no work, so it is admitted
+	 *   while the extension is disabled and for a complete Goal, it never sends a
+	 *   work message, and it never reloads attachments. That is what makes
+	 *   `/goal:edit --title` usable for relabeling without side effects.
+	 */
+	function editGoal(changes: GoalEditChanges, ctx: ExtensionCommandContext): void {
+		let objective: string | undefined;
+		if (changes.objective !== undefined) {
+			const validation = validateObjective(changes.objective);
+			if (!validation.ok) {
+				ctx.ui.notify(validation.error, "error");
+				return;
+			}
+			objective = validation.objective;
 		}
+		let title: string | undefined;
+		if (changes.title !== undefined) {
+			const validation = validateGoalTitle(changes.title);
+			if (!validation.ok) {
+				ctx.ui.notify(validation.error, "error");
+				return;
+			}
+			title = validation.title;
+		}
+		const changingObjective = objective !== undefined;
 		const goal = store.get();
 		if (!goal) {
 			ctx.ui.notify("There is no Goal to edit. Create one with /goal <objective> first.", "warning");
 			return;
 		}
-		// An edit of an *active* Goal is work-admitting: it steers a new objective
-		// into the running work, which is new Goal work. An edit of a Goal that is
-		// already stopped admits nothing — it only rewrites durable state — so it
-		// stays available while the extension is disabled.
-		if (goal.status === "active" && !admission.enabled) {
+		// Only an *objective* edit of an *active* Goal is work-admitting: it steers a
+		// new objective into the running work. A title-only edit is a label change,
+		// and an edit of a Goal that is already stopped admits nothing either, so
+		// both stay available while the extension is disabled.
+		if (changingObjective && goal.status === "active" && !admission.enabled) {
 			refuseWorkAdmittingEdit(ctx, goal);
 			return;
 		}
-		// An edit keeps the immutable attachment manifest, and the edit message of
-		// an active Goal re-sends it, so the artifacts must verify before the edit
-		// steers new work. A stopped Goal's edit rewrites durable state only and is
-		// verified again when work is eventually resumed.
+		// An objective edit keeps the immutable attachment manifest, and the edit
+		// message of an active Goal re-sends it, so the artifacts must verify before
+		// the edit steers new work. A title-only edit sends no message, so it never
+		// needs the contents; a stopped Goal's objective edit rewrites durable state
+		// only and is verified again when work is eventually resumed.
 		let contents: AttachmentContent[] = [];
-		if (goal.attachments?.length && goal.status === "active") {
+		if (changingObjective && goal.attachments?.length && goal.status === "active") {
 			const loaded = loadGoalAttachments(goal, ctx);
 			if (!loaded.ok) {
 				ctx.ui.notify(attachmentIntegrityError(goal, loaded.problems), "error");
@@ -3756,20 +3932,32 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			}
 			contents = loaded.contents;
 		}
-		const edited = store.editObjective(pi, validation.objective);
+		const edited = store.editInPlace(pi, {
+			...(changingObjective ? { objective } : {}),
+			...(title === undefined ? {} : { title }),
+		});
 		if (!edited.ok) {
 			notifyMutationFailure(ctx, "edited", edited);
 			return;
 		}
 		updateStatus(ctx);
 		const updated = edited.goal!;
+		if (!changingObjective) {
+			ctx.ui.notify(
+				`Goal ${updated.id} title set to ${JSON.stringify(updated.title ?? title ?? "")} (revision ${updated.revision}). ` +
+					`The Goal stays ${updated.status}; a title is a label, so no work was started or redirected.`,
+				"info",
+			);
+			return;
+		}
+		const titleNote = title === undefined ? "" : ` Title set to ${JSON.stringify(title)}.`;
 		if (updated.status === "active") {
 			// Redirect the active run through Pi's steering (or start work when
 			// idle, e.g. after an aborted run left the Goal dormant). The manifest is
 			// immutable across the edit, so the same attachments ride along.
 			const delivery = deliverWorkMessage(formatEditMessage(updated, contents), ctx);
 			ctx.ui.notify(
-				`Goal ${updated.id} objective updated (revision ${updated.revision}); usage history is preserved. Work ${delivery === "started" ? "started" : "steered"} on the new objective.`,
+				`Goal ${updated.id} objective updated (revision ${updated.revision}); usage history is preserved.${titleNote} Work ${delivery === "started" ? "started" : "steered"} on the new objective.`,
 				"info",
 			);
 			return;
@@ -3784,7 +3972,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			: "pi-goal is disabled (goal.enabled is false), so no work was started and /goal:resume stays refused " +
 					"until it is re-enabled.";
 		ctx.ui.notify(
-			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ${restart}`,
+			`Goal ${updated.id} objective updated (revision ${updated.revision}).${titleNote} The Goal stays ${updated.status}; ${restart}`,
 			"info",
 		);
 	}
@@ -4107,7 +4295,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// naming it would relabel a session the user may already recognize by its
 			// old name. Every failure path above returned before this point, so a
 			// refused, failed, or rolled-back creation never names anything.
-			if (!replacing) nameSessionFromObjective(ctx, goal.objective);
+			if (!replacing) nameSessionFromGoal(ctx, goal);
 			ctx.ui.notify(
 				replacing
 					? `Goal ${goal.id} created and activated, replacing ${previous!.id}. Initial work ${delivery === "started" ? "started" : "steered into the running work"}.`

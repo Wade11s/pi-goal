@@ -144,8 +144,8 @@ export interface GoalCommandBridgeRequest {
 	 * string is the bare status report and anything else is a creation (with its
 	 * leading `--budget` / `--no-budget` / `--file` / `--image` / `--remote-image`
 	 * options); for `goal:resume` it is empty or `--budget <new-total>`; for
-	 * `goal:edit` it is the new objective or empty for the editor; the other verbs
-	 * take nothing.
+	 * `goal:edit` it is empty for the editor, a leading `--title <text>` option
+	 * and/or the new objective; the other verbs take nothing.
 	 */
 	args: string;
 	/** Where the result is delivered. Called exactly once. */

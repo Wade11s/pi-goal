@@ -35,6 +35,16 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   reconstruction rather than trusted. A pre-repair 0.1.0 audit carries no
   `blockerId`; it is preserved verbatim for the one-time cutover handoff and can
   never be advanced by identity before it.
+- A snapshot carries the optional `title`: the Goal's one-line, 1–80 character
+  label. It is plain Goal state, so it is persisted verbatim, reconstructed from
+  the selected branch like the objective, and preserved by every later transition.
+  It is **absent** for every snapshot written before titles existed and for every
+  Goal created by `/goal` or `create_goal`; those reconstruct unchanged with no
+  title rather than an empty one. A title string that fails the one-line 1–80 rule
+  is dropped during reconstruction (never trusted, and never fatal), because a
+  display label must not cost the user the Goal it describes. A title-only
+  `/goal:edit --title` writes the next snapshot with the same identity and the
+  next revision, so replay and a restart see exactly the committed label.
 - The kickoff is delivered as a **user message** carrying the user's own
   objective (attributed as user-provided Goal data). As the session's first
   conversation entry it also makes Pi create and flush the session file, which

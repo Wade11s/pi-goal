@@ -73,5 +73,9 @@ Goal exists.
   entries needs revision in the implementation spec.
 - The confirmation editor, not a verbatim quotation, is the creation authority
   for the clarified path; `create_goal`'s quotation authority is untouched.
-- Goal-updated events, audit history, structured tool payloads, and the RPC
-  companion gain the title; the work is sized in the implementation spec.
+- Structured tool payloads, the status report, session naming, and the RPC
+  companion's get response gain the title. Goal-updated events, audit history,
+  and Goal metrics do **not**: title text follows the Objective's privacy
+  boundary, so it stays in the durable snapshot and the user-facing surfaces.
+  (This refines the earlier consequence note, which would have added the title to
+  the event stream.) The work is sized in the implementation spec.

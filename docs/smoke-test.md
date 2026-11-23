@@ -73,6 +73,18 @@ Expect the full report: objective, `active` status, identity, timestamps,
 revision, token budget, accounted token usage, active time, and remaining
 capacity. The compact footer indicator shows the same status and usage.
 
+Now give the Goal a title:
+
+```
+/goal:edit --title "Release prep"
+```
+
+Expect a `title set to` notification and the same Goal identity with the next
+revision; `/goal` now shows a `Title: Release prep` line above the objective, and
+`get_goal` returns the same `title`. The title-only edit starts no work. A title
+with a line break or more than 80 characters is refused and changes nothing, and
+a title edit never renames the session.
+
 ## 5. Watch automatic continuation
 
 Let the agent finish a turn. With the Goal still `active`, Pi continues on its
@@ -93,7 +105,9 @@ Write the haiku and a limerick about steering
 
 Save and exit. Expect an `objective updated` notification, the status indicator
 stays `active`, and the running work is steered to the new objective. Cancelling
-the editor leaves the objective unchanged.
+the editor leaves the objective unchanged. The typed form
+`/goal:edit --title <text> <objective>` changes the title and objective together
+in one revision.
 
 ## 7. Pause
 
