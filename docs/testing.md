@@ -336,8 +336,8 @@ bytes; and the headless (`hasUI: false`) `/goal:edit` guard.
 `test/goal56-command-bridge.test.mjs` covers the bridge with a fake Pi API, which
 is the only way to reach a few narrow cases deterministically: the whole outcome
 classifier truth table; strict version-2 request validation (a `name` outside the
-family, a non-string `args`, and a version-1 request refused with the upgrade
-message); the action derived from the command name for all six commands, with
+family, a non-string `args`, and a version-1 request dropped with the upgrade
+diagnostic rather than answered); the action derived from the command name for all six commands, with
 `/goal` refusing the old `pause` argument as a `create` that was `refused`, never
 `invalid`; a family name that is not a registered command at dispatch time,
 answered `invalid` with no Goal mutation; and a creation that commits in memory,

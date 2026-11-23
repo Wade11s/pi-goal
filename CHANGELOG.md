@@ -30,9 +30,10 @@ spelling in the message; nothing is silently reinterpreted.
 - **The Goal command bridge is version 2.** A request carries Pi's own dispatch
   shape — `{ version: 2, id, name, args, reply }`, where `name` is one of the
   six commands — instead of "the text after `/goal`". A version-1 request is
-  refused with the upgrade message, a `name` outside the family is dropped as
-  malformed, and the dispositions, transitions filter, once-only reply, busy
-  guard, and session-control guard are unchanged.
+  dropped as malformed (the upgrade diagnostic is logged, not replied, so a
+  mismatched caller's own timeout answers `unavailable`), and so is a `name`
+  outside the family; the dispositions, transitions filter, once-only reply,
+  busy guard, and session-control guard are unchanged.
 - **The RPC companion no longer mirrors pi-goal's parser** and is bumped to
   `0.2.0` with the bridge. Its `thread/goal/get`, `set`, and `clear` methods,
   params, and `authority: "external-user"` rule are unchanged, but a `set` whose

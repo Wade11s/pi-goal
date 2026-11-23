@@ -328,8 +328,8 @@ test("a malformed bridge request is dropped instead of half-executed", () => {
 		null,
 		"not-an-object",
 		42,
-		// The version-1 shape (a `command` string) is a mismatch, answered with the
-		// upgrade message rather than guessed at.
+		// The version-1 shape (a `command` string) is a mismatch, dropped with the
+		// upgrade diagnostic rather than guessed at or answered.
 		{ version: 1, id: "x", command: "clear", reply },
 		{ version: GOAL_COMMAND_BRIDGE_VERSION + 1, id: "x", name: "goal", args: "", reply },
 		{ id: "x", name: "goal", args: "", reply },
@@ -380,6 +380,27 @@ test("a malformed bridge request is dropped instead of half-executed", () => {
 		assert.equal(accepted.request.args, "--budget 150");
 		assert.equal("extra" in accepted.request, false);
 	}
+});
+
+test("a version-mismatched request is dropped: the caller's timeout, not a refusal, answers it", async (t) => {
+	const dir = withTempDir(t);
+	const { pi } = await startBridgeHarness(dir);
+	let replies = 0;
+	pi.events.emit(GOAL_COMMAND_BRIDGE, {
+		version: GOAL_COMMAND_BRIDGE_VERSION + 1,
+		id: "future-1",
+		name: "goal",
+		args: "",
+		reply: () => {
+			replies += 1;
+		},
+	});
+	assert.equal(replies, 0, "an unknown version is never answered, even with a well-formed reply");
+	await assert.rejects(
+		bridge(pi, "goal", "", { version: 1, id: "old-1", timeoutMs: 150 }),
+		/no bridge answer/,
+		"a version-1 request reaches the caller as its own timeout (unavailable), not as a refusal",
+	);
 });
 
 test("a bridged status/create/clear round-trip runs the user command surface", async (t) => {

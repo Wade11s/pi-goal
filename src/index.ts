@@ -130,6 +130,7 @@ import {
 	classifyGoalBridgeOutcome,
 	committedKindsFor,
 	commandContextForBridge,
+	GOAL_COMMAND_NAMES,
 	goalBridgeActionFor,
 	goalBridgeRefusal,
 	goalBridgeUnregisteredCommand,
@@ -276,6 +277,19 @@ export interface ParsedGoalArgs {
  * the two explicit spellings are recognized. It is also the only argument the
  * command accepts: a verb command never reads its argument as an Objective.
  */
+/**
+ * The creation options `/goal` accepts, as flag names without the leading `--`.
+ *
+ * One vocabulary for three readers: the option scanner below, the `/goal `
+ * argument completion, and the `/goal:edit` attachment refusal (which names only
+ * the attachment subset). A new option is added here once, not in three regexes.
+ */
+const GOAL_CREATION_FLAG_NAMES = ["budget", "no-budget", "file", "image", "remote-image"] as const;
+const GOAL_CREATION_FLAGS = GOAL_CREATION_FLAG_NAMES.map((name) => `--${name}`);
+const GOAL_ATTACHMENT_FLAG_NAMES = GOAL_CREATION_FLAG_NAMES.filter((name) => name !== "budget" && name !== "no-budget");
+const GOAL_OPTION_SCANNER = new RegExp(`^--(${GOAL_CREATION_FLAG_NAMES.join("|")})(?:=(\\S+))?(?:\\s+|$)`);
+const GOAL_ATTACHMENT_OPTION_SCANNER = new RegExp(`^--(${GOAL_ATTACHMENT_FLAG_NAMES.join("|")})(?:=|\\s|$)`);
+
 export type ResumeBudgetRequest =
 	| { kind: "none" }
 	| { kind: "value"; value: number };
@@ -338,7 +352,7 @@ function parseGoalArgs(raw: string): ParsedGoalArgs {
 	const attachments: AttachmentRequest[] = [];
 	const problems: string[] = [];
 	for (;;) {
-		const match = /^--(budget|no-budget|file|image|remote-image)(?:=(\S+))?(?:\s+|$)/.exec(rest);
+		const match = GOAL_OPTION_SCANNER.exec(rest);
 		if (!match) break;
 		const flag = match[1]!;
 		const inline = match[2];
@@ -454,9 +468,11 @@ type GoalCommand = { kind: "status" } | { kind: "create"; objective: string } | 
  * The bare word, matched case-insensitively and after trimming, is the old
  * `pause` / `resume` / `clear` / `history` / `edit` subcommand; `resume --budget`
  * (both spellings) is the old budget-raising resume. Each names the verb command
- * it used to reach, so the refusal can point at it.
+ * it used to reach, so the refusal can point at it. The list is derived from the
+ * command family itself, so a seventh verb cannot be registered without also
+ * being reserved here.
  */
-const RESERVED_GOAL_VERBS = ["pause", "resume", "clear", "history", "edit"] as const;
+const RESERVED_GOAL_VERBS = GOAL_COMMAND_NAMES.filter((name) => name !== "goal").map((name) => name.slice("goal:".length));
 
 /**
  * The reserved-word guard for the `/goal` creation path (ADR-0002).
@@ -2877,7 +2893,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 */
 	async function handleGoalEditCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
 		const trimmed = args.trim();
-		if (/^--(file|image|remote-image)(?:=|\s|$)/.test(trimmed)) {
+		if (GOAL_ATTACHMENT_OPTION_SCANNER.test(trimmed)) {
 			ctx.ui.notify(
 				"Goal not edited: /goal:edit changes only the objective and keeps the Goal's immutable attachment " +
 					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
@@ -2925,8 +2941,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** The leading creation options `/goal ` completes, in the order the parser reads them. */
-	const GOAL_CREATION_FLAGS = ["--budget", "--no-budget", "--file", "--image", "--remote-image"] as const;
 
 	/**
 	 * Prefix-filtered argument completions for a Goal command.
@@ -2957,31 +2971,31 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("goal", {
 		description: "Create (/goal <objective>) or inspect (bare /goal) the session Goal",
 		getArgumentCompletions: (prefix) => completeGoalFlags(GOAL_CREATION_FLAGS, prefix),
-		handler: handleGoalCommand,
+		handler: (args, ctx) => runGoalCommand("goal", args, ctx),
 	});
 	pi.registerCommand("goal:pause", {
 		description: "Pause the session Goal: no further automatic Goal runs start, and work in flight finishes",
-		handler: handleGoalPauseCommand,
+		handler: (args, ctx) => runGoalCommand("goal:pause", args, ctx),
 	});
 	pi.registerCommand("goal:resume", {
 		description:
 			"Restart a paused, blocked, usage_limited, or budget_limited Goal (--budget <new-total> raises a " +
 			"budget_limited Goal's ceiling)",
 		getArgumentCompletions: (prefix) => completeGoalFlags(["--budget"], prefix),
-		handler: handleGoalResumeCommand,
+		handler: (args, ctx) => runGoalCommand("goal:resume", args, ctx),
 	});
 	pi.registerCommand("goal:clear", {
 		description: "Clear the session Goal with a durable tombstone and return to ordinary prompt behavior",
-		handler: handleGoalClearCommand,
+		handler: (args, ctx) => runGoalCommand("goal:clear", args, ctx),
 	});
 	pi.registerCommand("goal:history", {
 		description: "Render the session's read-only Goal audit history",
-		handler: handleGoalHistoryCommand,
+		handler: (args, ctx) => runGoalCommand("goal:history", args, ctx),
 	});
 	pi.registerCommand("goal:edit", {
 		description:
 			"Edit the session Goal's objective in place: /goal:edit <objective>, or bare /goal:edit for the editor",
-		handler: handleGoalEditCommand,
+		handler: (args, ctx) => runGoalCommand("goal:edit", args, ctx),
 	});
 
 	/**

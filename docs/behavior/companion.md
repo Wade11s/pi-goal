@@ -47,7 +47,10 @@ The bridge is a request/response pair on Pi's shared extension event bus, channe
 The request carries Pi's own dispatch shape — the command name Pi dispatches on
 and the text after it — so the bridge never parses anything. A `name` outside the
 Goal command family is malformed and dropped, like a bad version; a version-1
-request (the old `command` string) is refused with the "upgrade both" message.
+request (the old `command` string) is dropped for the same reason, so the caller's
+own timeout answers `unavailable` rather than a refusal. The upgrade message is a
+validation diagnostic, not a reply: nothing answers a payload whose `reply` cannot
+be trusted.
 
 The result echoes `name` and `args` (so a caller correlates the answer with
 exactly what it sent) and adds:
@@ -120,11 +123,11 @@ consumer that reacts to commits should keep reading the event stream.
   how "which command committed?" becomes unanswerable.
 - **No session yet.** Before `session_start`, pi-goal has no session context, so
   the bridge refuses instead of running a command against nothing.
-- **Validated envelopes.** A malformed or future-version request is dropped (it
-  has no trustworthy `reply`); an unknown `version` or a `name` outside the
-  Goal command family is refused rather than guessed, and a family `name` that
-  Pi does not list as a registered command at dispatch time is answered
-  `invalid` without running anything.
+- **Validated envelopes.** A malformed request — an unknown or old `version`, a
+  `name` outside the Goal command family, a non-string `args` — is dropped rather
+  than guessed, because it has no trustworthy `reply` and the caller's own timeout
+  covers the lost answer; a family `name` that Pi does not list as a registered
+  command at dispatch time is answered `invalid` without running anything.
 - **No session control.** A bridged command may not start, fork, navigate, switch,
   or reload a session, and may not abort the user's run, compact its context, or
   shut Pi down. That is the whole session-control and agent/process-control
@@ -316,7 +319,7 @@ can prevent that.
 
 | Guarantee | Test |
 | --- | --- |
-| Outcome classifier never claims unproven success; transition filtering; strict v2 request validation (name in the family, string args, version-1 refused); action derived from the name for all six commands; a family name not registered at dispatch time answers `invalid` and runs nothing | `test/goal56-command-bridge.test.mjs` |
+| Outcome classifier never claims unproven success; transition filtering; strict v2 request validation (name in the family, string args, version-1 dropped with the upgrade diagnostic); action derived from the name for all six commands; a family name not registered at dispatch time answers `invalid` and runs nothing | `test/goal56-command-bridge.test.mjs` |
 | Bridged status/create/clear run the user command surface (`origin: "command"`) | `test/goal56-command-bridge.test.mjs` |
 | A creation that fails its durability poll answers `refused` and writes nothing | `test/goal56-command-bridge.test.mjs` |
 | Busy guard, declined replacement leaves Goal bytes identical | `test/goal56-command-bridge.test.mjs` |

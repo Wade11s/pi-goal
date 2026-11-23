@@ -131,6 +131,51 @@ test("the Goal command family is six registered commands and nothing else", () =
 	}
 });
 
+test("every registered command reports its own throw as a notification instead of escaping into Pi", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-goal-command-errors-"));
+	try {
+		const { pi, commands, handlers } = fakePi(join(dir, "session.jsonl"));
+		goalExtension(pi);
+		const notifications = [];
+		const sessionFile = join(dir, "session.jsonl");
+		const ctx = fakeCtx({ hasUI: false, sessionFile, notifications });
+		const start = handlers.get("session_start");
+		assert.ok(start, "pi-goal registered a session_start handler");
+		await start({ type: "session_start" }, ctx);
+		// An active Goal, so each verb reaches its real work rather than a no-Goal
+		// early return. The injected fault is a notification channel that throws:
+		// exactly the failure the command runner's net exists to absorb.
+		await commands.get("goal").handler(OBJECTIVE, ctx);
+		const before = notifications.length;
+		ctx.ui.notify = () => {
+			throw new Error("the notification channel failed");
+		};
+		const errors = [];
+		for (const name of GOAL_COMMANDS) {
+			await commands.get(name).handler("", {
+				...ctx,
+				ui: {
+					...ctx.ui,
+					notify: (message, type) => {
+						if (type === "error" && message.startsWith("pi-goal error:")) {
+							errors.push({ name, message });
+							return;
+						}
+						throw new Error("the notification channel failed");
+					},
+				},
+			});
+		}
+		assert.deepEqual(
+			errors.map((e) => e.name),
+			GOAL_COMMANDS,
+			`each registered command reported its own throw: ${JSON.stringify({ before, errors })}`,
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("/goal completes its creation flags and /goal:resume completes --budget, prefix-filtered", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-completions-"));
 	try {
