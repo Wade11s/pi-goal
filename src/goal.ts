@@ -6,7 +6,7 @@
  * and `budget_limited` are the non-continuing states a user, a genuine blocker,
  * a provider usage limit, or a budget produces. The conservative stopping rules
  * that produce `blocked` and `usage_limited` live in `./safety.ts`, with the
- * model-driven blocked audit in `./store.ts`; `/goal pause` and `/goal resume`
+ * model-driven blocked audit in `./store.ts`; `/goal:pause` and `/goal:resume`
  * produce `paused`, and `budget_limited` arrives with the budget milestone.
  */
 import { randomUUID } from "node:crypto";
@@ -25,7 +25,7 @@ import {
  * provider usage limit, or a budget produces, and a budget-limited Goal gets
  * exactly one bounded wrap-up before it stops. The conservative stopping rules
  * that produce `blocked` and `usage_limited` live in `./safety.ts`, with the
- * model-driven blocked audit in `./store.ts`; `/goal pause` and `/goal resume`
+ * model-driven blocked audit in `./store.ts`; `/goal:pause` and `/goal:resume`
  * produce `paused`, and the token and active-time budgets live in
  * `./accounting.ts`.
  */
@@ -571,20 +571,20 @@ export interface AdmissionView {
  * Lifecycle status is untouched and its Active elapsed time keeps accruing, so
  * pausing the Goal (not disabling the extension) is what stops that clock. Every
  * other status has already stopped the clock, and this block must not claim a
- * stopped Goal is accruing or that a refused `/goal resume` will start it.
+ * stopped Goal is accruing or that a refused `/goal:resume` will start it.
  */
 function admissionDisabledLines(status: GoalPublicState["status"]): string[] {
 	const clock =
 		status === "active"
-			? "this Goal keeps its active status and keeps accruing active time, and /goal pause — not disabling the " +
+			? "this Goal keeps its active status and keeps accruing active time, and /goal:pause — not disabling the " +
 				"extension — is what stops that clock"
 			: `this Goal is already ${status}, so its active time has already stopped and nothing restarts it while the ` +
 				"extension stays disabled";
 	return [
 		"Admission disabled: goal.enabled is false, so pi-goal admits no new Goal work — no /goal <objective> or " +
-			"create_goal, no work-admitting /goal edit, no /goal resume, and no automatic continuation. " +
+			"create_goal, no work-admitting /goal:edit, no /goal:resume, and no automatic continuation. " +
 			`Disabling the extension is an admission control, not a Lifecycle status and not a pause: ${clock}. ` +
-			"Inspection (/goal, get_goal), /goal pause, /goal clear, and terminal updates from work already in flight " +
+			"Inspection (/goal, get_goal), /goal:pause, /goal:clear, and terminal updates from work already in flight " +
 			"still work.",
 	];
 }
@@ -594,7 +594,7 @@ export function formatGoalSummary(state: GoalPublicState, admission: AdmissionVi
 	const budget = state.tokenBudget === null ? "none (unbounded)" : `${state.tokenBudget} tokens`;
 	const usage = state.usage;
 	// Every status hint that names a resume has to be admission-aware: a disabled
-	// extension refuses `/goal resume`, so a report may not promise it will start
+	// extension refuses `/goal:resume`, so a report may not promise it will start
 	// work. An enabled extension renders exactly what it always did.
 	const admissionOff = admission.admissionEnabled === false;
 	const lines = [
@@ -614,29 +614,29 @@ export function formatGoalSummary(state: GoalPublicState, admission: AdmissionVi
 		...(state.status === "paused"
 			? [
 					admissionOff
-						? "Paused: no automatic Goal runs start, and /goal resume is refused while pi-goal is disabled; /goal edit still works."
-						: "Paused: no automatic Goal runs start until /goal resume; /goal edit still works.",
+						? "Paused: no automatic Goal runs start, and /goal:resume is refused while pi-goal is disabled; /goal:edit still works."
+						: "Paused: no automatic Goal runs start until /goal:resume; /goal:edit still works.",
 				]
 			: []),
 		...(state.status === "blocked"
 			? [
 					admissionOff
-						? "Blocked: /goal resume is refused while pi-goal is disabled; once re-enabled it restarts this Goal with a fresh blocked audit."
-						: "Blocked: /goal resume restarts this Goal with a fresh blocked audit.",
+						? "Blocked: /goal:resume is refused while pi-goal is disabled; once re-enabled it restarts this Goal with a fresh blocked audit."
+						: "Blocked: /goal:resume restarts this Goal with a fresh blocked audit.",
 				]
 			: []),
 		...(state.status === "usage_limited"
 			? [
 					admissionOff
-						? "Usage limited: /goal resume is refused while pi-goal is disabled; once re-enabled it restarts this Goal once the limit is resolved."
-						: "Usage limited: /goal resume restarts this Goal once the limit is resolved.",
+						? "Usage limited: /goal:resume is refused while pi-goal is disabled; once re-enabled it restarts this Goal once the limit is resolved."
+						: "Usage limited: /goal:resume restarts this Goal once the limit is resolved.",
 				]
 			: []),
 		...(state.status === "budget_limited"
 			? [
 					admissionOff
-						? "Budget limited: /goal resume --budget <new-total> is refused while pi-goal is disabled; once re-enabled it raises the cumulative ceiling and restarts this Goal, and the configured default budget is never implicit resume authority."
-						: "Budget limited: /goal resume --budget <new-total> raises the cumulative ceiling and restarts this Goal; " +
+						? "Budget limited: /goal:resume --budget <new-total> is refused while pi-goal is disabled; once re-enabled it raises the cumulative ceiling and restarts this Goal, and the configured default budget is never implicit resume authority."
+						: "Budget limited: /goal:resume --budget <new-total> raises the cumulative ceiling and restarts this Goal; " +
 							"the configured default budget is never implicit resume authority.",
 				]
 			: []),
@@ -722,7 +722,7 @@ export function formatNoGoal(admissionEnabled = true): string {
 	if (admissionEnabled) return base;
 	return (
 		`${base} pi-goal is disabled (goal.enabled is false), so /goal <objective> and create_goal are refused ` +
-		"until it is re-enabled; get_goal, /goal pause, and /goal clear are unaffected."
+		"until it is re-enabled; get_goal, /goal:pause, and /goal:clear are unaffected."
 	);
 }
 
@@ -959,7 +959,7 @@ function containsAffirmativePauseClause(text: string, needle: string): boolean {
  *    request supersedes it).
  *
  * Occurrence of the words alone never grants pause authority; the user always
- * retains `/goal pause`.
+ * retains `/goal:pause`.
  */
 export function corroboratePauseRequest(
 	entries: readonly BranchEntryLike[],
@@ -1493,7 +1493,7 @@ export function formatContinuationMessage(
 				`- Count: ${goal.blockedAudit.turns} of ${BLOCKED_AUDIT_THRESHOLD} consecutive Goal turns.`,
 			]),
 		'- Use "blocked" only at a genuine impasse where no defensible path remains without user input or an external-state change. Never use it because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.',
-		'- A blocked Goal never continues automatically and only the user can resume it (/goal resume, which starts a fresh audit), so never reach for "blocked" to escape a difficult or merely tiring task.',
+		'- A blocked Goal never continues automatically and only the user can resume it (/goal:resume, which starts a fresh audit), so never reach for "blocked" to escape a difficult or merely tiring task.',
 		"",
 		"Conservative stops pi-goal enforces by itself, without asking the model:",
 		`- ${ACTIVITY_FREE_TURN_LIMIT} consecutive activity-free automatic Goal turns, or ${EXECUTION_UNAVAILABLE_TURN_LIMIT} consecutive turns in which commands could not be executed at all, stop the Goal as blocked.`,

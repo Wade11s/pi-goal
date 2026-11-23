@@ -352,7 +352,7 @@ export interface BudgetSettings {
  *
  * Admission is the gate every path that would start *new* Goal work passes
  * through: `/goal <objective>` (creation and replacement), `create_goal`, an
- * objective edit that would steer work into an active Goal, `/goal resume`, and
+ * objective edit that would steer work into an active Goal, `/goal:resume`, and
  * the automatic continuation the settlement seam requests. It is deliberately
  * not part of the durable Goal record: it is a host preference, so it never
  * rewrites a Lifecycle status, never pauses Active elapsed time, and survives
@@ -402,7 +402,7 @@ export function parseAdmissionSettings(settings: unknown): AdmissionSettings {
 /**
  * Extension-level convenience configuration (`goal.resumePrompt`).
  *
- * The prompt is a convenience over the durable `/goal resume` transition, never
+ * The prompt is a convenience over the durable `/goal:resume` transition, never
  * a substitute for it: it asks once at session start whether to run that same
  * user-owned resume, and declining, dismissing, timing out, or having no UI
  * leaves the paused Goal exactly as it was. Off by default, because resuming is
@@ -421,7 +421,7 @@ export interface ResumePromptSettings {
  *
  * The default is `false` and an invalid value also resolves to `false`: the
  * prompt is the one setting here that *offers* a lifecycle decision, so a
- * configuration mistake must fall back to the explicit `/goal resume` path
+ * configuration mistake must fall back to the explicit `/goal:resume` path
  * rather than ask a question the user never opted into. The mistake is reported
  * once, like the budget and admission settings.
  */

@@ -18,10 +18,10 @@
  * queued follow-ups. The model ends the loop by calling update_goal; a
  * complete, paused, cleared, or absent Goal never continues.
  *
- * The full lifecycle is user-controlled. `/goal edit <objective>` changes the
+ * The full lifecycle is user-controlled. `/goal:edit <objective>` changes the
  * objective in place (same identity, same history) and steers an active run;
- * `/goal pause` stops admission of further automatic runs immediately;
- * `/goal resume` restarts eligible work; `/goal clear` writes a durable
+ * `/goal:pause` stops admission of further automatic runs immediately;
+ * `/goal:resume` restarts eligible work; `/goal:clear` writes a durable
  * tombstone and returns the session to ordinary prompt behavior. Replacing an
  * unfinished objective through `/goal <objective>` requires confirmation
  * first. None of these commands wait for an active run to become idle — an
@@ -66,7 +66,7 @@
  * durable without a second Goal record, and it never mutates a Lifecycle status or
  * satisfies the Completion audit (see `./plan.ts`).
  * Every committed transition is also appended to the session branch as a
- * `goal-history` entry and rendered read-only by `/goal history` (see `history.ts`
+ * `goal-history` entry and rendered read-only by `/goal:history` (see `history.ts`
  * and `docs/behavior/history.md`). That timeline is derived diagnostic data, not
  * a second lifecycle source of truth: it is written from the same
  * committed-transition seam as the local event stream and projected from that
@@ -129,7 +129,9 @@ import {
 	classifyGoalBridgeOutcome,
 	committedKindsFor,
 	commandContextForBridge,
+	goalBridgeActionFor,
 	goalBridgeRefusal,
+	goalBridgeUnregisteredCommand,
 	parseGoalCommandBridgeRequest,
 	recordingCommandContext,
 	type GoalBridgeAction,
@@ -137,6 +139,7 @@ import {
 	type GoalBridgeTransition,
 	type GoalCommandBridgeRequest,
 	type GoalCommandBridgeResult,
+	type GoalCommandName,
 } from "./command-bridge.ts";
 import {
 	attachmentStoreRoot,
@@ -209,7 +212,7 @@ const EDIT_TIMEOUT_MS = 120_000;
  * The dialog's default answer is "No", so a user who is away, a host that never
  * answers, and an RPC client that ignores the request all leave the paused Goal
  * exactly as it was. The prompt is a convenience over the explicit, durable
- * `/goal resume` transition, so letting it lapse is always safe.
+ * `/goal:resume` transition, so letting it lapse is always safe.
  */
 const RESUME_PROMPT_TIMEOUT_MS = 120_000;
 
@@ -266,27 +269,26 @@ export interface ParsedGoalArgs {
 }
 
 /**
- * Parsed `/goal resume` request.
+ * Parsed `/goal:resume` request.
  *
  * The budget option is the only way to resume a `budget_limited` Goal, and only
- * the two explicit spellings are recognized. Everything else after `resume`
- * keeps its pre-repair meaning as an objective, so an objective that merely
- * starts with the word "resume" is never swallowed.
+ * the two explicit spellings are recognized. It is also the only argument the
+ * command accepts: a verb command never reads its argument as an Objective.
  */
 export type ResumeBudgetRequest =
 	| { kind: "none" }
 	| { kind: "value"; value: number };
 
 const RESUME_BUDGET_GUIDANCE =
-	"Goal not resumed: use /goal resume --budget <new-total> (or --budget=<new-total>) to raise a " +
-	"budget_limited Goal's cumulative token ceiling.";
+	"Goal not resumed: /goal:resume takes no argument except --budget <new-total> (or --budget=<new-total>), " +
+	"which raises a budget_limited Goal's cumulative token ceiling.";
 
 /**
- * Parse the argument of `/goal resume --budget <new-total>`.
+ * Parse the argument of `/goal:resume --budget <new-total>`.
  *
- * Strict on purpose: exactly one flag, one value, no trailing argument. A
- * malformed request is refused with guidance rather than being read as an
- * objective or silently ignored.
+ * Strict on purpose: exactly one flag, one value, no trailing argument. Anything
+ * else — a missing flag, a stray word, a second flag — is refused with the
+ * command's usage rather than being silently ignored.
  */
 function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string } {
 	const text = raw.trim();
@@ -303,8 +305,8 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 		if (!value) {
 			return {
 				error:
-					"Goal not resumed: /goal resume --budget needs a new total, for example " +
-					"/goal resume --budget 150.",
+					"Goal not resumed: /goal:resume --budget needs a new total, for example " +
+					"/goal:resume --budget 150.",
 			};
 		}
 		valueText = value[1]!;
@@ -315,7 +317,7 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 		return {
 			error:
 				`Goal not resumed: unexpected argument ${JSON.stringify(trailing)} after --budget ${valueText}. ` +
-				"Use /goal resume --budget <new-total>.",
+				"Use /goal:resume --budget <new-total>.",
 		};
 	}
 	const value = Number(valueText);
@@ -323,7 +325,7 @@ function parseResumeBudget(raw: string): ResumeBudgetRequest | { error: string }
 		return {
 			error:
 				`Goal not resumed: ${JSON.stringify(valueText)} is not a number. Use ` +
-				"/goal resume --budget <new-total>.",
+				"/goal:resume --budget <new-total>.",
 		};
 	}
 	return { kind: "value", value };
@@ -442,76 +444,63 @@ function describeError(error: unknown): string {
 }
 
 /** What the /goal command was asked to do. */
-type GoalCommand =
-	| { kind: "status" }
-	| { kind: "history" }
-	| { kind: "create"; objective: string }
-	| { kind: "edit"; objective: string }
-	| { kind: "edit-dialog" }
-	| { kind: "pause" }
-	| { kind: "resume"; budget: ResumeBudgetRequest }
-	| { kind: "clear" }
-	| { kind: "invalid"; message: string };
+type GoalCommand = { kind: "status" } | { kind: "create"; objective: string } | { kind: "invalid"; message: string };
+
+/**
+ * The whole-argument spellings of the verb commands, as a user migrating from
+ * Codex's space-separated subcommands would type them after `/goal`.
+ *
+ * The bare word, matched case-insensitively and after trimming, is the old
+ * `pause` / `resume` / `clear` / `history` / `edit` subcommand; `resume --budget`
+ * (both spellings) is the old budget-raising resume. Each names the verb command
+ * it used to reach, so the refusal can point at it.
+ */
+const RESERVED_GOAL_VERBS = ["pause", "resume", "clear", "history", "edit"] as const;
+
+/**
+ * The reserved-word guard for the `/goal` creation path (ADR-0002).
+ *
+ * An Objective is only ever the argument of `/goal`, so it can never be read as
+ * a lifecycle action — but Codex muscle memory types `/goal pause`, and without
+ * this guard that would silently create a Goal named "pause" and start work on
+ * it. The old spelling is refused, not aliased: the message names the verb
+ * command to type instead, and nothing else happens. The guard is the only
+ * trace of the old syntax in the code.
+ *
+ * It matches the trimmed, lower-cased argument against the bare verb words and
+ * against a leading `resume --budget`, and nothing else: `Clear the lint
+ * errors`, `Edit the README`, `Resume work on X`, and `history of the release`
+ * are Objectives. It applies to the `/goal` command only — `create_goal` has
+ * its own creation authority and no command ambiguity to resolve.
+ */
+function reservedGoalVerbRefusal(args: string): string | null {
+	const word = args.trim().toLowerCase();
+	if ((RESERVED_GOAL_VERBS as readonly string[]).includes(word)) {
+		return `Goal not created: \`${word}\` is a Goal command; use /goal:${word}.`;
+	}
+	if (/^resume\s+--budget(?:=|\s|$)/.test(word)) {
+		return (
+			"Goal not created: `resume --budget` is a Goal command; use /goal:resume --budget <new-total> " +
+			"(or --budget=<new-total>)."
+		);
+	}
+	return null;
+}
 
 /**
  * Parse /goal arguments.
  *
- * `pause`, `resume`, and `clear` are subcommands only when they are the entire
- * argument, so an objective that merely begins with one of them ("clear the
- * lint errors") stays a valid objective. `edit` is a subcommand whenever it is
- * the first word, because its remainder is the new objective; bare `/goal edit`
- * is a usage error rather than an objective literally named "edit".
- *
- * `edit` cannot change attachments: an Objective edit keeps the immutable
- * attachment manifest, and changing attachments requires a Replacement Goal,
- * so an edit whose objective starts with `--file`/`--image`/`--remote-image` is
- * refused with that guidance instead of silently becoming part of the objective.
- *
- * `history` joins `pause` and `clear` as a whole-argument subcommand, for the same
- * reason and with the same trade-off: `/goal history` renders the branch-local
- * timeline, while an objective that merely *starts* with the word ("history of
- * the release") stays an objective. The rendering is read-only — it can never
- * change Goal state — which is what makes it safe to reach from the same command
- * surface that creates Goals.
+ * The parser reduces to two meanings: an empty argument is the status report,
+ * anything else is a creation — after the reserved-word guard has had its say.
+ * Every lifecycle verb is its own command (`/goal:pause`, `/goal:resume`,
+ * `/goal:clear`, `/goal:history`, `/goal:edit`), so no rule about a first word or
+ * an entire argument is needed to tell a verb from an Objective any more.
  */
 function parseGoalCommand(args: string): GoalCommand {
 	const trimmed = args.trim();
 	if (trimmed === "") return { kind: "status" };
-	const spaceIndex = trimmed.search(/\s/);
-	const first = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
-	const remainder = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex).trim();
-	const word = first.toLowerCase();
-	if (remainder === "" && (word === "pause" || word === "clear" || word === "history")) {
-		return { kind: word };
-	}
-	if (word === "resume") {
-		if (remainder === "") return { kind: "resume", budget: { kind: "none" } };
-		if (/^--budget(?:=|\s|$)/.test(remainder)) {
-			const parsed = parseResumeBudget(remainder);
-			if ("error" in parsed) return { kind: "invalid", message: parsed.error };
-			return { kind: "resume", budget: parsed };
-		}
-		// `resume <other>` keeps its pre-repair meaning as an objective.
-		return { kind: "create", objective: trimmed };
-	}
-	if (word === "edit") {
-		if (remainder === "") {
-			// Bare `/goal edit` opens Pi's multi-line editor prefilled with the
-			// current objective. The typed form stays available for headless modes
-			// and for hosts without a dialog-capable UI.
-			return { kind: "edit-dialog" };
-		}
-		if (/^--(file|image|remote-image)(?:=|\s|$)/.test(remainder)) {
-			return {
-				kind: "invalid",
-				message:
-					"Goal not edited: /goal edit changes only the objective and keeps the Goal's immutable attachment " +
-					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
-					"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).",
-			};
-		}
-		return { kind: "edit", objective: remainder };
-	}
+	const reserved = reservedGoalVerbRefusal(trimmed);
+	if (reserved !== null) return { kind: "invalid", message: reserved };
 	return { kind: "create", objective: trimmed };
 }
 
@@ -617,7 +606,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * not be reported as a failed lifecycle transition, and a history append that
 	 * never landed leaves the documented diagnostic gap (a transition with no
 	 * record) instead of a wrong Goal. Nothing reads these entries back except the
-	 * read-only `/goal history` rendering — reconstruction reads `goal-state` alone
+	 * read-only `/goal:history` rendering — reconstruction reads `goal-state` alone
 	 * — so the failure mode is a shorter timeline, never a changed Goal.
 	 */
 	function appendGoalHistory(pi: ExtensionAPI, event: GoalUpdatedEvent, previous: GoalRecord | null): void {
@@ -684,7 +673,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * A run's *follow-up* turns are prepared against the context the run started with
 	 * plus its tool results, never against a Goal that appeared meanwhile, so
 	 * re-admitting the Goal at every `turn_start` would hand an old run whatever Goal
-	 * the user created while it was in flight — `/goal clear` plus
+	 * the user created while it was in flight — `/goal:clear` plus
 	 * `/goal <objective>`, or a replacement — and its `complete`, `blocked`, or
 	 * explicit-`pause` would be accepted against an identity the run never saw. The
 	 * binding is therefore re-admitted only to the identity it already holds; a
@@ -693,7 +682,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * A same-identity revision change is admitted, but not because the model has
 	 * necessarily seen it. An edit or a resume (including a budget raise) of an active
 	 * Goal is delivered or steered into the running work, so the model has seen that
-	 * revision. A user `/goal pause`, an automatic `budget_limited` transition, or an
+	 * revision. A user `/goal:pause`, an automatic `budget_limited` transition, or an
 	 * automatic blocked-threshold transition is not steered, and is safe for a
 	 * different reason: each leaves the Goal in a non-active status, and every
 	 * model-side transition (`complete`, `blocked`, and explicit `pause`) requires an
@@ -872,7 +861,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 *
 	 * Off by default. When on, a restored **paused** Goal may be offered one
 	 * confirmation dialog at session start; accepting runs the same durable user
-	 * resume as `/goal resume` (same identity, history, and a fresh Blocked audit),
+	 * resume as `/goal:resume` (same identity, history, and a fresh Blocked audit),
 	 * while declining, dismissing, timing out, or having no UI leaves the Goal
 	 * exactly as it was.
 	 */
@@ -1083,7 +1072,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			`${prefix} pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted. ` +
 			"Disabling the extension is an admission control, not a Lifecycle status and not a pause: no Goal was " +
 			"created, replaced, edited, resumed, or paused, and no work was started or aborted. Status inspection " +
-			"(/goal, get_goal), /goal pause, /goal clear, and terminal updates from work already in flight still work. " +
+			"(/goal, get_goal), /goal:pause, /goal:clear, and terminal updates from work already in flight still work. " +
 			"Re-enable goal.enabled to admit Goal work again."
 		);
 	}
@@ -1101,7 +1090,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * The clause is status-aware, for the same reason the status report is: a
 	 * complete Goal is terminal for its identity — replacing it is a new
 	 * `/goal <objective>`, not a resume — so promising that re-enabling makes
-	 * `/goal resume` work would be false. A still-active Goal is not resumed either;
+	 * `/goal:resume` work would be false. A still-active Goal is not resumed either;
 	 * the continuation is what admission withholds from it.
 	 */
 	function admissionDisabledUpdateCondition(status: GoalPublicState["status"]): string {
@@ -1114,7 +1103,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				"written."
 			);
 		}
-		const resume = status === "active" ? "" : " and no /goal resume";
+		const resume = status === "active" ? "" : " and no /goal:resume";
 		return (
 			" pi-goal is disabled (goal.enabled is false), so no new Goal work is admitted — no automatic continuation" +
 			`${resume} — until it is re-enabled; this update is a lifecycle write from work already in flight and stands ` +
@@ -1925,7 +1914,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					ctx,
 					`Goal ${current.id} is active, but pi-goal is disabled (goal.enabled is false), so no continuation was ` +
 						"requested at this settlement. The Goal keeps its active status and keeps accruing active time; " +
-						"/goal pause, not disabling the extension, stops that clock. Re-enable goal.enabled to admit Goal work again.",
+						"/goal:pause, not disabling the extension, stops that clock. Re-enable goal.enabled to admit Goal work again.",
 					"warning",
 				);
 			} else if (store.isWrapUpPending()) {
@@ -2051,7 +2040,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (result.ok) {
 			ctx.ui.notify(
 				`Goal ${result.goal.id} stopped and is now blocked (${stop.kind}): ${stop.blocker} ` +
-					"Automatic continuation has stopped; /goal resume restarts it with a fresh blocked audit once the " +
+					"Automatic continuation has stopped; /goal:resume restarts it with a fresh blocked audit once the " +
 					"blocker is resolved.",
 				"warning",
 			);
@@ -2140,7 +2129,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (result.ok) {
 				ctx.ui.notify(
 					`Goal ${result.goal.id} is now usage_limited: the provider reported a usage limit ` +
-						`(${failure.evidence}). Automatic continuation has stopped; /goal resume restarts it once the ` +
+						`(${failure.evidence}). Automatic continuation has stopped; /goal:resume restarts it once the ` +
 						"limit is resolved" +
 						// The stop itself is a lifecycle write and still lands, but the resume it
 						// names is admission: saying it restarts the Goal without qualification
@@ -2185,7 +2174,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				(admission.enabled
 					? "The Goal continues on the next successful run."
 					: "pi-goal is disabled (goal.enabled is false), so no continuation is admitted either: the Goal keeps its " +
-							"active status and keeps accruing active time, and /goal pause, not disabling the extension, stops that " +
+							"active status and keeps accruing active time, and /goal:pause, not disabling the extension, stops that " +
 							"clock. Re-enable goal.enabled to admit Goal work again."),
 			"warning",
 		);
@@ -2329,7 +2318,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					"A Goal is already set for this session (status: " +
 						`${existing.status}); cannot create another one. ` +
 						"Use get_goal to inspect it, or update_goal to complete it. Only the user can replace " +
-						"or clear a Goal, with /goal <objective> or /goal clear.",
+						"or clear a Goal, with /goal <objective> or /goal:clear.",
 					toPublicState(existing),
 				);
 			}
@@ -2417,7 +2406,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			action: Type.String({
 				description:
 					"complete, blocked, or pause. Pause requires user_request quoting the user's exact request; " +
-					"resume and clear are user-owned (/goal resume, /goal clear).",
+					"resume and clear are user-owned (/goal:resume, /goal:clear).",
 			}),
 			blocker: Type.Optional(
 				Type.String({
@@ -2456,7 +2445,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			"Never guess or reuse an old Blocker identity: call get_goal for the current one. The extension never compares blocker text, so wording alone can never advance the blocked audit.",
 			"Completing or blocking a Goal stops its automatic continuation, so never use either to escape a difficult or merely tiring task.",
 			"Call update_goal with action pause only when the user explicitly asked to pause this Goal, and quote their exact words in user_request. Never pause on your own initiative.",
-			"Never call update_goal to resume or clear a Goal; the user owns those transitions, and a budget-raising resume is /goal resume --budget <new-total>.",
+			"Never call update_goal to resume or clear a Goal; the user owns those transitions, and a budget-raising resume is /goal:resume --budget <new-total>.",
 		],
 		/**
 		 * Compatibility shim for the spellings a model reaches for: `{ status: … }`
@@ -2603,7 +2592,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						"update_goal can pause a Goal only after an explicit user request. " +
 							'Pass user_request with the user\'s exact words (for example "please pause the goal") ' +
 							"so the request can be verified against their messages. If the user has not asked, " +
-							"keep working; the user can also pause directly with /goal pause.",
+							"keep working; the user can also pause directly with /goal:pause.",
 						toPublicState(goal),
 					);
 				}
@@ -2623,7 +2612,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 							"update_goal could not verify an explicit pause request: the quote was found, but the " +
 								'user\u2019s message is not an affirmative pause instruction \u2014 it is negated ("do not pause"), ' +
 								'a keep-working or resume instruction, a deferral ("not now"), or a later user message ' +
-								"supersedes the request. If the user does want a pause they can run /goal pause; otherwise keep working.",
+								"supersedes the request. If the user does want a pause they can run /goal:pause; otherwise keep working.",
 							toPublicState(goal),
 						);
 					}
@@ -2631,7 +2620,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						"update_goal could not verify an explicit user request to pause this Goal: no recent " +
 							`user message contains ${JSON.stringify(previewObjective(quote, 200))}. ` +
 							"If the user did ask, repeat the call quoting their exact words in user_request; " +
-							"otherwise keep working. Pausing also stays available to the user as /goal pause.",
+							"otherwise keep working. Pausing also stays available to the user as /goal:pause.",
 						toPublicState(goal),
 					);
 				}
@@ -2653,8 +2642,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 								`Goal ${goal.id} paused at the user's explicit request (verified). ` +
 								"Report the pause and the current progress, then stop Goal work for this turn; " +
 								(admission.enabled
-									? "the user restarts work with /goal resume."
-									: "the user restarts work with /goal resume once pi-goal is re-enabled.") +
+									? "the user restarts work with /goal:resume."
+									: "the user restarts work with /goal:resume once pi-goal is re-enabled.") +
 								admissionDisabledUpdateCondition(state.status),
 						},
 					],
@@ -2665,7 +2654,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return goalToolError(
 				"update_goal supports only action complete, action blocked with a plain-language blocker, " +
 					"and action pause after an explicit user request (quote it in user_request). " +
-					"Resuming and clearing stay with the user (/goal resume, /goal clear).",
+					"Resuming and clearing stay with the user (/goal:resume, /goal:clear).",
 				toPublicState(goal),
 			);
 		},
@@ -2744,7 +2733,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(
 				`Goal ${result.goal.id} is now blocked: ${validation.blocker} ` +
 					`(the same blocker for ${result.turns} consecutive Goal turns). Automatic continuation has stopped; ` +
-					"resolving the blocker and running /goal resume is a user decision, and the resume starts a fresh audit.",
+					"resolving the blocker and running /goal:resume is a user decision, and the resume starts a fresh audit.",
 				"warning",
 			);
 			updateStatus(ctx);
@@ -2755,7 +2744,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						text:
 							`Goal ${result.goal.id} is blocked after the same blocker persisted for ${result.turns} ` +
 							"consecutive Goal turns. Automatic continuation has stopped. Report to the user what is " +
-							"blocking the work and what would unblock it; /goal resume restarts it with a fresh blocked audit" +
+							"blocking the work and what would unblock it; /goal:resume restarts it with a fresh blocked audit" +
 							(admission.enabled ? "." : " once pi-goal is re-enabled.") +
 							admissionDisabledUpdateCondition(state.status),
 					},
@@ -2786,99 +2775,229 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * The `/goal` command, in one place.
+	 * The `/goal` command: inspect when bare, create with an Objective.
 	 *
-	 * Both the registered user command and the in-process command bridge call this
-	 * function with the same argument text, so a bridged command *is* the command the
-	 * user sees: the same parsing, the same replacement confirmation dialog, the same
-	 * `goal.enabled` gate, the same Token-budget validation, and the same
-	 * durable-before-announced ordering. Nothing downstream can tell the difference,
-	 * which is the point — a second entry point that re-used the lifecycle helpers
-	 * instead would be a second lifecycle path.
+	 * Both the registered user command and the in-process command bridge reach it
+	 * through {@link runGoalCommand} with the same argument text, so a bridged
+	 * command *is* the command the user sees: the same parsing, the same
+	 * replacement confirmation dialog, the same `goal.enabled` gate, the same
+	 * Token-budget validation, and the same durable-before-announced ordering.
+	 * Nothing downstream can tell the difference, which is the point — a second
+	 * entry point that re-used the lifecycle helpers instead would be a second
+	 * lifecycle path.
 	 */
 	async function handleGoalCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-		try {
-			const command = parseGoalCommand(args);
-			// A direct Goal lifecycle operation is a user decision that supersedes
-			// any model-held creation authority. A bare status read is not a
-			// lifecycle operation and leaves the authority alone, and neither is
-			// the read-only history rendering: both only report durable state.
-			if (command.kind !== "status" && command.kind !== "history" && command.kind !== "invalid") {
+		const command = parseGoalCommand(args);
+		switch (command.kind) {
+			case "status":
+				// A bare status read is not a lifecycle operation and leaves any
+				// model-held creation authority alone.
+				await reportStatus(ctx);
+				return;
+			case "invalid":
+				// The reserved-word guard: nothing was asked of the Goal, so nothing
+				// is cleared either — the message only names the command to type.
+				ctx.ui.notify(command.message, "error");
+				return;
+			case "create":
+				// A creation is a user decision that supersedes any model-held
+				// creation authority, before anything about the creation is validated.
 				clearCreationAuthority();
-			}
-			switch (command.kind) {
-				case "status":
-					await reportStatus(ctx);
-					return;
-				case "history":
-					reportHistory(ctx);
-					return;
-				case "create":
-					await createOrReplaceGoal(command.objective, ctx);
-					return;
-				case "edit":
-					editGoal(command.objective, ctx);
-					return;
-				case "edit-dialog":
-					await editGoalInteractively(ctx);
-					return;
-				case "pause":
-					pauseGoal(ctx);
-					return;
-				case "resume":
-					resumeGoal(ctx, command.budget);
-					return;
-				case "clear":
-					clearGoal(ctx);
-					return;
-				case "invalid":
-					ctx.ui.notify(command.message, "error");
-					return;
-			}
+				await createOrReplaceGoal(command.objective, ctx);
+				return;
+		}
+	}
+
+	/**
+	 * Refuse a stray argument on a verb command that takes none.
+	 *
+	 * `/goal:pause foo` must not half-apply a lifecycle action: the extra text is
+	 * neither an Objective nor an option, so the verb reports its usage and touches
+	 * no Goal — no snapshot, no transition, no history record. An Objective belongs
+	 * after `/goal`, and the verb commands are how the lifecycle is reached.
+	 */
+	function refuseVerbArgument(
+		ctx: ExtensionCommandContext,
+		name: "goal:pause" | "goal:clear" | "goal:history",
+		args: string,
+	): boolean {
+		if (args.trim() === "") return false;
+		ctx.ui.notify(`/${name} takes no argument.`, "error");
+		return true;
+	}
+
+	async function handleGoalPauseCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		if (refuseVerbArgument(ctx, "goal:pause", args)) return;
+		// A pause is a user decision that supersedes any model-held creation authority.
+		clearCreationAuthority();
+		pauseGoal(ctx);
+	}
+
+	/**
+	 * `/goal:resume [--budget <new-total> | --budget=<new-total>]`.
+	 *
+	 * The budget option is parsed exactly as it always was — both spellings, the
+	 * positive-headroom and maximum rules, and the refusal texts live in
+	 * {@link parseResumeBudget} and {@link resumeGoal} — and it is the only argument
+	 * the command accepts. Anything else is the command's usage, reported the same
+	 * way, with the Goal untouched.
+	 */
+	async function handleGoalResumeCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		const trimmed = args.trim();
+		const budget: ResumeBudgetRequest | { error: string } = trimmed === "" ? { kind: "none" } : parseResumeBudget(trimmed);
+		if ("error" in budget) {
+			ctx.ui.notify(budget.error, "error");
+			return;
+		}
+		clearCreationAuthority();
+		resumeGoal(ctx, budget);
+	}
+
+	async function handleGoalClearCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		if (refuseVerbArgument(ctx, "goal:clear", args)) return;
+		clearCreationAuthority();
+		clearGoal(ctx);
+	}
+
+	/** `/goal:history` is read-only: it renders durable state and clears no authority. */
+	async function handleGoalHistoryCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		if (refuseVerbArgument(ctx, "goal:history", args)) return;
+		reportHistory(ctx);
+	}
+
+	/**
+	 * `/goal:edit`: the typed edit with an argument, the prefilled editor without.
+	 *
+	 * An edit cannot change attachments: an Objective edit keeps the immutable
+	 * attachment manifest, and changing attachments requires a Replacement Goal,
+	 * so an edit whose argument starts with `--file`/`--image`/`--remote-image` is
+	 * refused with that guidance instead of silently becoming part of the objective.
+	 */
+	async function handleGoalEditCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		const trimmed = args.trim();
+		if (/^--(file|image|remote-image)(?:=|\s|$)/.test(trimmed)) {
+			ctx.ui.notify(
+				"Goal not edited: /goal:edit changes only the objective and keeps the Goal's immutable attachment " +
+					"manifest. Changing attachments requires a Replacement Goal: /goal --file <path> --image <path> " +
+					"--remote-image <https URL> ... <objective> (with replacement confirmation when the current Goal is unfinished).",
+				"error",
+			);
+			return;
+		}
+		// An edit is a user decision that supersedes any model-held creation authority.
+		clearCreationAuthority();
+		if (trimmed === "") {
+			// Bare `/goal:edit` opens Pi's multi-line editor prefilled with the
+			// current objective. The typed form stays available for headless modes
+			// and for hosts without a dialog-capable UI.
+			await editGoalInteractively(ctx);
+			return;
+		}
+		editGoal(trimmed, ctx);
+	}
+
+	/** Every command of the Goal command family, by the name Pi dispatches it under. */
+	const goalCommandHandlers: Record<GoalCommandName, (args: string, ctx: ExtensionCommandContext) => Promise<void>> = {
+		goal: handleGoalCommand,
+		"goal:pause": handleGoalPauseCommand,
+		"goal:resume": handleGoalResumeCommand,
+		"goal:clear": handleGoalClearCommand,
+		"goal:history": handleGoalHistoryCommand,
+		"goal:edit": handleGoalEditCommand,
+	};
+
+	/**
+	 * Run one command of the Goal command family by name.
+	 *
+	 * The registered handlers and the in-process command bridge share this door,
+	 * so there is exactly one way a Goal command runs and the bridge cannot drift
+	 * from what the user types. A throw never escapes into Pi or the event bus: it
+	 * is reported through the same notification channel the handler uses, which a
+	 * bridged command's recording context captures as a diagnostic.
+	 */
+	async function runGoalCommand(name: GoalCommandName, args: string, ctx: ExtensionCommandContext): Promise<void> {
+		try {
+			await goalCommandHandlers[name](args, ctx);
 		} catch (error) {
 			ctx.ui.notify(`pi-goal error: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 	}
 
-	pi.registerCommand("goal", {
-		description:
-			"Create (/goal <objective>), inspect (bare /goal), read the Goal history (/goal history), edit " +
-			"(/goal edit <objective>), pause, resume (/goal resume, or /goal resume --budget <new-total> for a " +
-			"budget_limited Goal), or clear the session Goal",
-		handler: handleGoalCommand,
-	});
+	/** The leading creation options `/goal ` completes, in the order the parser reads them. */
+	const GOAL_CREATION_FLAGS = ["--budget", "--no-budget", "--file", "--image", "--remote-image"] as const;
 
 	/**
-	 * The command family a parsed `/goal` command belongs to, for the bridge's
-	 * transition filter. `edit-dialog` is the interactive spelling of an objective
-	 * edit: over the bridge it opens the same editor and commits the same
-	 * `objective-edited` transition. `history` is another read-only rendering, so it
-	 * belongs to the same family as the bare status report: nothing to commit, and
-	 * the answer is the state the branch already holds.
+	 * Prefix-filtered argument completions for a Goal command.
+	 *
+	 * Pi calls this with the text typed after the command name and falls back to
+	 * its own default behavior (file-path completion) when nothing matches, so no
+	 * match is an empty list rather than a guess. Only the two commands with a
+	 * fixed vocabulary complete: `/goal ` offers the creation options and
+	 * `/goal:resume ` offers `--budget`; an Objective is free text and completes
+	 * nothing.
 	 */
-	function bridgeActionFor(command: GoalCommand): GoalBridgeAction {
-		switch (command.kind) {
-			case "status":
-			case "history":
-				return "status";
-			case "create":
-				return "create";
-			case "edit":
-			case "edit-dialog":
-				return "edit";
-			case "pause":
-				return "pause";
-			case "resume":
-				return "resume";
-			case "clear":
-				return "clear";
-			case "invalid":
-				return "invalid";
-		}
+	function completeGoalFlags(flags: readonly string[], prefix: string): { value: string; label: string }[] {
+		return flags.filter((flag) => flag.startsWith(prefix)).map((flag) => ({ value: flag, label: flag }));
 	}
 
 	/**
-	 * Answer one bridge request by running the same `/goal` command the user would.
+	 * Register the Goal command family.
+	 *
+	 * Six commands sharing the `goal` namespace, after Pi's own `/skill:name`
+	 * convention: `/goal` keeps its two meanings (create with an Objective, inspect
+	 * without one) and each verb is its own `/` menu line with its own description,
+	 * so the menu itself teaches the lifecycle and an Objective is only ever the
+	 * argument of `/goal`. Pi dispatches on the text before the first space, so
+	 * nothing here needs a subcommand parser. There is no `/goal:status` and no
+	 * `/goal:create`: bare `/goal` already is the status report and `/goal
+	 * <objective>` already is the creation.
+	 */
+	pi.registerCommand("goal", {
+		description: "Create (/goal <objective>) or inspect (bare /goal) the session Goal",
+		getArgumentCompletions: (prefix) => completeGoalFlags(GOAL_CREATION_FLAGS, prefix),
+		handler: handleGoalCommand,
+	});
+	pi.registerCommand("goal:pause", {
+		description: "Pause the session Goal: no further automatic Goal runs start, and work in flight finishes",
+		handler: handleGoalPauseCommand,
+	});
+	pi.registerCommand("goal:resume", {
+		description:
+			"Restart a paused, blocked, usage_limited, or budget_limited Goal (--budget <new-total> raises a " +
+			"budget_limited Goal's ceiling)",
+		getArgumentCompletions: (prefix) => completeGoalFlags(["--budget"], prefix),
+		handler: handleGoalResumeCommand,
+	});
+	pi.registerCommand("goal:clear", {
+		description: "Clear the session Goal with a durable tombstone and return to ordinary prompt behavior",
+		handler: handleGoalClearCommand,
+	});
+	pi.registerCommand("goal:history", {
+		description: "Render the session's read-only Goal audit history",
+		handler: handleGoalHistoryCommand,
+	});
+	pi.registerCommand("goal:edit", {
+		description:
+			"Edit the session Goal's objective in place: /goal:edit <objective>, or bare /goal:edit for the editor",
+		handler: handleGoalEditCommand,
+	});
+
+	/**
+	 * Whether Pi still lists `/name` among the commands it can dispatch.
+	 *
+	 * A request's `name` is validated against the family before anything runs, and
+	 * every member is registered when the extension loads, so this is the belt to
+	 * that brace: a name that is valid for the protocol but is not a registered
+	 * command at dispatch time is answered `invalid` instead of run, because the
+	 * command the user could type and the command the bridge would run would then
+	 * be two different things. Pi's own command list is the registry of truth.
+	 */
+	function isGoalCommandRegistered(name: GoalCommandName): boolean {
+		return pi.getCommands().some((command) => command.name === name);
+	}
+
+	/**
+	 * Answer one bridge request by running the same Goal command the user would.
 	 *
 	 * The result is built from three facts and no guesses: the durable transitions
 	 * the store announced during the command, the diagnostics the command reported
@@ -2902,9 +3021,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			reply(
 				goalBridgeRefusal({
 					id: request.id,
-					command: request.command,
+					name: request.name,
+					args: request.args,
 					message:
-						"Goal command not run: pi-goal has not started a session yet, so the /goal command surface is not " +
+						"Goal command not run: pi-goal has not started a session yet, so the Goal command surface is not " +
 						"available. Retry once the session has loaded.",
 					goal: publicState,
 					admissionEnabled: admission.enabled,
@@ -2916,9 +3036,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			reply(
 				goalBridgeRefusal({
 					id: request.id,
-					command: request.command,
+					name: request.name,
+					args: request.args,
 					message:
-						"Goal command not run: another bridged /goal command is still running (it may be waiting for a " +
+						"Goal command not run: another bridged Goal command is still running (it may be waiting for a " +
 						"confirmation dialog). Retry after it finishes.",
 					goal: publicState,
 					admissionEnabled: admission.enabled,
@@ -2926,17 +3047,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			);
 			return;
 		}
-
-		const command = parseGoalCommand(request.command);
-		const action = bridgeActionFor(command);
+		if (!isGoalCommandRegistered(request.name)) {
+			reply(goalBridgeUnregisteredCommand(request, publicState, admission.enabled));
+			return;
+		}
+		const action = goalBridgeActionFor(request.name, request.args);
 		const recorded: GoalBridgeTransition[] = [];
 		const diagnostics: GoalBridgeDiagnostic[] = [];
 		bridgeInFlight = true;
 		bridgeTransitions = recorded;
 		try {
-			await handleGoalCommand(request.command, recordingCommandContext(commandContextForBridge(ctx), diagnostics));
+			await runGoalCommand(request.name, request.args, recordingCommandContext(commandContextForBridge(ctx), diagnostics));
 		} catch (error) {
-			// The command handler reports its own failures as notifications; this is the
+			// The command runner reports its own failures as notifications; this is the
 			// last-resort mirror for a throw outside them, and it is a refusal, never a
 			// success.
 			diagnostics.push({ level: "error", text: `pi-goal error: ${describeError(error)}` });
@@ -2962,7 +3085,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const result: GoalCommandBridgeResult = {
 			version: GOAL_COMMAND_BRIDGE_VERSION,
 			id: request.id,
-			command: request.command,
+			name: request.name,
+			args: request.args,
 			ok: outcome.ok,
 			disposition: outcome.disposition,
 			action,
@@ -3000,7 +3124,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				reply(
 					goalBridgeRefusal({
 						id: request.id,
-						command: request.command,
+						name: request.name,
+						args: request.args,
 						message: `pi-goal error: ${describeError(error)}`,
 						goal: goal ? toPublicState(goal) : null,
 						admissionEnabled: admission.enabled,
@@ -3243,7 +3368,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (goal.status === "paused") {
-			ctx.ui.notify(`Goal ${goal.id} is already paused. Use /goal resume to restart work.`, "info");
+			ctx.ui.notify(`Goal ${goal.id} is already paused. Use /goal:resume to restart work.`, "info");
 			return;
 		}
 		if (goal.status !== "active") {
@@ -3264,7 +3389,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// stops admission of further automatic runs, it never aborts work.
 		ctx.ui.notify(
 			`Goal ${goal.id} paused (revision ${paused.goal!.revision}). No further automatic Goal runs will start; ` +
-				"work already in flight finishes safely. Use /goal resume to restart, /goal clear to remove the Goal.",
+				"work already in flight finishes safely. Use /goal:resume to restart, /goal:clear to remove the Goal.",
 			"info",
 		);
 	}
@@ -3276,7 +3401,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * and every answer other than an explicit "yes" leaves the Goal untouched:
 	 * declining, dismissing, timing out, an unavailable UI, and a Goal that moved
 	 * while the dialog was open all change nothing. Acceptance is delegated to
-	 * {@link resumeGoal}, so it is literally `/goal resume`: the durable
+	 * {@link resumeGoal}, so it is literally `/goal:resume`: the durable
 	 * `markResumed` transition, the same identity and history, and a fresh Blocked
 	 * audit. That is also why the prompt is never offered for any other status —
 	 * `blocked` and `usage_limited` recovery is a user decision with its own
@@ -3301,7 +3426,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				ctx,
 				`Goal ${goal.id} restored (paused). The resume prompt is enabled, but pi-goal is disabled (goal.enabled is ` +
 					"false), so no resume was offered and nothing was resumed: the Goal stays paused and no new Goal work is " +
-					"admitted. Re-enable goal.enabled and run /goal resume to restart it, or leave it paused.",
+					"admitted. Re-enable goal.enabled and run /goal:resume to restart it, or leave it paused.",
 				"warning",
 			);
 			return;
@@ -3310,7 +3435,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notify(
 				ctx,
 				`Goal ${goal.id} restored (paused). The resume prompt is enabled, but this Pi mode has no interactive UI to ` +
-					"ask it, so nothing was asked and the Goal stays paused. Use /goal resume to restart it.",
+					"ask it, so nothing was asked and the Goal stays paused. Use /goal:resume to restart it.",
 				"info",
 			);
 			return;
@@ -3337,14 +3462,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				"Resume the paused Goal?",
 				`Goal ${goal.id} is paused: "${previewObjective(goal.objective)}". Resuming restarts work with the same ` +
 					"identity, history, and retained progress and starts a fresh blocked audit — the same durable transition " +
-					"as /goal resume. Declining, dismissing, or not answering leaves the Goal paused and changes nothing.",
+					"as /goal:resume. Declining, dismissing, or not answering leaves the Goal paused and changes nothing.",
 				{ timeout: dialogTimeoutMs(RESUME_PROMPT_TIMEOUT_MS) },
 			);
 		} catch (error) {
 			notify(
 				ctx,
 				`Goal ${goal.id} stays paused: the resume prompt could not be displayed (${describeError(error)}). ` +
-					"Use /goal resume to restart it.",
+					"Use /goal:resume to restart it.",
 				"warning",
 			);
 			return;
@@ -3355,7 +3480,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				ctx,
 				`Resume prompt closed without resuming: the Goal changed while the prompt was open` +
 					(current ? ` (now ${current.status}, revision ${current.revision})` : " (no Goal is set anymore)") +
-					", so the prompt no longer described the current state. The current Goal state stands; use /goal resume " +
+					", so the prompt no longer described the current state. The current Goal state stands; use /goal:resume " +
 					"to restart the Goal you want.",
 				"warning",
 			);
@@ -3368,7 +3493,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			notify(
 				ctx,
 				`Resume prompt not confirmed (declined, dismissed, or timed out): Goal ${current.id} stays paused and ` +
-					"nothing changed. Use /goal resume to restart it.",
+					"nothing changed. Use /goal:resume to restart it.",
 				"info",
 			);
 			return;
@@ -3404,7 +3529,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (budget.kind === "value" && goal.status !== "budget_limited") {
 			ctx.ui.notify(
 				`Goal ${goal.id} is ${goal.status}; the --budget option only resumes a budget_limited Goal. ` +
-					"Use /goal resume without --budget.",
+					"Use /goal:resume without --budget.",
 				"warning",
 			);
 			return;
@@ -3413,7 +3538,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(
 				`Goal ${goal.id} is budget_limited at ${store.getUsage().totalTokens} tokens of its ` +
 					`${goal.tokenBudget}-token budget. Resume it with a higher cumulative total: ` +
-					"/goal resume --budget <new-total>.",
+					"/goal:resume --budget <new-total>.",
 				"warning",
 			);
 			return;
@@ -3438,7 +3563,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// authenticate them *before* the durable resume transition. If the load
 		// fails, the Goal stays paused with an actionable integrity error instead of
 		// becoming active and then failing to start work (which would make the
-		// suggested `/goal resume` a no-op).
+		// suggested `/goal:resume` a no-op).
 		let contents: AttachmentContent[] = [];
 		if (goal.attachments?.length) {
 			const loaded = loadGoalAttachments(goal, ctx);
@@ -3528,7 +3653,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	/**
 	 * Interactive objective editing.
 	 *
-	 * Bare `/goal edit` opens Pi's multi-line editor prefilled with the current
+	 * Bare `/goal:edit` opens Pi's multi-line editor prefilled with the current
 	 * objective. The dialog is only opened when a dialog-capable UI exists
 	 * (`ctx.hasUI` is true in TUI and RPC modes); in print/JSON mode there is no
 	 * terminal-only dialog to open, so the command explains the typed form instead
@@ -3554,7 +3679,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) {
 			ctx.ui.notify(
 				"Interactive objective editing needs a UI, which this Pi mode does not have. " +
-					"Use /goal edit <new objective> to type the new objective instead.",
+					"Use /goal:edit <new objective> to type the new objective instead.",
 				"warning",
 			);
 			return;
@@ -3626,9 +3751,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// started because admission is off rather than because the Goal moved.
 		const restart = admission.enabled
 			? updated.status === "budget_limited"
-				? "/goal resume --budget <new-total> restarts work with a higher cumulative ceiling."
-				: "/goal resume restarts work."
-			: "pi-goal is disabled (goal.enabled is false), so no work was started and /goal resume stays refused " +
+				? "/goal:resume --budget <new-total> restarts work with a higher cumulative ceiling."
+				: "/goal:resume restarts work."
+			: "pi-goal is disabled (goal.enabled is false), so no work was started and /goal:resume stays refused " +
 					"until it is re-enabled.";
 		ctx.ui.notify(
 			`Goal ${updated.id} objective updated (revision ${updated.revision}). The Goal stays ${updated.status}; ${restart}`,
@@ -3646,7 +3771,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) {
 			ctx.ui.notify(
 				"Replacing the current Goal needs a confirmation this Pi mode cannot display (no UI), " +
-					"so the current Goal was kept. Use /goal clear followed by /goal <objective> instead.",
+					"so the current Goal was kept. Use /goal:clear followed by /goal <objective> instead.",
 				"warning",
 			);
 			return false;
@@ -3730,7 +3855,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				if (!confirmed) {
 					ctx.ui.notify(
 						`Replacement cancelled: the current ${existing.status} Goal was kept. ` +
-							"Use /goal edit <objective> to change the objective without replacing the Goal.",
+							"Use /goal:edit <objective> to change the objective without replacing the Goal.",
 						"info",
 					);
 					return;
@@ -3793,7 +3918,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					attachmentContents = materialized.contents;
 				}
 				// The remote fetch is a real network await, and the create lock
-				// excludes only other create/replace commands: a /goal clear, an
+				// excludes only other create/replace commands: a /goal:clear, an
 				// edit, a lifecycle command, or a create_goal tool call can run
 				// while DNS and the body read are pending. Revalidate the exact
 				// record this command captured — null included, for a fresh
@@ -3834,7 +3959,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					throw new Error("could not freeze the replaced Goal's admitted work");
 				}
 				// Stage and commit before any wait: the new record is what a
-				// concurrent /goal clear, edit, pause, or resume acts on, and
+				// concurrent /goal:clear, edit, pause, or resume acts on, and
 				// revalidating it after the wait detects exactly that change.
 				store.stage(pi, goal);
 				store.commit(goal);
@@ -3997,7 +4122,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * Read-only by construction: the handler reads the selected branch's history
 	 * entries and notifies a formatted timeline. There is no mutation here and no
 	 * mutation anywhere else that takes a history record as input — the timeline is
-	 * derived diagnostic data whose only purpose is to be read, so `/goal history`
+	 * derived diagnostic data whose only purpose is to be read, so `/goal:history`
 	 * can never become a second interface for changing Goal state.
 	 *
 	 * A branch with no history renders an explicit "no history" line rather than

@@ -1,15 +1,18 @@
 /**
  * Issue #56: the in-process Goal command bridge — the seam the optional
- * Codex-shaped companion adapter is built on.
+ * Codex-shaped companion adapter is built on. Issue #79 moved it to version 2:
+ * a request carries Pi's own dispatch shape (a Goal command family command name
+ * plus its argument text) instead of a string the bridge had to parse.
  *
  * These tests drive the real extension with a fake Pi API, the same way
  * `goal8-headless.test.mjs` does, so the narrow cases a real-Pi RPC test cannot
  * reach deterministically are covered here: the outcome classifier's whole
- * truth table, request validation, the busy and no-session guards, and — the
- * one that matters most — a creation that *committed in memory and then failed
- * its on-disk durability poll*. That creation is announced on the event stream
- * (the store's commit is the event bar) but retracted before any success is
- * reported, and the bridge must answer `refused`, never `committed`.
+ * truth table, strict request validation, the busy and no-session guards, a
+ * name that is valid for the protocol but not registered at dispatch time, and —
+ * the one that matters most — a creation that *committed in memory and then
+ * failed its on-disk durability poll*. That creation is announced on the event
+ * stream (the store's commit is the event bar) but retracted before any success
+ * is reported, and the bridge must answer `refused`, never `committed`.
  *
  * Everything observable end to end — the companion's public protocol, replacement
  * confirmation, creation authority, disabled admission, invalid budgets, and
@@ -27,9 +30,11 @@ import goalExtension from "../src/index.ts";
 import {
 	GOAL_COMMAND_BRIDGE,
 	GOAL_COMMAND_BRIDGE_VERSION,
+	GOAL_COMMAND_NAMES,
 	classifyGoalBridgeOutcome,
 	commandContextForBridge,
 	committedKindsFor,
+	goalBridgeActionFor,
 	parseGoalCommandBridgeRequest,
 } from "../src/command-bridge.ts";
 import companionManifest from "../companion/goal-rpc/package.json" with { type: "json" };
@@ -46,13 +51,14 @@ const COMPANION_DIR = join(REPO_ROOT, "companion", "goal-rpc");
 const PI_BINARY = process.env.PI_BINARY ?? "pi";
 
 /** A bridge answer: the request's own reply callback, resolved once. */
-function bridge(pi, command, { id = "bridge-1", version = GOAL_COMMAND_BRIDGE_VERSION, timeoutMs = 15_000 } = {}) {
+function bridge(pi, name, args, { id = "bridge-1", version = GOAL_COMMAND_BRIDGE_VERSION, timeoutMs = 15_000 } = {}) {
 	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => reject(new Error(`no bridge answer for ${JSON.stringify(command)}`)), timeoutMs);
+		const timer = setTimeout(() => reject(new Error(`no bridge answer for /${name} ${JSON.stringify(args)}`)), timeoutMs);
 		pi.events.emit(GOAL_COMMAND_BRIDGE, {
 			version,
 			id,
-			command,
+			name,
+			args,
 			reply: (result) => {
 				clearTimeout(timer);
 				resolve(result);
@@ -62,7 +68,9 @@ function bridge(pi, command, { id = "bridge-1", version = GOAL_COMMAND_BRIDGE_VE
 }
 
 /**
- * A fake Pi whose `appendEntry` writes the durable entries to a real session file.
+ * A fake Pi whose `appendEntry` writes the durable entries to a real session file
+ * and whose `getCommands` lists what was registered, like Pi's own command
+ * registry does.
  *
  * `append` selects what happens to a `goal-state` append: `write` (the real
  * behavior), `drop` (the append silently does nothing, so the store commits in
@@ -88,6 +96,14 @@ function fakePi(sessionFile, options = {}) {
 		},
 		registerCommand(name, definition) {
 			commands.set(name, definition);
+		},
+		getCommands() {
+			return [...commands].map(([name, definition]) => ({
+				name,
+				description: definition.description,
+				source: "extension",
+				sourceInfo: { path: REPO_ROOT, source: "pi-goal", scope: "user", origin: "package" },
+			}));
 		},
 		registerShortcut() {},
 		registerFlag() {},
@@ -128,7 +144,7 @@ function fakePi(sessionFile, options = {}) {
 	return { pi, handlers, busHandlers, tools, commands };
 }
 
-/** A command context with just enough surface for the `/goal` handlers. */
+/** A command context with just enough surface for the Goal command handlers. */
 function fakeCtx({ sessionFile, confirm } = {}) {
 	const notifications = [];
 	const ctx = {
@@ -148,7 +164,13 @@ function fakeCtx({ sessionFile, confirm } = {}) {
 		hasPendingMessages: () => false,
 		sessionManager: {
 			getSessionFile: () => sessionFile,
-			getBranch: () => [],
+			// Pi's branch is the session file's entries, and the history rendering
+			// reads `goal-history` entries from it, so the fake mirrors the file.
+			getBranch: () =>
+				readFileSync(sessionFile, "utf8")
+					.split("\n")
+					.filter((line) => line.trim() !== "")
+					.map((line) => JSON.parse(line)),
 			getCwd: () => "/tmp",
 		},
 	};
@@ -213,22 +235,25 @@ test("the outcome classifier never claims success it cannot prove", () => {
 		{ ok: false, disposition: "refused" },
 	);
 
-	// A read-only status query reports; it has nothing to commit and needs no proof.
-	assert.deepEqual(classifyGoalBridgeOutcome({ action: "status", transitions: [], diagnostics: [], committed: false }), {
-		ok: true,
-		disposition: "reported",
-	});
-	// ... but a status read that reported a problem did not answer, and saying
-	// "reported" would be a success claim without a commit behind it.
-	assert.deepEqual(
-		classifyGoalBridgeOutcome({
-			action: "status",
-			transitions: [],
-			diagnostics: [{ level: "error", text: "pi-goal error: the session file could not be read" }],
-			committed: false,
-		}),
-		{ ok: false, disposition: "refused" },
-	);
+	// A read-only query reports; it has nothing to commit and needs no proof. The
+	// history rendering is a read exactly like the status report.
+	for (const action of ["status", "history"]) {
+		assert.deepEqual(classifyGoalBridgeOutcome({ action, transitions: [], diagnostics: [], committed: false }), {
+			ok: true,
+			disposition: "reported",
+		});
+		// ... but a read that reported a problem did not answer, and saying
+		// "reported" would be a success claim without a commit behind it.
+		assert.deepEqual(
+			classifyGoalBridgeOutcome({
+				action,
+				transitions: [],
+				diagnostics: [{ level: "error", text: "pi-goal error: the session file could not be read" }],
+				committed: false,
+			}),
+			{ ok: false, disposition: "refused" },
+		);
+	}
 
 	assert.deepEqual(classifyGoalBridgeOutcome({ action: "invalid", transitions: [], diagnostics: [], committed: false }), {
 		ok: false,
@@ -265,6 +290,7 @@ test("the outcome classifier never claims success it cannot prove", () => {
 
 test("each action accepts only the transitions that can answer it", () => {
 	assert.deepEqual(committedKindsFor("status"), []);
+	assert.deepEqual(committedKindsFor("history"), []);
 	assert.deepEqual(committedKindsFor("invalid"), []);
 	assert.deepEqual(committedKindsFor("create"), ["created", "replaced"]);
 	assert.deepEqual(committedKindsFor("edit"), ["objective-edited"]);
@@ -276,34 +302,84 @@ test("each action accepts only the transitions that can answer it", () => {
 	assert.equal(committedKindsFor("create").includes("completed"), false);
 });
 
+test("the action is the command name, and only /goal looks at its argument", () => {
+	assert.equal(goalBridgeActionFor("goal", ""), "status");
+	assert.equal(goalBridgeActionFor("goal", "   "), "status");
+	assert.equal(goalBridgeActionFor("goal", OBJECTIVE), "create");
+	// The old space-separated spelling is still a create as far as the bridge is
+	// concerned: the creation path refuses it, and that refusal is the create
+	// action's answer (`refused`), never `invalid`.
+	assert.equal(goalBridgeActionFor("goal", "pause"), "create");
+	assert.equal(goalBridgeActionFor("goal", "--budget 5000 --file spec.md Ship it"), "create");
+	assert.equal(goalBridgeActionFor("goal:pause", ""), "pause");
+	assert.equal(goalBridgeActionFor("goal:pause", "foo"), "pause");
+	assert.equal(goalBridgeActionFor("goal:resume", "--budget 150"), "resume");
+	assert.equal(goalBridgeActionFor("goal:clear", ""), "clear");
+	assert.equal(goalBridgeActionFor("goal:history", ""), "history");
+	assert.equal(goalBridgeActionFor("goal:edit", ""), "edit");
+	assert.equal(goalBridgeActionFor("goal:edit", "New objective"), "edit");
+});
+
 test("a malformed bridge request is dropped instead of half-executed", () => {
 	const reply = () => {};
-	const ok = (payload) => parseGoalCommandBridgeRequest(payload);
+	const parse = (payload) => parseGoalCommandBridgeRequest(payload);
 
-	for (const payload of [
+	const refused = [
 		null,
 		"not-an-object",
 		42,
-		{ version: 2, id: "x", command: "", reply },
-		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "", command: "", reply },
-		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", command: 5, reply },
-		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", command: "" },
-		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", command: "x".repeat(100_001), reply },
-	]) {
-		const parsed = ok(payload);
+		// The version-1 shape (a `command` string) is a mismatch, answered with the
+		// upgrade message rather than guessed at.
+		{ version: 1, id: "x", command: "clear", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION + 1, id: "x", name: "goal", args: "", reply },
+		{ id: "x", name: "goal", args: "", reply },
+		// id
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "", name: "goal", args: "", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: 7, name: "goal", args: "", reply },
+		// name: missing, wrong type, or outside the Goal command family
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", args: "", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: 5, args: "", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal:status", args: "", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal:create", args: "", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goals", args: "", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "", args: "", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", command: "clear", reply },
+		// args: missing or not a string
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal", reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal", args: 5, reply },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal", args: null, reply },
+		// reply
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal", args: "" },
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal", args: "", reply: "not a function" },
+		// The length bound applies to the argument text.
+		{ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal", args: "x".repeat(100_001), reply },
+	];
+	for (const payload of refused) {
+		const parsed = parse(payload);
 		assert.equal(parsed.ok, false, `${JSON.stringify(payload)} must be refused`);
 		assert.ok(parsed.message.length > 0);
 	}
+	assert.match(parse({ version: 1, id: "x", command: "clear", reply }).message, /Upgrade the companion or pi-goal/);
+	assert.match(parse({ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal:status", args: "", reply }).message, /goal:pause/);
+	assert.match(parse({ version: GOAL_COMMAND_BRIDGE_VERSION, id: "x", name: "goal", args: 5, reply }).message, /string args/);
 
-	const accepted = ok({
-		version: GOAL_COMMAND_BRIDGE_VERSION,
-		id: "req-1",
-		command: "clear",
-		reply,
-	});
-	assert.equal(accepted.ok, true);
-	assert.equal(accepted.request.id, "req-1");
-	assert.equal(accepted.request.command, "clear");
+	// Every member of the family is accepted, and the accepted request is exactly
+	// the validated fields — nothing else from the payload travels.
+	for (const name of GOAL_COMMAND_NAMES) {
+		const accepted = parse({
+			version: GOAL_COMMAND_BRIDGE_VERSION,
+			id: "req-1",
+			name,
+			args: "--budget 150",
+			reply,
+			extra: "ignored?",
+		});
+		assert.equal(accepted.ok, true, name);
+		assert.equal(accepted.request.id, "req-1");
+		assert.equal(accepted.request.name, name);
+		assert.equal(accepted.request.args, "--budget 150");
+		assert.equal("extra" in accepted.request, false);
+	}
 });
 
 test("a bridged status/create/clear round-trip runs the user command surface", async (t) => {
@@ -311,18 +387,26 @@ test("a bridged status/create/clear round-trip runs the user command surface", a
 	const { pi, sessionFile } = await startBridgeHarness(dir);
 
 	// Bare status is the same read the user gets from `/goal`.
-	const status = await bridge(pi, "", { id: "get-1" });
+	const status = await bridge(pi, "goal", "", { id: "get-1" });
 	assert.equal(status.ok, true);
 	assert.equal(status.disposition, "reported");
 	assert.equal(status.action, "status");
 	assert.equal(status.goal, null);
 	assert.equal(status.admissionEnabled, true);
 	assert.equal(status.transitions.length, 0);
+	// The request's command name and argument are echoed, so the caller correlates
+	// the answer with exactly what it sent.
+	assert.equal(status.version, GOAL_COMMAND_BRIDGE_VERSION);
+	assert.equal(status.id, "get-1");
+	assert.equal(status.name, "goal");
+	assert.equal(status.args, "");
 
-	const created = await bridge(pi, `${OBJECTIVE}`, { id: "set-1" });
+	const created = await bridge(pi, "goal", `${OBJECTIVE}`, { id: "set-1" });
 	assert.equal(created.ok, true, JSON.stringify(created.diagnostics));
 	assert.equal(created.disposition, "committed");
 	assert.equal(created.action, "create");
+	assert.equal(created.name, "goal");
+	assert.equal(created.args, OBJECTIVE);
 	assert.deepEqual(
 		created.transitions.map((transition) => transition.kind),
 		["created"],
@@ -336,19 +420,111 @@ test("a bridged status/create/clear round-trip runs the user command surface", a
 	assert.equal(snapshot.data.goal.objective, OBJECTIVE);
 	assert.equal(snapshot.data.goal.origin, "command");
 
-	const stateAgain = await bridge(pi, "", { id: "get-2" });
+	const stateAgain = await bridge(pi, "goal", "", { id: "get-2" });
 	assert.equal(stateAgain.ok, true);
 	assert.equal(stateAgain.goal.id, created.goal.id);
 
-	const cleared = await bridge(pi, "clear", { id: "clear-1" });
+	const cleared = await bridge(pi, "goal:clear", "", { id: "clear-1" });
 	assert.equal(cleared.ok, true, JSON.stringify(cleared.diagnostics));
 	assert.equal(cleared.disposition, "committed");
+	assert.equal(cleared.action, "clear");
+	assert.equal(cleared.name, "goal:clear");
 	assert.deepEqual(
 		cleared.transitions.map((transition) => transition.kind),
 		["cleared"],
 	);
 	assert.equal(cleared.goal, null);
 	assert.equal(lastSnapshot(sessionFile).data.goal, null, "the tombstone is the newest durable entry");
+});
+
+test("the disposition truth table holds for every command in the family", async (t) => {
+	const dir = withTempDir(t);
+	const { pi, sessionFile } = await startBridgeHarness(dir);
+
+	// A verb with no Goal to act on reports "no Goal" at info level: declined,
+	// nothing to do, nothing committed.
+	for (const name of ["goal:pause", "goal:resume", "goal:clear"]) {
+		const result = await bridge(pi, name, "", { id: `bare-${name}` });
+		assert.equal(result.ok, false, name);
+		assert.equal(result.disposition, "declined", name);
+		assert.equal(result.action, name.slice("goal:".length));
+		assert.deepEqual(result.transitions, []);
+		assert.equal(goalStateBytes(sessionFile), "", `${name} with no Goal writes nothing`);
+	}
+	// A stray argument on a no-argument verb is the verb's usage error: refused.
+	const usage = await bridge(pi, "goal:pause", "foo", { id: "pause-foo" });
+	assert.equal(usage.ok, false);
+	assert.equal(usage.disposition, "refused");
+	assert.equal(usage.action, "pause");
+	assert.deepEqual(usage.transitions, []);
+	assert.deepEqual(usage.diagnostics, [{ level: "error", text: "/goal:pause takes no argument." }]);
+	// The history rendering is a read: reported, with the timeline as diagnostics.
+	const emptyHistory = await bridge(pi, "goal:history", "", { id: "history-0" });
+	assert.equal(emptyHistory.ok, true);
+	assert.equal(emptyHistory.disposition, "reported");
+	assert.equal(emptyHistory.action, "history");
+
+	// The old space-separated spelling reaches the creation path, which refuses it
+	// with the verb command to type instead; it is the create action's refusal.
+	const before = goalStateBytes(sessionFile);
+	const reserved = await bridge(pi, "goal", "pause", { id: "old-pause" });
+	assert.equal(reserved.ok, false);
+	assert.equal(reserved.disposition, "refused", "a reserved word is refused by the creation path, never invalid");
+	assert.equal(reserved.action, "create");
+	assert.deepEqual(reserved.transitions, []);
+	assert.ok(
+		reserved.diagnostics.some(
+			(diagnostic) => diagnostic.level === "error" && diagnostic.text === "Goal not created: `pause` is a Goal command; use /goal:pause.",
+		),
+		JSON.stringify(reserved.diagnostics),
+	);
+	assert.equal(goalStateBytes(sessionFile), before);
+
+	// Create, then walk every verb: each commits exactly its own transition.
+	assert.equal((await bridge(pi, "goal", OBJECTIVE, { id: "create" })).ok, true);
+	const paused = await bridge(pi, "goal:pause", "", { id: "pause" });
+	assert.equal(paused.ok, true, JSON.stringify(paused.diagnostics));
+	assert.equal(paused.disposition, "committed");
+	assert.equal(paused.action, "pause");
+	assert.deepEqual(
+		paused.transitions.map((transition) => transition.kind),
+		["paused"],
+	);
+	assert.equal(paused.goal.status, "paused");
+
+	const history = await bridge(pi, "goal:history", "", { id: "history" });
+	assert.equal(history.ok, true);
+	assert.equal(history.disposition, "reported");
+	assert.equal(history.action, "history");
+	assert.deepEqual(history.transitions, []);
+	assert.ok(history.diagnostics.some((diagnostic) => diagnostic.text.includes("created")), JSON.stringify(history.diagnostics));
+
+	const edited = await bridge(pi, "goal:edit", "A revised objective", { id: "edit" });
+	assert.equal(edited.ok, true, JSON.stringify(edited.diagnostics));
+	assert.equal(edited.disposition, "committed");
+	assert.equal(edited.action, "edit");
+	assert.deepEqual(
+		edited.transitions.map((transition) => transition.kind),
+		["objective-edited"],
+	);
+	assert.equal(edited.goal.objective, "A revised objective");
+
+	const resumed = await bridge(pi, "goal:resume", "", { id: "resume" });
+	assert.equal(resumed.ok, true, JSON.stringify(resumed.diagnostics));
+	assert.equal(resumed.disposition, "committed");
+	assert.equal(resumed.action, "resume");
+	assert.deepEqual(
+		resumed.transitions.map((transition) => transition.kind),
+		["resumed"],
+	);
+	assert.equal(resumed.goal.status, "active");
+
+	// `/goal:edit` keeps its attachment-flag refusal over the bridge too.
+	const flagRefusal = await bridge(pi, "goal:edit", "--file notes.md A revised objective", { id: "edit-flag" });
+	assert.equal(flagRefusal.ok, false);
+	assert.equal(flagRefusal.disposition, "refused");
+	assert.equal(flagRefusal.action, "edit");
+	assert.ok(flagRefusal.diagnostics.some((diagnostic) => /Replacement Goal/.test(diagnostic.text)));
 });
 
 test("a creation that fails its durability poll is answered as refused, never committed", async (t) => {
@@ -358,7 +534,7 @@ test("a creation that fails its durability poll is answered as refused, never co
 	// then fails and retracts the Goal.
 	const { pi, sessionFile } = await startBridgeHarness(dir, { append: "drop" });
 
-	const result = await bridge(pi, `${OBJECTIVE}`, { id: "set-durability" });
+	const result = await bridge(pi, "goal", `${OBJECTIVE}`, { id: "set-durability" });
 	assert.equal(result.ok, false, "a rolled-back creation must never report success");
 	assert.equal(result.disposition, "refused");
 	assert.deepEqual(
@@ -386,18 +562,20 @@ test("a replacement declined through the user dialog changes nothing", async (t)
 	});
 	const { pi, sessionFile } = await startBridgeHarness(dir, { confirm: () => answer });
 
-	const first = await bridge(pi, `${OBJECTIVE}`, { id: "set-first" });
+	const first = await bridge(pi, "goal", `${OBJECTIVE}`, { id: "set-first" });
 	assert.equal(first.ok, true, JSON.stringify(first.diagnostics));
 	const before = goalStateBytes(sessionFile);
 
-	const pending = bridge(pi, "A replacement objective", { id: "set-replace" });
+	const pending = bridge(pi, "goal", "A replacement objective", { id: "set-replace" });
 	// Let the command reach the confirmation dialog before asserting the guard.
 	await new Promise((resolve) => setTimeout(resolve, 50));
-	const busy = await bridge(pi, "clear", { id: "clear-while-busy" });
+	const busy = await bridge(pi, "goal:clear", "", { id: "clear-while-busy" });
 	assert.equal(busy.ok, false);
 	assert.equal(busy.disposition, "refused");
+	assert.equal(busy.action, null, "the busy guard refuses before any action is derived");
+	assert.equal(busy.name, "goal:clear");
 	assert.ok(
-		busy.diagnostics.some((diagnostic) => /another bridged \/goal command is still running/.test(diagnostic.text)),
+		busy.diagnostics.some((diagnostic) => /another bridged Goal command is still running/.test(diagnostic.text)),
 		JSON.stringify(busy.diagnostics),
 	);
 
@@ -475,7 +653,8 @@ test("the bridge calls reply exactly once, even when the callback throws", async
 	pi.events.emit(GOAL_COMMAND_BRIDGE, {
 		version: GOAL_COMMAND_BRIDGE_VERSION,
 		id: "reply-throws",
-		command: `${OBJECTIVE}`,
+		name: "goal",
+		args: `${OBJECTIVE}`,
 		reply: () => {
 			calls += 1;
 			const error = new Error("host reply channel is broken");
@@ -498,10 +677,13 @@ test("the bridge answers a request that arrives before any session started", asy
 	const { pi } = fakePi(sessionFile, {});
 	// Deliberately no `session_start`: this is a host calling too early.
 	goalExtension(pi);
-	const result = await bridge(pi, `${OBJECTIVE}`, { id: "early" });
+	const result = await bridge(pi, "goal", `${OBJECTIVE}`, { id: "early" });
 	assert.equal(result.ok, false);
 	assert.equal(result.disposition, "refused");
+	assert.equal(result.action, null);
 	assert.equal(result.goal, null);
+	assert.equal(result.name, "goal");
+	assert.equal(result.args, OBJECTIVE);
 	assert.ok(
 		result.diagnostics.some((diagnostic) => /has not started a session yet/.test(diagnostic.text)),
 		JSON.stringify(result.diagnostics),
@@ -509,11 +691,42 @@ test("the bridge answers a request that arrives before any session started", asy
 	assert.equal(goalStateBytes(sessionFile), "");
 });
 
+test("a family name that is not registered at dispatch time is answered invalid and runs nothing", async (t) => {
+	const dir = withTempDir(t);
+	const { pi, commands, sessionFile } = await startBridgeHarness(dir);
+	assert.equal((await bridge(pi, "goal", OBJECTIVE, { id: "create" })).ok, true);
+	const before = goalStateBytes(sessionFile);
+
+	// Pi's registry no longer lists the clear command (the extension was unloaded
+	// or its command was replaced). The name is valid for the protocol, so the
+	// request is not dropped — it is answered, as `invalid`, and no handler runs.
+	commands.delete("goal:clear");
+	const result = await bridge(pi, "goal:clear", "", { id: "unregistered" });
+	assert.equal(result.ok, false);
+	assert.equal(result.disposition, "invalid");
+	assert.equal(result.action, "invalid");
+	assert.equal(result.name, "goal:clear");
+	assert.deepEqual(result.transitions, []);
+	assert.ok(
+		result.diagnostics.some((diagnostic) => diagnostic.level === "error" && /not a registered command/.test(diagnostic.text)),
+		JSON.stringify(result.diagnostics),
+	);
+	assert.equal(result.goal.status, "active", "the Goal is untouched");
+	assert.equal(goalStateBytes(sessionFile), before, "no Goal bytes were written");
+
+	// Registered again, the same request commits as usual: the guard is about the
+	// registry, not about the name.
+	commands.set("goal:clear", {});
+	assert.equal((await bridge(pi, "goal:clear", "", { id: "registered-again" })).disposition, "committed");
+});
+
 test("the companion is independently installable and speaks the documented bridge", () => {
 	// The protocol is a wire contract, declared on both sides; a drift here is a
 	// silent incompatibility, so it is pinned rather than discovered in the field.
 	assert.equal(COMPANION_BRIDGE, GOAL_COMMAND_BRIDGE);
 	assert.equal(COMPANION_BRIDGE_VERSION, GOAL_COMMAND_BRIDGE_VERSION);
+	assert.equal(GOAL_COMMAND_BRIDGE_VERSION, 2, "version 2 is the name-plus-args request shape");
+	assert.deepEqual(GOAL_COMMAND_NAMES, ["goal", "goal:pause", "goal:resume", "goal:clear", "goal:history", "goal:edit"]);
 	assert.deepEqual([...GOAL_RPC_METHODS], ["thread/goal/get", "thread/goal/set", "thread/goal/clear"]);
 
 	// Optionality is structural: the companion package depends on nothing, and
@@ -522,12 +735,14 @@ test("the companion is independently installable and speaks the documented bridg
 	assert.deepEqual(Object.keys(dependencies), ["@earendil-works/pi-coding-agent"], "no pi-goal runtime dependency");
 	assert.deepEqual(companionManifest.pi.extensions, ["./index.ts"], "the companion installs its own extension only");
 
-	// No store internals, no second lifecycle path: the companion is a pure
-	// translator, so it imports nothing from pi-goal and registers no model tool.
+	// No store internals, no second lifecycle path, no parser mirror: the companion
+	// is a pure translator, so it imports nothing from pi-goal, registers no model
+	// tool, and no longer carries a copy of the command parser.
 	const source = readFileSync(new URL("../companion/goal-rpc/index.ts", import.meta.url), "utf8");
 	assert.equal(/from\s+"[^"]*\/src\//.test(source), false, "the companion must not import pi-goal internals");
 	assert.equal(source.includes("registerTool("), false, "the companion registers no model-callable tool");
 	assert.equal(source.includes("goal-state"), false, "the companion never names a durable Goal entry");
+	assert.equal(source.includes("commandCollision"), false, "the parser mirror is gone");
 	assert.equal(source.includes("appendEntry(GOAL_RPC_RESPONSE_ENTRY"), true, "the only write is its own response entry");
 	assert.equal(GOAL_RPC_RESPONSE_ENTRY, "goal-rpc-response");
 });
