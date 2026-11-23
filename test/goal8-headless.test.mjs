@@ -176,7 +176,7 @@ test("every registered command reports its own throw as a notification instead o
 	}
 });
 
-test("/goal completes its creation flags and /goal:resume completes --budget, prefix-filtered", () => {
+test("/goal completes its creation flags, /goal:resume completes --budget, and /goal:edit completes --title", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-completions-"));
 	try {
 		const { pi, commands } = fakePi(join(dir, "session.jsonl"));
@@ -202,8 +202,16 @@ test("/goal completes its creation flags and /goal:resume completes --budget, pr
 		assert.deepEqual(values(resume("--budget")), ["--budget"]);
 		assert.deepEqual(values(resume("--x")), []);
 
+		const edit = commands.get("goal:edit").getArgumentCompletions;
+		assert.equal(typeof edit, "function");
+		assert.deepEqual(values(edit("")), ["--title"]);
+		assert.deepEqual(values(edit("--t")), ["--title"]);
+		assert.deepEqual(values(edit("--title")), ["--title"]);
+		assert.deepEqual(values(edit("--x")), []);
+		assert.deepEqual(values(edit("objective text")), []);
+
 		// No other command in the family completes.
-		for (const name of ["goal:pause", "goal:clear", "goal:history", "goal:edit"]) {
+		for (const name of ["goal:pause", "goal:clear", "goal:history"]) {
 			assert.equal(commands.get(name).getArgumentCompletions, undefined, `/${name} offers no completion`);
 		}
 	} finally {

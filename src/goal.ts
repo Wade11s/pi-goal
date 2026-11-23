@@ -43,6 +43,14 @@ export type GoalStatus = (typeof GOAL_STATUSES)[number];
 export const MIN_OBJECTIVE_LENGTH = 3;
 export const MAX_OBJECTIVE_LENGTH = 2000;
 
+/**
+ * Goal title validation bounds (code points, after trimming). A Goal title is a
+ * one-line label, so a line terminator anywhere in it is refused rather than
+ * collapsed: the title is persisted verbatim and shown verbatim.
+ */
+export const MIN_TITLE_LENGTH = 1;
+export const MAX_TITLE_LENGTH = 80;
+
 /** Bounds for a model-reported blocker description (characters, after trimming). */
 export const MIN_BLOCKER_LENGTH = 3;
 export const MAX_BLOCKER_LENGTH = 500;
@@ -130,6 +138,15 @@ export interface GoalRecord {
 	id: string;
 	/** The user's objective, verbatim. Never rewritten by the extension. */
 	objective: string;
+	/**
+	 * Optional Goal title (issue #82): a one-line, 1–80 character label, persisted
+	 * as Goal state and set or changed by `/goal:edit --title`. Absent for every
+	 * Goal no title was ever given to — every snapshot written before titles
+	 * existed, and every creation through `/goal`, `create_goal`, or a direct path.
+	 * Like the Objective, its text never reaches Goal-updated events, goal-history
+	 * records, or Goal metrics.
+	 */
+	title?: string;
 	status: GoalStatus;
 	/**
 	 * Who created the Goal. Absent in snapshots written before provenance was
@@ -381,6 +398,8 @@ export const CUSTOM_WRAPUP_MESSAGE_TYPE = "goal-budget-wrapup";
 export const goalPublicStateSchema = Type.Object({
 	id: Type.String(),
 	objective: Type.String(),
+	/** The Goal title, or null when the Goal has none. */
+	title: Type.Union([Type.Null(), Type.String()]),
 	status: Type.String(),
 	/** Who created the Goal: "command" (user typed /goal) or "tool" (model called create_goal). */
 	origin: Type.String(),
@@ -496,6 +515,7 @@ export function toPublicState(goal: GoalRecord): GoalPublicState {
 	return {
 		id: goal.id,
 		objective: goal.objective,
+		title: goal.title ?? null,
 		status: goal.status,
 		origin: goal.origin ?? "command",
 		createdAt: new Date(goal.createdAt).toISOString(),
@@ -599,6 +619,7 @@ export function formatGoalSummary(state: GoalPublicState, admission: AdmissionVi
 	const admissionOff = admission.admissionEnabled === false;
 	const lines = [
 		`Goal ${state.id} — ${state.status}`,
+		...(state.title !== null ? [`Title: ${state.title}`] : []),
 		`Objective: ${state.objective}`,
 		`Created by: ${state.origin === "tool" ? "the model (create_goal)" : "the user (/goal)"}`,
 		`Created: ${state.createdAt}`,

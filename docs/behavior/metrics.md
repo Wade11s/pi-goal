@@ -13,8 +13,8 @@ telemetry.
 Counting, dashboards, and hosted export all want the same small handful of
 numbers: how many transitions of each kind happened, which Lifecycle statuses
 were reached, what the work cost, how long it ran, and whether a budget was in
-play. None of that requires the Objective, the Blocker text, or anything else the
-user wrote.
+play. None of that requires the Objective, the Goal title, the Blocker text, or
+anything else the user wrote.
 
 So metrics are a **projection**, not a collector. `toGoalMetrics(event)` is a
 pure function from one committed `pi-goal:updated` event to one
@@ -72,6 +72,8 @@ Deliberately absent from the default metric:
 
 - the Objective's text — and also its length and origin, which stay on the local
   event because an operational record does not need them;
+- the Goal title's text — it is label text under the Objective's privacy boundary,
+  so no metric field carries it;
 - Blocker descriptions;
 - attachment contents and manifest (display labels, hashes, media types);
 - source file names, source paths, and source URLs;

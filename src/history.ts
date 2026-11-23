@@ -20,7 +20,10 @@
  *   history entry cannot resurrect, clear, replace, or otherwise change the
  *   authoritative Goal — the worst it can do is make the timeline harder to read;
  * - it records **metadata, never contents**: the manifest hashes (with media type,
- *   size, and label) rather than attachment bytes, exactly as the event does.
+ *   size, and label) rather than attachment bytes, exactly as the event does. The
+ *   Goal title text is not recorded either: it follows the Objective's privacy
+ *   boundary, and the record is projected from the event payload, which never
+ *   carries the label.
  *
  * The one asymmetry the design accepts is the crash window between the lifecycle
  * commit and this append. A process that dies in that window leaves a transition

@@ -51,8 +51,10 @@ import {
 	type GoalBinding,
 	MAX_BLOCKER_LENGTH,
 	MAX_OBJECTIVE_LENGTH,
+	MAX_TITLE_LENGTH,
 	MIN_BLOCKER_LENGTH,
 	MIN_OBJECTIVE_LENGTH,
+	MIN_TITLE_LENGTH,
 	USAGE_ENTRY_TYPE,
 } from "./goal.ts";
 import {
@@ -263,6 +265,28 @@ export type WrapUpResult =
 export interface CreateGoalOptions {
 	/** Explicit token budget; undefined means "use the configured default". */
 	tokenBudget?: number;
+	/**
+	 * A validated Goal title (one line, 1–80 characters). No creation path sets one
+	 * yet: a title arrives through `/goal:edit --title` today and through the
+	 * confirmed Objective clarification later. Leaving it undefined is what keeps
+	 * every existing creation title-less.
+	 */
+	title?: string;
+}
+
+/**
+ * The changes one in-place `/goal:edit` may commit.
+ *
+ * The fields are independent: an objective-only edit changes only the objective
+ * (the historical behavior), a title-only edit changes only the title, and both
+ * together change both in the same revision. An omitted field is left untouched,
+ * never cleared — there is no command that removes a title.
+ */
+export interface GoalEditChanges {
+	/** The validated new Objective. */
+	objective?: string;
+	/** The validated new Goal title. */
+	title?: string;
 }
 
 /**
@@ -505,7 +529,7 @@ export class GoalStore {
 			return null;
 		}
 
-		const goal = copyRecord(withSanitizedAudit(baseline.goal));
+		const goal = copyRecord(sanitizeRecord(baseline.goal));
 		const repaired = baseline.repaired === true || this.hasCutover(branch, goal.id);
 		this.current = goal;
 		this.supersededTail = null;
@@ -766,7 +790,7 @@ export class GoalStore {
 						// tail from the entries before it. Without this, every reload of a
 						// branch that had a replacement would report the recovered tail as
 						// still unwritten and append the same historical snapshot again.
-						supersededRecord = copyRecord(withSanitizedAudit(snapshot.goal));
+						supersededRecord = copyRecord(sanitizeRecord(snapshot.goal));
 						supersededLedger.restore(normalizeUsage(snapshot.goal.usage));
 						supersededDirty = false;
 					}
@@ -822,7 +846,7 @@ export class GoalStore {
 					snapshotGoalId = goalId;
 				}
 				previousSnapshotRecord = snapshot.goal
-					? copyRecord(withSanitizedAudit(snapshot.goal))
+					? copyRecord(sanitizeRecord(snapshot.goal))
 					: null;
 			}
 			if (index <= afterIndex) continue;
@@ -1979,31 +2003,51 @@ export class GoalStore {
 	}
 
 	/**
-	 * Edit the objective of the current Goal in place: the identity, creation
-	 * time, origin, budget, and usage history are all preserved, only the
-	 * objective changes and the revision advances. A complete Goal is a
-	 * finished identity and cannot be edited — replacing it is a new Goal.
+	 * Edit the current Goal in place: the identity, creation time, origin, budget,
+	 * attachment manifest, and usage history are all preserved, only the requested
+	 * content changes and the revision advances.
+	 *
+	 * A complete Goal is a finished identity and its **objective** cannot be edited
+	 * — replacing it is a new Goal. A **title-only** edit is a label change that
+	 * reopens no work, so it stays available for a complete Goal. That is the one
+	 * deliberate asymmetry: it keeps `/goal:edit --title` usable for relabeling a
+	 * finished Goal while no path can restart one by editing it.
+	 *
+	 * A title-only edit commits under the `objective-edited` transition kind: it is
+	 * an in-place Goal text edit, and the event/history/metrics projection carries
+	 * no title text in either case (see `./events.ts`).
 	 */
-	editObjective(pi: ExtensionAPI, objective: string): GoalMutationResult {
+	editInPlace(pi: ExtensionAPI, changes: GoalEditChanges): GoalMutationResult {
 		const current = this.current;
 		if (!current) {
 			return { ok: false, reason: "no-goal", message: "no Goal is set in this session" };
 		}
-		if (current.status === "complete") {
+		if (current.status === "complete" && changes.objective !== undefined) {
 			return {
 				ok: false,
 				reason: "not-eligible",
 				message: "a complete Goal is finished and cannot be edited; use /goal <objective> to set a new one",
 			};
 		}
-		const result = this.commitSnapshot(pi, {
+		const next: GoalRecord = {
 			...current,
-			objective,
+			...(changes.objective === undefined ? {} : { objective: changes.objective }),
+			...(changes.title === undefined ? {} : { title: changes.title }),
 			updatedAt: Date.now(),
 			revision: current.revision + 1,
-		});
+		};
+		const result = this.commitSnapshot(pi, next);
 		if (result.ok) this.emitTransition("objective-edited", result.goal, current);
 		return result;
+	}
+
+	/**
+	 * Edit only the objective of the current Goal in place (the historical path).
+	 * A thin wrapper over {@link editInPlace}, kept because the objective-only edit
+	 * is the common case and reads better at its call sites and in tests.
+	 */
+	editObjective(pi: ExtensionAPI, objective: string): GoalMutationResult {
+		return this.editInPlace(pi, { objective });
 	}
 
 	/**
@@ -2554,6 +2598,7 @@ export class GoalStore {
 		return {
 			id: goalId(),
 			objective,
+			...(options.title === undefined ? {} : { title: options.title }),
 			status: "active",
 			origin,
 			createdAt: now,
@@ -2576,6 +2621,57 @@ export function validateObjective(raw: string): { ok: true; objective: string } 
 		};
 	}
 	return { ok: true, objective };
+}
+
+/**
+ * Line terminators a Goal title may not contain.
+ *
+ * A title is a one-line label: the durable value is shown verbatim in the status
+ * report and used as a session name, so a line break is refused instead of being
+ * folded away. U+0085, U+2028, and U+2029 are line terminators for several text
+ * processors and terminals even though they are not `\n`, so leaving them out
+ * would let a hand-edited title split a rendered line.
+ */
+const TITLE_LINE_TERMINATOR = /[\r\n\u0085\u2028\u2029]/;
+
+/**
+ * Validate a Goal title: one line, {@link MIN_TITLE_LENGTH}–{@link MAX_TITLE_LENGTH}
+ * characters (code points) after trimming.
+ *
+ * The one-line rule is checked against the **raw** value, before trimming. A
+ * trailing or leading line break is still a line break: trimming it away and
+ * persisting the remainder would accept a value that was never one line, and a
+ * caller could not tell the accepted label from the one it typed. Surrounding
+ * spaces and tabs are still trimmed, because they cannot break a line.
+ *
+ * Code points, not UTF-16 code units, for the same reason the session-name cap
+ * counts them: a title is a human label, and an emoji-heavy 40-character title
+ * must not be refused as if it were 80. The trimmed title is what is persisted.
+ *
+ * Validation lives here rather than in the command handler so the command, a
+ * future clarified creation, and reconstruction's sanitizer all apply the exact
+ * same rule. A refused title is reported to the user and mutates nothing.
+ */
+export function validateGoalTitle(raw: string): { ok: true; title: string } | { ok: false; error: string } {
+	// Before trimming: a title with a leading or trailing terminator is not one
+	// line, and the trim below must not be able to hide that.
+	if (TITLE_LINE_TERMINATOR.test(raw)) {
+		return {
+			ok: false,
+			error: "Goal not edited: the title must be one line; line breaks are not allowed.",
+		};
+	}
+	const title = raw.trim();
+	const length = Array.from(title).length;
+	if (length < MIN_TITLE_LENGTH || length > MAX_TITLE_LENGTH) {
+		return {
+			ok: false,
+			error:
+				`Goal not edited: the title must be ${MIN_TITLE_LENGTH} to ${MAX_TITLE_LENGTH} characters after ` +
+				"trimming, on one line.",
+		};
+	}
+	return { ok: true, title };
 }
 
 export function validateBlocker(raw: string): { ok: true; blocker: string } | { ok: false; error: string } {
@@ -2608,6 +2704,7 @@ function isGoalRecord(value: unknown): value is GoalRecord | null {
 	if (typeof record.status !== "string" || !GOAL_STATUS_SET.has(record.status)) {
 		return false;
 	}
+	if (record.title !== undefined && typeof record.title !== "string") return false;
 	if (record.tokenBudget !== undefined && typeof record.tokenBudget !== "number") return false;
 	if (record.wrapUpPending !== undefined && typeof record.wrapUpPending !== "boolean") return false;
 	// A malformed attachment manifest is not trusted either. Attachments are
@@ -2707,4 +2804,36 @@ function withSanitizedAudit(goal: GoalRecord): GoalRecord {
 		return rest;
 	}
 	return goal;
+}
+
+/**
+ * Drop an unusable `title` instead of trusting it.
+ *
+ * Like the audit, a title is hand-editable session data and is display-only, so a
+ * value that fails the one-line 1–80 rule is dropped rather than failing the whole
+ * snapshot closed: losing a label must never cost the user the Goal it describes.
+ * The structural type is already checked by `isGoalRecord`; this validates the
+ * *content* and trims a value that is valid but not in its canonical form. A
+ * leading or trailing line terminator is not trimmed away — it is invalid and the
+ * title is dropped, exactly as the live validation refuses it. A title-less
+ * record — every snapshot written before titles existed — is returned unchanged,
+ * which is what makes old snapshots reconstruct identically.
+ */
+function withSanitizedTitle(goal: GoalRecord): GoalRecord {
+	if (goal.title === undefined) return goal;
+	const validation = validateGoalTitle(goal.title);
+	if (!validation.ok) {
+		const { title: _dropped, ...rest } = goal;
+		return rest;
+	}
+	return validation.title === goal.title ? goal : { ...goal, title: validation.title };
+}
+
+/**
+ * The canonical form of a reconstructed record: one sanitizer per optional field
+ * whose content is validated rather than trusted. Applied at every point a
+ * snapshot is read, so the live record and a replayed branch agree.
+ */
+function sanitizeRecord(goal: GoalRecord): GoalRecord {
+	return withSanitizedTitle(withSanitizedAudit(goal));
 }

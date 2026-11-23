@@ -42,7 +42,7 @@ import {
 } from "./helpers/rpc-harness.mjs";
 import {
 	MAX_SESSION_NAME_LENGTH,
-	applySessionNameFromObjective,
+	applySessionNameFromGoal,
 	deriveSessionName,
 	parseSessionNamingSettings,
 } from "../src/session-naming.ts";
@@ -181,7 +181,7 @@ test("an Objective with no usable text yields no name", () => {
 
 test("an opted-out session is not even read", () => {
 	const session = fakeSession("A name the user typed");
-	assert.deepEqual(applySessionNameFromObjective(session, OBJECTIVE, false), { kind: "off" });
+	assert.deepEqual(applySessionNameFromGoal(session, { objective: OBJECTIVE }, false), { kind: "off" });
 	assert.deepEqual(session.state.calls, [], "no write was attempted");
 	assert.equal(session.state.name, "A name the user typed");
 });
@@ -189,7 +189,7 @@ test("an opted-out session is not even read", () => {
 test("an existing name is never overwritten, whoever wrote it", () => {
 	for (const existing of ["My own title", "Ship the release notes page"]) {
 		const session = fakeSession(existing);
-		assert.deepEqual(applySessionNameFromObjective(session, "A completely different objective", true), {
+		assert.deepEqual(applySessionNameFromGoal(session, { objective: "A completely different objective" }, true), {
 			kind: "already-named",
 			name: existing,
 		});
@@ -197,7 +197,7 @@ test("an existing name is never overwritten, whoever wrote it", () => {
 	}
 	// A whitespace-only name is not a name, so it does not block a real one.
 	const blank = fakeSession("   ");
-	assert.deepEqual(applySessionNameFromObjective(blank, OBJECTIVE, true), { kind: "named", name: OBJECTIVE });
+	assert.deepEqual(applySessionNameFromGoal(blank, { objective: OBJECTIVE }, true), { kind: "named", name: OBJECTIVE });
 	assert.deepEqual(blank.state.calls, [OBJECTIVE]);
 });
 
@@ -206,7 +206,7 @@ test("the write is reported as a failure instead of being mistaken for a naming"
 	session.setSessionName = () => {
 		throw new Error("disk full");
 	};
-	assert.deepEqual(applySessionNameFromObjective(session, OBJECTIVE, true), {
+	assert.deepEqual(applySessionNameFromGoal(session, { objective: OBJECTIVE }, true), {
 		kind: "failed",
 		reason: "disk full",
 	});
@@ -215,7 +215,7 @@ test("the write is reported as a failure instead of being mistaken for a naming"
 	unreadable.getSessionName = () => {
 		throw new Error("session file unreadable");
 	};
-	assert.equal(applySessionNameFromObjective(unreadable, OBJECTIVE, true).kind, "failed");
+	assert.equal(applySessionNameFromGoal(unreadable, { objective: OBJECTIVE }, true).kind, "failed");
 });
 
 // ---------------------------------------------------------------------------

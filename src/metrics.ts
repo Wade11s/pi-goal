@@ -13,7 +13,9 @@
  * names, source URLs, raw session identifiers, and raw user prompts have no field
  * to travel in, and a future event field (however sensitive) is invisible to
  * metrics until someone deliberately adds it here *and* updates the pinned key
- * set in `test/goal55-metrics-store.test.mjs`.
+ * set in `test/goal55-metrics-store.test.mjs`. The Goal title is in the same
+ * position: it is label text under the Objective's privacy boundary, so no
+ * metric carries it.
  *
  * `createGoalMetricsPublisher` is the optional local consumer seam. pi-goal
  * hands the projection to a sink (in core: an emit on Pi's shared extension
@@ -65,8 +67,9 @@ export interface GoalMetricsBudget {
  *
  * Deliberately absent: Goal identity and revision (a per-Goal correlation key is
  * an identifier a hosted backend does not need for operational metrics),
- * objective text or its length/origin, Blocker text, attachment material and
- * manifest, source paths and URLs, session identifiers, and prompt text.
+ * objective text or its length/origin, Goal title text, Blocker text, attachment
+ * material and manifest, source paths and URLs, session identifiers, and prompt
+ * text.
  */
 export interface GoalMetrics {
 	/** The metric schema version. */
