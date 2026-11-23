@@ -1,6 +1,6 @@
 /**
  * pi-goal RPC companion — Codex-shaped Goal `get`/`set`/`clear` for host
- * integrations (pi-goal issue #56).
+ * integrations (pi-goal issue #56; bridge request shape revised in #79).
  *
  * ## What this is
  *
@@ -11,23 +11,25 @@
  * | --- | --- |
  * | `thread/goal/get` | bare `/goal` (inspect) |
  * | `thread/goal/set` | `/goal [--budget N\|--no-budget] [--file p] [--image p] <objective>` |
- * | `thread/goal/clear` | `/goal clear` |
+ * | `thread/goal/clear` | `/goal:clear` |
  *
  * It is a thin adapter, not a second lifecycle. Every method is translated into
- * the exact argument text a user would type after `/goal` and executed by
- * pi-goal's own command handler through the documented in-process command bridge
- * (`pi-goal:command-bridge`). Replacement confirmation, `goal.enabled` admission,
- * Token-budget and attachment validation, and the durable-before-announced
- * ordering therefore all live in pi-goal, in one place: this package never reads
- * a Goal snapshot, never writes one, never touches a tombstone or a usage
- * checkpoint, and imports nothing from pi-goal.
+ * the Goal command family command a user would type and its exact argument text,
+ * and executed by pi-goal's own command handler through the documented in-process
+ * command bridge (`pi-goal:command-bridge`). Replacement confirmation,
+ * `goal.enabled` admission, Token-budget and attachment validation, and the
+ * durable-before-announced ordering therefore all live in pi-goal, in one place:
+ * this package never reads a Goal snapshot, never writes one, never touches a
+ * tombstone or a usage checkpoint, and imports nothing from pi-goal.
  *
- * Because `set` renders command *text*, the one thing this package must check
- * itself is that the text it renders is still a create: an objective of `clear`
- * would render `/goal clear`, which clears the current Goal. Objectives whose
- * trimmed form the command surface parses as any non-`create` kind are refused
- * before rendering, so a `set` can never smuggle a lifecycle subcommand (see
- * `commandCollision`).
+ * Because the bridge carries Pi's own dispatch shape — a command name plus the
+ * text after it — this package holds no copy of pi-goal's parser. An Objective is
+ * only ever the argument of `/goal`, so a `set` cannot render a lifecycle
+ * command: `get` sends `/goal`, `set` sends `/goal <objective>`, and `clear`
+ * sends `/goal:clear`. An Objective that is the bare word `clear` or `pause` is
+ * refused by pi-goal's own creation path (the reserved-word guard that corrects
+ * the old space-separated spelling), and that refusal comes back through the
+ * bridge verbatim: one parser, one source of truth.
  *
  * ## Why it is optional
  *
@@ -96,8 +98,8 @@ export const GOAL_RPC_RESPONSE_ENTRY = "goal-rpc-response";
 /** Channel on Pi's shared extension event bus carrying the bridged command. */
 export const GOAL_COMMAND_BRIDGE = "pi-goal:command-bridge";
 
-/** The bridge envelope version this package speaks. */
-export const GOAL_COMMAND_BRIDGE_VERSION = 1;
+/** The bridge envelope version this package speaks: version 2 carries a command name plus its argument text. */
+export const GOAL_COMMAND_BRIDGE_VERSION = 2;
 
 /**
  * How long to wait for pi-goal to answer one bridged command.
@@ -131,11 +133,11 @@ export type GoalRpcErrorCode =
 	| "unauthorized"
 	/** pi-goal did not answer: not installed, too old, or still busy past the timeout. */
 	| "unavailable"
-	/** pi-goal parsed the command but refused it (disabled, not applicable, rolled back, ...). */
+	/** pi-goal ran the command and refused it (disabled, not applicable, a reserved-word Objective, rolled back, ...). */
 	| "refused"
 	/** pi-goal ran the command, changed nothing, and reported no problem (for example a declined replacement). */
 	| "declined"
-	/** pi-goal could not parse the translated command text at all. */
+	/** pi-goal answered that the named command was not a registered command at dispatch time, so nothing ran. */
 	| "invalid-command";
 
 /** The structured outcome of one method call. */
@@ -190,92 +192,6 @@ const ACCEPTED_PARAMS: Record<GoalRpcMethod, ReadonlySet<string>> = {
  * refuses to invent.
  */
 const ACCEPTED_FIELDS: ReadonlySet<string> = new Set(["version", "id", "method", "params", "authority"]);
-
-/** Leading options pi-goal's command surface would read as flags rather than as the objective. */
-const LEADING_FLAGS = ["--budget", "--no-budget", "--file", "--image", "--remote-image"] as const;
-
-/**
- * The whole-argument subcommands pi-goal's command surface accepts.
- *
- * Kept as a local list rather than imported: the companion must not depend on
- * pi-goal, and a dependency would make "independently installable" a fiction.
- * The list is therefore *synchronized by hand* with `parseGoalCommand` in
- * `src/index.ts`, and the two are pinned together by tests on both sides.
- */
-const LIFECYCLE_WHOLE_WORD_COMMANDS = ["pause", "clear", "history", "edit", "resume"] as const;
-
-/** One collision between an objective and the `/goal` command surface. */
-interface CommandCollision {
-	/** The subcommand or option the command surface would parse the objective as. */
-	rendered: string;
-	/** Why that parse would not create the Goal the request named. */
-	effect: string;
-}
-
-/**
- * Does this objective render as something other than a create?
- *
- * The check is a local mirror of `parseGoalCommand` (and of the creation option
- * scanner behind it), not an interpretation of the objective: it asks exactly
- * one question — would `/goal <objective>` be read as a create? Everything the
- * command surface treats as a lifecycle or attachment parse is named here:
- *
- * - the whole-argument subcommands `pause`, `clear`, `history`, `edit`, and
- *   `resume` (matched case-insensitively, because the command surface lowercases
- *   the first word);
- * - any objective led by `edit`, which the command surface reads as an objective
- *   edit, and any objective led by `resume --budget ...`, which it reads as a
- *   budget-recovering resume;
- * - any objective led by an option token (`--budget`, `--no-budget`, `--file`,
- *   `--image`, `--remote-image`), which the creation scanner consumes as an
- *   option instead of as the objective.
- *
- * Deliberately conservative in one direction only: an objective that merely
- * *starts with* one of those words but keeps going (`clear the cache`,
- * `history of the release`, `resume the migration`) is a create on both sides
- * and stays accepted. A false negative here would let a `set` destroy or
- * mutate the current Goal through a parse the caller never asked for, so the
- * guard is worth its small over-refusal surface; a false positive is a stated
- * refusal, never a silent reinterpretation.
- */
-function commandCollision(objective: string): CommandCollision | null {
-	const trimmed = objective.trim();
-	if (trimmed === "") return null;
-	const spaceIndex = trimmed.search(/\s/);
-	const first = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
-	const remainder = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex).trim();
-	const word = first.toLowerCase();
-
-	if (remainder === "" && (LIFECYCLE_WHOLE_WORD_COMMANDS as readonly string[]).includes(word)) {
-		return {
-			rendered: `/goal ${word}`,
-			effect: `pi-goal would run the ${word} subcommand instead of creating a Goal`,
-		};
-	}
-	if (word === "edit") {
-		return {
-			rendered: `/goal edit ${remainder}`.trim(),
-			effect:
-				"pi-goal would read the text after `edit` as a new objective for the *current* Goal (or refuse it) " +
-				"instead of creating one",
-		};
-	}
-	if (word === "resume" && /^--budget(?:=|\s|$)/.test(remainder)) {
-		return {
-			rendered: `/goal ${trimmed}`,
-			effect: "pi-goal would resume the current Goal with a new budget instead of creating one",
-		};
-	}
-	if ((LEADING_FLAGS as readonly string[]).some((flag) => first === flag || first.startsWith(`${flag}=`))) {
-		return {
-			rendered: `/goal ${trimmed}`,
-			effect:
-				`pi-goal's command surface reads a leading ${LEADING_FLAGS.join("/")} token as an option, so the Goal would ` +
-				"be created with a different objective than the request named",
-		};
-	}
-	return null;
-}
 
 let generatedIds = 0;
 
@@ -374,43 +290,43 @@ function parseRequest(text: string): ParseOutcome {
 	return { ok: true, request: { id, method, params, authority: candidate.authority } };
 }
 
-/** A shell-inert token check: pi-goal's command parser splits on whitespace and has no quoting. */
+/** A shell-inert token check: pi-goal's creation option scanner splits on whitespace and has no quoting. */
 function hasUnsupportedWhitespace(value: string): boolean {
 	return /\s/.test(value);
 }
 
+/** The Goal command family commands this package can send: the only three a `get`/`set`/`clear` maps onto. */
+export type GoalBridgeCommandName = "goal" | "goal:clear";
+
+/** A bridged command: the command name Pi dispatches on, and the exact text a user would type after it. */
+export interface GoalBridgeCommand {
+	name: GoalBridgeCommandName;
+	args: string;
+}
+
 /**
- * Translate one method call into `/goal` argument text.
+ * Translate one method call into a Goal command family command.
  *
- * The translation is the whole mapping: `set` renders exactly the leading options
- * a user would type, in the documented order (`--budget`/`--no-budget`, then
- * `--file`/`--image`, then the objective), and `get`/`clear` are the bare and
- * `clear` spellings. No value is interpreted here — a budget below pi-goal's
- * minimum, a path pi-goal will refuse, an oversized objective: all of it is
- * validated by pi-goal, so the companion cannot silently disagree with the
- * command surface about what is acceptable.
+ * The translation is the whole mapping, and it is deliberately shallow: `get`
+ * is `/goal`, `clear` is `/goal:clear`, and `set` is `/goal` with exactly the
+ * leading options a user would type, in the documented order (`--budget`/
+ * `--no-budget`, then `--file`/`--image`, then the objective). Nothing about
+ * the objective is interpreted here — a budget below pi-goal's minimum, a path
+ * pi-goal will refuse, an oversized objective, or the bare word `clear` (which
+ * pi-goal's creation path refuses, naming `/goal:clear`): all of it is validated
+ * by pi-goal, so the companion cannot silently disagree with the command surface
+ * about what is acceptable.
  */
-function buildCommand(method: GoalRpcMethod, params: Record<string, unknown>): { ok: true; command: string } | { ok: false; message: string } {
-	if (method === "thread/goal/get") return { ok: true, command: "" };
-	if (method === "thread/goal/clear") return { ok: true, command: "clear" };
+function buildCommand(
+	method: GoalRpcMethod,
+	params: Record<string, unknown>,
+): { ok: true; command: GoalBridgeCommand } | { ok: false; message: string } {
+	if (method === "thread/goal/get") return { ok: true, command: { name: "goal", args: "" } };
+	if (method === "thread/goal/clear") return { ok: true, command: { name: "goal:clear", args: "" } };
 
 	const objective = params.objective;
 	if (typeof objective !== "string" || objective.trim() === "") {
 		return { ok: false, message: "thread/goal/set requires a non-empty string params.objective" };
-	}
-	// Checked *before* the command text is rendered: a collision means the text
-	// would ask for something other than a create, and the command surface has no
-	// way to take it back. `/goal clear` from a `set` is a clear, not a Goal.
-	const collision = commandCollision(objective);
-	if (collision !== null) {
-		return {
-			ok: false,
-			message:
-				`the objective ${JSON.stringify(objective.trim())} collides with pi-goal's /goal command surface: rendered as ` +
-				`${collision.rendered}, ${collision.effect}. Nothing was run and no Goal was changed. Create the Goal ` +
-				"through the command surface (`/goal <objective>`), or use a different objective that is not read as a " +
-				"subcommand or leading option.",
-		};
 	}
 
 	const parts: string[] = [];
@@ -444,7 +360,7 @@ function buildCommand(method: GoalRpcMethod, params: Record<string, unknown>): {
 		}
 	}
 	parts.push(objective.trim());
-	return { ok: true, command: parts.join(" ") };
+	return { ok: true, command: { name: "goal", args: parts.join(" ") } };
 }
 
 type BridgeCall = { ok: true; result: Record<string, unknown> } | { ok: false; message: string };
@@ -456,7 +372,7 @@ type BridgeCall = { ok: true; result: Record<string, unknown> } | { ok: false; m
  * callback. A timeout is reported as `unavailable` — the one thing this function
  * must never do is assume the command succeeded because it stopped waiting.
  */
-function callBridge(pi: ExtensionAPI, id: string, command: string, timeoutMs: number): Promise<BridgeCall> {
+function callBridge(pi: ExtensionAPI, id: string, command: GoalBridgeCommand, timeoutMs: number): Promise<BridgeCall> {
 	return new Promise<BridgeCall>((resolve) => {
 		let settled = false;
 		const settle = (outcome: BridgeCall): void => {
@@ -470,8 +386,8 @@ function callBridge(pi: ExtensionAPI, id: string, command: string, timeoutMs: nu
 				ok: false,
 				message:
 					`pi-goal did not answer within ${timeoutMs}ms. The pi-goal extension is probably not installed (or predates ` +
-					`the ${GOAL_COMMAND_BRIDGE} bridge, added in pi-goal 0.1.1), or another bridged command is still waiting for a ` +
-					"confirmation dialog. Install or upgrade pi-goal, then retry.",
+					`version ${GOAL_COMMAND_BRIDGE_VERSION} of the ${GOAL_COMMAND_BRIDGE} bridge, added in pi-goal 0.2.0), or ` +
+					"another bridged command is still waiting for a confirmation dialog. Install or upgrade pi-goal, then retry.",
 			});
 		}, timeoutMs);
 		// A pending bridge wait must never hold the process open on its own.
@@ -480,7 +396,8 @@ function callBridge(pi: ExtensionAPI, id: string, command: string, timeoutMs: nu
 			pi.events.emit(GOAL_COMMAND_BRIDGE, {
 				version: GOAL_COMMAND_BRIDGE_VERSION,
 				id,
-				command,
+				name: command.name,
+				args: command.args,
 				reply: (result: unknown): void => {
 					if (result === null || typeof result !== "object") {
 						settle({ ok: false, message: "pi-goal answered the bridge request with a non-object result" });
