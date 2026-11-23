@@ -485,11 +485,12 @@ const RESERVED_GOAL_VERBS = GOAL_COMMAND_NAMES.filter((name) => name !== "goal")
  * nothing else happens. The guard is the only trace of the old syntax in the
  * code.
  *
- * It matches the trimmed, lower-cased argument against the bare verb words and
- * against a leading `resume --budget`, and nothing else: `Clear the lint
- * errors`, `Edit the README`, `Resume work on X`, and `history of the release`
- * are Objectives. It applies to the `/goal` command only — `create_goal` has
- * its own creation authority and no command ambiguity to resolve.
+ * It matches the trimmed, lower-cased Objective that is left after the leading
+ * creation options have been scanned, against the bare verb words and against a
+ * leading `resume --budget`, and nothing else: `Clear the lint errors`, `Edit
+ * the README`, `Resume work on X`, and `history of the release` are Objectives.
+ * It applies to the `/goal` command only — `create_goal` has its own creation
+ * authority and no command ambiguity to resolve.
  */
 function reservedGoalVerbRefusal(args: string): string | null {
 	// An Objective can be preceded by creation options — a user types
