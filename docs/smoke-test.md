@@ -1,11 +1,12 @@
 # Real-Pi interactive smoke test
 
 This procedure verifies the user-facing package against a real Pi process: the
-documented installation workflow, Goal creation, automatic continuation,
-interactive objective editing, pause, resume, status reporting, restart
-persistence, clear, and the colon-namespaced command family with its
-old-spelling refusals. It is a manual complement to the deterministic RPC suite
-(`npm test`), which remains the automated gate.
+documented installation workflow, Objective clarification and the single-Goal
+refusal, Goal creation, the Goal title, automatic continuation, interactive
+objective editing, pause, resume, status reporting, restart persistence, clear,
+and the colon-namespaced command family with its old-spelling refusals. It is a
+manual complement to the deterministic RPC suite (`npm test`), which remains the
+automated gate.
 
 ## Prerequisites
 
@@ -45,8 +46,8 @@ pi
 
 The extension registers six Goal commands — `/goal`, `/goal:pause`,
 `/goal:resume`, `/goal:clear`, `/goal:history`, and `/goal:edit` — plus the
-`get_goal`, `create_goal`, and `update_goal` model tools. Typing `/` lists each
-command on its own line with its own description, and there is no `/goal:status`
+`get_goal`, `create_goal`, `propose_goal`, and `update_goal` model tools (plus
+opt-in `update_plan`). Typing `/` lists each command on its own line with its own description, and there is no `/goal:status`
 and no `/goal:create` (bare `/goal` and `/goal <objective>` already are those).
 When a UI exists, the footer/status bar shows a compact Goal indicator as soon as
 a Goal exists.
@@ -60,9 +61,11 @@ a Goal exists.
 With the default `goal.clarifyOnCreate: true` this starts Objective
 clarification:
 
-- an `Objective clarification started: no Goal is committed yet.` notification;
+- an `Objective clarification started: no new Goal is committed yet.`
+  notification;
 - the model asks about the objective, constraints, and acceptance criteria — no
-  Goal exists yet, so `/goal` still reports "No Goal is set";
+  Goal exists yet, so bare `/goal` reports that no Goal is set and names the open
+  clarification and its held flags;
 - once you answer, the model calls `propose_goal` and a confirmation editor opens
   with `Title: <draft title>`, a blank line, then the drafted Objective (the
   English three sections). Edit either part and save.
@@ -74,9 +77,10 @@ Expect after saving:
 - the status uses exactly the title and Objective you left in the editor;
 - the agent starts working immediately.
 
-Try cancelling a second clarification (`/goal Add a second haiku`) instead of
-saving: no Goal is created, nothing is written, and `/goal` still reports the
-first Goal unchanged (or "No Goal is set" if you cleared it first).
+To try cancellation, clear the first Goal (`/goal:clear`) or use a fresh session,
+then run `/goal Add a second haiku` and cancel the confirmation: no new Goal is
+created, nothing is materialized or fetched, and bare `/goal` reports that no
+Goal is set.
 
 To verify persistence, start a clarification that holds flags
 (`/goal --file notes.md --budget 5000 …`), answer one question, then exit Pi and
@@ -104,11 +108,12 @@ dialog-capable client) skips clarification with a notice.
 /goal
 ```
 
-Expect the full report: objective, `active` status, identity, timestamps,
-revision, token budget, accounted token usage, active time, and remaining
-capacity. The compact footer indicator shows the same status and usage.
+Expect the full report: title (when present), objective, `active` status,
+identity, timestamps, revision, token budget, accounted token usage, active time,
+and remaining capacity. The compact footer indicator shows the same status and
+usage.
 
-Now give the Goal a title:
+To exercise title editing, change the confirmed title:
 
 ```
 /goal:edit --title "Release prep"
@@ -297,7 +302,7 @@ consecutive Goal turns, using the identity pi-goal issues.
 - Several reports inside one Goal turn are one audit step. Only the third
   *consecutive* Goal turn moves the Goal to `blocked`; a turn that makes progress,
   verifies a wait, or reports nothing breaks the chain, and so does any user
-  action, a resume, or a Replacement Goal.
+  action, a resume, or a new Goal identity.
 - `/goal` shows the blocker description and the `Blocked audit: N of 3` count. It
   deliberately does not show the opaque identity.
 - `/goal:resume` after the stop restarts the Goal with a fresh audit.
@@ -415,8 +420,8 @@ reproduce the user-visible surface by hand.
    `/goal` twice a few seconds apart: `Active time` must still be increasing —
    disabling the extension does not stop the clock.
 5. Try `/goal <objective>`, `/goal:edit <objective>`, and `/goal:resume`. Expect a
-   refusal naming what is refused and what still works; no replacement
-   confirmation dialog may open.
+   refusal naming what is refused and what still works; no clarification starts
+   and no dialog opens.
 6. `/goal:pause`, then `/goal:edit <objective>`: the edit of an already-stopped
    Goal is allowed and says no work was started.
 7. Remove the setting (or set it to `true`) and restart on the same session. The
@@ -451,7 +456,7 @@ reproduce the user-visible surface by hand.
 7. Remove the setting (or set it to `false`) and restart: the paused Goal is
    restored with no dialog and only `/goal:resume` restarts it.
 
-## 23. Optional: naming the session from the Objective
+## 23. Optional: naming the session from the Goal title or Objective
 
 `goal.sessionNameFromObjective` (default `false`) is a convenience, not a
 Lifecycle behavior. The deterministic coverage is
@@ -466,8 +471,9 @@ the steps below reproduce the user-visible surface by hand.
    pi-goal never overwrites a name that exists.
 4. With a named session, `/goal:edit <new objective>`. Expect the name to be
    unchanged while the Goal's objective and revision change.
-5. With a named session, `/goal <another objective>` and confirm the replacement.
-   Expect the name to be unchanged again.
+5. With a named session, complete the current Goal (or `/goal:clear`) and run
+   `/goal <another objective>`, saving the clarification when enabled. Expect the
+   name to be unchanged again.
 6. A long objective (over 80 characters) is named with exactly its first 80
    characters, and a multi-line objective with only its first line.
 
@@ -496,9 +502,10 @@ The durable artifacts live beside the session file:
 1. Run `/goal:edit Refine the attached requirements without changing the files`.
    The manifest and hashes stay unchanged. `/goal:edit --file ./other.txt New
    objective` is refused with Replacement Goal guidance.
-2. Replace the Goal with a different `--file`/`--image` selection and confirm.
-   The new identity gets its own manifest; the old identity's artifact directory
-   remains.
+2. Complete the current Goal (or `/goal:clear`), then create another with a
+   different `--file`/`--image` selection (saving the confirmation when
+   clarification is on). The new identity gets its own manifest; the old
+   identity's artifact directory remains.
 3. Restart the session. The attachments verify and later Continuations use the
    same hashes; the original source paths are not needed.
 4. `/goal:clear` removes the current Goal but does **not** remove either Goal's
@@ -584,7 +591,7 @@ header names the timeline as non-authoritative.
    run, and no command mutates a Goal from a record.
 3. Pause, resume, edit, and clear, checking the timeline after each: every
    committed transition gets exactly one record, and refusals (a second pause, a
-   second clear, a declined replacement) get none.
+   second clear, a `/goal` refused by an unfinished Goal) get none.
 4. For the malformed-entry check, stop Pi and truncate one `goal-history` line's
    JSON payload in the session file (leave the entry's id, parent, and timestamp
    intact). Restart: `/goal` reports the unchanged Goal, and `/goal:history`
@@ -622,21 +629,39 @@ behave as a namespace and that the old spelling has no side effects.
    argument."* and change nothing; `/goal:resume --budget` without a number is
    refused with the guidance to supply a new total. None of them half-applies a
    lifecycle action.
-6. Confirm the behaviour flip the other way: `/goal Edit the README to add a
-   smoke-test line` **creates** a Goal named after that Objective (it is not an
-   edit of the current Goal), and so does `/goal Clear the lint errors`.
+6. Finish or clear the current Goal (or use a fresh session) before each command.
+   `/goal Edit the README to add a smoke-test line` **starts creation**
+   (clarification by default), so after the confirmation editor the Goal carries
+   that Objective and is not an edit of the current Goal; `/goal Clear the lint
+   errors` behaves the same way when run in its own free Goal slot.
 
 ## Checklist
 
 - [ ] Installed with `pi install ./` and visible in `pi list`.
 - [ ] `--file`/`--image` attachments reach kickoff and Continuation with stable
-      hashes, survive restart and replacement/clear retention, and fail closed
+      hashes, survive restart and complete-to-new/clear retention, and fail closed
       with an explicit error when an artifact is missing or corrupt.
 - [ ] `--remote-image` fetches once over HTTPS, keeps the same hash across
       Continuations and restarts, sends no credentials/cookies/referrer, and
       refuses HTTP, credentials, non-public destinations, bad redirects, MIME
       mismatches, and oversized bodies without a success event.
-- [ ] `/goal <objective>` creates an active Goal and starts work.
+- [ ] `/goal <raw idea>` starts Objective clarification: no new Goal is committed
+      until the model's `propose_goal` call opens the `Title:` + Objective editor
+      and you save it; saving commits exactly the title and Objective you left in
+      the editor and starts work, while cancelling or timing out creates no new
+      Goal, leaves no artifact, makes no remote request, and leaves any existing
+      complete Goal untouched.
+- [ ] An unfinished Goal (`active`, `paused`, `blocked`, `usage_limited`, or
+      `budget_limited`) refuses `/goal <objective>` with a warning naming
+      `/goal:clear` before any clarification or dialog, and a complete Goal is
+      superseded with no replacement-confirmation dialog (normal clarification
+      still applies when enabled), its record kept in `/goal:history`.
+- [ ] `/goal <objective>` creates an active Goal and starts work (directly with
+      `goal.clarifyOnCreate: false` or a UI-less host, otherwise after the
+      clarification).
+- [ ] The confirmed Goal title appears in the bare `/goal` status report and in
+      `get_goal`, and never in `pi-goal:updated` events, `goal-history` records,
+      or metrics.
 - [ ] The `/` menu lists exactly the six Goal commands, `/goal ` completes the
       five creation flags and `/goal:resume ` completes `--budget`, every old
       space-separated spelling is refused with the verb to type and no side
@@ -675,9 +700,10 @@ behave as a namespace and that the old spelling has no side effects.
 - [ ] A run admitted against a replaced identity cannot complete, report a
       blocker against, or pause the Goal that replaced it; the replaced identity
       keeps its own durable superseded record.
-- [ ] With `goal.enabled: false`, creation, replacement, `create_goal`, a
-      work-admitting edit, resume, and automatic continuation are all refused,
-      while inspection, pause, clear, and in-flight terminal updates still work.
+- [ ] With `goal.enabled: false`, creation (including the supersede of a
+      complete Goal), `create_goal`, a work-admitting edit, resume, and automatic
+      continuation are all refused, while inspection, pause, clear, and in-flight
+      terminal updates still work.
 - [ ] An active-but-disabled Goal keeps its `active` status and keeps accruing
       `Active time`; `/goal:pause`, not disabling the extension, stops it.
 - [ ] Re-enabling `goal.enabled` restores admission, and the restored active Goal
@@ -688,9 +714,10 @@ behave as a namespace and that the old spelling has no side effects.
       and unchanged.
 - [ ] `active`, `complete`, `blocked`, `usage_limited`, and `budget_limited` Goals
       are never prompted for, and a disabled extension never offers the prompt.
-- [ ] With `goal.sessionNameFromObjective: true`, `/goal <objective>` names an
-      unnamed session from the Objective's first line (whitespace-collapsed, at
-      most 80 characters), and `create_goal` does the same.
+- [ ] With `goal.sessionNameFromObjective: true`, a creation names an unnamed
+      session from the Goal title when present, falling back to the Objective's
+      first line (whitespace-collapsed, at most 80 characters), and `create_goal`
+      does the same with no title.
 - [ ] With the setting absent or `false`, no session is ever named.
 - [ ] A session name the user provided is never overwritten, an Objective edit and
       a Replacement Goal never rename it, and a failed or rolled-back creation

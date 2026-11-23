@@ -328,9 +328,10 @@ truncated record.
 Every interactive dialog pi-goal opens (the Objective-clarification confirmation
 editor, the interactive objective editor, the resume prompt) carries a `timeout`
 and a safe default answer, so an unattended host cannot make a command or a tool
-call wait forever. `/goal <objective>` itself opens no dialog: an unfinished Goal
-refuses it before any clarification, a complete one is superseded silently, and
-the confirmation editor belongs to the model's `propose_goal` call.
+call wait forever. `/goal <objective>` itself opens no replacement-confirmation
+dialog: an unfinished Goal refuses it before any clarification, a complete one
+still follows normal clarification when enabled, and the confirmation editor
+belongs to the model's `propose_goal` call.
 `PI_GOAL_DIALOG_TIMEOUT_MS` overrides that bound with a positive integer number
 of milliseconds; it exists so the timeout branches are testable through the
 real-Pi harness without waiting the production interval out. An unset or invalid
@@ -437,10 +438,10 @@ crossing) and asserts the same refusal for each: one warning that names
 `goal-state` bytes, the `goal-history` count, and the run count all unchanged, and
 a bare `/goal` report identical to the one before the refusals. It also proves the
 escape hatch (`/goal:clear` then the same `/goal <objective>` creates a fresh
-identity), that `create_goal` still refuses while any Goal exists, and that a
-complete Goal is superseded without a dialog — the preserved complete record
-carries its exact already-accounted totals, the new identity starts at zero, and a
-restart reconstructs the branch and renders the same three-record timeline.
+identity), that `create_goal` still refuses while any Goal exists, and that this
+direct-creation suite supersedes a complete Goal without a replacement-confirmation
+dialog — the preserved complete record carries its exact already-accounted totals,
+the new identity starts at zero, and a restart reconstructs the branch and renders the same three-record timeline.
 
 The historical-branch fixtures in `test/fixtures/historical/` cover the branch
 shapes the command surface can no longer produce: a released 0.2.0 session that

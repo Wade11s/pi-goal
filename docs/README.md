@@ -14,8 +14,10 @@ procedure, and the historical evidence behind the V1 repair programme.
   [continuation](behavior/continuation.md) → [stopping](behavior/stopping.md) →
   [accounting](behavior/accounting.md). For the user command surface,
   [ADR-0002](adr/0002-colon-namespaced-goal-command-family.md) →
-  [lifecycle](behavior/lifecycle.md). The [glossary](../GLOSSARY.md) fixes the
-  vocabulary these docs use.
+  [lifecycle](behavior/lifecycle.md). For creation semantics,
+  [ADR-0003](adr/0003-objective-clarification-and-single-goal-creation.md) →
+  [lifecycle](behavior/lifecycle.md#create-a-goal). The [glossary](../GLOSSARY.md)
+  fixes the vocabulary these docs use.
 - **Verifying a change** — [testing](testing.md) → [smoke test](smoke-test.md) →
   the relevant [traceability](#traceability) matrix.
 
@@ -25,7 +27,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 
 | Doc | Covers |
 | --- | --- |
-| [behavior/lifecycle.md](behavior/lifecycle.md) | Create (Objective clarification by default, or direct creation), replace, edit, inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Goal title or Objective, the opt-in progress-plan tool, and the `goal.enabled` admission control |
+| [behavior/lifecycle.md](behavior/lifecycle.md) | Create (Objective clarification by default, or direct creation), the single-Goal refusal and complete-Goal supersede, edit (objective and title), inspect, the status indicator, pause/resume/clear, the opt-in resume prompt, opt-in session naming from the Goal title or Objective, the opt-in progress-plan tool, and the `goal.enabled` admission control |
 | [behavior/attachments.md](behavior/attachments.md) | `--file`/`--image`/`--remote-image` Objective attachments: fetch security, limits, the immutable artifact store, the trust boundary, restore verification, and V1 retention |
 | [behavior/budgets.md](behavior/budgets.md) | `--budget` and `--no-budget`, settings defaults and hard maximum, cumulative budget raises, budget exhaustion and the bounded wrap-up |
 | [behavior/continuation.md](behavior/continuation.md) | The `agent_before_settle` seam, one provider request per settlement, the evidence audit, and the no-progress contract |
@@ -42,7 +44,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 
 | Doc | Covers |
 | --- | --- |
-| [tools.md](tools.md) | `get_goal`, `create_goal` and its creation authority, the objective's trust boundary, `update_goal` and its execution binding, the opt-in `update_plan` progress plan, structured tool responses |
+| [tools.md](tools.md) | `get_goal`, `create_goal` and its creation authority, `propose_goal` and the clarification confirmation, the objective's trust boundary, `update_goal` and its execution binding, the opt-in `update_plan` progress plan, structured tool responses |
 | [limitations.md](limitations.md) | What the extension does not understand, cannot preempt, or intentionally leaves to the user |
 | [codex-migration.md](codex-migration.md) | Per-capability Codex comparison, released-provider status, and verification evidence |
 | [subagent-usage.md](subagent-usage.md) | Provider-neutral cumulative snapshots, Pi tool-result deltas, cursor reconstruction, ownership, final collection, and observation-time V1 |
@@ -60,6 +62,7 @@ Every rule the extension enforces, and every reason it is shaped that way.
 | --- | --- |
 | [adr/0001-conservative-stopping.md](adr/0001-conservative-stopping.md) | Why stopping is deterministic and extension-owned |
 | [adr/0002-colon-namespaced-goal-command-family.md](adr/0002-colon-namespaced-goal-command-family.md) | Why the Goal command family is colon-namespaced and the old spellings are refused |
+| [adr/0003-objective-clarification-and-single-goal-creation.md](adr/0003-objective-clarification-and-single-goal-creation.md) | Why `/goal` clarifies by default, adds a Goal title, and never replaces an unfinished Goal |
 | [agents/domain.md](agents/domain.md) | How agents consume the glossary and ADRs |
 | [agents/issue-tracker.md](agents/issue-tracker.md) | GitHub issue conventions |
 | [agents/triage-labels.md](agents/triage-labels.md) | Triage roles and label strings |

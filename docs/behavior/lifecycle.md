@@ -81,8 +81,9 @@ creation authority**: exactly the saved title (one line, 1–80 characters) and
 Objective (3–2000 characters) commit, with `origin: "command"`, through the same
 creation path a typed `/goal` uses. The three-section template is a drafting
 convention, never a validation rule — an Objective without the sections is still
-a valid Objective. **Cancelling or a dialog timeout creates nothing**: no Goal, no
-attachment materialization, no remote fetch, and any current Goal is untouched.
+a valid Objective. **Cancelling or a dialog timeout creates nothing new**: no new
+Goal, no attachment materialization, no remote fetch, and any current Goal is
+untouched.
 The pending entry is cleared, and the model is told no Goal was created.
 
 What the raw idea is held with matters:
@@ -92,8 +93,11 @@ What the raw idea is held with matters:
 - `--file`, `--image`, and `--remote-image <https URL>` ride it too, and are read
   or fetched **only after the confirming save**. A cancelled clarification makes
   no network request and leaves no artifact behind.
-- The flags are validated when `/goal` runs, so a bad path or budget refuses before
-  the interview rather than after it.
+- Flag syntax and budget values are validated when `/goal` runs, so malformed
+  options refuse before the interview. File existence, readability, type, size,
+  attachment-count limits, and the remote fetch are validated only at the
+  confirming save; a source that disappears during the interview leaves the
+  saved draft recoverable for retry.
 
 `goal.clarifyOnCreate: false` restores immediate creation (below). A host without
 a dialog-capable UI — print and JSON modes — skips clarification, creates directly
@@ -146,7 +150,7 @@ pending entry once its Goal commits.
 
 ### Direct creation
 
-Every creation path that does not clarify is unchanged:
+Every creation path that does not clarify follows the direct path:
 
 - Validates the objective (3–2000 characters after trimming).
 - May be **title-less**: `create_goal`, a UI-less `/goal`, and a
@@ -198,10 +202,12 @@ bridge and the RPC companion see the same thing — a `set` or a bridged `/goal`
 against an unfinished Goal answers **`refused`** with that diagnostic verbatim,
 and the old declined-replacement outcome no longer exists.
 
-A **complete** Goal does not block: the creation proceeds with no dialog and
-takes the session's single Goal slot, and the complete record is **superseded**
-through the retained replacement machinery. `create_goal` is unchanged: it still
-refuses while any Goal exists, complete or not.
+A **complete** Goal does not block. There is no replacement-confirmation dialog,
+but with clarification on, the normal interview and `propose_goal` editor still
+precede the creation that takes the session's single Goal slot; direct creation
+supersedes immediately. The complete record is **superseded** through the retained
+replacement machinery. `create_goal` is unchanged: it still refuses while any
+Goal exists, complete or not.
 
 The superseded Goal is not erased. Its already-accounted usage is written as a
 durable **current** snapshot before the new identity commits — current, not
@@ -256,8 +262,9 @@ delivered into that run through Pi's steering mechanism (after the current
 turn's tool calls, before the next model request), so the live work is
 redirected safely instead of being interrupted; if the session is idle, editing
 restarts work with a kickoff message. A paused Goal can be edited too — it stays
-paused until resumed. A complete Goal is finished and cannot be edited; replace
-it instead.
+paused until resumed. A complete Goal's objective is frozen: changing it means a
+new Goal (a complete record is superseded by `/goal <objective>`), while a
+title-only relabel is still admitted because a label reopens no work.
 
 Bare `/goal:edit` opens Pi's multi-line editor prefilled with the current
 objective. Saving applies the edit in place; cancelling leaves it unchanged.

@@ -8,12 +8,23 @@ what it cannot preempt, and what is intentionally left to the user.
 
 - `create_goal` (the model tool) refuses while **any** Goal exists, including a
   complete, blocked, or usage-limited one, because replacing and clearing are
-  user-owned actions, confirmed through `/goal <objective>`. The tool description,
-  its error message, and this section all say so. Because of that, a blocked or
+  user-owned actions: `/goal <objective>` refuses an unfinished Goal with a
+  warning naming `/goal:clear` and supersedes only a complete one, while
+  `/goal:clear` remains the way to abandon a Goal. The tool description, its
+  error message, and this section all say so. Because of that, a blocked or
   usage-limited Goal waits for the user: the model cannot complete or resume it
   either, so it does not quietly resume work the user was told had stopped.
   Restarting it is the user's `/goal:resume`, which keeps the identity and starts
   a fresh audit.
+- Objective clarification is the default `/goal` creation path only when a
+  dialog-capable UI is present. A UI-less host (print/JSON) creates directly with
+  a notice, and `goal.clarifyOnCreate: false` restores direct creation on any
+  host; a UI-capable host whose `propose_goal` tool cannot be registered fails
+  closed instead of bypassing the confirmation. The interview, the pending
+  clarification, and the confirmation editor add interactive steps the model can
+  leave vague — the Objective it drafts is a convention, not a validated schema,
+  so the user must still read and edit the saved document. A Goal created
+  without clarification has no title until `/goal:edit --title` gives it one.
 - A model-requested pause is corroborated by exact-quote matching plus a
   conservative lexical check that the newer human message contains an
   affirmative pause instruction. The extension does not semantically understand
@@ -61,12 +72,15 @@ what it cannot preempt, and what is intentionally left to the user.
   trusted, so a hand-edited or truncated file produces a shorter timeline with a
   notice, never a different Goal.
 - An edit preserves the Goal identity, creation time, origin, budget, attachment
-  manifest, and usage history: only the objective changes and the revision
-  advances. Changing attachments requires a Replacement Goal. Replacement of
-  an unfinished Goal gives the session a fresh identity and fresh revisions, and
-  preserves the replaced Goal's accounted history on its own superseded record
-  rather than transferring any of it. Refining the finish line without replacing
-  anything is what `/goal:edit` is for.
+  manifest, and usage history: an objective edit changes only the objective, a
+  title-only edit changes only the title, and a combined edit changes both, while
+  the revision advances. Changing attachments requires a new Goal, so finish the
+  current Goal or run `/goal:clear` first. `/goal <objective>` refuses an
+  unfinished Goal and supersedes a complete one without a replacement-confirmation
+  dialog (normal clarification still applies), giving the session a fresh identity
+  and fresh revisions while the replaced Goal's accounted history stays on its own
+  superseded record instead of being transferred. Refining the finish line without
+  replacing anything is what `/goal:edit` is for.
 - Bare `/goal:edit` needs a dialog-capable UI. TUI and RPC hosts that implement
   Pi's extension-UI subprotocol can answer the editor dialog; print/JSON mode and
   hosts without a dialog-capable UI get guidance to use

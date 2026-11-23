@@ -2,8 +2,9 @@
 
 - Status: accepted
 - Date: 2026-11-24
-- Relates to: the "Objective clarification", "Goal title", "Goal", "Objective",
-  "Replacement Goal", and "Session naming" entries in `GLOSSARY.md`
+- Relates to: the "Objective clarification", "Pending clarification", "Goal title",
+  "Goal", "Objective", "Replacement Goal", and "Session naming" entries in
+  `GLOSSARY.md`
 
 ## Context
 
@@ -23,10 +24,13 @@ Goal exists.
    starts a conversation instead of committing a Goal: the model interviews the
    user, drafts the final Objective and a Goal title, and opens a confirmation
    editor where both are editable. Saving the draft is the creation authority
-   and commits the Goal; cancelling is zero-side-effect — no Goal, no
+   and commits the Goal; cancelling is zero-side-effect — no new Goal, no
    materialized artifacts, no remote fetches, current Goal untouched.
    Attachment arguments (`--file`/`--image`/`--remote-image`) are held and only
-   materialized after the confirmed save. A host without UI skips clarification,
+   materialized after the confirmed save. The pending entry is durable and moves
+   through `pending` → `confirming` → `ended`; it is reconstructed on the selected
+   branch and anchored to the base Goal identity, so a later Goal-slot change
+   makes a stale draft unconfirmable. A host without UI skips clarification,
    creates directly as before, and prints a notice.
 2. **The Objective template is a drafting convention, not a validation rule.**
    The model drafts three English-titled sections — `Objective:` (one sentence
@@ -46,7 +50,9 @@ Goal exists.
    finish the current Goal) instead of showing a replacement confirmation;
    a complete Goal does not block creation. Bare `/goal` remains the status
    report, so no `/goal:status` is added. The Replacement Goal / Superseded
-   record machinery remains for historical reconstruction only. The
+   record machinery remains for historical branches and for superseding a
+   complete Goal without a replacement-confirmation dialog (normal clarification still
+   applies); it is never used to replace an unfinished one. The
    `create_goal` tool path is unchanged by all of the above.
 
 ### Considered options
@@ -68,14 +74,18 @@ Goal exists.
 ## Consequences
 
 - This is a **breaking default-behavior change** for `/goal`: creation no longer
-  commits immediately, and in-place replacement is gone. The CHANGELOG, README,
-  and lifecycle docs must say so, and the glossary's Replacement Goal family of
-  entries needs revision in the implementation spec.
+  commits immediately, and in-place replacement is gone. With an unfinished Goal
+  present the command refuses and names `/goal:clear`; only a complete Goal is
+  superseded, without a replacement-confirmation dialog (normal clarification
+  still applies). The CHANGELOG, README, and lifecycle docs must say so,
+  and the glossary's Replacement Goal family of entries is revised with it.
 - The confirmation editor, not a verbatim quotation, is the creation authority
   for the clarified path; `create_goal`'s quotation authority is untouched.
 - Structured tool payloads, the status report, session naming, and the RPC
-  companion's get response gain the title. Goal-updated events, audit history,
-  and Goal metrics do **not**: title text follows the Objective's privacy
-  boundary, so it stays in the durable snapshot and the user-facing surfaces.
-  (This refines the earlier consequence note, which would have added the title to
-  the event stream.) The work is sized in the implementation spec.
+  companion's get response gain the title. Title text is **excluded** from
+  Goal-updated events, `goal-history` records, and Goal metrics: it follows the
+  Objective's privacy boundary, so it stays in the durable snapshot and the
+  user-facing surfaces. (This corrects the earlier consequence note, which would
+  have added the title to the event stream.) A title-only edit still commits an
+  ordinary in-place transition, without the label text. The work is sized in the
+  implementation spec.

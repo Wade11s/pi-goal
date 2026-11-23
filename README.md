@@ -56,7 +56,7 @@ pi list                  # pi-goal appears under User packages
 Pin a tag, branch, or commit by appending it to the source:
 
 ```sh
-pi install git:github.com/Wade11s/pi-goal@v0.1.1   # or a branch / commit
+pi install git:github.com/Wade11s/pi-goal@v0.3.0   # or a branch / commit
 ```
 
 A git ref is pinned: `pi update --extensions` reconciles the checkout but never
@@ -114,8 +114,9 @@ uses Pi's host-provided packages (`peerDependencies` only).
   UI-capable host whose confirmation tool cannot be registered refuses instead of
   bypassing the confirmation.
 - When an **unfinished** Goal already exists, `/goal <objective>` refuses with a
-  warning naming `/goal:clear` (before any clarification); a **complete** Goal is
-  superseded without a dialog.
+  warning naming `/goal:clear` (before any clarification). A **complete** Goal
+  does not block: there is no replacement-confirmation dialog, but the normal
+  interview and `propose_goal` editor still apply when clarification is on.
 
 Add explicit supporting material without changing the Objective's length
 policy:
@@ -126,7 +127,8 @@ policy:
 ```
 
 `--file`, `--image`, and `--remote-image <https URL>` are repeatable leading
-options. Remote images are fetched **once** at creation over HTTPS only, with no
+options. Remote images are fetched **once** at the creation commit (after the
+confirming save when clarification is on) over HTTPS only, with no
 credentials, a 15-second deadline, at most three revalidated redirects, and
 loopback/link-local/private destinations refused. Plain arguments remain text,
 and model-driven `create_goal` remains text-only. See
@@ -180,7 +182,7 @@ occupied, so none of them wait for idle. Details:
 | `blocked` | Three consecutive Goal turns reported the same genuine blocker, or made no activity. `/goal:resume` restarts with a fresh audit. |
 | `usage_limited` | The provider reported an exhausted plan or quota. `/goal:resume` restarts. |
 | `budget_limited` | The token budget was reached. One bounded wrap-up is allowed, then no continuation. Raise the cumulative budget to resume. |
-| `complete` | Terminal for the Goal's identity. Replace it with `/goal <objective>`. |
+| `complete` | Terminal for the Goal's identity. Supersede it with `/goal <objective>`; the complete record stays in history. |
 
 `goal.enabled` (Pi settings, default `true`) is an **Admission control**, not a
 status: while it is false, no new Goal work is admitted — no creation or
@@ -253,8 +255,8 @@ continues automatically: only the user's `/goal:resume` restarts it.
 ### Objective attachments
 
 Use repeatable leading `--file <path>`, `--image <path>`, and
-`--remote-image <https-url>` options at creation or Replacement Goal time. Text
-files must be non-empty UTF-8; PNG, JPEG, GIF, and WebP images are recognized by
+`--remote-image <https-url>` options at fresh creation or complete-to-new
+creation. Text files must be non-empty UTF-8; PNG, JPEG, GIF, and WebP images are recognized by
 their **bytes**, while SVG and unknown types are refused. Limits are 8
 attachments, 1 MiB per text file, 10 MiB per image, and 25 MiB total.
 
@@ -273,8 +275,9 @@ the model as encoded, delimited **untrusted data** under the Objective's nonce
 boundary; images use Pi's text/image content arrays. Every kickoff and
 Continuation loads the same manifest and never refetches a remote source.
 
-An Objective edit retains that manifest; changing attachments requires a
-Replacement Goal. Clear and replacement retain committed artifacts so historical
+An Objective edit retains that manifest; changing attachments requires a new
+Goal, so finish the current Goal or run `/goal:clear` first. Clear and
+complete-to-new creation retain committed artifacts so historical
 branches remain reconstructable: **V1 has no destructive automatic garbage
 collection**. Missing or corrupt restored artifacts produce an explicit error and
 suppress automatic Continuation without changing Lifecycle status. This explicit
@@ -292,7 +295,8 @@ pending-draft object to infer.
 `goal.enabled` (default `true`) is an admission control: while it is false,
 pi-goal admits no new Goal work, so nothing unattended starts.
 
-- **Refused:** `/goal <objective>` (creation and replacement), `create_goal`,
+- **Refused:** `/goal <objective>` (creation, including complete-to-new
+  supersede), `create_goal`,
   `/goal:edit` of an *active* Goal (an edit there steers work into a running
   Goal), `/goal:resume`, and the automatic continuation or budget wrap-up the
   settlement seam would otherwise request. A pending wrap-up is deferred, not
@@ -474,9 +478,13 @@ attachments.
 
 ## Limitations
 
-- `create_goal` refuses while **any** Goal exists; replacing, clearing, and
-  resuming stay with the user. A blocked or usage-limited Goal therefore waits
-  for the user instead of quietly resuming itself.
+- `create_goal` refuses while **any** Goal exists; `/goal <objective>` refuses an
+  **unfinished** one with a warning naming `/goal:clear` and supersedes only a
+  **complete** record (without a replacement-confirmation dialog; normal
+  clarification still applies). Abandoning or clearing an unfinished Goal and
+  resuming it stay with the user. A
+  blocked or usage-limited Goal therefore waits for the user instead of quietly
+  resuming itself.
 - Model-requested creation and pause are corroborated by exact-quote matching
   plus conservative deterministic checks. Unusual phrasing, image-only requests,
   and requests whose exact words were never sent as text are refused; the direct
@@ -560,13 +568,15 @@ npm test           # deterministic real-Pi RPC suite (requires pi 1.5.1+ on PATH
 ```
 
 `npm test` runs the complete RPC suite plus unit tests for accounting, the
-store's durability boundaries, the compact status line, the interactive/headless
-editing guard, and the `pi install` package workflow. It needs no model
+store's durability boundaries, the compact status line, the
+interactive/headless editing guard, Objective clarification and Goal-title
+persistence, and the `pi install` package workflow. It needs no model
 credentials or network service.
 
 To verify the package installation and the interactive surface by hand, follow
 [docs/smoke-test.md](docs/smoke-test.md). The checklist covers installation,
-creation, automatic continuation, editing, pause/resume/clear, budget recovery,
+Objective clarification and the single-Goal refusal, creation, automatic
+continuation, editing (objective and title), pause/resume/clear, budget recovery,
 the status indicator, restart persistence, the clear tombstone, frozen active
 time, identity-scoped attribution of queued work, and local plus remote-image
 attachments (fetch-once and stable hashes above all), including artifact
@@ -576,7 +586,7 @@ retention and restore verification.
 
 | Doc | Contents |
 | --- | --- |
-| [Goal lifecycle](docs/behavior/lifecycle.md) | Create, replace, edit, inspect, pause, resume, clear, opt-in convenience UX, and the status indicator |
+| [Goal lifecycle](docs/behavior/lifecycle.md) | Create (Objective clarification by default, or direct), single-Goal refusal and complete-Goal supersede, edit (objective and title), inspect, pause, resume, clear, opt-in convenience UX, and the status indicator |
 | [Objective attachments](docs/behavior/attachments.md) | Explicit local text/images and HTTPS remote images, immutable artifacts, fetch security, trust framing, limits, restore verification, and V1 retention |
 | [Token budgets](docs/behavior/budgets.md) | `--budget`, settings defaults and hard maximum, raising the ceiling, budget exhaustion |
 | [Automatic continuation](docs/behavior/continuation.md) | The settlement seam and the no-progress contract |
