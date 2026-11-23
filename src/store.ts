@@ -394,6 +394,17 @@ export class GoalStore {
 	 */
 	private lastNotice: string | null = null;
 
+	/**
+	 * Whether the last reconstruction could not trust the selected branch: its
+	 * newest snapshot was malformed, or the branch itself could not be read.
+	 *
+	 * This is deliberately separate from {@link takeNotice} (which the caller
+	 * consumes for display): other features that must not act on an unknown Goal
+	 * slot — notably the pending Objective clarification — consult it to fail closed
+	 * for as long as the branch is unreadable. A successful reconstruction clears it.
+	 */
+	private failedClosed = false;
+
 	constructor(events?: GoalStoreEvents) {
 		this.events = events;
 	}
@@ -447,12 +458,14 @@ export class GoalStore {
 	 */
 	reconstruct(ctx: ExtensionContext): GoalRecord | null {
 		this.lastNotice = null;
+		this.failedClosed = false;
 		let branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>;
 		try {
 			branch = ctx.sessionManager.getBranch();
 		} catch (error) {
 			// Never break the session on corrupt entries; report and keep absent state.
 			console.error("[pi-goal] failed to reconstruct Goal state:", error);
+			this.failedClosed = true;
 			this.resetRuntimeState();
 			return null;
 		}
@@ -500,6 +513,7 @@ export class GoalStore {
 		// is exactly what the cutover contract forbids.
 		if (!isGoalSnapshot(latest)) {
 			this.resetRuntimeState();
+			this.failedClosed = true;
 			this.lastNotice =
 				"pi-goal could not read the newest Goal snapshot on this branch (malformed data or an " +
 				"unsupported version), so it left the session without a Goal instead of falling back to an older " +
@@ -1506,6 +1520,17 @@ export class GoalStore {
 		const notice = this.lastNotice;
 		this.lastNotice = null;
 		return notice;
+	}
+
+	/**
+	 * Whether the last reconstruction failed closed on an unreadable branch.
+	 *
+	 * True when the newest snapshot could not be read or the branch itself could
+	 * not be listed. No other feature may act on a Goal slot it cannot see, so the
+	 * pending clarification is neither offered nor confirmed in this state.
+	 */
+	reconstructionFailedClosed(): boolean {
+		return this.failedClosed;
 	}
 
 	/** Whether the selected branch still needs its one-time legacy cutover. */

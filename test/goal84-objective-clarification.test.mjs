@@ -201,6 +201,7 @@ test("the default path records the pending clarification, interviews the model, 
 			idea: IDEA,
 			budget: { kind: "default" },
 			attachments: [],
+			baseGoalId: null,
 		});
 		await session.waitForNotify((record) => record.message.includes("Objective clarification started"));
 
@@ -434,6 +435,7 @@ test("cancelling the confirmation creates nothing: no Goal, no artifacts, no fet
 				{ kind: "text", path: attachmentPath },
 				{ kind: "remote-image", url: remoteUrl },
 			],
+			baseGoalId: null,
 		});
 		assert.equal(fixture.requests.length, 0, "the remote image was not fetched before the save");
 		const sessionFile = await session.sessionFile();
@@ -532,6 +534,7 @@ test("attachment and budget flags ride the pending entry and materialize only af
 			idea: IDEA,
 			budget: { kind: "value", value: 5000 },
 			attachments: [{ kind: "text", path: attachmentPath }],
+			baseGoalId: null,
 		});
 		const sessionFile = await session.sessionFile();
 		assert.deepEqual(storedGoalIds(attachmentStoreRoot(sessionFile)), [], "nothing is materialized before the save");
@@ -818,6 +821,7 @@ test("the production default clarifies when goal.clarifyOnCreate is absent from 
 			idea: IDEA,
 			budget: { kind: "default" },
 			attachments: [],
+			baseGoalId: null,
 		});
 		assert.equal(goalSnapshots(readSessionEntries(await session.sessionFile())).length, 0, "no Goal was committed");
 		assert.equal(

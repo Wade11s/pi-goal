@@ -46,18 +46,45 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   `/goal:edit --title` writes the next snapshot with the same identity and the
   next revision, so replay and a restart see exactly the committed label.
 - A pending Objective clarification is a **`goal-clarification`** custom entry,
-  separate from `goal-state` and written before any Goal exists: it carries the raw
-  idea and the leading `--budget` / `--no-budget` / `--file` / `--image` /
-  `--remote-image` flags, and a later `pending: null` entry records that the
-  clarification ended (saved, cancelled, or timed out). That end is written before
-  memory forgets the pending entry, and only for the exact pending clarification
-  the confirmation captured: a newer `/goal` or a concurrent confirmation keeps its
-  own state, and a failed end-write leaves the pending open and is surfaced rather
-  than reported as cleared. It is not Goal state — nothing is reconstructed from
-  it, no Goal snapshot or event is written beside it, and its attachments stay
-  unread flags rather than a manifest. Restart
-  reconstruction of a pending clarification is issue #85: today a restart starts
-  with none, and `propose_goal` refuses until the user runs `/goal` again.
+  separate from `goal-state` and written before any Goal exists. Version 2 carries
+  three states: **`pending`** (the raw idea plus the leading `--budget` /
+  `--no-budget` / `--file` / `--image` / `--remote-image` flags), **`confirming`**
+  (the same state plus the document the user saved in the confirmation editor,
+  written *before* the creation commit), and **`ended`** (the terminal record for a
+  cancel, a timeout, a stale confirmation, or a committed Goal). The newest entry
+  wins on the branch. Cancellation and an uncommitted save are deliberately
+  different records: a failed creation or a crash mid-fetch leaves `confirming`,
+  so the user's edited draft and held flags survive and the editor reopens with
+  that draft; only a finished clarification is `ended`. It is not Goal state — no
+  Goal snapshot, Goal-updated event, history record, or Attachment manifest exists
+  beside it.
+- A pending entry also records the **base Goal identity** it was started against
+  (`null` when no Goal existed, or the complete Goal it may supersede). It is
+  reconstructed at the same two seams as the Goal, from the newest
+  `goal-clarification` entry on the selected branch, and it is offered only when
+  all of the following hold: Goal reconstruction trusted the branch (a newest
+  `goal-state` entry that failed closed blocks restoration *and* confirmation),
+  `goal.clarifyOnCreate` is on, `propose_goal` is still pi-goal's own tool (the
+  registry is re-read, not the session-start answer), the host has a dialog-capable
+  UI, and every current `goal-state` entry after the clarification entry carries
+  the recorded base identity. A Goal created, replaced, or cleared after the
+  interview started therefore **supersedes** the draft silently, even if a crash
+  lost the write that would have retired it and even if that Goal later completes —
+  a restart can never turn the stale draft into a Goal that overwrites what the
+  user chose in the meantime. A finalized `superseded` snapshot is history and is
+  ignored; an unreadable `goal-state` entry after the clarification counts as a
+  conflicting identity, and an unreadable *newest* clarification entry fails closed
+  with a notice and no fallback. A transition of the *same* Goal (an edit, a pause)
+  keeps the identity and does not invalidate the draft. Reconstruction reads no
+  attachment and makes no network request.
+- Every creation path retires a pending or confirming entry once its Goal commits:
+  the clarified save writes `ended`, and a direct `/goal` (clarification off or no
+  UI) or a `create_goal` call retires a leftover entry in the same session. A
+  crash between the Goal commit and that write is harmless because the base
+  identity no longer matches. A new `/goal` replaces the pending entry, so a
+  restart reconstructs the replacement — and an editor still open for the replaced
+  interview can never commit, because its captured pending clarification is no
+  longer current.
 - The kickoff is delivered as a **user message** carrying the user's own
   objective (attributed as user-provided Goal data). As the session's first
   conversation entry it also makes Pi create and flush the session file, which
