@@ -16,10 +16,12 @@
  * `pi-goal:metrics` projection. Both are read back from the session file, so a
  * title text that leaked into either would fail the test.
  *
- * The honesty rules are the suite's: every script is sized exactly (a held
- * continuation is consumed by an explicit abort, which is asserted), and every
- * test ends with `assertCleanRun()`, so a green result can only come from the
- * Goal lifecycle and never from a scripted-provider error.
+ * Every scenario creates its Goal through the real `create_goal` tool and then
+ * pauses it through the corroborated `update_goal` pause. That stops the
+ * continuation loop deterministically *without* an abort, so each script runs to
+ * a natural clean settle, every script is sized exactly, and every test ends with
+ * `assertCleanRun()`. No held provider step is needed, which is what keeps the
+ * "clean run" claim literal rather than an expected-abort exception.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -43,6 +45,39 @@ const EVENTS_LOG_TYPE = "goal-events-log";
 const METRICS_LOG_TYPE = "goal-metrics-log";
 const HISTORY_ENTRY_TYPE = "goal-history";
 const NAMING_ON = { goal: { sessionNameFromObjective: true } };
+
+/**
+ * The human request that authorizes both creation and the model-requested pause.
+ *
+ * The pause instruction is its own clause on purpose: `corroboratePauseRequest`
+ * reads the clause that contains the quote, so a "create a goal and pause it"
+ * sentence would not qualify as an affirmative pause instruction. The quote the
+ * model passes is `PAUSE_QUOTE`, a verbatim fragment of this message.
+ */
+const CREATE_REQUEST = "Please create a goal for the release notes page. Pause it.";
+const CREATE_QUOTE = "Please create a goal for the release notes page.";
+const PAUSE_QUOTE = "Pause it";
+
+/** Provider steps for a title-less Goal that ends up paused (a clean settle, no abort). */
+function createAndPauseSteps(extra = []) {
+	return [
+		{
+			toolCalls: [
+				{
+					name: "create_goal",
+					args: { objective: OBJECTIVE, user_request: CREATE_QUOTE },
+				},
+			],
+		},
+		{
+			toolCalls: [
+				{ name: "update_goal", args: { action: "pause", user_request: PAUSE_QUOTE } },
+			],
+		},
+		{ text: "Created and paused." },
+		...extra,
+	];
+}
 
 /** Start a session whose peers record the public event and metrics surfaces. */
 function startTitleSession(options = {}) {
@@ -80,13 +115,27 @@ function durableSessionName(entries) {
 	return typeof name === "string" && name.trim() ? name.trim() : undefined;
 }
 
-/** Abort the hanging continuation so lifecycle commands can run from idle. */
-async function abortActiveLoop(session, runs) {
-	await session.waitFor(`${runs} agent runs started`, (records) =>
-		records.filter((record) => record.type === "agent_start").length >= runs ? true : undefined,
-	);
-	await session.sendSimple("abort");
+/**
+ * Create a title-less Goal through `create_goal`, then pause it through the
+ * corroborated `update_goal` pause, and prove the run settled cleanly.
+ *
+ * The pause is the deterministic loop stop: it is durable before the run settles,
+ * so the settlement asks for no continuation and the script needs no held step.
+ * Returns the paused record (revision 1) for the scenario's own assertions.
+ */
+async function startPausedGoal(session) {
+	await session.prompt(CREATE_REQUEST);
+	const created = await session.waitForToolResult("create_goal", 1);
+	assert.equal(created.isError, false, "the Goal was created");
+	const pause = await session.waitForToolResult("update_goal", 1);
+	assert.equal(pause.isError, false, "the corroborated pause was admitted");
 	await session.waitForSettled(1);
+
+	const goal = currentGoal(readSessionEntries(await session.sessionFile()));
+	assert.ok(goal, "the paused Goal is durable");
+	assert.equal(goal.status, "paused", "the loop stopped through a lifecycle transition, not an abort");
+	assert.equal(goal.title, undefined, "a create_goal creation is title-less");
+	return goal;
 }
 
 /**
@@ -121,25 +170,15 @@ function assertTitleAbsentFromDerivedSurfaces(entries, title) {
 test("a title-only /goal:edit sets the title in place and shows it in status and structured payloads", async () => {
 	const session = await startTitleSession();
 	script(
-		[
-			{ text: "On it.", usage: { input: 40, output: 10 } },
-			// The automatic continuation hangs so the test can abort the loop and
-			// run lifecycle commands from idle deterministically.
-			{ hang: true },
+		createAndPauseSteps([
 			{ toolCalls: [{ name: "get_goal", args: {} }] },
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
 			{ text: "Done." },
-		],
+		]),
 		session,
 	);
 	try {
-		await session.prompt(`/goal ${OBJECTIVE}`);
-		await session.waitForNotify((record) => record.message.includes("created and activated"));
-		await abortActiveLoop(session, 2);
-
-		const created = currentGoal(readSessionEntries(await session.sessionFile()));
-		assert.equal(created.title, undefined, "a /goal creation is title-less");
-		assert.equal(created.revision, 0);
+		const paused = await startPausedGoal(session);
 
 		// --- The edit itself: same identity, next revision, title only. ---------
 		const runsBeforeEdit = runCount(session);
@@ -149,13 +188,12 @@ test("a title-only /goal:edit sets the title in place and shows it in status and
 		assert.match(editNotice.message, /no work was started or redirected/);
 		assert.equal(runCount(session), runsBeforeEdit, "a title-only edit starts no run");
 
-		const entriesAfterEdit = readSessionEntries(await session.sessionFile());
-		const edited = currentGoal(entriesAfterEdit);
-		assert.equal(edited.id, created.id, "the Goal keeps its identity");
+		const edited = currentGoal(readSessionEntries(await session.sessionFile()));
+		assert.equal(edited.id, paused.id, "the Goal keeps its identity");
 		assert.equal(edited.objective, OBJECTIVE, "--title alone changes only the title");
 		assert.equal(edited.title, TITLE, "the title is durable Goal state");
-		assert.equal(edited.revision, 1, "the edit is the next revision");
-		assert.equal(edited.status, "active", "a label edit does not move the Lifecycle status");
+		assert.equal(edited.revision, paused.revision + 1, "the edit is the next revision");
+		assert.equal(edited.status, "paused", "a label edit does not move the Lifecycle status");
 
 		// The human status report renders the title when present.
 		await session.prompt("/goal");
@@ -167,29 +205,34 @@ test("a title-only /goal:edit sets the title in place and shows it in status and
 		);
 
 		// --- Structured payloads: get_goal and update_goal carry the title. ------
-		await session.prompt("Check the goal, then finish it.");
+		// The resumed run binds to the edited revision, reads the Goal, and
+		// completes it; completion is terminal, so the run settles without a
+		// continuation request.
+		await session.prompt("/goal:resume");
+		await session.waitForNotify((record) => record.message.includes("resumed"));
 		const getResult = (await session.waitForToolResult("get_goal", 1)).result;
 		assert.equal(getResult.structuredContent.goal.title, TITLE, "get_goal's structured payload carries the title");
 		assert.equal(getResult.structuredContent.goal.objective, OBJECTIVE);
 		assert.match(String(getResult.content[0].text), new RegExp(`^Title: ${TITLE}$`, "m"));
 
-		const completeResult = (await session.waitForToolResult("update_goal", 1)).result;
+		const completeResult = (await session.waitForToolResult("update_goal", 2)).result;
 		assert.equal(completeResult.structuredContent.goal.status, "complete");
 		assert.equal(completeResult.structuredContent.goal.title, TITLE, "update_goal's structured payload carries it");
 		await session.waitForSettled(2);
-		assert.equal(currentGoal(readSessionEntries(await session.sessionFile())).title, TITLE);
+
+		const entries = readSessionEntries(await session.sessionFile());
+		assert.equal(currentGoal(entries).title, TITLE);
 
 		// --- Privacy: the title text never reaches a derived surface. -----------
-		assertTitleAbsentFromDerivedSurfaces(readSessionEntries(await session.sessionFile()), TITLE);
+		assertTitleAbsentFromDerivedSurfaces(entries, TITLE);
 		assert.deepEqual(
-			customEntries(readSessionEntries(await session.sessionFile()), HISTORY_ENTRY_TYPE).map(
-				(entry) => entry.data.kind,
-			),
-			["created", "objective-edited", "completed"],
+			customEntries(entries, HISTORY_ENTRY_TYPE).map((entry) => entry.data.kind),
+			["created", "paused", "objective-edited", "resumed", "completed"],
 			"the title edit committed one derived transition, without its text",
 		);
 
-		assertStepsConsumed(session, 5, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 6);
+		assertCleanRun(session);
 	} finally {
 		await session.stop();
 	}
@@ -197,23 +240,9 @@ test("a title-only /goal:edit sets the title in place and shows it in status and
 
 test("--title combined with an Objective changes both in one revision and starts no work", async () => {
 	const session = await startTitleSession();
-	script(
-		[
-			{ text: "On it.", usage: { input: 40, output: 10 } },
-			{ hang: true },
-		],
-		session,
-	);
+	script(createAndPauseSteps(), session);
 	try {
-		await session.prompt(`/goal ${OBJECTIVE}`);
-		await session.waitForNotify((record) => record.message.includes("created and activated"));
-		await abortActiveLoop(session, 2);
-
-		// Paused, so the combined edit rewrites durable state without admitting work
-		// and the scenario needs no further provider turns.
-		await session.prompt("/goal:pause");
-		await session.waitForNotify((record) => record.message.includes("paused"));
-		const paused = currentGoal(readSessionEntries(await session.sessionFile()));
+		const paused = await startPausedGoal(session);
 		const runsBeforeEdit = runCount(session);
 
 		await session.prompt(`/goal:edit --title "${TITLE}" ${EDITED_OBJECTIVE}`);
@@ -228,7 +257,8 @@ test("--title combined with an Objective changes both in one revision and starts
 		assert.equal(edited.revision, paused.revision + 1, "both changes are one revision");
 		assert.equal(edited.status, "paused", "the Lifecycle status is unchanged");
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3);
+		assertCleanRun(session);
 	} finally {
 		await session.stop();
 	}
@@ -236,35 +266,26 @@ test("--title combined with an Objective changes both in one revision and starts
 
 test("invalid titles are refused with no Goal mutation", async () => {
 	const session = await startTitleSession();
-	script(
-		[
-			{ text: "On it.", usage: { input: 40, output: 10 } },
-			{ hang: true },
-		],
-		session,
-	);
+	script(createAndPauseSteps(), session);
 	try {
-		await session.prompt(`/goal ${OBJECTIVE}`);
-		await session.waitForNotify((record) => record.message.includes("created and activated"));
-		await abortActiveLoop(session, 2);
+		await startPausedGoal(session);
 
-		const bytesBefore = JSON.stringify(
-			customEntries(readSessionEntries(await session.sessionFile()), "goal-state"),
-		);
-		const historyBefore = customEntries(
-			readSessionEntries(await session.sessionFile()),
-			HISTORY_ENTRY_TYPE,
-		).length;
+		const entriesBefore = readSessionEntries(await session.sessionFile());
+		const bytesBefore = JSON.stringify(customEntries(entriesBefore, "goal-state"));
+		const historyBefore = customEntries(entriesBefore, HISTORY_ENTRY_TYPE).length;
+		const runsBefore = runCount(session);
 
 		const refusals = [
 			["/goal:edit --title", /--title needs a title/],
 			['/goal:edit --title ""', /title must be 1 to 80 characters/],
 			[`/goal:edit --title "${LONG_TITLE}"`, /title must be 1 to 80 characters/],
-			// U+2028 is a line terminator to text processors but not to Pi's command
-			// transport, so the title reaches validation intact and proves the one-line
-			// rule. Plain newlines are covered at the unit seam, where no transport can
-			// split the command.
+			// U+2028 and U+0085 are line terminators to text processors but not to
+			// Pi's command transport, so the title reaches validation intact and
+			// proves the one-line rule — including at the leading and trailing edges,
+			// which must be refused rather than trimmed away.
 			['/goal:edit --title "two\u2028lines"', /must be one line/],
+			['/goal:edit --title "Release prep\u2028"', /must be one line/],
+			['/goal:edit --title "\u0085Release prep"', /must be one line/],
 			[`/goal:edit --title "${TITLE}" --file notes.md`, /attachment manifest/],
 		];
 		for (const [command, expected] of refusals) {
@@ -290,14 +311,15 @@ test("invalid titles are refused with no Goal mutation", async () => {
 			"no refused edit appended a history record",
 		);
 		assert.equal(currentGoal(entriesAfter).title, undefined);
-		assert.equal(runCount(session), 2, "no refused edit started a run");
+		assert.equal(runCount(session), runsBefore, "no refused edit started a run");
 
 		// A valid title still applies afterwards, so the refusal was about the value.
 		await session.prompt(`/goal:edit --title "${TITLE}"`);
 		await session.waitForNotify((record) => record.message.includes("title set to"));
 		assert.equal(currentGoal(readSessionEntries(await session.sessionFile())).title, TITLE);
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3);
+		assertCleanRun(session);
 	} finally {
 		await session.stop();
 	}
@@ -305,20 +327,12 @@ test("invalid titles are refused with no Goal mutation", async () => {
 
 test("session naming still names a fresh creation from the Objective, and a title edit never renames", async () => {
 	const session = await startTitleSession({ settings: NAMING_ON });
-	script(
-		[
-			{ text: "On it.", usage: { input: 40, output: 10 } },
-			{ hang: true },
-		],
-		session,
-	);
+	script(createAndPauseSteps(), session);
 	try {
-		await session.prompt(`/goal ${OBJECTIVE}`);
-		await session.waitForNotify((record) => record.message.includes("created and activated"));
-		assert.equal((await session.getState()).sessionName, OBJECTIVE, "the creation names the session");
+		await startPausedGoal(session);
+		assert.equal((await session.getState()).sessionName, OBJECTIVE, "the fresh creation names the session");
 		const nameBeforeEdit = (await session.getState()).sessionName;
 
-		await abortActiveLoop(session, 2);
 		await session.prompt(`/goal:edit --title "${TITLE}"`);
 		await session.waitForNotify((record) => record.message.includes("title set to"));
 
@@ -330,7 +344,8 @@ test("session naming still names a fresh creation from the Objective, and a titl
 		assert.equal(sessionInfoEntries(entries).length, 1, "the edit appended no session_info entry");
 		assert.equal(currentGoal(entries).title, TITLE);
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3);
+		assertCleanRun(session);
 	} finally {
 		await session.stop();
 	}

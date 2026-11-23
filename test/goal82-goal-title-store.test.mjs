@@ -92,6 +92,15 @@ test("a Goal title is one line of 1 to 80 characters after trimming", () => {
 		["two\rlines", /one line/],
 		["two\u2028lines", /one line/],
 		["two\u0085lines", /one line/],
+		// The one line rule is checked before trimming, so a terminator at either
+		// edge is refused rather than silently stripped into an accepted label.
+		["Release prep\n", /one line/],
+		["\nRelease prep", /one line/],
+		["Release prep\r", /one line/],
+		["\r\nRelease prep\r\n", /one line/],
+		["Release prep\u2028", /one line/],
+		["\u2029Release prep", /one line/],
+		["Release prep\u0085", /one line/],
 	];
 	for (const [raw, expected] of invalid) {
 		const result = validateGoalTitle(raw);
@@ -230,7 +239,15 @@ test("a persisted title reconstructs verbatim on a new branch read", () => {
 });
 
 test("a malformed title is dropped at reconstruction without losing the Goal", () => {
-	for (const title of ["two\nlines", "x".repeat(81), `  ${"y".repeat(90)}  `]) {
+	for (const title of [
+		"two\nlines",
+		"x".repeat(81),
+		`  ${"y".repeat(90)}  `,
+		// A leading or trailing terminator is invalid too: reconstruction must not
+		// normalize what the live validation refuses.
+		"Release prep\n",
+		"\u2028Release prep",
+	]) {
 		const store = new GoalStore();
 		store.reconstruct(fakeCtx([snapshotEntry(legacySnapshot({ title }))]));
 		const goal = store.get();
@@ -528,6 +545,10 @@ test("invalid /goal:edit titles are refused before any Goal mutation", async () 
 			['--title ""', /1 to 80 characters/],
 			[`--title "${"x".repeat(81)}"`, /1 to 80 characters/],
 			['--title "two\nlines"', /one line/],
+			// Trailing and leading terminators are refused before trimming, so they
+			// cannot silently become an accepted one-line label.
+			['--title "Release prep\n"', /one line/],
+			['--title "\u2028Release prep"', /one line/],
 			['--title "unterminated', /opening quote is not closed/],
 			[`--title "${TITLE}" --title "again"`, /only once/],
 			[`--title "${TITLE}" --file notes.md`, /attachment manifest/],

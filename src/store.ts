@@ -2638,6 +2638,12 @@ const TITLE_LINE_TERMINATOR = /[\r\n\u0085\u2028\u2029]/;
  * Validate a Goal title: one line, {@link MIN_TITLE_LENGTH}–{@link MAX_TITLE_LENGTH}
  * characters (code points) after trimming.
  *
+ * The one-line rule is checked against the **raw** value, before trimming. A
+ * trailing or leading line break is still a line break: trimming it away and
+ * persisting the remainder would accept a value that was never one line, and a
+ * caller could not tell the accepted label from the one it typed. Surrounding
+ * spaces and tabs are still trimmed, because they cannot break a line.
+ *
  * Code points, not UTF-16 code units, for the same reason the session-name cap
  * counts them: a title is a human label, and an emoji-heavy 40-character title
  * must not be refused as if it were 80. The trimmed title is what is persisted.
@@ -2647,13 +2653,15 @@ const TITLE_LINE_TERMINATOR = /[\r\n\u0085\u2028\u2029]/;
  * same rule. A refused title is reported to the user and mutates nothing.
  */
 export function validateGoalTitle(raw: string): { ok: true; title: string } | { ok: false; error: string } {
-	const title = raw.trim();
-	if (TITLE_LINE_TERMINATOR.test(title)) {
+	// Before trimming: a title with a leading or trailing terminator is not one
+	// line, and the trim below must not be able to hide that.
+	if (TITLE_LINE_TERMINATOR.test(raw)) {
 		return {
 			ok: false,
 			error: "Goal not edited: the title must be one line; line breaks are not allowed.",
 		};
 	}
+	const title = raw.trim();
 	const length = Array.from(title).length;
 	if (length < MIN_TITLE_LENGTH || length > MAX_TITLE_LENGTH) {
 		return {
@@ -2806,8 +2814,10 @@ function withSanitizedAudit(goal: GoalRecord): GoalRecord {
  * snapshot closed: losing a label must never cost the user the Goal it describes.
  * The structural type is already checked by `isGoalRecord`; this validates the
  * *content* and trims a value that is valid but not in its canonical form. A
- * title-less record — every snapshot written before titles existed — is returned
- * unchanged, which is what makes old snapshots reconstruct identically.
+ * leading or trailing line terminator is not trimmed away — it is invalid and the
+ * title is dropped, exactly as the live validation refuses it. A title-less
+ * record — every snapshot written before titles existed — is returned unchanged,
+ * which is what makes old snapshots reconstruct identically.
  */
 function withSanitizedTitle(goal: GoalRecord): GoalRecord {
 	if (goal.title === undefined) return goal;

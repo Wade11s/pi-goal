@@ -181,8 +181,10 @@ value is one quoted string or one unquoted token; both `--title "two words"` and
 - `--title` together with an objective changes **both** in the same next
   revision, and the objective half follows every rule below.
 - An invalid title is refused with no Goal mutation: empty or whitespace-only,
-  more than 80 characters, or containing a line break (including U+2028 and
-  U+0085). The same refusal covers a missing value, an unterminated quote, and a
+  more than 80 characters, or containing a line break anywhere — including at the
+  start or end (checked on the raw value before trimming, so a trailing newline
+  or U+2028 is refused rather than silently stripped), and including U+2028 and
+  U+0085. The same refusal covers a missing value, an unterminated quote, and a
   duplicate `--title`.
 - Title text follows the Objective's privacy boundary: it is durable Goal state
   and appears in the status report, the structured tool payloads, session naming,
