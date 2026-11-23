@@ -209,9 +209,11 @@ document's format/parse rules, the UI-less direct creation with its notice,
 `propose_goal` registration/refusal gating (including a reload that turns the
 setting off while Pi keeps the registration), and the failure matrix a real
 session cannot inject — a foreign extension owning the tool name (creation fails
-closed), a failed `pending: null` write (surfaced, the clarification stays open,
-and a save is refused), and a duplicate confirmation whose save already committed
-(the stale cancel clears nothing and reports the committed Goal).
+closed), a failed terminal end write (surfaced on cancel with the clarification
+still open; a save still commits because its confirming record precedes the
+commit, and the leftover draft is abandoned by the new Goal's identity), and a
+duplicate confirmation whose save already committed (the stale cancel clears
+nothing and reports the committed Goal).
 
 Clarification persistence (issue #85) is tested at both seams too.
 `test/goal85-clarification-persistence.test.mjs` reuses the attachment suites'
@@ -222,28 +224,49 @@ surfaces only: the RPC record stream, the branch's `goal-clarification`,
 `goal-state`, message, and `goal-events-log` entries, the artifact store beside
 the session file, and the remote-image fixture's request log. It covers a
 post-restart `propose_goal` save committing with the original raw idea and the
-original `--budget`/`--file`/`--remote-image` flags, a mid-clarification restart
+original `--budget`/`--file`/`--remote-image` flags; a mid-clarification restart
 whose flags stay unread and unfetched until the confirming save (one fetch, one
-materialization), a second `/goal` replacing the pending entry while the first
+materialization); a second `/goal` replacing the pending entry while the first
 confirmation editor is still open (the replaced save is refused, creates nothing,
-and does not clear the replacement, which then commits with its own flags), a
+and does not clear the replacement, which then commits with its own flags); and a
 cancelled clarification with attachment flags leaving zero Goal bytes, zero
-artifacts, zero fetches, and zero Goal-updated events — and its durable end not
-resurrecting an offer after a restart, where a stale `propose_goal` is refused. It
-also pins fail-closed restoration: with `goal.clarifyOnCreate: false`, a UI-less
-host, or another extension owning the `propose_goal` name, the pending entry is not
-offered and no direct creation bypasses the missing confirmation; a direct `/goal`
-on such a restart retires the leftover entry once its Goal commits, and the next
-restart (with the flow on again) does not resurrect it. A branch-navigation
-scenario drives real `ctx.navigateTree()` through `test/extensions/tree-nav.ts`:
-navigating away from the branch that holds the entry hides the clarification, and
-navigating back restores it and still commits. The pure rules — newest-entry
-selection with no fallback from a malformed one, every held-flag shape, and the
-restore/malformed/open-status and replacement-instruction text — are unit-tested
-in `test/goal85-clarification-persistence-store.test.mjs`, which also exercises the
-`session_start` wiring a real RPC session cannot reach (a UI-less host, and a
-malformed newest entry surfacing its notice without falling back).
+artifacts, zero fetches, and zero Goal-updated events, with its durable end not
+resurrecting an offer after a restart, where a stale `propose_goal` is refused.
 
+The supersede and draft-recovery shapes a live session cannot stage are reached
+deterministically too. A direct `/goal` (clarification off) commits a different
+Goal, which then completes; the test rewrites the session file to drop only the
+retirement record — the crash window between the commit and that write — and
+restarts, proving the stale draft is not offered and `propose_goal` refuses
+without touching the completed Goal. A real `create_goal` call during an interview
+retires the entry, and the restart offers nothing. A valid interview plus a
+`goal-state` entry whose version is rewritten to an unsupported one makes the
+store fail closed: the startup notice names it, no clarification is offered or
+advertised, `propose_goal` refuses with the repair path, no new snapshot is
+written over the corrupt one, and `/goal` refuses to record a new interview. Two
+further scenarios exercise the `confirming` state: an attachment deleted between
+the interview and the save makes the commit fail, and the restart reopens the
+editor with the *user's* edited draft (never the model's new one) before the retry
+commits it with the held flags; and a remote image held open by the fixture lets a
+SIGKILL land mid-fetch, after which the restart still restores the draft and the
+confirmation can be cancelled cleanly. A branch-navigation scenario drives real
+`ctx.navigateTree()` through `test/extensions/tree-nav.ts`: navigating away from
+the branch that holds the entry hides the clarification, and navigating back
+restores it and still commits.
+
+The pure rules are unit-tested in
+`test/goal85-clarification-persistence-store.test.mjs`: newest-entry selection
+with no fallback from a malformed one, the three entry states and every held-flag
+shape, the base-Goal identity matrix (same-Goal transitions allowed; a created,
+replaced, cleared, or unreadable slot supersedes; a `superseded` historical
+snapshot does not), a malformed stored draft being dropped rather than failing the
+interview, the restore/malformed/open-status and replacement-instruction text, and
+the session-start wiring a real RPC session cannot reach: a UI-less host, a
+malformed newest clarification entry, an unreadable Goal branch blocking both
+restoration and start, and a late `propose_goal` takeover (blocked at `/goal` and
+withdrawn from an already-offered interview on the next turn). This Pi version
+keeps the first registration of a tool name, so the takeover seams are pinned
+against the fake Pi rather than a real peer extension.
 The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
 surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
 durable Lifecycle status, is stopped, and is reopened from a copy of its session
@@ -515,8 +538,9 @@ To verify the package installation and the interactive surface by hand, follow
       and Objective; cancelling or timing out creates and materializes nothing
 - [ ] A clarification survives a restart (graceful or a killed process): the
       notice names it, `/goal` reports the held flags, `propose_goal` still
-      commits with them, and nothing was read or fetched before the save; a new
-      `/goal` replaces it and the replaced editor's save creates nothing
+      commits with them, nothing was read or fetched before the save, and a failed
+      save reopens with the draft you saved; a new `/goal` replaces it and the
+      replaced editor's save creates nothing
 - [ ] `goal.clarifyOnCreate: false` creation and immediate work, and a UI-less
       mode's direct creation with its notice
 - [ ] `/goal --file <path> --image <path> <objective>` sends encoded untrusted

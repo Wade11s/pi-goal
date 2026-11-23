@@ -232,7 +232,12 @@ test("a UI-capable /goal records the pending clarification durably and sends the
 
 		assert.equal(customEntries(fx, "goal-state").length, 0, "no Goal was committed");
 		const pending = customEntries(fx, CLARIFICATION_ENTRY_TYPE).at(-1).data.pending;
-		assert.deepEqual(pending, { idea: OBJECTIVE, budget: { kind: "value", value: 5000 }, attachments: [] });
+		assert.deepEqual(pending, {
+			idea: OBJECTIVE,
+			budget: { kind: "value", value: 5000 },
+			attachments: [],
+			baseGoalId: null,
+		});
 		assert.ok(
 			fx.state.notifications.some((notice) => notice.message.includes("Objective clarification started")),
 			JSON.stringify(fx.state.notifications),
@@ -353,7 +358,7 @@ test("a host where another extension owns propose_goal refuses the creation and 
 	}
 });
 
-test("a failed durable clear is surfaced and blocks the save instead of being reported as cleared", async () => {
+test("a failed durable end is surfaced, and a save still commits because the confirming record precedes it", async () => {
 	const fx = fixture({ goal: { clarifyOnCreate: true } });
 	try {
 		const ctx = await startPendingClarification(fx);
@@ -362,8 +367,8 @@ test("a failed durable clear is surfaced and blocks the save instead of being re
 		const toolCtx = { ...ctx, hasUI: true };
 		fx.state.failClarificationClear = true;
 
-		// Cancel with a broken `pending: null` append: the clarification is still open,
-		// so the result must say so instead of claiming a clear that never landed.
+		// Cancel with a broken end append: the clarification is still open, so the
+		// result must say so instead of claiming a clear that never landed.
 		fx.state.editorResponses.push(undefined);
 		const cancelled = await propose.execute("call-cancel", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
 		assert.equal(cancelled.isError, true);
@@ -379,33 +384,50 @@ test("a failed durable clear is surfaced and blocks the save instead of being re
 		assert.deepEqual(
 			customEntries(fx, CLARIFICATION_ENTRY_TYPE).map((entry) => entry.data.pending),
 			[pending],
-			"no clear entry landed, and memory still holds the pending clarification",
+			"no end entry landed, and memory still holds the pending clarification",
 		);
 
-		// A save on the still-open clarification must refuse: committing here would
-		// leave an open pending record before the Goal snapshot.
+		// A save no longer depends on that end write: the confirmed draft is recorded
+		// *before* the commit, so the Goal is created and the failed terminal write is
+		// reported as a warning rather than blocking the user's confirmed creation.
 		fx.state.editorResponses.push(formatClarificationDocument(TITLE, DRAFT));
 		const saved = await propose.execute("call-save", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
-		assert.equal(saved.isError, true);
-		assert.match(saved.content[0].text, /the confirmation was not committed/);
+		assert.notEqual(saved.isError, true, JSON.stringify(saved.content));
+		const committed = customEntries(fx, "goal-state").at(-1).data.goal;
+		assert.equal(committed.title, TITLE);
+		assert.equal(committed.objective, DRAFT);
 		assert.ok(
 			fx.state.notifications.some(
-				(notice) => notice.type === "error" && notice.message.includes("the confirmation was not committed"),
+				(notice) =>
+					notice.type === "warning" && notice.message.includes("Objective clarification's end could not be recorded"),
 			),
-			"the failed save is surfaced to the user too",
+			JSON.stringify(fx.state.notifications),
 		);
-		assert.equal(customEntries(fx, "goal-state").length, 0, "no Goal bytes were written");
-
-		// Once the session write works again, the same clarification can be cancelled.
-		fx.state.failClarificationClear = false;
-		fx.state.editorResponses.push(undefined);
-		const retried = await propose.execute("call-cancel-2", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
-		assert.notEqual(retried.isError, true);
 		assert.deepEqual(
 			customEntries(fx, CLARIFICATION_ENTRY_TYPE).map((entry) => entry.data.pending),
-			[pending, null],
-			"the retry records the durable end",
+			[pending, pending],
+			"the open entry and the confirming record, with no terminal end",
 		);
+
+		// Memory forgot the clarification once the Goal committed, so a duplicate call
+		// finds nothing to confirm.
+		fx.state.editorResponses.push(undefined);
+		const duplicate = await propose.execute("call-again", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
+		assert.equal(duplicate.isError, true);
+		assert.match(duplicate.content[0].text, /no Objective clarification is in progress/);
+
+		// A restart must not resurrect the draft: the confirming record's base is
+		// `null`, and a Goal snapshot with a different identity landed after it.
+		fx.state.failClarificationClear = false;
+		await startSession(fx);
+		assert.equal(
+			fx.state.notifications.some((notice) => notice.message.includes("Objective clarification restored")),
+			false,
+			JSON.stringify(fx.state.notifications),
+		);
+		const refused = await propose.execute("call-restart", { title: TITLE, objective: DRAFT }, undefined, undefined, toolCtx);
+		assert.equal(refused.isError, true);
+		assert.match(refused.content[0].text, /no Objective clarification is in progress/);
 	} finally {
 		rmSync(fx.dir, { recursive: true, force: true });
 	}
@@ -451,8 +473,8 @@ test("a duplicate confirmation whose save already committed cannot clear or misr
 		assert.equal(customEntries(fx, "goal-state").length, 1, "the stale confirmation committed nothing");
 		assert.deepEqual(
 			customEntries(fx, CLARIFICATION_ENTRY_TYPE).map((entry) => entry.data.pending),
-			[pending, null],
-			"exactly one clear entry, and the committed pending was not ended twice",
+			[pending, pending, null],
+			"the open entry, the confirming record, and exactly one terminal end",
 		);
 	} finally {
 		rmSync(fx.dir, { recursive: true, force: true });

@@ -113,17 +113,36 @@ an `Objective clarification restored` notice and starts no run; the conversation
 with the model continues, `propose_goal` still commits, and bare `/goal` reports
 the open clarification and the flags it is holding. Reconstruction reads no
 attachment and fetches nothing, so a restart cannot materialize or fetch anything.
-It is offered only when the session can finish it — `goal.clarifyOnCreate` on,
-`propose_goal` registered, and a dialog-capable UI — and an unreadable newest
-entry fails closed with a notice instead of falling back to an older pending
-entry. A direct `/goal` on a session that cannot clarify (`goal.clarifyOnCreate:
-false`, or no dialog-capable UI) retires a leftover pending entry once its Goal
-commits, so the interview it superseded does not reappear later. A **new `/goal
-<idea>` during clarification replaces the pending entry**: the new idea and flags
-win, the interview starts over (the model is told the earlier one is abandoned),
-nothing was created for the old idea, and saving an editor still open from the
-replaced interview is refused — it is no longer the current clarification, so it
-neither creates a Goal nor clears the newer one.
+
+Restoration and confirmation fail closed when they cannot be trusted. The entry
+records the **base Goal identity** it was started against, and it is offered only
+while that identity is still the branch's Goal slot: a Goal created, replaced, or
+cleared after the interview started supersedes the draft, even if a crash lost the
+write that would have retired it and even if that Goal later completes — a stale
+draft can never overwrite a Goal the user chose in the meantime. A Goal branch
+whose newest snapshot is unreadable blocks both the offer and the confirmation
+with a repair notice instead of writing a new snapshot over state pi-goal cannot
+see. An unreadable newest clarification entry fails closed with a notice rather
+than falling back to an older one, and the flow must be enabled, `propose_goal`
+must still be pi-goal's own tool at that moment, and the host must have a
+dialog-capable UI.
+
+**Saving is not the end of the record; committing is.** The confirmed document is
+written durably as a `confirming` state before the creation commit, so a failed
+creation (a budget refusal, a stale Goal, a missing attachment, a fetch failure) or
+a crash mid-save cannot strand the user's edited draft behind a terminal record:
+the editor reopens with that draft when `propose_goal` is called again, with the
+held flags, and the retry commits. Cancelling or timing out is a different, final
+record. The terminal `ended` state is written after the Goal commits; a crash
+between the two is resolved by the base identity.
+
+A **new `/goal <idea>` during clarification replaces the pending entry**: the new
+idea and flags win, the interview starts over (the model is told the earlier one is
+abandoned), nothing was created for the old idea, and saving an editor still open
+from the replaced interview is refused — it is no longer the current clarification,
+so it neither creates a Goal nor clears the newer one. Every creation path that
+bypasses the editor (a direct `/goal` or a `create_goal` call) retires a leftover
+pending entry once its Goal commits.
 
 ### Direct creation
 

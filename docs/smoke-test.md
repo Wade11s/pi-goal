@@ -87,6 +87,12 @@ creates the Goal with the held budget and attachment. Typing a new
 `/goal <other idea>` while a clarification is open restarts the interview with
 the new idea, and saving the replaced editor creates nothing.
 
+If a confirming save fails — for example because an attachment file disappeared
+between the interview and the save — the clarification is not ended: restart Pi
+on the same session and expect the restore notice to say the saved draft is kept,
+then retry `propose_goal` and find the editor reopened with the draft you saved.
+The retry commits it with the held budget and attachment flags.
+
 To verify the escape hatches, add `{ "goal": { "clarifyOnCreate": false } }` to
 `~/.pi/agent/settings.json` and restart: `/goal <objective>` creates immediately
 with no editor and no title. A UI-less host (`pi -p`, JSON/RPC without a
@@ -648,8 +654,9 @@ behave as a namespace and that the old spelling has no side effects.
 - [ ] `/goal:clear` removes the Goal and the status indicator.
 - [ ] A clarification survives a restart (or a killed process): the notice names
       it, `/goal` reports the held flags, `propose_goal` still commits with them,
-      and nothing was read or fetched before the save; a new `/goal` replaces it
-      and the replaced editor's save creates nothing.
+      nothing was read or fetched before the save, and a failed save reopens with
+      the draft you saved; a new `/goal` replaces it and the replaced editor's
+      save creates nothing.
 - [ ] The Goal survives a restart with its usage intact.
 - [ ] `/reload` after a clear does not resurrect the Goal.
 - [ ] A legacy 0.1.0 session loads without work, is cut over once, and reports its

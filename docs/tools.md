@@ -59,29 +59,38 @@ Goal was created (a legitimate outcome, so it is not an error result). The clear
 is **conditional on the captured clarification still being current** and is made
 durable before memory forgets it: a duplicate confirmation whose save already
 committed clears nothing and reports the committed Goal, and a failed
-`pending: null` write is surfaced as an error while the clarification stays open
-— it is never reported as cleared, and the save that would follow it is refused
-rather than committing a Goal with an open pending record before it. A save
-opens no second path either: the held `--budget`/`--no-budget` and
-`--file`/`--image`/`--remote-image` flags resolve and materialize only inside that
-commit. If an **unfinished** Goal appeared while the editor was open, the save is
-refused exactly like a typed `/goal` and the pending entry is gone.
+`ended` write is surfaced as an error while the clarification stays open — it is
+never reported as cleared.
 
-The pending clarification is **durable**: a graceful or unclean restart (and a
-reload, fork/clone, or branch selection that keeps the entry) reconstructs it,
-so the same conversation can still call `propose_goal` and commit, with the raw
-idea and flags unchanged and nothing read or fetched by the reconstruction. Bare
-`/goal` names the open clarification and the flags it is holding; a restart whose
-session cannot confirm it (`goal.clarifyOnCreate: false`, a UI-less host, or
-`propose_goal` unavailable because another extension owns the name) offers nothing
-and fails closed, and an unreadable newest entry does the same rather than reviving
-an older clarification. A direct `/goal` on such a session retires the leftover
-pending entry once its Goal commits, so a superseded interview does not resurface.
-A **new `/goal <idea>` replaces** the pending clarification: the
-new idea and flags win, the interview starts over, nothing was created for the
-abandoned idea, and a save from the replaced editor is refused because the
-captured clarification is no longer current — it neither commits nor clears the
-newer one.
+A save is not the same terminal record as a cancel. The confirmed document is
+written durably as a **`confirming`** state *before* the creation commit, and the
+terminal `ended` state is written only after the Goal commits. A commit that fails
+(budget, a stale Goal, an attachment, a fetch, a session write) or a process that
+dies mid-fetch therefore leaves the confirmed draft and the held
+`--budget`/`--no-budget` and `--file`/`--image`/`--remote-image` flags recoverable:
+the next `propose_goal` call reopens the editor with the user's saved draft, and
+the retry commits it. Those flags resolve and materialize only inside that commit,
+so nothing is read or fetched until a save is under way.
+
+The pending clarification is **durable** and branch-scoped. A graceful or unclean
+restart (and a reload, fork/clone, or branch selection that keeps the entry)
+reconstructs it, so the same conversation can still call `propose_goal` and
+commit, with the raw idea and flags unchanged and nothing read or fetched by the
+reconstruction. Bare `/goal` names the open clarification and the flags it is
+holding, and a recovered confirmation says its draft is kept. The entry records
+the **base Goal identity** it was started against: a Goal created, replaced, or
+cleared afterwards supersedes the draft (even after a crash that lost the
+retirement write, and even if that Goal later completes), so a stale draft can
+never overwrite a Goal the user chose in the meantime. Restoration and
+confirmation fail closed while the branch's newest Goal snapshot is unreadable,
+and while `goal.clarifyOnCreate` is off, another extension owns `propose_goal`, or
+the host has no dialog-capable UI — every one of those seams re-reads the registry
+instead of trusting the session-start answer. An unreadable newest clarification
+entry also fails closed rather than reviving an older one. A **new `/goal <idea>`
+replaces** the pending clarification: the new idea and flags win, the interview
+starts over, nothing was created for the abandoned idea, and a save from the
+replaced editor is refused because the captured clarification is no longer
+current — it neither commits nor clears the newer one.
 
 The model-facing description and prompt guidelines carry the drafting template as
 a **convention**: `Objective:` (one sentence stating what is different when the
