@@ -105,6 +105,26 @@ pending clarification, and creates no Goal. The saved editor is the only creatio
 authority on that path, so a direct commit would silently bypass the mandatory
 confirmation. `goal.enabled: false` refuses before any clarification starts.
 
+**A clarification survives the session lifecycle.** The pending entry is durable
+state: a graceful exit or an unclean kill, then a resume (`--continue` /
+`--session`), reload, fork/clone, or tree navigation that selects the branch still
+holding it, restores the same raw idea and the same unread flags. Restart prints
+an `Objective clarification restored` notice and starts no run; the conversation
+with the model continues, `propose_goal` still commits, and bare `/goal` reports
+the open clarification and the flags it is holding. Reconstruction reads no
+attachment and fetches nothing, so a restart cannot materialize or fetch anything.
+It is offered only when the session can finish it — `goal.clarifyOnCreate` on,
+`propose_goal` registered, and a dialog-capable UI — and an unreadable newest
+entry fails closed with a notice instead of falling back to an older pending
+entry. A direct `/goal` on a session that cannot clarify (`goal.clarifyOnCreate:
+false`, or no dialog-capable UI) retires a leftover pending entry once its Goal
+commits, so the interview it superseded does not reappear later. A **new `/goal
+<idea>` during clarification replaces the pending entry**: the new idea and flags
+win, the interview starts over (the model is told the earlier one is abandoned),
+nothing was created for the old idea, and saving an editor still open from the
+replaced interview is refused — it is no longer the current clarification, so it
+neither creates a Goal nor clears the newer one.
+
 ### Direct creation
 
 Every creation path that does not clarify is unchanged:

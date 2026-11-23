@@ -213,6 +213,37 @@ closed), a failed `pending: null` write (surfaced, the clarification stays open,
 and a save is refused), and a duplicate confirmation whose save already committed
 (the stale cancel clears nothing and reports the committed Goal).
 
+Clarification persistence (issue #85) is tested at both seams too.
+`test/goal85-clarification-persistence.test.mjs` reuses the attachment suites'
+restart pattern — one shared session and working directory, a first process that
+records the pending entry, then a second process started from the same session
+file — for both a graceful `stop()` and a SIGKILL, and asserts from public
+surfaces only: the RPC record stream, the branch's `goal-clarification`,
+`goal-state`, message, and `goal-events-log` entries, the artifact store beside
+the session file, and the remote-image fixture's request log. It covers a
+post-restart `propose_goal` save committing with the original raw idea and the
+original `--budget`/`--file`/`--remote-image` flags, a mid-clarification restart
+whose flags stay unread and unfetched until the confirming save (one fetch, one
+materialization), a second `/goal` replacing the pending entry while the first
+confirmation editor is still open (the replaced save is refused, creates nothing,
+and does not clear the replacement, which then commits with its own flags), a
+cancelled clarification with attachment flags leaving zero Goal bytes, zero
+artifacts, zero fetches, and zero Goal-updated events — and its durable end not
+resurrecting an offer after a restart, where a stale `propose_goal` is refused. It
+also pins fail-closed restoration: with `goal.clarifyOnCreate: false`, a UI-less
+host, or another extension owning the `propose_goal` name, the pending entry is not
+offered and no direct creation bypasses the missing confirmation; a direct `/goal`
+on such a restart retires the leftover entry once its Goal commits, and the next
+restart (with the flow on again) does not resurrect it. A branch-navigation
+scenario drives real `ctx.navigateTree()` through `test/extensions/tree-nav.ts`:
+navigating away from the branch that holds the entry hides the clarification, and
+navigating back restores it and still commits. The pure rules — newest-entry
+selection with no fallback from a malformed one, every held-flag shape, and the
+restore/malformed/open-status and replacement-instruction text — are unit-tested
+in `test/goal85-clarification-persistence-store.test.mjs`, which also exercises the
+`session_start` wiring a real RPC session cannot reach (a UI-less host, and a
+malformed newest entry surfacing its notice without falling back).
+
 The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
 surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
 durable Lifecycle status, is stopped, and is reopened from a copy of its session
@@ -482,6 +513,10 @@ To verify the package installation and the interactive surface by hand, follow
 - [ ] `/goal <raw idea>` Objective clarification: pending entry, interview,
       confirmation editor, and a committed Goal carrying exactly the saved title
       and Objective; cancelling or timing out creates and materializes nothing
+- [ ] A clarification survives a restart (graceful or a killed process): the
+      notice names it, `/goal` reports the held flags, `propose_goal` still
+      commits with them, and nothing was read or fetched before the save; a new
+      `/goal` replaces it and the replaced editor's save creates nothing
 - [ ] `goal.clarifyOnCreate: false` creation and immediate work, and a UI-less
       mode's direct creation with its notice
 - [ ] `/goal --file <path> --image <path> <objective>` sends encoded untrusted

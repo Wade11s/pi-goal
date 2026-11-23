@@ -67,6 +67,22 @@ opens no second path either: the held `--budget`/`--no-budget` and
 commit. If an **unfinished** Goal appeared while the editor was open, the save is
 refused exactly like a typed `/goal` and the pending entry is gone.
 
+The pending clarification is **durable**: a graceful or unclean restart (and a
+reload, fork/clone, or branch selection that keeps the entry) reconstructs it,
+so the same conversation can still call `propose_goal` and commit, with the raw
+idea and flags unchanged and nothing read or fetched by the reconstruction. Bare
+`/goal` names the open clarification and the flags it is holding; a restart whose
+session cannot confirm it (`goal.clarifyOnCreate: false`, a UI-less host, or
+`propose_goal` unavailable because another extension owns the name) offers nothing
+and fails closed, and an unreadable newest entry does the same rather than reviving
+an older clarification. A direct `/goal` on such a session retires the leftover
+pending entry once its Goal commits, so a superseded interview does not resurface.
+A **new `/goal <idea>` replaces** the pending clarification: the
+new idea and flags win, the interview starts over, nothing was created for the
+abandoned idea, and a save from the replaced editor is refused because the
+captured clarification is no longer current — it neither commits nor clears the
+newer one.
+
 The model-facing description and prompt guidelines carry the drafting template as
 a **convention**: `Objective:` (one sentence stating what is different when the
 work is done), `Constraints:` (hard limits, `None` when empty), and

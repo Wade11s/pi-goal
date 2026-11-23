@@ -53,11 +53,26 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
   memory forgets the pending entry, and only for the exact pending clarification
   the confirmation captured: a newer `/goal` or a concurrent confirmation keeps its
   own state, and a failed end-write leaves the pending open and is surfaced rather
-  than reported as cleared. It is not Goal state — nothing is reconstructed from
-  it, no Goal snapshot or event is written beside it, and its attachments stay
-  unread flags rather than a manifest. Restart
-  reconstruction of a pending clarification is issue #85: today a restart starts
-  with none, and `propose_goal` refuses until the user runs `/goal` again.
+  than reported as cleared. It is not Goal state — no Goal snapshot or event is
+  written beside it, and its attachments stay unread flags rather than a manifest.
+  It is reconstructed at the same two seams as the Goal, from the **newest**
+  `goal-clarification` entry on the selected branch: a graceful or unclean restart,
+  a reload, a fork/clone, or tree navigation that selects a branch still holding
+  one restores the same raw idea and the same unread flags, so the interview
+  continues and `propose_goal` still reaches a committed Goal. A later
+  `pending: null` means there is nothing to restore, and an unreadable newest entry
+  **fails closed** with an actionable notification and no fallback to an older
+  pending entry — the session may already have ended that one. Reconstruction reads
+  no attachment and makes no network request. It is offered only when this session
+  can finish it (`goal.clarifyOnCreate` on, `propose_goal` registered, and a
+  dialog-capable UI); otherwise the durable entry stays as history and the flow is
+  unavailable rather than falling back to an unconfirmed, direct creation. A
+  direct `/goal` on such a session (clarification off, or no UI) **retires** a
+  leftover pending entry once its Goal commits, so an interview it superseded
+  cannot reappear after a later restart. A new `/goal` replaces the
+  pending entry, so a restart reconstructs the replacement — and an editor still
+  open for the replaced interview can never commit, because its captured pending
+  clarification is no longer current.
 - The kickoff is delivered as a **user message** carrying the user's own
   objective (attributed as user-provided Goal data). As the session's first
   conversation entry it also makes Pi create and flush the session file, which

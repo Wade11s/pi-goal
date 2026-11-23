@@ -227,8 +227,12 @@ import {
 	PROPOSE_GOAL_TOOL_NAME,
 	formatClarificationDocument,
 	formatClarificationInterviewMessage,
+	formatOpenClarificationStatus,
+	formatPendingClarificationMalformedNotice,
+	formatPendingClarificationRestoredNotice,
 	parseClarificationDocument,
 	pendingClarificationEntry,
+	readPendingClarification,
 	type PendingClarification,
 } from "./clarification.ts";
 
@@ -1079,15 +1083,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let clarifyOnCreate: ClarifyOnCreateSettings = { enabled: true, problems: [] };
 
 	/**
-	 * The pending clarification this runtime started, or null.
+	 * The pending clarification this runtime holds, or null.
 	 *
 	 * The durable record is the `goal-clarification` session entry appended when
 	 * `/goal` begins the interview; this is the live view of it, because the model
-	 * asks to propose a Goal in a later model turn than the command. It is cleared
-	 * when the confirmation is saved, cancelled, or times out, and at every session
-	 * start: reconstruction of a pending clarification across a restart is issue
-	 * #85, so today a restart simply has no pending clarification and
-	 * `propose_goal` refuses until the user runs `/goal` again.
+	 * asks to propose a Goal in a later model turn than the command. It is rebuilt
+	 * from the selected branch at every `session_start` and `session_tree` (issue
+	 * #85), so a graceful or unclean restart continues the same interview with the
+	 * same raw idea and flags, and it is cleared when the confirmation is saved,
+	 * cancelled, or times out. A new `/goal` replaces it, and the identity check in
+	 * {@link endPendingClarification} keeps the replaced interview's open editor from
+	 * committing anything.
 	 */
 	let pendingClarification: PendingClarification | null = null;
 
@@ -1600,9 +1606,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// are lazy handles onto the live runner, so this stays valid for the session.
 		sessionContext = ctx;
 		clearCreationAuthority();
-		// A pending clarification is runtime state over a durable entry: its restart
-		// reconstruction is issue #85, so a new session starts with none. Stale memory
-		// from a previous session must never authorize a Goal in this one.
+		// A pending clarification is runtime state over a durable entry. Memory is
+		// cleared here, and the branch is read again below: stale state from a previous
+		// session must never authorize a Goal in this one, and an interview this branch
+		// still holds must not become a dead end (issue #85).
 		pendingClarification = null;
 		budgetSettings = parseBudgetSettings(pi.getSettings());
 		for (const problem of budgetSettings.problems) notify(ctx, problem, "warning");
@@ -1662,6 +1669,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					: "";
 			notify(ctx, `Goal ${goal.id} restored (${goal.status}).${disabled}`, "info");
 		}
+		// Rebuilt after the Goal notice so a restored clarification reads as the state
+		// left behind, not as a new one: the raw idea and flags are the ones the user
+		// typed before the restart, still unread and unfetched.
+		reconstructPendingClarification(ctx);
 		updateStatus(ctx);
 		// Asked after the restore notice and only for a restored `paused` Goal. The
 		// call is fire-and-forget by design: the dialog is created now, but
@@ -1818,6 +1829,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		applyCutover(ctx);
 		// The selected branch's Goal owns its own manifest; verify it like a restore.
 		surfaceAttachmentVerification(store.get(), ctx);
+		// The pending clarification is branch-local too: navigating to a branch that
+		// still holds one restores that interview, and navigating to a branch that ended
+		// it forgets it, so a stale editor from the branch left behind cannot commit.
+		reconstructPendingClarification(ctx);
 		notifyBranchChange(ctx, before, after);
 		// The status line follows the selected branch too, and the accounting
 		// baseline is rebuilt with it.
@@ -4341,6 +4356,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) {
 				const outcome = await commitGoalCreation(request, ctx);
 				if (!outcome.ok) return;
+				endSupersededPendingClarification(ctx);
 				ctx.ui.notify(
 					"Objective clarification was skipped: this Pi mode has no dialog-capable UI, so the confirmation " +
 						"editor could not be opened. The Goal was created directly from the raw idea; start Pi with a " +
@@ -4352,7 +4368,94 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			await startClarification(request, ctx);
 			return;
 		}
-		await commitGoalCreation(request, ctx);
+		const outcome = await commitGoalCreation(request, ctx);
+		if (!outcome.ok) return;
+		// A `/goal` that did not clarify still supersedes an earlier clarification: this
+		// command is the user's answer to the interview, so a durable pending entry it
+		// leaves behind must not come back after a restart.
+		endSupersededPendingClarification(ctx);
+	}
+
+	/**
+	 * Retire a pending clarification that a direct creation made moot.
+	 *
+	 * A direct creation happens only when this session cannot clarify
+	 * (`goal.clarifyOnCreate: false`) or has no dialog-capable UI, which is also why
+	 * the in-memory pending is always null on these paths. The branch may still hold
+	 * the newest pending entry from an earlier session — and a `/goal <idea>` is
+	 * exactly the command that supersedes it, so leaving it open would let a later
+	 * restart offer an interview this Goal already answered. Only a branch that
+	 * actually holds one is touched, so the common case writes nothing.
+	 *
+	 * The Goal is already committed when this runs: a failed end-write cannot undo it
+	 * and is reported as a warning rather than as a creation failure. The next `/goal`
+	 * replaces the leftover entry, and the confirmation of one would be refused while
+	 * this Goal is unfinished.
+	 */
+	function endSupersededPendingClarification(ctx: ExtensionCommandContext): void {
+		let pendingOnBranch: boolean;
+		try {
+			pendingOnBranch = readPendingClarification(ctx.sessionManager.getBranch()).kind === "pending";
+		} catch {
+			return;
+		}
+		if (!pendingOnBranch) return;
+		try {
+			pi.appendEntry(CLARIFICATION_ENTRY_TYPE, pendingClarificationEntry(null));
+		} catch (error) {
+			ctx.ui.notify(
+				`Goal created, but the superseded Objective clarification could not be recorded as ended ` +
+					`(${describeError(error)}). The Goal is unaffected; run /goal again to replace the leftover entry.`,
+				"warning",
+			);
+		}
+	}
+
+	/**
+	 * Rebuild the pending clarification from the selected branch.
+	 *
+	 * Called at the same two seams Goal reconstruction uses — `session_start`
+	 * (startup, resume, reload, new, fork/clone) and `session_tree` (branch
+	 * navigation) — so an open interview survives a graceful or unclean restart with
+	 * the raw idea and flags the user typed. Nothing is read, materialized, or
+	 * fetched here: the held flags stay flags, exactly as before the restart.
+	 *
+	 * Two conditions decide whether the reconstructed state is *offered*:
+	 *
+	 * - the flow must be on, `propose_goal` registered, and the host must have a
+	 *   dialog-capable UI. An interview this session could not confirm is a dead end,
+	 *   and falling back to a direct creation would bypass the confirmation the entry
+	 *   exists for, so the fail-closed direction is to offer nothing. The durable entry
+	 *   stays on the branch as history until the next `/goal` replaces it (a direct
+	 *   creation retires it) or a confirmation ends it.
+	 * - the newest entry must be readable. Reconstruction never falls back to an
+	 *   older pending entry, because the session may already have ended it on this
+	 *   branch; a malformed newest entry is surfaced instead of guessed.
+	 *
+	 * Memory is cleared first, on every call: stale runtime state from a previous
+	 * session or branch must never authorize a Goal in this one, even when the read
+	 * throws.
+	 */
+	function reconstructPendingClarification(ctx: ExtensionContext): void {
+		pendingClarification = null;
+		let read: ReturnType<typeof readPendingClarification>;
+		try {
+			read = readPendingClarification(ctx.sessionManager.getBranch());
+		} catch (error) {
+			// A broken branch must not break the session; report and stay closed.
+			console.error("[pi-goal] failed to reconstruct the pending objective clarification:", error);
+			return;
+		}
+		if (read.kind === "malformed") {
+			notify(ctx, formatPendingClarificationMalformedNotice(), "warning");
+			return;
+		}
+		if (read.kind !== "pending") return;
+		// The confirmation editor is the only creation authority on the clarified
+		// path, so an interview this session cannot confirm is not offered at all.
+		if (!clarifyOnCreate.enabled || !proposeGoalRegistered || !ctx.hasUI) return;
+		pendingClarification = read.pending;
+		notify(ctx, formatPendingClarificationRestoredNotice(read.pending), "info");
 	}
 
 	/**
@@ -4367,8 +4470,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * checked under the same lock, so a `/goal` that races another creation is
 	 * refused before it records a pending entry. A **complete** Goal does not block:
 	 * the save supersedes it through the ordinary replacement machinery, exactly like
-	 * a direct creation. A second `/goal` replaces the pending entry (newest wins);
-	 * replacing it *as a conversation* — cancelling the old interview — is issue #85.
+	 * a direct creation. A second `/goal` replaces the pending entry and starts the
+	 * interview over with the new idea and flags (issue #85): the newest durable
+	 * entry wins on the branch, so a restart reconstructs the replacement and not the
+	 * abandoned idea, and the model is told the earlier interview is abandoned.
 	 */
 	async function startClarification(request: GoalCreationRequest, ctx: ExtensionCommandContext): Promise<void> {
 		await runExclusive(async () => {
@@ -4389,6 +4494,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				refuseUnavailableClarification(ctx);
 				return;
 			}
+			// A second `/goal` replaces the pending clarification: the newest entry wins
+			// on the branch, and the new idea and flags are what the next save commits.
+			// The old interview is abandoned as a conversation too (the model is told so
+			// below), and an editor still open for it can never commit anything because
+			// the captured pending is no longer current (see `endPendingClarification`).
+			const replaced = pendingClarification !== null;
 			const pending: PendingClarification = {
 				idea: request.objective,
 				budget: request.budget,
@@ -4397,9 +4508,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			try {
 				pi.appendEntry(CLARIFICATION_ENTRY_TYPE, pendingClarificationEntry(pending));
 			} catch (error) {
+				// The previous pending (if any) is unchanged: memory and branch still agree
+				// that it is the current interview.
 				ctx.ui.notify(
 					`Goal not created: recording the Objective clarification in the session failed (${describeError(error)}). ` +
-						"Nothing was created; fix the cause and run /goal again.",
+						"Nothing was created; fix the cause and run /goal again. Any earlier open clarification is unchanged.",
 					"error",
 				);
 				return;
@@ -4408,14 +4521,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// The user-facing half of the contract: no Goal exists, the model interviews
 			// them, and the editor is where both the title and the Objective become real.
 			ctx.ui.notify(
-				"Objective clarification started: no new Goal is committed yet. Answer the model's questions about the " +
-					"objective, constraints, and acceptance criteria, then review and save the drafted Goal in the " +
-					"confirmation editor. Cancelling it creates nothing.",
+				replaced
+					? "Objective clarification restarted: no Goal was created for the previous idea, and no Goal is committed " +
+							"for this one yet. Answer the model's questions about the new idea, then review and save the drafted " +
+							"Goal in the confirmation editor. Cancelling it creates nothing."
+					: "Objective clarification started: no new Goal is committed yet. Answer the model's questions about the " +
+							"objective, constraints, and acceptance criteria, then review and save the drafted Goal in the " +
+							"confirmation editor. Cancelling it creates nothing.",
 				"info",
 			);
 			// The first Goal-work message is the interview, so it is delivered the same
 			// busy-safe way: idle starts a turn, an in-flight run receives a steer.
-			deliverMessage(formatClarificationInterviewMessage(pending.idea), ctx);
+			deliverMessage(formatClarificationInterviewMessage(pending.idea, { replaced }), ctx);
 		});
 	}
 
@@ -4980,7 +5097,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	async function reportStatus(ctx: ExtensionCommandContext): Promise<void> {
 		const goal = store.get();
 		if (!goal) {
-			ctx.ui.notify(formatNoGoal(admission.enabled), "info");
+			// An open clarification is the one piece of user-facing state a branch can
+			// hold without a Goal, and it is exactly what a restart must not hide: bare
+			// `/goal` names it and the flags it is still holding.
+			ctx.ui.notify(
+				pendingClarification === null
+					? formatNoGoal(admission.enabled)
+					: `${formatNoGoal(admission.enabled)} ${formatOpenClarificationStatus(pendingClarification)}`,
+				"info",
+			);
 			return;
 		}
 		ctx.ui.notify(formatGoalSummary(toPublicState(goal), { admissionEnabled: admission.enabled }), "info");
