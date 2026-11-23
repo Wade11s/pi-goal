@@ -611,6 +611,29 @@ test("a reserved-word Objective is refused by pi-goal itself, verbatim, and an O
 		assert.deepEqual(refused.transitions, [], `${objective} committed no transition`);
 		assert.equal(await goalBytes(session), before, `${objective} wrote no Goal bytes`);
 	}
+	// The same Objective with creation options must be refused too: the companion
+	// renders `{ budget: null }` as `--no-budget <objective>` and `{ budget: n }`
+	// as `--budget n <objective>`, but the Objective is still the reserved word.
+	for (const [id, params, diagnostic] of [
+		["set-clear-unbounded", { objective: "clear", budget: null }, "Goal not created: `clear` is a Goal command; use /goal:clear."],
+		["set-edit-budget", { objective: "edit", budget: 90000 }, "Goal not created: `edit` is a Goal command; use /goal:edit."],
+		[
+			"set-resume-budget-option",
+			{ objective: "resume", budget: 90000 },
+			"Goal not created: `resume` is a Goal command; use /goal:resume.",
+		],
+	]) {
+		const refused = await call(session, id, "thread/goal/set", params, "external-user");
+		assert.equal(refused.ok, false, `${JSON.stringify(params)} must be refused`);
+		assert.equal(refused.disposition, "refused", `${JSON.stringify(params)}: ${JSON.stringify(refused)}`);
+		assert.deepEqual(
+			refused.diagnostics,
+			[{ level: "error", text: diagnostic }],
+			`${JSON.stringify(params)}: pi-goal's own diagnostic, verbatim`,
+		);
+		assert.deepEqual(refused.transitions, [], "the option-bearing refusal committed no transition");
+		assert.equal(await goalBytes(session), before, "the option-bearing refusal wrote no Goal bytes");
+	}
 
 	// The current Goal is untouched: same identity, same status, same durable record.
 	const survived = await call(session, "get-after-reserved", "thread/goal/get");

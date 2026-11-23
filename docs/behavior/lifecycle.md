@@ -37,11 +37,14 @@ argument.`) that touches no Goal. `/goal ` completes its creation flags
 verbs as subcommands of one command, after Codex — `/goal`, a space, then `pause`,
 `resume`, `clear`, `history`, `edit`, or `resume --budget N`. Those are now
 refused with the command to type instead — *"Goal not created: `pause` is a
-Goal command; use /goal:pause."* — before any option is scanned or any
-replacement confirmation is asked, so the refusal writes no snapshot, announces
+Goal command; use /goal:pause."* — before any replacement confirmation is
+asked, so the refusal writes no snapshot, announces
 no transition, and appends no history record. The guard ignores case and
 surrounding whitespace (`/goal Pause` and `/goal  pause  ` are caught too) and
-matches only the bare word, so `Clear the lint errors`, `Resume work on X`, and
+scans leading creation options before matching, so `/goal --no-budget clear`
+and an RPC `set` rendered as `--budget 90000 edit` are refused too: an option
+must not smuggle a reserved Objective past the guard. It matches only the bare
+word, so `Clear the lint errors`, `Resume work on X`, and
 `history of the release` are Objectives. It applies to the `/goal` command only;
 `create_goal` keeps its own creation authority. See
 [ADR-0002](../adr/0002-colon-namespaced-goal-command-family.md).

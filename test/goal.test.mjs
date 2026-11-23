@@ -595,6 +595,21 @@ test("the old space-separated spellings are refused with the command to type, an
 			["clear padded", "/goal clear ", "Goal not created: `clear` is a Goal command; use /goal:clear."],
 			["history padded", "/goal history  ", "Goal not created: `history` is a Goal command; use /goal:history."],
 			["edit padded", "/goal  edit ", "Goal not created: `edit` is a Goal command; use /goal:edit."],
+			[
+				"option then clear",
+				"/goal --no-budget clear",
+					"Goal not created: `clear` is a Goal command; use /goal:clear.",
+			],
+			[
+				"budget then edit",
+				"/goal --budget=90000 edit",
+					"Goal not created: `edit` is a Goal command; use /goal:edit.",
+			],
+			[
+				"option then resume budget",
+				"/goal --no-budget resume --budget 150",
+					"Goal not created: `resume --budget` is a Goal command; use /goal:resume --budget <new-total> (or --budget=<new-total>).",
+			],
 			["resume", "/goal resume", "Goal not created: `resume` is a Goal command; use /goal:resume."],
 			["RESUME", "/goal RESUME", "Goal not created: `resume` is a Goal command; use /goal:resume."],
 			["clear", "/goal clear", "Goal not created: `clear` is a Goal command; use /goal:clear."],

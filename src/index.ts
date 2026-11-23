@@ -492,8 +492,13 @@ const RESERVED_GOAL_VERBS = GOAL_COMMAND_NAMES.filter((name) => name !== "goal")
  * its own creation authority and no command ambiguity to resolve.
  */
 function reservedGoalVerbRefusal(args: string): string | null {
-	const word = args.trim().toLowerCase();
-	if ((RESERVED_GOAL_VERBS as readonly string[]).includes(word)) {
+	// An Objective can be preceded by creation options — a user types
+	// `/goal --no-budget clear`, and the companion renders a `set` with a budget
+	// as `--budget 90000 clear`. Refuse the Objective the creation path would
+	// actually use, not the raw argument: scanning with the same parser closes
+	// the option-smuggling path without a second copy of its token rules.
+	const word = parseGoalArgs(args).objective.toLowerCase();
+	if (RESERVED_GOAL_VERBS.includes(word as (typeof RESERVED_GOAL_VERBS)[number])) {
 		return `Goal not created: \`${word}\` is a Goal command; use /goal:${word}.`;
 	}
 	if (/^resume\s+--budget(?:=|\s|$)/.test(word)) {
@@ -2331,7 +2336,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (existing) {
 				// A Goal of any status, including a complete one, still occupies the
 				// session's single Goal slot. Replacing or clearing one is a user-owned
-				// action (/goal <objective> confirms a replacement; bare /goal reports).
+				// action (/goal <objective> confirms a replacement; /goal:clear removes it).
 				return goalToolError(
 					"A Goal is already set for this session (status: " +
 						`${existing.status}); cannot create another one. ` +

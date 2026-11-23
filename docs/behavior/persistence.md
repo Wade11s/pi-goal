@@ -49,7 +49,7 @@ reload, and tree navigation, and how a 0.1.0 snapshot is migrated exactly once.
 - Creation is durability-first: the snapshot is written and made visible, the
   kickoff triggers the file flush, and only after that snapshot is the **last**
   `goal-state` entry on disk is success announced. Visibility comes first so a
-  `/goal:clear`, `edit`, `pause`, or `resume` issued while creation waits for
+  `/goal:clear`, `/goal:edit`, `/goal:pause`, or `/goal:resume` issued while creation waits for
   idle acts on the same record the creation captured; every wait revalidates
   the exact id and revision, and a changed record suppresses the queued stale
   kickoff. A tombstone written during the wait therefore counts as *not* durable
