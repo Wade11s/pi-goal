@@ -211,16 +211,20 @@ test("an old run's follow-up turn cannot complete a Goal created after Clear", a
 	}
 });
 
-test("an old run's follow-up turn cannot complete a Goal that replaced it while it was in flight", async () => {
+test("an old run's follow-up turn cannot complete a Goal created after it while it was in flight", async () => {
+	// One session works one Goal at a time (ADR-0003), so the creation that takes the
+	// slot supersedes a *complete* Goal. The completing run's follow-up turn is still
+	// in flight when the next Goal takes the slot; its stale completion was prepared
+	// against the old identity, so it must be refused rather than complete the new one.
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "provider-gate");
 	script(
 		[
-			{ toolCalls: [{ name: "bash", args: { command: "true" } }], waitForFile: gate },
-			// The old run's follow-up turn, after the replacement's steered kickoff.
 			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			// The completing run's follow-up turn, held across the creation.
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }], waitForFile: gate },
 			{ text: "The stale completion was refused." },
-			// The replacement Goal's first automatic Continuation, aborted to bound it.
+			// The new Goal's first automatic Continuation, aborted to bound it.
 			{ hang: true },
 		],
 		session,
@@ -228,20 +232,25 @@ test("an old run's follow-up turn cannot complete a Goal that replaced it while 
 	try {
 		await session.prompt(`/goal ${OLD_OBJECTIVE}`);
 		await session.waitForNotify((r) => r.message.includes("created and activated"));
-		await waitForTurns(session, 1);
-		const original = await waitForStoredGoal(session, (goal) => goal.objective === OLD_OBJECTIVE);
+		const original = await waitForStoredGoal(session, (goal) => goal.status === "complete", "the old Goal to complete");
+		await waitForTurns(session, 2);
 
-		const replacePromise = submitCommand(session, "replace-held", `/goal ${NEW_OBJECTIVE}`);
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
+		const replacePromise = session.prompt(`/goal ${NEW_OBJECTIVE}`);
+		assert.equal((await replacePromise).data.disposition, "handled");
 		const replaced = await waitForStoredGoal(
 			session,
 			(goal) => goal.objective === NEW_OBJECTIVE && goal.status === "active",
-			"the replacement Goal",
+			"the new Goal",
 		);
-		assert.notEqual(replaced.id, original.id, "the replacement is a new identity");
+		assert.notEqual(replaced.id, original.id, "the new Goal is a new identity");
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"a complete Goal never asks for a replacement confirmation",
+		);
 
 		writeFileSync(gate, "", "utf8");
-		const stale = await session.waitForToolResult("update_goal", 1);
+		const stale = await session.waitForToolResult("update_goal", 2);
 		assert.equal(stale.isError, true, "the stale completion is refused");
 		assert.match(String(stale.result.content[0].text), /prepared against/);
 		const refused = structuredGoal(stale.result);
@@ -250,7 +259,6 @@ test("an old run's follow-up turn cannot complete a Goal that replaced it while 
 		assert.equal(refused.status, "active", "the replacement is not completed");
 		assert.equal(refused.revision, 0, "the replacement is not mutated");
 
-		await replacePromise;
 		await abortRun(session, 2);
 
 		const entries = readSessionEntries(await session.sessionFile());
@@ -261,8 +269,8 @@ test("an old run's follow-up turn cannot complete a Goal that replaced it while 
 						s.data.superseded === true ? "superseded" : "current"
 					}`,
 			),
-			["old:active:0:current", "old:active:0:current", "new:active:0:current", "old:active:0:superseded"],
-			"the replacement keeps its durable superseded record and the stale completion added nothing",
+			["old:active:0:current", "old:complete:1:current", "old:complete:1:current", "new:active:0:current"],
+			"the old identity's completion and the record the creation preserves; the stale completion added nothing",
 		);
 		const current = currentGoal(entries);
 		assert.equal(current.id, replaced.id);
@@ -273,16 +281,20 @@ test("an old run's follow-up turn cannot complete a Goal that replaced it while 
 		assert.equal(live.status, "active");
 		assert.equal(live.revision, 0);
 		assert.equal(live.objective, NEW_OBJECTIVE);
-		assert.equal(live.totalTokens, 45, "only the old run's post-kickoff turns and the continuation are charged to the replacement");
-		const superseded = goalSnapshots(entries).filter((s) => s.data.goal.id !== replaced.id).at(-1);
-		assert.equal(superseded.data.superseded, true);
-		assert.equal(superseded.data.goal.usage.totalTokens, 15, "the old identity keeps only the turn admitted before the replacement");
+		assert.equal(live.totalTokens, 30, "the new Goal's own kickoff and the continuation are its only work");
+		const oldRecords = goalSnapshots(entries).filter((s) => s.data.goal.id !== replaced.id);
+		assert.equal(oldRecords.at(-1).data.goal.usage.totalTokens, 15, "the old identity keeps only the turn admitted before the creation");
+		assert.equal(
+			oldRecords.at(-1).data.goal.status,
+			"complete",
+			"the stale completion of the old identity was refused, so its status is unchanged",
+		);
 		assert.equal(
 			entries.filter((e) => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes(NEW_OBJECTIVE)).length,
 			1,
-			"the replacement's kickoff was delivered exactly once",
+			"the new Goal's kickoff was delivered exactly once",
 		);
-		assert.equal(continuationEntries(entries).length, 1, "the replacement continued exactly once");
+		assert.equal(continuationEntries(entries).length, 1, "the new Goal continued exactly once");
 		assert.equal(runCount(session), 2, "the old run plus one continuation");
 		assertStepsConsumed(session, 4, [{ stopReason: "aborted" }]);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));

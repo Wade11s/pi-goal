@@ -26,7 +26,6 @@ import {
 	liveUsage,
 	readSessionEntries,
 	script,
-	submitCommand,
 	waitForSnapshot,
 } from "./helpers/rpc-harness.mjs";
 
@@ -339,7 +338,12 @@ test("selected-parent-branch replay drops the abandoned observation but retains 
 	assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 });
 
-test("Replacement Goal keeps historical and late observed Rex work on the superseded identity", skipLive, async (t) => {
+test("a Goal created after the original completed is never charged its late observed Rex work", skipLive, async (t) => {
+	// One session works one Goal at a time (ADR-0003): the creation that takes the slot
+	// supersedes a *complete* Goal. The original Goal's completing run is still in
+	// flight — it holds a late Rex observation whose result lands after the new Goal's
+	// snapshot — and that observation was admitted for the original identity. It must
+	// stay off the new Goal entirely: no nested tokens, no transfer, exactly once.
 	const env = await startRexAcceptanceEnv();
 	t.after(() => env.stop());
 	const session = await PiRpcSession.start(env.sessionOptions());
@@ -351,45 +355,61 @@ test("Replacement Goal keeps historical and late observed Rex work on the supers
 	const lateGate = join(session.cwd, "late");
 	const [spawn, held] = spawnSteps(handleGate);
 	const historical = { toolCalls: [{ name: "rex_wait", args: { handles: ["__HANDLE__"], timeoutMs: 60_000 } }], usage: { input: 5, output: 1 } };
+	const completeOriginal = { toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 8, output: 2 } };
 	const late = { toolCalls: [{ name: "rex_observe", args: { handles: ["__HANDLE__"] } }], waitForFile: lateGate, usage: { input: 6, output: 1 } };
-	const replacementText = { text: "Replacement kickoff.", usage: { input: 20, output: 2 } };
+	const replacementText = { text: "New Goal kickoff.", usage: { input: 20, output: 2 } };
 	const complete = { toolCalls: [{ name: "update_goal", args: { action: "complete" } }], usage: { input: 8, output: 2 } };
 	const done = { text: "Done.", usage: { input: 4, output: 1 } };
-	script([spawn, held, historical, late, replacementText, complete, done], session);
+	script([spawn, held, historical, completeOriginal, late, replacementText, complete, done], session);
 	const kickoff = session.prompt(`/goal --no-budget ${OBJECTIVE}: original`);
 	const spawned = await session.waitForToolResult("rex_spawn", 1);
 	const handle = spawned.result.details.runs[0].handle;
 	const original = lastGoalSnapshot(readSessionEntries(await session.sessionFile())).data.goal;
-	script([spawn, held, ...substitute([historical, late], { __HANDLE__: handle }), replacementText, complete, done], session);
+	script(
+		[spawn, held, ...substitute([historical, completeOriginal, late], { __HANDLE__: handle }), replacementText, complete, done],
+		session,
+	);
 	writeFileSync(handleGate, "", "utf8");
 	assertChildDelta(await session.waitForToolResult("rex_wait", 1));
-	await session.waitFor("the held late-observation turn", (records) => records.filter((record) => record.type === "turn_start").length >= 3 ? true : undefined);
+
+	// The original Goal completes; the completing run's late observation is then held.
+	await waitForSnapshot(session, (snapshot) => snapshot.data.goal?.status === "complete", "the original Goal to complete");
 	await env.waitForRun(handle);
 	await env.send(handle, "late turn for the original Goal");
 	await env.waitForRun(handle);
+	await session.waitFor("the held late-observation turn", (records) =>
+		records.filter((record) => record.type === "turn_start").length >= 5 ? true : undefined,
+	);
 
-	const replacement = submitCommand(session, "replace-rex", `/goal --no-budget ${OBJECTIVE}: replacement`);
-	await session.respondToConfirm((record) => record.title.includes("Replace the current Goal"), true);
-	assert.equal((await replacement).data.disposition, "handled");
+	// A complete Goal does not block the next creation, and asks nothing of the user.
+	const replacement = await session.prompt(`/goal --no-budget ${OBJECTIVE}: replacement`);
+	assert.equal(replacement.data.disposition, "handled");
 	await session.waitForNotify((record) => record.message.includes("created and activated, replacing"));
+	assert.equal(
+		session.records.filter((record) => record.type === "extension_ui_request" && record.method === "confirm").length,
+		0,
+		"a complete Goal never asks for a replacement confirmation",
+	);
+
+	// Release the late observation: it belongs to the original identity's completed
+	// run, so it is charged to nobody and never to the new Goal.
 	writeFileSync(lateGate, "", "utf8");
 	const lateObserved = await session.waitForToolResult("rex_observe", 1);
 	assertChildDelta(lateObserved, 1);
-	await awaitProviderSteps(session, 7);
+	await awaitProviderSteps(session, 8);
 	await kickoff;
 
 	const entries = readSessionEntries(await session.sessionFile());
-	const oldEntry = goalSnapshots(entries).filter((entry) => entry.data.goal?.id === original.id).at(-1);
-	const old = oldEntry.data.goal;
+	const old = goalSnapshots(entries).filter((entry) => entry.data.goal?.id === original.id).at(-1).data.goal;
 	const current = lastGoalSnapshot(entries).data.goal;
-	assert.equal(oldEntry.data.superseded, true, "the old identity is retained only as a historical record");
-	assert.equal(old.usage.nestedTokens, 2 * CHILD_ACCOUNTED, "both historical and late observations stay with the old Goal");
-	assert.equal(old.usage.totalTokens, 12 + 4 + 6 + 7 + 2 * CHILD_ACCOUNTED);
+	assert.equal(old.status, "complete", "the original Goal's own record is preserved as complete");
+	assert.equal(old.usage.nestedTokens, CHILD_ACCOUNTED, "only the observation admitted before completion stays with it");
+	assert.equal(old.usage.totalTokens, 12 + 4 + 6 + 10 + CHILD_ACCOUNTED);
 	assert.notEqual(current.id, original.id);
 	assert.equal(current.status, "complete");
-	assert.equal(current.usage.nestedTokens, 0, "nothing transfers to the replacement identity");
+	assert.equal(current.usage.nestedTokens, 0, "nothing transfers to the new identity");
 	assert.equal(current.usage.totalTokens, 22 + 10);
-	assertStepsConsumed(session, 7);
+	assertStepsConsumed(session, 8);
 	assertCleanRun(session);
 	assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 });

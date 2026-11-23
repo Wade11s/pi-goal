@@ -75,8 +75,8 @@ Not recorded:
   exactly as the `pi-goal:updated` stream does (the same accepted corner documented
   in [events](events.md)); the later retraction takes the Goal back on the
   authoritative `goal-state` channel and appends nothing further.
-- **A declined replacement confirmation.** Nothing was committed, so nothing is
-  recorded.
+- **A creation refused by an unfinished Goal.** Nothing was committed, so nothing
+  is recorded; the user is told to finish the Goal or run `/goal:clear` first.
 
 ## The documented crash gap
 

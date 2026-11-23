@@ -227,7 +227,8 @@ describes, with the committed identity, revision, previous/current statuses,
 timestamp, usage summary, Active elapsed time, and manifest hashes — across the
 whole user-command lifecycle, a restart that renders the same timeline and then
 grows it, the budget stop and its recovery, the blocked threshold, a provider
-usage limit, a declined replacement, attachment metadata (hashes, never contents),
+usage limit, a creation that supersedes a complete Goal, attachment metadata
+(hashes, never contents),
 and real `ctx.navigateTree()` branch navigation through `test/extensions/tree-nav.ts`,
 where each selected branch renders only its own records. Two scenarios rewrite the
 session file between sessions to reach seams a live process cannot: a truncated
@@ -243,9 +244,10 @@ truncated record.
 
 ### Dialog timeouts
 
-Every interactive dialog pi-goal opens (a replacement confirmation, the
-interactive objective editor, the resume prompt) carries a `timeout` and a safe
-default answer, so an unattended host cannot make a command wait forever.
+Every interactive dialog pi-goal opens (the interactive objective editor, the
+resume prompt) carries a `timeout` and a safe default answer, so an unattended
+host cannot make a command wait forever. `/goal <objective>` opens no dialog:
+an unfinished Goal refuses it and a complete one is superseded silently.
 `PI_GOAL_DIALOG_TIMEOUT_MS` overrides that bound with a positive integer number
 of milliseconds; it exists so the timeout branches are testable through the
 real-Pi harness without waiting the production interval out. An unset or invalid
@@ -340,6 +342,33 @@ available, a live scenario dispatches through the released provider's
 `rex_spawn` and inspects the run record's `launchArgs`, so the documented
 profile is proven to reach the child Pi as real launch arguments.
 
+### Single-Goal creation (issue #83)
+
+`test/goal83-single-goal-creation.test.mjs` is the seam for ADR-0003's creation
+semantics through real `pi --mode rpc` sessions. It reaches every unfinished
+Lifecycle status through that status's own real transition (`active` by an aborted
+run, `paused` through a kickoff-then-pause gate, `blocked` by three activity-free
+turns, `usage_limited` by Pi's quota error, `budget_limited` by a real budget
+crossing) and asserts the same refusal for each: one warning that names
+`/goal:clear`, no extension-UI `confirm` request anywhere in the scenario, the raw
+`goal-state` bytes, the `goal-history` count, and the run count all unchanged, and
+a bare `/goal` report identical to the one before the refusals. It also proves the
+escape hatch (`/goal:clear` then the same `/goal <objective>` creates a fresh
+identity), that `create_goal` still refuses while any Goal exists, and that a
+complete Goal is superseded without a dialog — the preserved complete record
+carries its exact already-accounted totals, the new identity starts at zero, and a
+restart reconstructs the branch and renders the same three-record timeline.
+
+The historical-branch fixtures in `test/fixtures/historical/` cover the branch
+shapes the command surface can no longer produce: a released 0.2.0 session that
+replaced an *unfinished* Goal mid-flight and then crashed before the freeze
+boundary. `test/goal9-ownership.test.mjs` replays it (and a budgeted derivation)
+through a real Pi session and asserts the recovered superseded record, the
+replacement current at zero usage, the derived timeline, and that the restored
+replacement is an ordinary unfinished Goal that `/goal <objective>` now refuses.
+The superseded-tail mechanics themselves stay pinned at the store seam in
+`test/goal9-store.test.mjs`.
+
 ### Goal RPC companion and the command bridge
 
 `test/goal8-headless.test.mjs` drives the command handlers with a fake Pi API and
@@ -363,8 +392,9 @@ announces its transition on the event stream, and then fails its on-disk
 durability poll. That last one is the point of the seam: the bridge must answer
 `refused` for the retracted creation even though the event stream already
 announced it, and the test asserts the answer and the empty `goal-state` bytes.
-The same file pins the busy guard (a second bridged command while a confirmation
-dialog is open), the declined-replacement no-op, the no-session guard, the
+The same file pins the busy guard (a second bridged command while the first is
+still waiting), a creation refused by an unfinished Goal forwarding the command's
+own warning verbatim, the no-session guard, the
 session-control guard (a bridged context throws for `abort`, `shutdown`,
 `compact`, `newSession`, `fork`, `navigateTree`, `switchSession`, and `reload`,
 and the test asserts the underlying session was never touched), the once-only
@@ -378,8 +408,9 @@ mirror.
 against a real `pi --mode rpc` subprocess: one `/goal-rpc <json>` extension
 command in, one `goal-rpc-response` entry (published as `entry_appended`) out. It
 covers get/set/clear round-trips (including `origin: "command"`, so a bridged
-`set` is provably the user path and not `create_goal`), replacement confirmation
-declined and accepted with the superseded history record, the stale-run binding
+`set` is provably the user path and not `create_goal`), the single-Goal refusal
+(`set` against an unfinished Goal answers `refused` with pi-goal's diagnostic
+verbatim) and the accepted supersede of a complete Goal, the stale-run binding
 refusal that survives a replacement, disabled admission, invalid budgets (both
 pi-goal's whole-number rule and the companion's own envelope checks), declared
 model authority, and a companion-only session with no pi-goal installed, which

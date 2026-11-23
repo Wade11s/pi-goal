@@ -16,7 +16,8 @@
  * It is a thin adapter, not a second lifecycle. Every method is translated into
  * the Goal command family command a user would type and its exact argument text,
  * and executed by pi-goal's own command handler through the documented in-process
- * command bridge (`pi-goal:command-bridge`). Replacement confirmation,
+ * command bridge (`pi-goal:command-bridge`). The single-Goal creation rule, its
+ * refusal against an unfinished Goal (with the silent supersede of a complete one),
  * `goal.enabled` admission, Token-budget and attachment validation, and the
  * durable-before-announced ordering therefore all live in pi-goal, in one place:
  * this package never reads a Goal snapshot, never writes one, never touches a
@@ -104,8 +105,8 @@ export const GOAL_COMMAND_BRIDGE_VERSION = 2;
 /**
  * How long to wait for pi-goal to answer one bridged command.
  *
- * Generous, because a `set` that needs replacement confirmation waits for a
- * human. A host that wants to fail fast shortens it with
+ * Generous, because a `set` can wait for a dialog (the interactive objective
+ * editor) or for the session to go idle. A host that wants to fail fast shortens it with
  * `PI_GOAL_RPC_TIMEOUT_MS`; the timeout produces a structured `unavailable`
  * error, never a success.
  */
@@ -133,9 +134,15 @@ export type GoalRpcErrorCode =
 	| "unauthorized"
 	/** pi-goal did not answer: not installed, too old, or still busy past the timeout. */
 	| "unavailable"
-	/** pi-goal ran the command and refused it (disabled, not applicable, a reserved-word Objective, rolled back, ...). */
+	/**
+	 * pi-goal ran the command and refused it (disabled, an unfinished Goal already
+	 * set, a reserved-word Objective, rolled back, ...).
+	 */
 	| "refused"
-	/** pi-goal ran the command, changed nothing, and reported no problem (for example a declined replacement). */
+	/**
+	 * pi-goal ran the command, changed nothing, and reported no problem (for example
+	 * clearing when no Goal is set, or a cancelled objective editor).
+	 */
 	| "declined"
 	/** pi-goal answered that the named command was not a registered command at dispatch time, so nothing ran. */
 	| "invalid-command";

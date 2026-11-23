@@ -426,9 +426,9 @@ interface PreparedAttachment {
  * Preflight every request without touching the network or the filesystem.
  *
  * Count, per-kind duplicate labels, local SVG names, and remote URL syntax are
- * all refused here, before a replacement confirmation can lead anywhere and
- * before any byte is read or fetched. Media-type validation still happens on
- * the actual bytes later; this is the cheap structural pass.
+ * all refused here, before a creation can be committed and before any byte is
+ * read or fetched. Media-type validation still happens on the actual bytes
+ * later; this is the cheap structural pass.
  */
 function preflightRequests(requests: readonly AttachmentRequest[]): { ok: true } | { ok: false; error: string } {
 	if (requests.length === 0) return { ok: true };

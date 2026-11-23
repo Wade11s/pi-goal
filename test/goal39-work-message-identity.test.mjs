@@ -233,17 +233,23 @@ test("a stale queued resume for a cleared Goal cannot open the new Goal's admiss
 	}
 });
 
-test("a stale queued resume for a replaced Goal stays on the old identity and never opens the replacement", async () => {
+test("a stale queued resume for an abandoned Goal opens nothing and is charged to nobody", async () => {
+	// A work message queued for a Goal that is then abandoned is delivered into the
+	// run that is still in flight. It names the old identity, so it must not open the
+	// successor's admission: only the successor's own kickoff and Continuation are its
+	// work, and the abandoned response is charged to nobody. (`/goal` no longer
+	// replaces an unfinished Goal — ADR-0003 — so abandoning it through `/goal:clear`
+	// is the reachable form of the same boundary.)
 	const session = await PiRpcSession.start();
 	const gate = join(session.cwd, "provider-gate");
 	script(
 		[
-			// B's kickoff, held. Its response lands after the replacement snapshot,
-			// so it is the old identity's already-admitted in-flight tail.
+			// B's kickoff, held: its response lands after the tombstone and the
+			// successor's snapshot, so it is an already-admitted in-flight tail.
 			{ text: "B kickoff response.", waitForFile: gate, usage: { input: 100, output: 10 } },
 			// The old run's turn after the queued B resume message is delivered.
 			{ text: "B resumed turn.", usage: { input: 100, output: 40 } },
-			// The replacement's own kickoff, steered into the same run.
+			// The successor's own kickoff.
 			{ text: "C kickoff response.", usage: { input: 20, output: 2 } },
 			// C's first automatic Continuation, aborted to bound the scenario.
 			{ hang: true },
@@ -261,16 +267,17 @@ test("a stale queued resume for a replaced Goal stays on the old identity and ne
 		await session.prompt("/goal:resume");
 		await session.waitForNotify((r) => r.message.includes("resumed"));
 
-		// Replace B with C while B's kickoff is in flight. The replacement confirms,
-		// writes C's snapshot, and steers C's own kickoff into the running work.
-		const replacePromise = submitCommand(session, "replace-b", `/goal ${OBJECTIVE_C}`);
-		await session.respondToConfirm((r) => r.title.includes("Replace the current Goal"), true);
-		assert.equal((await replacePromise).data.disposition, "handled");
-		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
-		const c = currentGoalSnapshot(goalSnapshots(readSessionEntries(await session.sessionFile()))).data.goal;
-		assert.equal(c.id !== b.id, true, "the replacement is a new identity");
+		// Abandon B while its kickoff is in flight, then create C. C's snapshot is the
+		// creation boundary the queued resume message is delivered after.
+		const cleared = await session.prompt("/goal:clear");
+		assert.equal(cleared.data.disposition, "handled");
+		await session.waitForNotify((r) => r.message.includes("cleared"));
+		const createPromise = submitCommand(session, "create-c", `/goal ${OBJECTIVE_C}`);
+		await waitForTurns(session, 1);
+		const c = await waitForStoredGoal(session, (goal) => goal.objective === OBJECTIVE_C);
 
 		writeFileSync(gate, "", "utf8");
+		await createPromise;
 		await session.waitFor(
 			"C's continuation run started",
 			(records) => (records.filter((r) => r.type === "agent_start").length >= 2 ? true : undefined),
@@ -279,18 +286,20 @@ test("a stale queued resume for a replaced Goal stays on the old identity and ne
 		await session.waitForSettled(1);
 
 		const status = await reportStatus(session);
-		assert.equal(status.goalId, c.id, "the replacement is the current Goal");
-		assert.equal(status.status, "active", "the replacement is not budget_limited by B's stale work");
-		assert.equal(status.totalTokens, 37, "only the replacement's own kickoff and aborted Continuation are charged");
+		assert.equal(status.goalId, c.id, "the successor is the current Goal");
+		assert.equal(status.status, "active", "the successor is not budget_limited by B's stale work");
+		assert.equal(status.totalTokens, 37, "only the successor's own kickoff and aborted Continuation are charged");
 
 		const entries = readSessionEntries(await session.sessionFile());
-		const superseded = goalSnapshots(entries).filter((e) => e.data.superseded === true);
-		assert.equal(superseded.length, 1, "the old identity's tail is frozen once");
-		assert.equal(superseded[0].data.goal.id, b.id, "the frozen tail belongs to B");
-		assert.equal(
-			superseded[0].data.goal.usage.totalTokens,
-			110,
-			"B's already-admitted in-flight response stays on its superseded record",
+		const abandoned = goalSnapshots(entries).filter((e) => e.data.goal?.id === b.id);
+		assert.deepEqual(
+			abandoned.map((e) => e.data.goal.status),
+			["active", "paused", "active"],
+			"the abandoned identity's own lifecycle is all it recorded",
+		);
+		assert.ok(
+			abandoned.every((e) => e.data.goal.usage.totalTokens === 0),
+			"its late response is charged to nobody",
 		);
 		assert.equal(namedWorkMessages(entries, c.id).length, 1, "C's kickoff is delivered exactly once");
 		assert.equal(

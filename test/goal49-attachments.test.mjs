@@ -458,26 +458,46 @@ test("an objective edit retains the immutable manifest; changing attachments req
 	}
 });
 
-test("a Replacement Goal selects new attachments and retains the replaced Goal's artifacts across clear", async () => {
+test("a new Goal selects new attachments and retains the replaced Goal's artifacts across clear", async () => {
 	const dirs = sharedDirs();
 	const { spec, shot } = writeStandardFixtures(dirs);
 	const session = await startSession(dirs);
-	script([{ text: "Kickoff.", usage: { input: 30, output: 8 } }, { hang: true }], session);
+	// The first Goal completes, so the next creation supersedes a complete Goal — the
+	// only replacement the single-Goal rule still allows (ADR-0003).
+	script(
+		[
+			{ text: "Kickoff.", usage: { input: 30, output: 8 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+			{ text: "Second kickoff.", usage: { input: 20, output: 2 } },
+			{ hang: true },
+		],
+		session,
+	);
 	try {
 		await session.prompt(`/goal --file ${spec} ${OBJECTIVE}`);
-		await abortActiveLoop(session, 2);
+		await session.waitForSettled(1);
 		const sessionFile = await session.sessionFile();
 		const root = attachmentStoreRoot(sessionFile);
 		const first = goalSnapshots(readSessionEntries(sessionFile))[0].data.goal;
+		assert.equal(
+			goalSnapshots(readSessionEntries(sessionFile)).at(-1).data.goal.status,
+			"complete",
+			"the first Goal finished before the next creation",
+		);
 		assert.deepEqual(storedGoalIds(root), [first.id]);
 
-		// Replace with a different attachment set: confirmation, then a new
-		// identity whose manifest names the new files.
+		// Create the next Goal with a different attachment set: it supersedes the
+		// complete record with no dialog, and its manifest names the new files.
 		const replacementObjective = "Ship the second release with the screenshot";
 		const replacePromise = session.prompt(`/goal --file ${spec} --image ${shot} ${replacementObjective}`);
-		await session.respondToConfirm(() => true, true);
 		await replacePromise;
 		await session.waitForNotify((r) => r.message.includes("created and activated, replacing"));
+		assert.equal(
+			session.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm").length,
+			0,
+			"a complete Goal never asks for a replacement confirmation",
+		);
 		const entries = readSessionEntries(sessionFile);
 		const replacement = goalSnapshots(entries).find(
 			(s) => s.data.goal?.id !== first.id && s.data.goal?.objective === replacementObjective,
@@ -490,8 +510,14 @@ test("a Replacement Goal selects new attachments and retains the replaced Goal's
 		// Both identities keep their artifacts: retention, not garbage collection.
 		assert.deepEqual(storedGoalIds(root).sort(), [first.id, replacement.id].sort());
 
-		// Clearing the replacement retains every committed artifact, because
-		// another selected branch may still reference them.
+		// Wait for the new Goal's own kickoff to run, so the scenario is the goal
+		// lifecycle and not a race between the delivery and the clear.
+		await session.waitFor("the new Goal's kickoff run started", (records) =>
+			records.filter((r) => r.type === "agent_start").length >= 3 ? true : undefined,
+		);
+
+		// Clearing the new Goal retains every committed artifact, because another
+		// selected branch may still reference them.
 		await session.prompt("/goal:clear");
 		await session.waitForNotify((r) => r.message.includes("cleared"));
 		assert.deepEqual(storedGoalIds(root).sort(), [first.id, replacement.id].sort());
@@ -504,7 +530,9 @@ test("a Replacement Goal selects new attachments and retains the replaced Goal's
 			replacement.attachments.map((a) => a.hash),
 		);
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		// Two clean Goals: the first completes, the second's kickoff answers. The
+		// clear lands before the second Goal settles, so it owes no Continuation.
+		assertStepsConsumed(session, 4);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();
@@ -516,22 +544,31 @@ test("a failed attachment validation leaves the previous Goal and its artifacts 
 	const dirs = sharedDirs();
 	const { spec } = writeStandardFixtures(dirs);
 	const session = await startSession(dirs);
-	script([{ text: "Kickoff.", usage: { input: 30, output: 8 } }, { hang: true }], session);
+	// The first Goal completes, so the refused creation is a real attempt at
+	// superseding it rather than the unfinished-Goal refusal.
+	script(
+		[
+			{ text: "Kickoff.", usage: { input: 30, output: 8 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
 	try {
 		await session.prompt(`/goal --file ${spec} ${OBJECTIVE}`);
-		await abortActiveLoop(session, 2);
+		await session.waitForSettled(1);
 		const sessionFile = await session.sessionFile();
 		const before = goalSnapshots(readSessionEntries(sessionFile));
 		const root = attachmentStoreRoot(sessionFile);
 		const first = before[0].data.goal;
+		assert.equal(before.at(-1).data.goal.status, "complete", "the first Goal finished before the attempt");
 
 		// A good file followed by a missing file: source validation refuses the
-		// whole request before any new artifact is written. The active Goal's
-		// replacement confirmation comes first, exactly as for text-only replacement.
+		// whole request before any new artifact is written and before any durable
+		// transition, so the complete Goal and its artifacts are untouched.
 		const good = join(dirs.workDir, "good.txt");
 		writeFileSync(good, "good bytes", "utf8");
 		const failedPromise = session.prompt(`/goal --file ${good} --image ${join(dirs.workDir, "missing.png")} Third objective`);
-		await session.respondToConfirm(() => true, true);
 		const failed = await failedPromise;
 		assert.equal(failed.data.disposition, "handled");
 		const refusal = await session.waitForNotify((r) => r.message.includes("Goal not created:"));
@@ -542,12 +579,12 @@ test("a failed attachment validation leaves the previous Goal and its artifacts 
 		assert.equal(after[0].data.goal.id, first.id);
 		assert.equal(after[0].data.goal.revision, first.revision);
 		assert.deepEqual(after[0].data.goal.attachments, first.attachments);
-		assert.deepEqual(storedGoalIds(root), [first.id], "the refused replacement left no artifacts and kept the old ones");
-		assert.equal(runCount(session), 2, "no kickoff ran for the refused replacement");
+		assert.deepEqual(storedGoalIds(root), [first.id], "the refused creation left no artifacts and kept the old ones");
+		assert.equal(runCount(session), 2, "no kickoff ran for the refused creation");
 		const kinds = eventLog(readSessionEntries(sessionFile)).map((e) => e.data.kind);
-		assert.deepEqual(kinds, ["created"], "no replaced event for the refused replacement");
+		assert.deepEqual(kinds, ["created", "completed"], "no replaced event for the refused creation");
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await session.stop();
@@ -559,11 +596,20 @@ test("a snapshot failure after materialization keeps the previous Goal, retracts
 	const dirs = sharedDirs();
 	const { spec } = writeStandardFixtures(dirs);
 	const session = await startSession(dirs);
-	script([{ text: "Kickoff.", usage: { input: 30, output: 8 } }, { hang: true }], session);
+	// The first Goal completes, so the failed creation is a real attempt at
+	// superseding it rather than the unfinished-Goal refusal.
+	script(
+		[
+			{ text: "Kickoff.", usage: { input: 30, output: 8 } },
+			{ toolCalls: [{ name: "update_goal", args: { action: "complete" } }] },
+			{ text: "Done." },
+		],
+		session,
+	);
 	let sessionFile;
 	try {
 		await session.prompt(`/goal --file ${spec} ${OBJECTIVE}`);
-		await abortActiveLoop(session, 2);
+		await session.waitForSettled(1);
 		sessionFile = await session.sessionFile();
 		const root = attachmentStoreRoot(sessionFile);
 		const before = readSessionEntries(sessionFile);
@@ -575,8 +621,7 @@ test("a snapshot failure after materialization keeps the previous Goal, retracts
 		chmodSync(sessionFile, 0o444);
 		let failure;
 		try {
-			const failedPromise = session.prompt(`/goal --file ${spec} A replacement whose snapshot cannot commit`);
-			await session.respondToConfirm(() => true, true);
+			const failedPromise = session.prompt(`/goal --file ${spec} A new objective whose snapshot cannot commit`);
 			assert.equal((await failedPromise).data.disposition, "handled");
 			failure = await session.waitForNotify((r) =>
 				r.message.includes("writing the replacement to the session failed"),
@@ -591,10 +636,10 @@ test("a snapshot failure after materialization keeps the previous Goal, retracts
 		assert.equal(goalSnapshots(after).at(-1).data.goal.id, first.id);
 		assert.deepEqual(goalSnapshots(after).at(-1).data.goal.attachments, first.attachments);
 		assert.deepEqual(storedGoalIds(root), [first.id], "the uncommitted replacement artifacts were retracted");
-		assert.equal(runCount(session), 2, "no kickoff started for the failed replacement");
-		assert.deepEqual(eventLog(after).map((e) => e.data.kind), ["created"], "no replacement success event");
+		assert.equal(runCount(session), 2, "no kickoff started for the failed creation");
+		assert.deepEqual(eventLog(after).map((e) => e.data.kind), ["created", "completed"], "no replacement success event");
 
-		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assertStepsConsumed(session, 3);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		if (sessionFile) chmodSync(sessionFile, 0o644);
@@ -1070,7 +1115,7 @@ test("a resume whose artifact fails to load leaves the Goal paused and names a r
 		);
 		assert.match(failure.message, /is no longer valid UTF-8/);
 		assert.match(failure.message, /Restore the original bytes/);
-		assert.match(failure.message, /replace the Goal/);
+		assert.match(failure.message, /\/goal:clear this Goal and create a new one that re-attaches the files/);
 		assert.doesNotMatch(
 			failure.message,
 			/restart the work with \/goal:resume/,
