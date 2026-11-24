@@ -109,10 +109,11 @@ commit would silently bypass the mandatory confirmation. `goal.enabled: false`
 refuses before any clarification starts.
 
 **Unavailable is not the same thing as taken.** Pi's registry is filtered by the
-session's own tool policy, so a missing `propose_goal` has three possible causes —
-another extension already owns the name, pi-goal's registration of it failed, or
-this session's `--tools` / `--exclude-tools` policy hides it — and the refusal
-names all three instead of asserting one. A session that hides only `get_goal`
+session's own tool policy, so a missing `propose_goal` has four possible causes —
+another extension already owns the name, pi-goal's registration of it failed, this
+session's `--tools` / `--exclude-tools` policy hides it, or pi-goal cannot read the
+registry to confirm that its own declaration is the one in force — and the refusal
+names all four instead of asserting one. A session that hides only `get_goal`
 while admitting `propose_goal` therefore **runs the clarification flow** rather
 than refusing: hiding a Goal tool says nothing about who owns the confirmation
 tool's name. A session whose policy hides `propose_goal` itself still refuses,
@@ -622,7 +623,11 @@ reconstructed from the transcript every turn.
   still registers `update_plan`, a session that hides `update_plan` itself is
   silent at startup and simply never has the tool named in a Continuation, and an
   unreadable registry declines with a cause-neutral warning rather than claiming a
-  competing owner. See
+  competing owner. A Continuation re-reads the registry at the seam that names the
+  tool rather than trusting the session-start flag, because Pi keeps the first
+  *extension in load order* that declares a name: an extension loaded before
+  pi-goal can take `update_plan` on a later event, and an automatic Continuation
+  must not then instruct a tool pi-goal does not own. See
   [model tools](../tools.md#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner).
 
 The tool is registered at session start, not at extension load, because Pi's

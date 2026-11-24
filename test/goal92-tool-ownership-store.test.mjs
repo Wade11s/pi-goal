@@ -3,10 +3,12 @@
  *
  * `pi.getAllTools()` returns only the tools the session's `--tools` allowlist and
  * `--exclude-tools` denylist admit, so a registry that does not list a tool is
- * ambiguous by construction. A real Pi session can only produce a subset of the
- * outcomes — Pi keeps the *first* registration of a name, so a peer extension can
- * never displace a registration pi-goal already made — and this seam is where the
- * rest are reached deterministically:
+ * ambiguous by construction. Pi keeps the first **extension in load order** that
+ * declares a name — not the first one to register it — so an extension loaded
+ * before pi-goal can register on a later event and displace a registration pi-goal
+ * already made; that reachable seam is covered by real-Pi scenarios in
+ * `goal92-tool-ownership.test.mjs`. This seam is where the rest are reached
+ * deterministically:
  *
  * - a registry that omits `get_goal` but not `propose_goal` (the issue's repro);
  * - a registry that cannot be read at all;
@@ -160,11 +162,20 @@ function noticeMessages(fx) {
 	return fx.state.notifications.map((notice) => notice.message);
 }
 
-/** Every notification the runtime produced, asserted to mention nothing of a tool. */
-function assertNoToolNotice(fx, toolName) {
-	for (const message of noticeMessages(fx)) {
+/**
+ * Every notification that mentions `toolName`, asserted to be free of a false
+ * foreign-owner claim.
+ *
+ * Scoped to the tool's own notices, because a scenario may legitimately carry an
+ * accurate warning about a *different* tool: an extension that really does own
+ * `update_plan` must still be reported, and that report must not be mistaken for a
+ * claim about `propose_goal`.
+ */
+function assertNoFalseOwnerNotice(fx, toolName) {
+	for (const message of noticeMessages(fx).filter((notice) => notice.includes(toolName))) {
 		assert.ok(!message.includes(FOREIGN_OWNER_NOTICE), `a tool policy was reported as a foreign owner: ${message}`);
 		assert.ok(!message.includes(`did not register ${toolName}`), `a false registration failure: ${message}`);
+		assert.ok(!message.includes("took its place"), `a false takeover: ${message}`);
 	}
 }
 
@@ -180,7 +191,7 @@ test("a registry without get_goal and without propose_goal still registers propo
 
 		const propose = fx.tools.find((tool) => tool.name === "propose_goal");
 		assert.ok(propose, `the confirmation tool is registered: ${fx.tools.map((tool) => tool.name)}`);
-		assertNoToolNotice(fx, "propose_goal");
+		assertNoFalseOwnerNotice(fx, "propose_goal");
 		assert.deepEqual(fx.state.notifications, [], "a successful registration is silent");
 
 		// And the flow works: `/goal` records the interview instead of refusing.
@@ -191,6 +202,93 @@ test("a registry without get_goal and without propose_goal still registers propo
 			"the clarification was recorded",
 		);
 		assert.equal(fx.state.messages.length, 1, "the interview was delivered");
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
+	}
+});
+
+test("a visible foreign update_plan never becomes pi-goal's identity", async () => {
+	// High 2 of the review: the load-time trio is filtered out, so a foreign
+	// `update_plan` is the only other tool in the registry. Accepting it as a
+	// witness would let a peer extension define pi-goal's identity, which then
+	// reports pi-goal's own `propose_goal` as a takeover and the peer's tool as
+	// owned. Only the three load-time tools may witness identity, so the plan
+	// tool's foreign owner is simply declined and the confirmation tool is still
+	// pi-goal's own.
+	const fx = fixture({ goal: { planTool: true, clarifyOnCreate: true } }, {
+		hiddenTools: ["get_goal", "create_goal", "update_goal"],
+		foreignPlan: true,
+	});
+	try {
+		goalExtension(fx.pi);
+		await startSession(fx);
+
+		const declined = fx.state.notifications.find((notice) =>
+			notice.message.includes(`pi-goal did not register ${PLAN_TOOL_NAME}`),
+		);
+		assert.ok(declined, JSON.stringify(fx.state.notifications));
+		assert.match(declined.message, new RegExp(FOREIGN_OWNER_NOTICE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+		assert.equal(
+			fx.tools.some((tool) => tool.name === PLAN_TOOL_NAME),
+			false,
+			"the foreign plan tool was not shadowed",
+		);
+
+		// The foreign `update_plan` did not become pi-goal's identity: the
+		// confirmation tool registered, is pi-goal's own, and nothing warned about it.
+		assert.ok(fx.tools.some((tool) => tool.name === "propose_goal"), "the confirmation tool is registered");
+		assertNoFalseOwnerNotice(fx, "propose_goal");
+		await fx.commands.get("goal").handler(OBJECTIVE, fx.ctx);
+		assert.equal(
+			customEntries(fx, CLARIFICATION_ENTRY_TYPE).at(-1).data.pending.idea,
+			OBJECTIVE,
+			"the clarification was recorded, so pi-goal still owns propose_goal",
+		);
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
+	}
+});
+
+test("a name this runtime registered but cannot attribute declines instead of claiming it", async () => {
+	// The fail-closed half of the witness rule. The first session hid every pi-goal
+	// tool, so identity was never established; the second session admits
+	// `propose_goal`, which is in force and was registered by this runtime, but with
+	// no witness and no bootstrap there is nothing to attribute it to. Declining is
+	// the safe direction, and the warning says what could not be determined rather
+	// than claiming a competing owner.
+	const fx = fixture(CLARIFY_SETTINGS, { hiddenTools: ["get_goal", "create_goal", "update_goal", "propose_goal"] });
+	try {
+		goalExtension(fx.pi);
+		await startSession(fx);
+		assert.ok(fx.tools.some((tool) => tool.name === "propose_goal"), "the first session registered the tool");
+		assert.deepEqual(fx.state.notifications, [], "a policy-hidden registration is silent");
+
+		// A reload with a wider tool policy: the name is now visible and in force.
+		fx.state.hiddenTools = ["get_goal", "create_goal", "update_goal"];
+		await startSession(fx);
+
+		assert.equal(
+			fx.tools.filter((tool) => tool.name === "propose_goal").length,
+			1,
+			"the declaration was not re-registered over the one already in force",
+		);
+		const warning = fx.state.notifications.find((notice) =>
+			notice.message.includes("pi-goal did not register propose_goal"),
+		);
+		assert.ok(warning, JSON.stringify(fx.state.notifications));
+		assert.equal(warning.type, "warning");
+		assert.match(warning.message, /could not tell which declarations in it are its own/);
+		assert.ok(!warning.message.includes(FOREIGN_OWNER_NOTICE), warning.message);
+		assert.ok(!warning.message.includes("took its place"), warning.message);
+
+		await fx.commands.get("goal").handler(OBJECTIVE, fx.ctx);
+		const refusal = fx.state.notifications.find((notice) =>
+			notice.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.ok(refusal, JSON.stringify(fx.state.notifications));
+		assert.equal(refusal.type, "error");
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.equal(customEntries(fx, CLARIFICATION_ENTRY_TYPE).length, 0, "no interview was recorded");
 	} finally {
 		rmSync(fx.dir, { recursive: true, force: true });
 	}
@@ -250,7 +348,7 @@ test("a verified takeover keeps refusing on later session starts", async () => {
 			fx.tools.some((tool) => tool.name === "propose_goal"),
 			"the first session start registered pi-goal's own tool",
 		);
-		assertNoToolNotice(fx, "propose_goal");
+		assertNoFalseOwnerNotice(fx, "propose_goal");
 
 		// Another extension takes the name over, then the runtime starts a session
 		// again: a reload, a fork, or a branch navigation. The captured handler is
@@ -299,7 +397,7 @@ test("a hidden get_goal still registers update_plan, and a real conflict still d
 			hidden.tools.some((tool) => tool.name === PLAN_TOOL_NAME),
 			`the plan tool is registered: ${hidden.tools.map((tool) => tool.name)}`,
 		);
-		assertNoToolNotice(hidden, PLAN_TOOL_NAME);
+		assertNoFalseOwnerNotice(hidden, PLAN_TOOL_NAME);
 		assert.deepEqual(hidden.state.notifications, [], "a successful registration is silent");
 	} finally {
 		rmSync(hidden.dir, { recursive: true, force: true });
@@ -339,7 +437,7 @@ test("a policy-hidden update_plan registers silently and no Continuation names i
 			fx.tools.some((tool) => tool.name === PLAN_TOOL_NAME),
 			"the tool really was handed to Pi",
 		);
-		assertNoToolNotice(fx, PLAN_TOOL_NAME);
+		assertNoFalseOwnerNotice(fx, PLAN_TOOL_NAME);
 		assert.deepEqual(fx.state.notifications, [], "a hidden registration is silent at startup");
 	} finally {
 		rmSync(fx.dir, { recursive: true, force: true });

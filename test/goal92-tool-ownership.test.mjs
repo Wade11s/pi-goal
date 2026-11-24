@@ -54,6 +54,12 @@ const CLARIFY_SETTINGS = { goal: { clarifyOnCreate: true } };
 const PLAN_TOOL_ON = { goal: { planTool: true } };
 /** The test-only probe that records the tools a real session declares to the model. */
 const ACTIVE_TOOLS_PEER = join(import.meta.dirname, "extensions", "active-tools-peer.ts");
+/** A peer loaded *before* pi-goal that takes `propose_goal` on `turn_start`. */
+const PROPOSE_GOAL_LATE_PEER = join(import.meta.dirname, "extensions", "propose-goal-late-peer.ts");
+/** The same peer for the `update_plan` name. */
+const PLAN_LATE_PEER = join(import.meta.dirname, "extensions", "plan-late-peer.ts");
+/** Tool names a scenario filters out so only the tool under test stays visible. */
+const HIDE_GOAL_TOOLS = "get_goal,create_goal,update_goal";
 /** The one sentence the bug printed, and the one that must never come back. */
 const FOREIGN_OWNER_NOTICE = "another extension already provides a tool with that name";
 
@@ -138,6 +144,13 @@ async function answerConfirmation(session, transform = (prefill) => prefill) {
 			: { type: "extension_ui_response", id: request.id, value },
 	);
 	return request;
+}
+
+/** The text of every finalized call to one tool, in the order they finalized. */
+function toolTexts(session, toolName) {
+	return session.records
+		.filter((record) => record.type === "tool_execution_end" && record.toolName === toolName)
+		.map((record) => String(record.result?.content?.[0]?.text ?? ""));
 }
 
 /** Every `goal-clarification` entry on the branch, in append order. */
@@ -240,6 +253,8 @@ test("a session whose policy hides propose_goal is silent at startup and refuses
 		assert.match(refusal.message, /another extension already owns the propose_goal name/);
 		assert.match(refusal.message, /the registration itself failed/);
 		assert.match(refusal.message, /this session's tool policy \(--tools \/ --exclude-tools\) keeps the tool out of the model's reach/);
+		assert.match(refusal.message, /could not read the tool registry to confirm that its own declaration is the one in force/);
+		assert.match(refusal.message, /fix whatever makes the tool registry unreadable/);
 		assert.match(refusal.message, /No Goal was created and no clarification was started/);
 		assert.match(refusal.message, /set goal\.clarifyOnCreate to false/);
 		// Fail closed: no Goal, no interview that could never be confirmed, no editor.
@@ -289,6 +304,7 @@ test("a hidden get_goal still lets the opt-in plan tool register and be declared
 		await session.sendSimple("abort");
 		await session.waitForSettled(1);
 		const continuations = continuationEntries(readSessionEntries(await session.sessionFile()));
+		assert.equal(continuations.length, 1, "exactly one Continuation before the abort");
 		assert.ok(
 			continuations.every((entry) => String(entry.content).includes("Progress plan (optional, update_plan):")),
 			"an enabled session's Continuation still names the plan tool",
@@ -330,6 +346,121 @@ test("a session whose policy hides update_plan is silent and no Continuation nam
 		assert.equal(continuations.length, 1, "exactly one Continuation before the abort");
 		for (const entry of continuations) {
 			assert.ok(!String(entry.content).includes("update_plan"), "no Continuation names a tool the policy hides");
+		}
+
+		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("a peer that takes propose_goal on turn_start is never mistaken for pi-goal's own", async () => {
+	// The reachable takeover. Pi keeps the first *extension in load order* that
+	// declares a name, so this peer — loaded before pi-goal — wins the `propose_goal`
+	// name even though pi-goal registered it first, and it wins it on `turn_start`,
+	// after pi-goal has already confirmed its own registration. The tool under test
+	// must never vouch for itself: with nothing else visible to identify pi-goal, the
+	// only honest answers are "not mine" or "cannot tell", never "mine".
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, {
+			excludeTools: HIDE_GOAL_TOOLS,
+			preExtensions: [PROPOSE_GOAL_LATE_PEER],
+		});
+		script(
+			[
+				{ text: "Warm answer." },
+				{ toolCalls: [{ name: "propose_goal", args: { title: DRAFT_TITLE, objective: DRAFT_OBJECTIVE } }] },
+				{ text: "The peer tool answered." },
+			],
+			session,
+		);
+		await session.prompt("warm the session up so the peer's turn_start has run");
+		await session.waitForSettled(1);
+
+		// Nothing warned at startup, and nothing warned about the takeover either:
+		// pi-goal registered first and legitimately owned the name at session start.
+		for (const message of notifyMessages(session)) {
+			assert.ok(!message.includes(FOREIGN_OWNER_NOTICE), `a false foreign owner: ${message}`);
+			assert.ok(!message.includes("did not register propose_goal"), `a false registration failure: ${message}`);
+		}
+
+		// `/goal` now fails closed instead of recording an interview that the peer's
+		// tool could never confirm.
+		const response = await session.prompt(`/goal ${IDEA}`);
+		assert.equal(response.data.disposition, "handled");
+		const refusal = await session.waitForNotify((record) =>
+			record.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.equal(refusal.notifyType, "error");
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.equal(
+			notifyMessages(session).some((message) => message.includes("Objective clarification started")),
+			false,
+			"no interview was started for a confirmation this session cannot open",
+		);
+		const { entries } = await session.getEntries();
+		assert.equal(clarificationEntries(entries).length, 0, "no pending clarification was recorded");
+		assert.equal(goalSnapshots(entries).length, 0, "no Goal was created");
+
+		// The model-visible `propose_goal` really is the peer's: a call to it returns
+		// the peer's own result, never pi-goal's confirmation flow.
+		const tools = await declaredTools(dirs);
+		assert.ok(tools.includes("propose_goal"), `the name is still declared: ${JSON.stringify(tools)}`);
+		await session.prompt("Try to propose a Goal for this idea.");
+		const call = await session.waitForToolResult("propose_goal", 1);
+		assert.equal(call.isError, false, "the peer's own tool runs without error");
+		assert.equal(toolTexts(session, "propose_goal").length, 1, "exactly one propose_goal call finalized");
+		assert.match(
+			toolTexts(session, "propose_goal")[0],
+			/peer tool: this is not pi-goal's propose_goal/,
+			"the declaration in force is the peer's",
+		);
+		await waitForNextSettle(session);
+
+		assertCleanRun(session);
+		assertStepsConsumed(session, 3);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("a peer that takes update_plan on turn_start is named in no Continuation", async () => {
+	// The plan tool's half of the same seam, and the reason the Continuation gates on
+	// live ownership: an automatic Continuation that instructed a tool pi-goal no
+	// longer owns would waste a Goal turn and teach the model to ignore the extension.
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, {
+			settings: PLAN_TOOL_ON,
+			excludeTools: HIDE_GOAL_TOOLS,
+			preExtensions: [PLAN_LATE_PEER],
+		});
+		script([{ text: "Kickoff answer." }, { hang: true }], session);
+		await session.prompt("/goal --no-budget Ship the release notes page");
+		await session.waitForNotify((record) => record.message.includes("created and activated"));
+		await session.waitFor(
+			"the continuation run started",
+			(records) => (records.filter((record) => record.type === "agent_start").length >= 2 ? true : undefined),
+		);
+		await session.sendSimple("abort");
+		await session.waitForSettled(1);
+
+		for (const message of notifyMessages(session)) {
+			assert.ok(!message.includes(FOREIGN_OWNER_NOTICE), `a false foreign owner: ${message}`);
+			assert.ok(!message.includes("did not register update_plan"), `a false registration failure: ${message}`);
+		}
+		const continuations = continuationEntries(readSessionEntries(await session.sessionFile()));
+		assert.equal(continuations.length, 1, "exactly one Continuation before the abort");
+		for (const entry of continuations) {
+			assert.ok(
+				!String(entry.content).includes("update_plan"),
+				"no Continuation names a tool another extension took over",
+			);
 		}
 
 		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);

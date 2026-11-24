@@ -46,10 +46,11 @@ a typed `/goal` uses. The model's arguments are only the prefill. Because the
 editor is the only authority on this path, a UI-capable host whose `propose_goal`
 tool is unavailable refuses `/goal` outright instead of falling back to a direct
 creation; a UI-less host is the one exception, and it creates directly with a
-notice. *Unavailable* has three causes, and the refusal names all three rather
+notice. *Unavailable* has four causes, and the refusal names all four rather
 than asserting one: another extension already owns the name, pi-goal's
-registration of it failed, or this session's tool policy (`--tools` /
-`--exclude-tools`) hides the tool. See
+registration of it failed, this session's tool policy (`--tools` /
+`--exclude-tools`) hides the tool, or pi-goal cannot read the tool registry to
+confirm that its own declaration is the one in force. See
 [Tool-name ownership](#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner). A saved
 document whose first line is not the `Title:` line, or whose title breaks the
 one-line rule, is refused and the same document reopens for correction instead of
@@ -263,6 +264,12 @@ Both registrations pi-goal performs — `propose_goal` and the opt-in `update_pl
 inferring pi-goal's own identity from a particular Goal tool, and they share one
 rule and one set of warnings so the two cannot drift apart.
 
+Pi keeps the first **extension in load order** that declares a name — not the first
+one to register it — so an extension loaded before pi-goal can register on a later
+event and displace a registration pi-goal already made. That is why identity is
+never taken from the declaration under test: a tool is not its own witness, and a
+foreign owner of the name would otherwise authenticate itself as pi-goal.
+
 Ownership is decided **before** anything is registered, so pi-goal never replaces
 another extension's tool:
 
@@ -271,7 +278,8 @@ another extension's tool:
 | no tool of that name | the name is free; pi-goal registers it |
 | a tool of that name this runtime has not registered | **foreign**; pi-goal registers nothing and says so |
 | a tool of that name this runtime registered, from another source | **verified takeover**; pi-goal registers nothing and keeps refusing |
-| the registry cannot be read | **unverifiable**; pi-goal registers nothing with a cause-neutral warning |
+| the registry cannot be read | **unreadable**; pi-goal registers nothing with a cause-neutral warning |
+| the registry was read, but pi-goal's own declarations cannot be identified in it | **unidentified**; pi-goal registers nothing with a cause-neutral warning |
 
 The registration is then **confirmed rather than assumed**, and every outcome says
 what actually happened:
@@ -281,7 +289,15 @@ what actually happened:
 | **owned** — pi-goal's own declaration is in force | silent | the tool is promised |
 | **verified takeover** — another extension's declaration displaced it | a warning naming the takeover | `/goal` refuses; no Continuation names a plan tool |
 | **hidden** — the registration landed but the session's tool policy keeps the tool out of the model's reach | **silent** | `/goal` refuses with cause-neutral wording; no Continuation names a plan tool |
-| **unverifiable** — pi-goal cannot confirm its own declaration is in force | a cause-neutral warning | `/goal` refuses |
+| **unreadable** / **unidentified** — pi-goal cannot confirm its own declaration is in force | a cause-neutral warning | `/goal` refuses |
+
+Identity itself is established once per runtime, and only from a source that cannot
+be the tool under test: one of the three tools pi-goal registers at extension load
+(`get_goal`, `create_goal`, `update_goal`) — Pi refuses to load two extensions that
+register the same name at load, so such a name being visible on the first read of a
+runtime is pi-goal's — or the declaration visible in the same synchronous
+confirmation of a registration this runtime just made. With neither, ownership is
+unverifiable, and every path fails closed.
 
 Two rules follow from the table, and both are behaviour changes from 0.3.0:
 

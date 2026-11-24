@@ -185,7 +185,12 @@ what it cannot preempt, and what is intentionally left to the user.
   session's tool policy: a session that hides `get_goal` is not a session where
   someone else owns `update_plan`, and a session that hides `update_plan` itself
   is silent at startup rather than warned about a conflict that does not exist. An
-  unreadable registry declines to register with a cause-neutral warning.
+  unreadable registry declines to register with a cause-neutral warning. Identity is
+  never taken from the declaration under test — a tool is not its own witness — and
+  never from an opt-in tool another extension may legitimately own: it comes from
+  one of the three tools pi-goal registers at extension load, or from the
+  declaration confirmed immediately after a registration this runtime just made.
+  With neither, ownership is unverifiable and the registration is declined.
 - Metrics are local and best-effort: `pi-goal:metrics` delivery has no queue,
   retry, spool, acknowledgement, or replay. A consumer that needs completeness
   must persist and verify records itself and treat gaps as possible. pi-goal

@@ -149,20 +149,11 @@ test("the documented launch arguments produce a read-only real Pi session, leavi
 	assert.equal(child.args.filter((arg) => arg === "--tools").length, 1);
 
 	// Integration check: the session's actual model-visible tool set is read-only.
+	// This scenario runs with the harness default `goal.clarifyOnCreate: false`, so
+	// pi-goal registers no clarification tool here and a "clean startup" assertion
+	// would be vacuous; the scenario below starts a child with clarification enabled
+	// and owns that coverage (issue #92).
 	assert.deepEqual(JSON.parse(readFileSync(childToolsPath, "utf8")).sort(), [...READ_ONLY_TOOLS].sort());
-	// Clean startup: the profile's denylist hides `get_goal`, and that is a tool
-	// policy rather than a competing extension, so pi-goal must not report a
-	// registration problem that does not exist (issue #92).
-	const childNotices = child.records
-		.filter((record) => record.type === "extension_ui_request" && record.method === "notify")
-		.map((record) => record.message);
-	for (const message of childNotices) {
-		assert.ok(!message.includes("propose_goal"), `the review child's startup said something about a Goal tool: ${message}`);
-		assert.ok(
-			!message.includes("another extension already provides a tool with that name"),
-			`a tool policy was reported as a foreign owner: ${message}`,
-		);
-	}
 	const childGoalState = readSessionEntries(await child.sessionFile()).filter(
 		(entry) => entry.type === "custom" && entry.customType === "goal-state",
 	);

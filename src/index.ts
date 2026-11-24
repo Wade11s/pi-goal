@@ -2323,13 +2323,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// for queued work that already satisfies the decision.
 		pendingRunKind = "automatic";
 		store.beginGoalWork(goal.id);
+		// The plan tool is named here only while pi-goal still owns it. The
+		// session-start flag is the answer for *this* session start, and another
+		// extension can take the name afterwards — Pi keeps the first extension in
+		// load order that declares it, so an earlier-loaded peer can register
+		// `update_plan` on a later event and displace pi-goal's own. An automatic
+		// Continuation that instructed a tool pi-goal does not own would waste a Goal
+		// turn and teach the model to ignore the extension, so the registry is
+		// re-read at the seam that names it.
+		const planToolInForce = planTool.enabled && ownsTool(PLAN_TOOL_NAME);
 		return {
 			entries: [
 				...event.entries,
 				{
 					type: "custom_message",
 					customType: CUSTOM_MESSAGE_TYPE,
-					content: formatContinuationMessage(goal, { planTool: planToolRegistered }, contents.contents),
+					content: formatContinuationMessage(goal, { planTool: planToolInForce }, contents.contents),
 					display: true,
 				},
 			],
@@ -4257,22 +4266,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * Fail closed instead: no Goal, no pending interview that could never be
 	 * confirmed, and a diagnostic naming both ways forward.
 	 *
-	 * The diagnostic names all three causes instead of asserting one, because they
-	 * are indistinguishable from the command's side of the seam and the old single
-	 * cause was simply wrong for two of them: another extension owning the name, a
-	 * registration that failed, and a session whose `--tools` / `--exclude-tools`
-	 * policy hides the tool all leave `propose_goal` equally unusable. A user who
-	 * filtered the tool themselves must not be sent hunting for a phantom extension.
+	 * The diagnostic names every cause instead of asserting one, because they are
+	 * indistinguishable from the command's side of the seam and the old single cause
+	 * was simply wrong for most of them: another extension owning the name, a
+	 * registration that failed, a session whose `--tools` / `--exclude-tools` policy
+	 * hides the tool, and a tool registry pi-goal cannot read or cannot identify
+	 * itself in all leave `propose_goal` equally unusable. A user who filtered the
+	 * tool themselves must not be sent hunting for a phantom extension.
 	 */
 	function refuseUnavailableClarification(ctx: ExtensionCommandContext): void {
 		ctx.ui.notify(
 			"Goal not created: Objective clarification is enabled (goal.clarifyOnCreate is true), but the " +
 				`${PROPOSE_GOAL_TOOL_NAME} tool could not be registered for this session, so there is no confirmation ` +
-				"editor to authorize a Goal. Three different causes produce that: another extension already owns the " +
-				"propose_goal name (pi-goal will not replace it), the registration itself failed, or this session's tool " +
-				"policy (--tools / --exclude-tools) keeps the tool out of the model's reach. No Goal was created and no " +
-				"clarification was started. Rename or unload the conflicting extension, or adjust the session's tool " +
-				"policy, and run /goal again — or set goal.clarifyOnCreate to false to create directly without confirmation.",
+				"editor to authorize a Goal. Four different causes produce that: another extension already owns the " +
+				"propose_goal name (pi-goal will not replace it), the registration itself failed, this session's tool " +
+				"policy (--tools / --exclude-tools) keeps the tool out of the model's reach, or pi-goal could not read " +
+				"the tool registry to confirm that its own declaration is the one in force. No Goal was created and no " +
+				"clarification was started. Rename or unload the conflicting extension, adjust the session's tool " +
+				"policy, or fix whatever makes the tool registry unreadable (a host or extension whose getAllTools() " +
+				"throws), and run /goal again — or set goal.clarifyOnCreate to false to create directly without " +
+				"confirmation.",
 			"error",
 		);
 	}
@@ -4495,7 +4508,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				? "another extension took over the propose_goal tool"
 				: survival.kind === "hidden"
 					? "this session's tool policy (--tools / --exclude-tools) hides the propose_goal tool"
-					: `pi-goal could not confirm that its own propose_goal tool is the one in force (${survival.reason})`;
+					: survival.kind === "unreadable"
+						? `pi-goal could not read this session's tool registry to confirm that its own propose_goal tool is the one in force (${survival.reason})`
+						: `pi-goal could not tell which declarations in this session's tool registry are its own, so it could not confirm that propose_goal is the one in force (${survival.reason})`;
 		pendingClarification = null;
 		pendingConfirmation = null;
 		notify(
