@@ -1,6 +1,6 @@
 /**
  * Tool-name ownership: whether pi-goal may register a tool name, and whether the
- * declaration now in force is pi-goal's own.
+ * declaration now in force is the one this runtime handed to Pi.
  *
  * Pi's tool registry is keyed by name across every loaded extension, and it is
  * **filtered by the session's tool policy**: `pi.getAllTools()` returns only the
@@ -15,31 +15,31 @@
  * never registered and `/goal` refused creation, with a message that named a cause
  * that did not exist.
  *
- * The rule that replaced it has to survive three further facts about Pi's registry,
- * and all three are about *who* a declaration belongs to rather than whether it
- * exists:
+ * What replaced it has to survive three further facts about Pi's registry, and all
+ * three are about *who* a declaration belongs to rather than whether it exists:
  *
- * 1. **A tool is never its own witness.** Deriving pi-goal's identity from the very
- *    declaration under test makes any foreign owner of that name authenticate
- *    itself as pi-goal, which is fail-open in the worst direction.
- * 2. **No Goal tool is a witness either.** Pi keeps the first *extension in load
- *    order* that declares a name, and extension handlers run in load order, so an
- *    extension loaded before pi-goal can register `get_goal` from its own
- *    `session_start` — before pi-goal reads the registry at all — and win the name.
- *    Reading identity out of a Goal tool therefore hands the peer that wants the
- *    name the power to define this extension's identity.
- * 3. **"This runtime registered it" is not by itself proof either.** Two copies of
- *    the same extension file share a source path, so the other copy's registration
- *    is not this runtime's to rely on.
+ * 1. **Pi keeps the first extension in *load order* that declares a name**, not the
+ *    first one to register it, and extension handlers run in load order. So an
+ *    extension loaded before pi-goal can win a name pi-goal already registered —
+ *    from its own `session_start`, or, because `registerTool` synchronously refreshes
+ *    the registry and applying the loadout runs active tools' `prepareLoadout` hooks,
+ *    from *inside* pi-goal's own `registerTool` call, between its ownership check and
+ *    its confirmation.
+ * 2. **Nothing about a declaration's provenance can be inferred.** A source path is
+ *    shared by every copy of a file, a Goal tool is exactly the name a peer that
+ *    wants to be mistaken for pi-goal would take, and the declaration under test is
+ *    the one a foreign owner would most like to be believed.
+ * 3. **Being in the registry is not being reachable.** `getAllTools()` still lists
+ *    tools a peer removed with `pi.setActiveTools()`, so a tool the model can no
+ *    longer call must not be promised.
  *
- * Identity is therefore established in exactly one way: the **bootstrap** of a
- * registration this runtime just made. `checkName` proved the name free, this
- * runtime registered it, and nothing has run in between, so the declaration visible
- * in that same synchronous confirmation is the one pi-goal just handed to Pi. Every
- * later check compares against that, and requires that this runtime is the one that
- * registered the name. With no bootstrap, ownership is unverifiable and every path
- * fails closed — the honest answer to "whose is this?" is "I cannot tell", never a
- * guess in either direction.
+ * So identity is **object identity**, which none of those can forge: Pi returns the
+ * very `parameters` object that was handed to `registerTool`, by reference. A
+ * declaration is pi-goal's iff `entry.parameters` is the exact object this runtime
+ * passed for that name. There is no cache to poison, no witness to steal, no path to
+ * confuse, and no window a reentrant peer can slip through — it would have to
+ * present an object it cannot hold. Availability adds the second half: the tool must
+ * also be in the session's active loadout.
  *
  * Both registrations pi-goal performs — `propose_goal` and the opt-in `update_plan`
  * — go through the one flow in {@link registerOwnedTool}, so the rule and the
@@ -48,45 +48,64 @@
  * tool.
  */
 
-/**
- * Why a declaration that is in force cannot be attributed to this runtime.
- *
- * Two shapes, because they need different wording and different repairs: a registry
- * that could not be read at all, and one that was read but in which pi-goal's own
- * declarations could not be identified.
- */
-type UnverifiableCause = { kind: "unreadable"; reason: string } | { kind: "unidentified"; reason: string };
-
 /** The part of Pi's `ToolInfo` an ownership decision reads. */
 export interface ToolRegistryEntry {
 	name: string;
-	sourceInfo?: { path?: string };
+	/**
+	 * The tool's parameter schema, as Pi returns it: the *same object* the
+	 * registering extension handed to `registerTool`. Optional only so a fake that
+	 * does not model the seam still type-checks; a missing value simply never
+	 * matches, which is the fail-closed direction.
+	 */
+	parameters?: unknown;
 }
 
 /** Whether a tool name is pi-goal's to register. */
 export type ToolNameOwnership =
-	/** No tool of that name is in force: the name is free. */
+	/** Nothing of that name is in force: the name is free. */
 	| { kind: "free" }
 	/** A tool of that name is in force from another extension, which pi-goal must not replace. */
 	| { kind: "foreign" }
-	/** This runtime registered the name, and another extension's declaration is the one in force. */
+	/** This runtime registered the name, and a different declaration is the one in force. */
 	| { kind: "takeover" }
-	/** Ownership could not be determined, so the name is treated as taken. */
-	| UnverifiableCause;
+	/** The registry could not be read. */
+	| { kind: "unreadable"; reason: string };
 
 /** What became of a registration this runtime was allowed to attempt. */
 export type ToolSurvival =
-	/** pi-goal's own declaration of the tool, registered by this runtime, is the one in force. */
+	/** The declaration in force is the very one this runtime handed to Pi. */
 	| { kind: "owned" }
-	/** Another extension's declaration displaced the one this runtime registered. */
+	/** A different declaration is in force, so the registration was displaced. */
 	| { kind: "takeover" }
 	/** The name is not in the readable registry at all, which only the session's tool policy can explain. */
 	| { kind: "hidden" }
-	/** pi-goal could not confirm that its own declaration is the one in force. */
-	| UnverifiableCause;
+	/** The registry could not be read. */
+	| { kind: "unreadable"; reason: string };
+
+/** What a tool this runtime registered is worth to the model right now. */
+export type ToolAvailability =
+	/** It is pi-goal's own declaration and the session's active loadout declares it. */
+	| { kind: "available" }
+	/** A different declaration is in force. */
+	| { kind: "takeover" }
+	/** The name is not in the readable registry, so the session's tool policy hid it. */
+	| { kind: "hidden" }
+	/** It is pi-goal's own declaration, but the session's active loadout does not declare it. */
+	| { kind: "inactive" }
+	/** The registry or the active loadout could not be read. */
+	| { kind: "unreadable"; reason: string }
+	/**
+	 * This runtime never registered the name. Defensive: the callers that ask about
+	 * availability gate on their own registration flag first, so a well-formed seam
+	 * never reaches it.
+	 */
+	| { kind: "unregistered" };
 
 /** Reads the registry as Pi exposes it. Throwing is a legitimate outcome. */
 export type ToolRegistryReader = () => ToolRegistryEntry[];
+
+/** Reads the session's model-visible tool names, or undefined on a host without the seam. */
+export type ActiveToolReader = () => string[] | undefined;
 
 /** The tool-specific clauses every registration warning is built from. */
 export interface ToolRegistrationWording {
@@ -110,22 +129,10 @@ export interface ToolRegistrationWording {
  */
 const REPAIR_UNREADABLE = "fix the host or extension whose getAllTools() throws";
 
-/** How to recover from a registry in which pi-goal cannot identify its own declarations. */
-const REPAIR_UNIDENTIFIED = "restart the session so pi-goal can identify its own tool declarations";
-
 /** The cause sentence shared by every "another extension owns this name" warning. */
 const FOREIGN_CAUSE = "another extension already provides a tool with that name, and pi-goal will not replace it.";
 /** The cause sentence shared by every "another extension took this name over" warning. */
 const TAKEOVER_CAUSE = "another extension's tool of the same name took its place.";
-/** Why a registry that was read still cannot tell pi-goal which declarations are its own. */
-const OWN_SOURCE_UNKNOWN_REASON =
-	"no declaration of a tool this runtime registered is visible in this session's tool registry, so pi-goal " +
-	"could not tell which declarations in it are its own";
-/** Why a declaration from this extension's own file is still not this runtime's to rely on. */
-const NOT_THIS_RUNTIME_REASON =
-	"the declaration in force comes from this extension's own file, but this runtime did not register it";
-/** Why a name this runtime never registered, and that is not in force, cannot be relied on. */
-const NOT_REGISTERED_REASON = "pi-goal did not register that tool in this session, and no declaration of it is in force";
 
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -158,114 +165,60 @@ function notInForceWarning(
 	return joinSentences(`pi-goal registered ${name}, but`, cause, consequence, `${repair}, or ${wording.without}.`);
 }
 
-/**
- * The cause clause for a registration pi-goal declined because it could not verify
- * the name at all.
- *
- * Deliberately cause-neutral in both shapes: each says what pi-goal could not find
- * out and what it did instead, and neither claims that another extension owns the
- * name.
- */
-function notRegisteredCause(cause: UnverifiableCause): string {
-	return cause.kind === "unreadable"
-		? `it could not read this session's tool registry to check whether the name is already taken ` +
-				`(${cause.reason}), so it declined to register rather than risk replacing another extension's tool`
-		: `${cause.reason}; it declined to register rather than risk replacing another extension's tool`;
+/** The cause clause for a registration pi-goal declined because it could not read the registry. */
+function unreadableRegistryCause(reason: string): string {
+	return (
+		`it could not read this session's tool registry to check whether the name is already taken ` +
+		`(${reason}), so it declined to register rather than risk replacing another extension's tool`
+	);
 }
 
 /** The cause clause for a registration whose own declaration could not be confirmed. */
-function notConfirmedCause(cause: UnverifiableCause): string {
-	return cause.kind === "unreadable"
-		? `the session's tool registry could not be read (${cause.reason})`
-		: cause.reason;
-}
-
-/** The repair clause that matches an unverifiable cause. */
-function repairFor(cause: UnverifiableCause): string {
-	return cause.kind === "unreadable" ? REPAIR_UNREADABLE : REPAIR_UNIDENTIFIED;
-}
-
-/** A non-empty source path, or undefined. */
-function sourcePathOf(entry: ToolRegistryEntry | undefined): string | undefined {
-	const path = entry?.sourceInfo?.path;
-	return typeof path === "string" && path !== "" ? path : undefined;
+function unconfirmedRegistryCause(reason: string): string {
+	return `the session's tool registry could not be read (${reason}).`;
 }
 
 /**
- * Whether a declaration that is in force is the one this extension owns.
- *
- * The shared tail of both checks, phrased without either caller's vocabulary so the
- * registration guard and the survival check cannot disagree about what they saw.
- */
-type DeclarationAttribution =
-	/** The declaration in force is this runtime's own registration. */
-	| { kind: "ours" }
-	/** The declaration in force comes from somewhere else. */
-	| { kind: "takeover" }
-	/** The declaration cannot be attributed to this runtime. */
-	| UnverifiableCause;
-
-/**
- * Attribute a declaration that is in force to this runtime or to somebody else.
- *
- * `ownSource` is the bootstrap cache and nothing else: no Goal tool may supply it,
- * because a peer that wants the name can own that tool, and the declaration under
- * test certainly may not, because that would let a foreign owner authenticate
- * itself. `registeredByThisRuntime` is a conjunct of "ours" for the same reason —
- * two copies of one extension file share a path, and only one of them is this
- * runtime.
- */
-function attribute(
-	existing: ToolRegistryEntry,
-	ownSource: string | undefined,
-	registeredByThisRuntime: boolean,
-): DeclarationAttribution {
-	if (ownSource === undefined) return { kind: "unidentified", reason: OWN_SOURCE_UNKNOWN_REASON };
-	if (sourcePathOf(existing) !== ownSource) return { kind: "takeover" };
-	return registeredByThisRuntime
-		? { kind: "ours" }
-		: { kind: "unidentified", reason: NOT_THIS_RUNTIME_REASON };
-}
-
-/**
- * The ownership state of every tool name this runtime registered, plus the source
- * path that identifies pi-goal in the registry.
+ * The ownership state of every tool name this runtime registered, keyed by the exact
+ * schema object it handed to Pi.
  *
  * Per-runtime state lives here rather than in a module-level variable so a second
  * runtime in the same process starts from a clean slate: a name one runtime
- * registered says nothing about what another runtime may register.
+ * registered says nothing about what another runtime may register, and the two
+ * runtimes' schema objects are different objects even when they come from the same
+ * source file.
  */
 export interface ToolOwnershipGuard {
 	/** Whether pi-goal may register `name` now, and why not when it may not. */
 	checkName(name: string): ToolNameOwnership;
 	/**
-	 * Confirm a registration this runtime has *just* made, and record what became
-	 * of it. Only this method may establish identity, and only from the declaration
-	 * under test, because only here is that declaration provably the one pi-goal
-	 * just handed to Pi; every other seam must go through {@link checkSurvival}.
+	 * Confirm a registration this runtime has *just* made, and record what became of
+	 * it. Only this method may establish identity, and only through object identity,
+	 * so a reentrant peer cannot make its own declaration look like the one pi-goal
+	 * just handed to Pi.
 	 */
 	confirmRegistration(name: string): ToolSurvival;
-	/** Whether the declaration of `name` now in force is pi-goal's own. */
-	checkSurvival(name: string): ToolSurvival;
-	/** Record that this runtime registered `name` itself. */
-	noteRegistered(name: string): void;
+	/** Whether the tool this runtime registered is usable by the model right now. */
+	checkAvailability(name: string): ToolAvailability;
+	/** Record the schema this runtime handed to Pi for `name`. */
+	noteRegistered(name: string, schema: object): void;
 }
 
 /**
- * Build the ownership guard over one registry reader.
+ * Build the ownership guard over Pi's registry read and its active-loadout read.
  *
- * The reader is Pi's `getAllTools`, and it is allowed to throw: a host without that
- * seam, or one that fails mid-session, is an outcome rather than a crash.
+ * Both readers are allowed to throw, and the active-loadout reader is allowed to be
+ * absent: a host without these seams is an outcome rather than a crash. A host
+ * without `getActiveTools` falls back to ownership alone, because that is all it can
+ * answer — the fail-closed half (no Continuation naming a tool the model cannot
+ * call) then rests on the registry read, which such a host does provide.
  */
-export function createToolOwnershipGuard(readTools: ToolRegistryReader): ToolOwnershipGuard {
-	/** Every name this runtime passed to `registerTool`. */
-	const registered = new Set<string>();
-	/**
-	 * The source path that identifies pi-goal in the registry, established once by
-	 * the bootstrap of a registration this runtime made. Never derived from a Goal
-	 * tool and never from a declaration under suspicion.
-	 */
-	let cachedOwnSource: string | undefined;
+export function createToolOwnershipGuard(
+	readTools: ToolRegistryReader,
+	readActiveTools: ActiveToolReader,
+): ToolOwnershipGuard {
+	/** The exact schema object this runtime handed to Pi, per tool name. */
+	const schemas = new Map<string, object>();
 
 	const read = (): { ok: true; tools: ToolRegistryEntry[] } | { ok: false; reason: string } => {
 		try {
@@ -274,6 +227,10 @@ export function createToolOwnershipGuard(readTools: ToolRegistryReader): ToolOwn
 			return { ok: false, reason: describeError(error) };
 		}
 	};
+
+	/** Whether the declaration of `name` now in force is the one this runtime registered. */
+	const owns = (existing: ToolRegistryEntry, schema: object | undefined): boolean =>
+		schema !== undefined && existing.parameters === schema;
 
 	return {
 		checkName(name: string): ToolNameOwnership {
@@ -284,12 +241,13 @@ export function createToolOwnershipGuard(readTools: ToolRegistryReader): ToolOwn
 			// entry: the session's tool policy filters the registry, so absence is never
 			// evidence about ownership either way.
 			if (existing === undefined) return { kind: "free" };
-			// A name this runtime has not registered is somebody else's, whoever it is.
-			if (!registered.has(name)) return { kind: "foreign" };
-			// This runtime registered the name, so it stays ours only while the
-			// declaration in force is the one this runtime registered.
-			const attribution = attribute(existing, cachedOwnSource, true);
-			return attribution.kind === "ours" ? { kind: "free" } : attribution;
+			// The name is in force. Whether it is pi-goal's to register is decided by the
+			// schema object, which no other extension can present: a name this runtime has
+			// never registered is somebody else's, and a name this runtime registered but
+			// whose declaration has since been displaced is a takeover.
+			const schema = schemas.get(name);
+			if (schema === undefined) return { kind: "foreign" };
+			return owns(existing, schema) ? { kind: "free" } : { kind: "takeover" };
 		},
 
 		confirmRegistration(name: string): ToolSurvival {
@@ -299,37 +257,36 @@ export function createToolOwnershipGuard(readTools: ToolRegistryReader): ToolOwn
 			// pi-goal just registered the name, so a readable registry that does not
 			// list it is the session's tool policy hiding it — never a takeover.
 			if (existing === undefined) return { kind: "hidden" };
-			// Bootstrap: the one and only way identity is established. `checkName`
-			// found the name free, this runtime registered it, and nothing has run in
-			// between, so the declaration now in force is the one pi-goal just handed
-			// to Pi.
-			if (cachedOwnSource === undefined) {
-				const path = sourcePathOf(existing);
-				if (path !== undefined) cachedOwnSource = path;
-			}
-			const attribution = attribute(existing, cachedOwnSource, registered.has(name));
-			return attribution.kind === "ours" ? { kind: "owned" } : attribution;
+			// Object identity, checked in the same synchronous moment as the
+			// registration: a peer that squatted the name reentrantly presents its own
+			// schema, so this answers `takeover` rather than believing it.
+			return owns(existing, schemas.get(name)) ? { kind: "owned" } : { kind: "takeover" };
 		},
 
-		checkSurvival(name: string): ToolSurvival {
+		checkAvailability(name: string): ToolAvailability {
+			const schema = schemas.get(name);
+			if (schema === undefined) return { kind: "unregistered" };
 			const attempt = read();
 			if (!attempt.ok) return { kind: "unreadable", reason: attempt.reason };
 			const existing = attempt.tools.find((tool) => tool.name === name);
-			// A registration of ours that is no longer in the readable registry was
-			// hidden by the session's tool policy, not stolen. A name we never
-			// registered and that is not in force is simply not there, and saying the
-			// policy hid it would name a cause that does not exist.
-			if (existing === undefined) {
-				return registered.has(name) ? { kind: "hidden" } : { kind: "unidentified", reason: NOT_REGISTERED_REASON };
+			if (existing === undefined) return { kind: "hidden" };
+			if (!owns(existing, schema)) return { kind: "takeover" };
+			// Ours and in force. The model can still only call it while the session's
+			// active loadout declares it: `getAllTools()` keeps every tool a peer
+			// removed with `setActiveTools`, so the registry alone would promise a tool
+			// the model cannot reach.
+			let active: string[] | undefined;
+			try {
+				active = readActiveTools();
+			} catch (error) {
+				return { kind: "unreadable", reason: `the active tool loadout could not be read (${describeError(error)})` };
 			}
-			// No bootstrap here. A tool that is in force is never its own witness: a
-			// foreign owner of the name would authenticate itself as pi-goal.
-			const attribution = attribute(existing, cachedOwnSource, registered.has(name));
-			return attribution.kind === "ours" ? { kind: "owned" } : attribution;
+			if (active === undefined) return { kind: "available" };
+			return active.includes(name) ? { kind: "available" } : { kind: "inactive" };
 		},
 
-		noteRegistered(name: string): void {
-			registered.add(name);
+		noteRegistered(name: string, schema: object): void {
+			schemas.set(name, schema);
 		},
 	};
 }
@@ -339,6 +296,8 @@ export interface RegisterOwnedToolOptions {
 	guard: ToolOwnershipGuard;
 	/** The tool name being registered. */
 	name: string;
+	/** The exact schema object handed to Pi. It is the tool's identity. */
+	schema: object;
 	/** The tool-specific clauses every warning is built from. */
 	wording: ToolRegistrationWording;
 	/** The registration itself, which may throw. */
@@ -356,23 +315,21 @@ export interface RegisterOwnedToolOptions {
  * lose the name; and each failure is its own outcome with its own wording:
  *
  * - **foreign** — another extension already owns the name: pi-goal registers nothing;
- * - **takeover** — this runtime registered the name and another extension's
- *   declaration is the one in force: pi-goal registers nothing and keeps refusing;
+ * - **takeover** — this runtime registered the name and a different declaration is
+ *   the one in force: pi-goal registers nothing and keeps refusing;
  * - **unreadable** — the registry could not be read: pi-goal registers nothing;
- * - **unidentified** — the registry was read, but the declaration in force cannot be
- *   attributed to this runtime: pi-goal registers nothing;
  * - **failed** — `registerTool` threw;
  * - **hidden** — the registration landed but the session's tool policy keeps the
- *   tool out of the model's reach. Silent at startup, because nothing went wrong
- *   and there is nobody to tell; `/goal` explains it instead;
- * - **owned** — this runtime's own declaration is the one in force.
+ *   tool out of the registry. Silent at startup, because nothing went wrong and
+ *   there is nobody to tell; `/goal` explains it instead;
+ * - **owned** — the declaration in force is the one this runtime handed to Pi.
  *
  * Everything except **owned** answers `false`, which is the fail-closed direction:
  * the caller then declines to promise the tool rather than naming a tool the model
  * cannot call.
  */
 export function registerOwnedTool(options: RegisterOwnedToolOptions): boolean {
-	const { guard, name, wording, register, notify } = options;
+	const { guard, name, schema, wording, register, notify } = options;
 	const ownership = guard.checkName(name);
 	if (ownership.kind === "foreign") {
 		notify(notRegisteredWarning(name, FOREIGN_CAUSE, wording, wording.consequence, wording.repairOwner));
@@ -382,14 +339,14 @@ export function registerOwnedTool(options: RegisterOwnedToolOptions): boolean {
 		notify(notInForceWarning(name, TAKEOVER_CAUSE, wording, wording.consequenceDisplaced, wording.repairOwner));
 		return false;
 	}
-	if (ownership.kind === "unreadable" || ownership.kind === "unidentified") {
+	if (ownership.kind === "unreadable") {
 		notify(
 			notRegisteredWarning(
 				name,
-				notRegisteredCause(ownership),
+				unreadableRegistryCause(ownership.reason),
 				wording,
 				wording.consequence,
-				repairFor(ownership),
+				REPAIR_UNREADABLE,
 			),
 		);
 		return false;
@@ -406,7 +363,7 @@ export function registerOwnedTool(options: RegisterOwnedToolOptions): boolean {
 		);
 		return false;
 	}
-	guard.noteRegistered(name);
+	guard.noteRegistered(name, schema);
 	const survival = guard.confirmRegistration(name);
 	if (survival.kind === "owned") return true;
 	if (survival.kind === "hidden") return false;
@@ -415,11 +372,12 @@ export function registerOwnedTool(options: RegisterOwnedToolOptions): boolean {
 		return false;
 	}
 	notify(
-		joinSentences(
-			`pi-goal registered ${name}, but it could not confirm that its own declaration is the one in force ` +
-				`(${notConfirmedCause(survival)}).`,
+		notInForceWarning(
+			name,
+			unconfirmedRegistryCause(survival.reason),
+			wording,
 			wording.consequenceDisplaced,
-			`${repairFor(survival)}, or ${wording.without}.`,
+			REPAIR_UNREADABLE,
 		),
 	);
 	return false;

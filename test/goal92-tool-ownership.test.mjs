@@ -54,6 +54,12 @@ const CLARIFY_SETTINGS = { goal: { clarifyOnCreate: true } };
 const PLAN_TOOL_ON = { goal: { planTool: true } };
 /** The test-only probe that records the tools a real session declares to the model. */
 const ACTIVE_TOOLS_PEER = join(import.meta.dirname, "extensions", "active-tools-peer.ts");
+/** A peer loaded *before* pi-goal that squats `propose_goal` from a `prepareLoadout` hook. */
+const PROPOSE_GOAL_LOADOUT_PEER = join(import.meta.dirname, "extensions", "propose-goal-loadout-peer.ts");
+/** A peer loaded after pi-goal that removes `propose_goal` from the active loadout. */
+const PROPOSE_GOAL_DEACTIVATE_PEER = join(import.meta.dirname, "extensions", "propose-goal-deactivate-peer.ts");
+/** A peer loaded after pi-goal that removes `update_plan` from the active loadout. */
+const PLAN_DEACTIVATE_PEER = join(import.meta.dirname, "extensions", "plan-deactivate-peer.ts");
 /** A peer loaded *before* pi-goal that takes `get_goal` on `session_start`. */
 const GET_GOAL_NAME_PEER = join(import.meta.dirname, "extensions", "get-goal-name-peer.ts");
 /** A peer loaded *before* pi-goal that takes `get_goal` and `propose_goal` on `session_start`. */
@@ -77,14 +83,16 @@ function scratch() {
 
 /** Start a real Pi session with the given tool policy, settings, and extensions. */
 function startSession(dirs, options = {}) {
-	const { settings, ...rest } = options;
+	const { settings, extraExtensions, ...rest } = options;
 	return PiRpcSession.start({
 		cwd: dirs.workDir,
 		sessionDir: dirs.sessionDir,
 		agentDir: dirs.agentDir,
 		settings: settings ?? CLARIFY_SETTINGS,
 		env: { PI_GOAL_TEST_ACTIVE_TOOLS: join(dirs.workDir, "active-tools.json") },
-		extraExtensions: [ACTIVE_TOOLS_PEER],
+		// The probe is always loaded; a scenario's own peers join it rather than
+		// replacing it, so the model-visible tool set is always observable.
+		extraExtensions: [ACTIVE_TOOLS_PEER, ...(options.extraExtensions ?? [])],
 		...rest,
 	});
 }
@@ -262,17 +270,18 @@ test("a session whose policy hides propose_goal is silent at startup and refuses
 		assert.equal(refusal.notifyType, "error");
 		// The frame does not claim the registration failed: this one landed.
 		assert.match(refusal.message, /propose_goal tool is not available for this session/);
-		// All four causes are named, and none of them is asserted as *the* cause.
+		// All five causes are named, and none of them is asserted as *the* cause.
 		assert.match(refusal.message, /another extension already owns the propose_goal name/);
 		assert.match(refusal.message, /the registration itself failed/);
 		assert.match(refusal.message, /this session's tool policy \(--tools \/ --exclude-tools\) keeps the tool out of the model's reach/);
-		assert.match(refusal.message, /pi-goal cannot confirm that its own declaration is the one in force/);
-		assert.match(refusal.message, /because the tool registry could not be read/);
-		assert.match(refusal.message, /because nothing in it identifies pi-goal's own declarations/);
-		assert.match(refusal.message, /make the tool registry readable again/);
-		assert.match(refusal.message, /restart the session so pi-goal can identify its own declarations/);
+		assert.match(refusal.message, /this session's active tool loadout does not declare it/);
+		assert.match(refusal.message, /the tool registry could not be read/);
+		assert.match(refusal.message, /adjust the session's tool policy or its active tool loadout/);
 		assert.match(refusal.message, /No Goal was created and no clarification was started/);
 		assert.match(refusal.message, /set goal\.clarifyOnCreate to false/);
+		// And the one cause this session actually has is named last, so the list teaches
+		// and the tail diagnoses.
+		assert.match(refusal.message, /This session: this session's tool policy \(--tools \/ --exclude-tools\) hides the propose_goal tool\./);
 		// Fail closed: no Goal, no interview that could never be confirmed, no editor.
 		// The branch is read through Pi's own seam, because a session whose only
 		// command was refused has written no session file to read.
@@ -628,5 +637,160 @@ test("a peer that owns get_goal and propose_goal is reported accurately, and a r
 		assert.equal(second.extensionErrors().length, 0, JSON.stringify(second.extensionErrors()));
 	} finally {
 		await cleanup(dirs, first, second);
+	}
+});
+
+test("a peer that squats propose_goal from a loadout hook never gets it believed", async () => {
+	// High 1 of the review, and the reason identity is object identity. `registerTool`
+	// synchronously refreshes the registry, and applying the active loadout runs the
+	// `prepareLoadout` hooks of the tools declared to the model — so this peer's hook
+	// runs *inside* pi-goal's own `registerTool` call, between its ownership check and
+	// its confirmation, and wins the name by load order. No cache, witness or source
+	// path survives that; the schema object does, because the peer cannot present it.
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, { preExtensions: [PROPOSE_GOAL_LOADOUT_PEER] });
+		script(
+			[
+				{ text: "Warm answer." },
+				{ toolCalls: [{ name: "propose_goal", args: { title: DRAFT_TITLE, objective: DRAFT_OBJECTIVE } }] },
+				{ text: "The peer tool answered." },
+			],
+			session,
+		);
+		await session.prompt("warm the session up so the provider is one request in");
+		await session.waitForSettled(1);
+
+		// The squat is reported as what it is: a takeover of a tool this runtime
+		// registered, never as a foreign owner and never as nothing at all.
+		const takeover = await session.waitForNotify((record) =>
+			record.message.includes("pi-goal registered propose_goal, but another extension's tool of the same name took its place"),
+		);
+		assert.equal(takeover.notifyType, "warning");
+		assert.match(takeover.message, /will refuse rather than create a Goal/);
+
+		// `/goal` refuses with a true cause, and no interview is recorded or offered.
+		const response = await session.prompt(`/goal ${IDEA}`);
+		assert.equal(response.data.disposition, "handled");
+		const refusal = await session.waitForNotify((record) =>
+			record.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.equal(refusal.notifyType, "error");
+		assert.match(refusal.message, /another extension took over the propose_goal tool/);
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.equal(
+			notifyMessages(session).some((message) => message.includes("Objective clarification started")),
+			false,
+			"no interview was started for a confirmation this session cannot open",
+		);
+		const { entries } = await session.getEntries();
+		assert.equal(clarificationEntries(entries).length, 0, "no pending clarification was recorded");
+		assert.equal(goalSnapshots(entries).length, 0, "no Goal was created");
+
+		// The model-visible `propose_goal` is the peer's, so a call reaches the peer.
+		const tools = await declaredTools(dirs);
+		assert.ok(tools.includes("propose_goal"), `the name is still declared: ${JSON.stringify(tools)}`);
+		await session.prompt("Try to propose a Goal for this idea.");
+		const call = await session.waitForToolResult("propose_goal", 1);
+		assert.equal(call.isError, false, "the peer's own tool runs without error");
+		assert.match(
+			toolTexts(session, "propose_goal")[0],
+			/peer tool: this is not pi-goal's propose_goal/,
+			"the declaration in force is the peer's",
+		);
+		await waitForNextSettle(session);
+
+		assertCleanRun(session);
+		assertStepsConsumed(session, 3);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("a peer that deactivates propose_goal leaves the interview unoffered", async () => {
+	// High 3 of the review. `getAllTools()` still lists a tool a peer removed with
+	// `pi.setActiveTools()`, so a rule that only asked the registry would keep
+	// promising a tool the model can no longer call: the interview would be recorded
+	// and sent, and its confirmation could never be opened.
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, { extraExtensions: [PROPOSE_GOAL_DEACTIVATE_PEER] });
+		script([{ text: "Warm answer." }, { text: "After the refusal." }], session);
+		// The probe records the loadout when a run starts, so warm the session up
+		// before reading it: the peer's deactivation happens on its own session_start.
+		await session.prompt("warm the session up so the peer's loadout change is recorded");
+		await session.waitForSettled(1);
+
+		// The registration succeeded and nothing warned: the peer only changed the
+		// loadout, which is nobody's fault.
+		const tools = await declaredTools(dirs);
+		assert.equal(tools.includes("propose_goal"), false, "the peer removed the tool from the model's loadout");
+		for (const message of notifyMessages(session)) {
+			assert.ok(!message.includes(FOREIGN_OWNER_NOTICE), `a false foreign owner: ${message}`);
+			assert.ok(!message.includes("took its place"), `a false takeover: ${message}`);
+		}
+
+		const response = await session.prompt(`/goal ${IDEA}`);
+		assert.equal(response.data.disposition, "handled");
+		const refusal = await session.waitForNotify((record) =>
+			record.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.equal(refusal.notifyType, "error");
+		assert.match(refusal.message, /not in this session's active tool loadout/);
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.equal(
+			notifyMessages(session).some((message) => message.includes("Objective clarification started")),
+			false,
+			"no interview was recorded for a tool the model cannot call",
+		);
+		const { entries } = await session.getEntries();
+		assert.equal(clarificationEntries(entries).length, 0, "no pending clarification was recorded");
+		assert.equal(goalSnapshots(entries).length, 0, "no Goal was created");
+		assert.equal(runCount(session), 1, "only the warm-up prompt ran");
+
+		assertCleanRun(session);
+		assertStepsConsumed(session, 1);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("a peer that deactivates update_plan leaves it out of every Continuation", async () => {
+	// The plan tool's half of High 3, and the reason the Continuation gates on live
+	// availability: an automatic Continuation that instructed a tool the model cannot
+	// call would waste a Goal turn and teach the model to ignore the extension.
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, {
+			settings: PLAN_TOOL_ON,
+			extraExtensions: [PLAN_DEACTIVATE_PEER],
+		});
+		script([{ text: "Kickoff answer." }, { hang: true }], session);
+		await session.prompt("/goal --no-budget Ship the release notes page");
+		await session.waitForNotify((record) => record.message.includes("created and activated"));
+		await session.waitFor(
+			"the continuation run started",
+			(records) => (records.filter((record) => record.type === "agent_start").length >= 2 ? true : undefined),
+		);
+		await session.sendSimple("abort");
+		await session.waitForSettled(1);
+
+		const tools = await declaredTools(dirs);
+		assert.equal(tools.includes("update_plan"), false, "the peer removed the tool from the model's loadout");
+		const continuations = continuationEntries(readSessionEntries(await session.sessionFile()));
+		assert.equal(continuations.length, 1, "exactly one Continuation before the abort");
+		for (const entry of continuations) {
+			assert.ok(!String(entry.content).includes("update_plan"), "no Continuation names a tool the model cannot call");
+		}
+
+		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
 	}
 });

@@ -374,12 +374,17 @@ function restartFixture(branch, options = {}) {
 			return [...commands.values()];
 		},
 		getAllTools() {
-			const own = tools.map((tool) => ({ name: tool.name, sourceInfo: { path: OWN_SOURCE } }));
+			// The same `parameters` object the extension handed to `registerTool`, as Pi
+			// returns it: object identity is the ownership rule.
+			const own = tools.map((tool) => ({ name: tool.name, parameters: tool.parameters }));
 			if (!state.foreignProposeGoal) return own;
 			return [
 				...own.filter((tool) => tool.name !== "propose_goal"),
-				{ name: "propose_goal", sourceInfo: { path: join(dir, "peer-extension.ts") } },
+				{ name: "propose_goal", parameters: { type: "object", properties: { peer: { type: "string" } } } },
 			];
+		},
+		getActiveTools() {
+			return tools.map((tool) => tool.name);
 		},
 		getSettings() {
 			return state.settings;

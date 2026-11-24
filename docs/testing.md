@@ -284,7 +284,7 @@ a session that hides only `get_goal` registers `propose_goal`, declares it to th
 model, and carries a clarification through the confirmation editor to a committed
 Goal with no registration notice anywhere in the recorded notifications; a session
 whose policy hides `propose_goal` itself is silent at startup and `/goal` refuses
-with cause-neutral wording naming all four causes, creating nothing; and the
+with cause-neutral wording naming all five causes, creating nothing; and the
 opt-in `update_plan` registers and is taught in a Continuation when only
 `get_goal` is hidden, while a session that hides `update_plan` is silent and has
 it named in no Continuation. Absence of a false notice is asserted against the
@@ -304,21 +304,37 @@ and therefore run *before* pi-goal reads the registry: the first proves a stolen
 `get_goal` cannot become pi-goal's identity (the clarification flow runs to a
 committed Goal with no warning about pi-goal's own tools), and the second proves
 that a peer owning both names is reported accurately while a durable interview on
-the branch is not offered as confirmable. All four fail on the pre-fix commit.
+the branch is not offered as confirmable.
 
-`test/goal92-tool-ownership-store.test.mjs` pins the rest against a fake Pi whose
-registry is a filtered view of what the extension registered: a registry without
-`get_goal` and without `propose_goal` still registers silently; identity comes only
-from a registration this runtime made, so the session where `propose_goal` is the
-only visible pi-goal tool still reaches **owned**; a declaration carrying this
-extension's own source path is still not this runtime's when another instance
-registered it, so the durable interview is not offered; a registry that throws
-declines with a distinct cause-neutral warning that never claims a foreign owner; a
-visible foreign `update_plan` can never become pi-goal's identity, so the
-confirmation tool is still owned and `/goal` still records the interview; a name
-this runtime registered but cannot attribute declines instead of claiming it; a
-verified takeover keeps refusing on a later session start in the same runtime; and
-the `update_plan` matrix at both ends, whose genuine-conflict case
+Two more cover the seams that reachability needs a peer for.
+`test/extensions/propose-goal-loadout-peer.ts` owns a tool whose `prepareLoadout`
+hook registers `propose_goal`, so the squat happens *inside* pi-goal's own
+`registerTool` call — between its ownership check and its confirmation — and wins by
+load order: pi-goal must report a takeover of its own tool, refuse `/goal`, record
+nothing, and let the model's call reach the peer's tool.
+`test/extensions/propose-goal-deactivate-peer.ts` and
+`test/extensions/plan-deactivate-peer.ts` call `pi.setActiveTools()` without their
+name, which leaves the declaration in the registry while the model can no longer
+call it: no interview may be recorded or offered, and no Continuation may name the
+plan tool. All four fail on the pre-fix commit.
+
+`test/goal92-tool-ownership-store.test.mjs` pins the rest against a fake Pi that
+models both seams the rule reads — `getAllTools()` returns the *same* `parameters`
+object `registerTool` received, as Pi does, and `getActiveTools()` reports the
+model-visible names. It covers: a registry without `get_goal` and without
+`propose_goal` still registers silently; a session where `propose_goal` is the only
+visible pi-goal tool still reaches **owned**, because the registration itself
+establishes identity; a declaration from a *second runtime* of the same file is
+**foreign**, so the durable interview is not offered; a registration Pi refuses is
+its own warning and establishes nothing; a transient registry failure between the
+ownership check and the confirmation leaves the declaration in place while the
+session never confirmed it, so a later successful registration of the plan tool does
+not make the confirmation tool available again; a registered tool the active loadout
+does not declare is unavailable; an unreadable active loadout is unavailable too; a
+registry that throws outright declines with a cause-neutral warning that never
+claims a foreign owner; a visible foreign `update_plan` can never become pi-goal's
+identity; a verified takeover keeps refusing on a later session start in the same
+runtime; and the `update_plan` matrix at both ends, whose genuine-conflict case
 `test/goal53-progress-plan.test.mjs` already covers through a real peer extension.
 `test/goal57-review-profile.test.mjs` additionally starts a review child with the
 documented profile *and* clarification enabled, proving a clean startup and an

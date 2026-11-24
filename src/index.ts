@@ -246,6 +246,30 @@ import {
 } from "./clarification.ts";
 
 /**
+ * The `propose_goal` parameter schema, as one object for the life of the process.
+ *
+ * It is not decoration: it *is* the tool's identity. Pi hands the very object passed
+ * to `registerTool` back out of `getAllTools()`, so the ownership guard in
+ * `./tool-ownership.ts` recognises pi-goal's own declaration by reference and no
+ * other extension can present it. Building the schema per call would give every
+ * registration a fresh identity and make the guard fail closed forever.
+ */
+const PROPOSE_GOAL_PARAMETERS = Type.Object({
+	title: Type.String({
+		minLength: MIN_TITLE_LENGTH,
+		maxLength: MAX_TITLE_LENGTH,
+		description: "The drafted Goal title: one line, 1-80 characters.",
+	}),
+	objective: Type.String({
+		minLength: MIN_OBJECTIVE_LENGTH,
+		maxLength: MAX_OBJECTIVE_LENGTH,
+		description:
+			"The drafted Goal objective, ideally with the Objective: / Constraints: / Acceptance criteria: " +
+			"sections. The user may edit it in the confirmation editor before it becomes the Goal.",
+	}),
+});
+
+/**
  * Auto-cancel an interactive objective edit after this long.
  *
  * Pi's `editor` dialog has no timeout option of its own, so a host that never
@@ -720,7 +744,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * session_start within the same runtime. See `./tool-ownership.ts` for why a
 	 * session's tool policy can never be read as a foreign owner.
 	 */
-	const toolOwnership = createToolOwnershipGuard(() => pi.getAllTools());
+	const toolOwnership = createToolOwnershipGuard(
+		() => pi.getAllTools(),
+		// Availability's second half: the tools the session actually declares to the
+		// model. Absent on an older host, in which case ownership alone answers.
+		() => (typeof pi.getActiveTools === "function" ? pi.getActiveTools() : undefined),
+	);
 
 	/**
 	 * The optional local metrics consumer seam: the same committed event, projected
@@ -1178,6 +1207,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		registerOwnedTool({
 			guard: toolOwnership,
 			name: PLAN_TOOL_NAME,
+			schema: planParametersSchema,
 			wording: PLAN_TOOL_REGISTRATION_WORDING,
 			notify: (message) => notify(ctx, message, "warning"),
 			register: registerPlanToolDefinition,
@@ -1256,22 +1286,60 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Whether the declaration of `name` now in force is pi-goal's own.
+	 * Why the confirmation tool is not usable by the model right now, or null when it
+	 * is. Every seam that offers an interview — recording one, offering a restored
+	 * one, reporting an open one, confirming one — asks this one question, so an
+	 * offered interview is always one the model can actually finish.
 	 *
-	 * The belt to the registration guard's braces: a registration that was allowed
-	 * can still lose the name, and only the declaration actually in force may be
-	 * relied on. Every seam that matters — recording an interview, offering a
-	 * restored one, confirming one, naming a plan tool in a Continuation — re-reads
-	 * the registry through here instead of trusting the session-start flag, because
-	 * another extension can take the name afterwards.
-	 *
-	 * `./tool-ownership.ts` owns the rule; this is the one-line form the call sites
-	 * read. A *hidden* tool — registered, but kept out of the model's reach by this
-	 * session's tool policy — is not pi-goal's to promise either, which is the
-	 * fail-closed direction.
+	 * The registration flag is part of the answer, not a substitute for it. A
+	 * transient registry failure during the confirmation leaves the registration in
+	 * place while the flag stays false, and a later successful registration of another
+	 * tool must not make that look available again.
 	 */
-	function ownsTool(name: string): boolean {
-		return toolOwnership.checkSurvival(name).kind === "owned";
+	function proposeGoalUnavailableReason(): string | null {
+		const availability = toolOwnership.checkAvailability(PROPOSE_GOAL_TOOL_NAME);
+		// The registration flag is the other half of the predicate, and it is checked
+		// *after* availability so the two halves cannot mask each other. A transient
+		// registry failure during the confirmation leaves the declaration in place — so
+		// availability alone would answer yes — while this session never finished
+		// registering, and a later successful registration of another tool must not make
+		// that look available again.
+		if (availability.kind === "available") {
+			return proposeGoalRegistered ? null : "the propose_goal tool was registered but this session never confirmed it";
+		}
+		switch (availability.kind) {
+			case "takeover":
+				return "another extension took over the propose_goal tool";
+			case "hidden":
+				return "this session's tool policy (--tools / --exclude-tools) hides the propose_goal tool";
+			case "inactive":
+				return "the propose_goal tool is registered but is not in this session's active tool loadout";
+			case "unreadable":
+				return `pi-goal could not read the session's tool state to confirm that propose_goal is usable (${availability.reason})`;
+			default:
+				return (
+					"the propose_goal tool is not registered in this session (another extension owns the name, the " +
+					"registration failed, or the tool registry could not be read)"
+				);
+		}
+	}
+
+	/** Whether the confirmation tool is registered and usable by the model right now. */
+	function proposeGoalAvailable(): boolean {
+		return proposeGoalUnavailableReason() === null;
+	}
+
+	/**
+	 * Whether the opt-in plan tool is registered and usable by the model right now.
+	 *
+	 * The Continuation asks this at the seam that names the tool rather than trusting
+	 * a session-start flag: another extension can take the name, or remove it from the
+	 * active loadout, after this runtime registered it, and an automatic Continuation
+	 * that instructed a tool the model cannot call would waste a Goal turn and teach
+	 * it to ignore the extension.
+	 */
+	function planToolAvailable(): boolean {
+		return planTool.enabled && toolOwnership.checkAvailability(PLAN_TOOL_NAME).kind === "available";
 	}
 
 	/** The uniform tool error for a refused plan call. No plan record is persisted. */
@@ -1314,6 +1382,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		proposeGoalRegistered = registerOwnedTool({
 			guard: toolOwnership,
 			name: PROPOSE_GOAL_TOOL_NAME,
+			schema: PROPOSE_GOAL_PARAMETERS,
 			wording: PROPOSE_GOAL_REGISTRATION_WORDING,
 			notify: (message) => notify(ctx, message, "warning"),
 			register: registerProposeGoalDefinition,
@@ -1326,20 +1395,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			name: PROPOSE_GOAL_TOOL_NAME,
 			label: "Propose Goal",
 			description: PROPOSE_GOAL_DESCRIPTION,
-			parameters: Type.Object({
-				title: Type.String({
-					minLength: MIN_TITLE_LENGTH,
-					maxLength: MAX_TITLE_LENGTH,
-					description: "The drafted Goal title: one line, 1-80 characters.",
-				}),
-				objective: Type.String({
-					minLength: MIN_OBJECTIVE_LENGTH,
-					maxLength: MAX_OBJECTIVE_LENGTH,
-					description:
-						"The drafted Goal objective, ideally with the Objective: / Constraints: / Acceptance criteria: " +
-						"sections. The user may edit it in the confirmation editor before it becomes the Goal.",
-				}),
-			}),
+			parameters: PROPOSE_GOAL_PARAMETERS,
 			outputSchema: getGoalOutputSchema,
 			promptSnippet: PROPOSE_GOAL_PROMPT_SNIPPET,
 			promptGuidelines: [...PROPOSE_GOAL_PROMPT_GUIDELINES],
@@ -2319,7 +2375,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// Continuation that instructed a tool pi-goal does not own would waste a Goal
 		// turn and teach the model to ignore the extension, so the registry is
 		// re-read at the seam that names it.
-		const planToolInForce = planTool.enabled && ownsTool(PLAN_TOOL_NAME);
+		const planToolInForce = planToolAvailable();
 		return {
 			entries: [
 				...event.entries,
@@ -4258,28 +4314,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * indistinguishable from the command's side of the seam and the old single cause
 	 * was simply wrong for most of them: another extension owning the name, a
 	 * registration that failed, a session whose `--tools` / `--exclude-tools` policy
-	 * hides the tool, and a tool registry pi-goal cannot read or cannot identify its
-	 * own declarations in all leave `propose_goal` equally unusable. The two
-	 * unverifiable causes are separated, because their repairs differ: a registry
-	 * that could not be read is a host or extension problem, while a readable
-	 * registry that identifies nothing needs a session where pi-goal's own
-	 * declarations are visible. A user who filtered the tool themselves must not be
-	 * sent hunting for a phantom extension, and a tool the session's policy merely
-	 * hides must not be described as one that failed to register.
+	 * hides the tool, an active loadout that no longer declares it, and a tool
+	 * registry that cannot be read all leave `propose_goal` equally unusable. A user
+	 * who filtered the tool themselves must not be sent hunting for a phantom
+	 * extension, a tool the session's policy merely hides must not be described as one
+	 * that failed to register, and a tool another extension merely deactivated must
+	 * not be described as one that was taken over. The one cause this session actually
+	 * has is named last, so the list teaches and the tail diagnoses.
 	 */
 	function refuseUnavailableClarification(ctx: ExtensionCommandContext): void {
+		const cause = proposeGoalUnavailableReason();
 		ctx.ui.notify(
 			"Goal not created: Objective clarification is enabled (goal.clarifyOnCreate is true), but the " +
 				`${PROPOSE_GOAL_TOOL_NAME} tool is not available for this session, so there is no confirmation editor ` +
-				"to authorize a Goal. Four different causes produce that: another extension already owns the " +
+				"to authorize a Goal. Five different causes produce that: another extension already owns the " +
 				"propose_goal name (pi-goal will not replace it), the registration itself failed, this session's tool " +
-				"policy (--tools / --exclude-tools) keeps the tool out of the model's reach, or pi-goal cannot confirm " +
-				"that its own declaration is the one in force — either because the tool registry could not be read, or " +
-				"because nothing in it identifies pi-goal's own declarations. No Goal was created and no clarification " +
-				"was started. Rename or unload the conflicting extension, fix the registration, adjust the session's " +
-				"tool policy, make the tool registry readable again, or restart the session so pi-goal can identify its " +
-				"own declarations, and run /goal again — or set goal.clarifyOnCreate to false to create directly " +
-				"without confirmation.",
+				"policy (--tools / --exclude-tools) keeps the tool out of the model's reach, the tool is registered " +
+				"but this session's active tool loadout does not declare it, or the tool registry could not be read. " +
+			"No Goal was created and no clarification was started. Rename or unload the conflicting extension, fix " +
+				"the registration, adjust the session's tool policy or its active tool loadout, make the tool " +
+				"registry readable again, and run /goal again — or set goal.clarifyOnCreate to false to create " +
+				"directly without confirmation." +
+				(cause === null ? "" : ` (This session: ${cause}.)`),
 			"error",
 		);
 	}
@@ -4465,7 +4521,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (read.kind !== "pending") return;
 		// The confirmation editor is the only creation authority on the clarified
 		// path, so an interview this session cannot confirm is not offered at all.
-		if (!clarifyOnCreate.enabled || !ownsTool(PROPOSE_GOAL_TOOL_NAME) || !ctx.hasUI) return;
+		if (!clarifyOnCreate.enabled || !proposeGoalAvailable() || !ctx.hasUI) return;
 		pendingClarification = read.pending;
 		pendingConfirmation =
 			read.confirmed === null ? null : { pending: read.pending, draft: read.confirmed };
@@ -4487,24 +4543,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * no longer offered.
 	 *
 	 * The cause is read from the outcome rather than assumed, because a tool that is
-	 * no longer pi-goal's is not always one another extension took: this session's
-	 * tool policy can hide it, and a registry that cannot be read leaves the question
-	 * open. Naming a takeover that did not happen would send the user hunting for an
-	 * extension that does not exist.
+	 * no longer usable is not always one another extension took: this session's tool
+	 * policy can hide it, another extension can remove it from the active loadout, and
+	 * a registry that cannot be read leaves the question open. Naming a takeover that
+	 * did not happen would send the user hunting for an extension that does not exist.
 	 */
 	function reconcileClarificationToolOwnership(ctx: ExtensionContext): void {
 		if (pendingClarification === null) return;
 		if (!clarifyOnCreate.enabled) return;
-		const survival = toolOwnership.checkSurvival(PROPOSE_GOAL_TOOL_NAME);
-		if (survival.kind === "owned") return;
-		const cause =
-			survival.kind === "takeover"
-				? "another extension took over the propose_goal tool"
-				: survival.kind === "hidden"
-					? "this session's tool policy (--tools / --exclude-tools) hides the propose_goal tool"
-					: survival.kind === "unreadable"
-						? `pi-goal could not read this session's tool registry to confirm that its own propose_goal tool is the one in force (${survival.reason})`
-						: `pi-goal could not tell which declarations in this session's tool registry are its own, so it could not confirm that propose_goal is the one in force (${survival.reason})`;
+		const cause = proposeGoalUnavailableReason();
+		if (cause === null) return;
 		pendingClarification = null;
 		pendingConfirmation = null;
 		notify(
@@ -4551,7 +4599,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// creation lock, rather than trusting the session-start flag: another
 			// extension can take the `propose_goal` name after pi-goal registered it, and
 			// an interview whose editor is no longer pi-goal's could never be confirmed.
-			if (!proposeGoalRegistered || !ownsTool(PROPOSE_GOAL_TOOL_NAME)) {
+			if (!proposeGoalAvailable()) {
 				refuseUnavailableClarification(ctx);
 				return;
 			}
@@ -4768,7 +4816,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// The tool's ownership is re-read here, not trusted from session_start: another
 		// extension can take the name after pi-goal registered it, and a confirmation
 		// opened by a tool pi-goal no longer owns could never commit.
-		if (!clarifyOnCreate.enabled || !proposeGoalRegistered || !ownsTool(PROPOSE_GOAL_TOOL_NAME)) {
+		if (!clarifyOnCreate.enabled || !proposeGoalAvailable()) {
 			return goalToolError(
 				"Goal not created: Objective clarification is off for this session (goal.clarifyOnCreate is false, or the " +
 					"propose_goal tool is not registered, was taken over by another extension, or is hidden by this " +
@@ -5282,9 +5330,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// when this session cannot confirm it (the flow is off, or another extension
 			// has taken the tool), because either would be a dead end.
 			const offered =
-				pendingClarification !== null &&
-				clarifyOnCreate.enabled &&
-				ownsTool(PROPOSE_GOAL_TOOL_NAME)
+				pendingClarification !== null && clarifyOnCreate.enabled && proposeGoalAvailable()
 					? pendingClarification
 					: null;
 			ctx.ui.notify(

@@ -46,11 +46,12 @@ a typed `/goal` uses. The model's arguments are only the prefill. Because the
 editor is the only authority on this path, a UI-capable host whose `propose_goal`
 tool is unavailable refuses `/goal` outright instead of falling back to a direct
 creation; a UI-less host is the one exception, and it creates directly with a
-notice. *Unavailable* has four causes, and the refusal names all four rather
+notice. *Unavailable* has five causes, and the refusal names all five rather
 than asserting one: another extension already owns the name, pi-goal's
 registration of it failed, this session's tool policy (`--tools` /
-`--exclude-tools`) hides the tool, or pi-goal cannot read the tool registry to
-confirm that its own declaration is the one in force. See
+`--exclude-tools`) hides the tool, the tool is registered but this session's
+active tool loadout does not declare it, or the tool registry could not be read.
+See
 [Tool-name ownership](#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner). A saved
 document whose first line is not the `Title:` line, or whose title breaks the
 one-line rule, is refused and the same document reopens for correction instead of
@@ -266,8 +267,11 @@ rule and one set of warnings so the two cannot drift apart.
 Pi keeps the first **extension in load order** that declares a name — not the first
 one to register it — and extension handlers run in load order, so an extension
 loaded before pi-goal can register a name from its own `session_start`, before
-pi-goal reads the registry at all, and win it. That rules out every shortcut for
-deciding whose declaration is in force:
+pi-goal reads the registry at all, and win it. `pi.registerTool()` even refreshes
+the registry synchronously, and applying the active loadout runs the
+`prepareLoadout` hooks of the tools declared to the model, so such a peer can act
+from *inside* pi-goal's own registration. That rules out every shortcut for deciding
+whose declaration is in force:
 
 - **the declaration under test is never its own witness** — a foreign owner of the
   name would otherwise authenticate itself as pi-goal;
@@ -278,6 +282,12 @@ deciding whose declaration is in force:
   extension file share a source path, and the other copy's registration is not this
   runtime's to rely on.
 
+So identity is **object identity**, which none of those can forge: Pi hands the very
+`parameters` object passed to `registerTool` back out of `getAllTools()`, by
+reference. A declaration is pi-goal's iff that object is the one this runtime
+registered for that name. There is no source path to confuse, no witness to steal,
+and no cache a reentrant peer can poison.
+
 Ownership is decided **before** anything is registered, so pi-goal never replaces
 another extension's tool:
 
@@ -285,28 +295,27 @@ another extension's tool:
 | --- | --- |
 | no tool of that name | the name is free; pi-goal registers it |
 | a tool of that name this runtime has not registered | **foreign**; pi-goal registers nothing and says so |
-| a tool of that name this runtime registered, from another source | **verified takeover**; pi-goal registers nothing and keeps refusing |
+| a tool of that name this runtime registered, but a different declaration is in force | **takeover**; pi-goal registers nothing and keeps refusing |
 | the registry cannot be read | **unreadable**; pi-goal registers nothing with a cause-neutral warning |
-| the registry was read, but pi-goal's own declarations cannot be identified in it | **unidentified**; pi-goal registers nothing with a cause-neutral warning |
 
 The registration is then **confirmed rather than assumed**, and every outcome says
 what actually happened:
 
 | Outcome | Startup | What `/goal` and the Continuation do |
 | --- | --- | --- |
-| **owned** — this runtime's own declaration of the tool is in force | silent | the tool is promised |
-| **verified takeover** — another extension's declaration displaced it | a warning naming the takeover | `/goal` refuses; no Continuation names a plan tool |
-| **hidden** — the registration landed but the session's tool policy keeps the tool out of the model's reach | **silent** | `/goal` refuses with cause-neutral wording; no Continuation names a plan tool |
-| **unreadable** / **unidentified** — pi-goal cannot confirm its own declaration is in force | a cause-neutral warning | `/goal` refuses |
+| **owned** — the declaration in force is the one this runtime handed to Pi | silent | the tool is promised |
+| **takeover** — another extension's declaration displaced it, reentrantly or not | a warning naming the takeover | `/goal` refuses; no Continuation names a plan tool |
+| **hidden** — the registration landed but the session's tool policy keeps the tool out of the registry | **silent** | `/goal` refuses with cause-neutral wording; no Continuation names a plan tool |
+| **unreadable** — the registry could not be read | a cause-neutral warning | `/goal` refuses |
 
-Identity itself is established in exactly one way: the **bootstrap** of a
-registration this runtime just made. `checkName` proved the name free, this runtime
-registered it, and nothing has run in between, so the declaration visible in that
-same synchronous confirmation is the one pi-goal just handed to Pi. Every later
-check compares against it *and* requires that this runtime is the one that
-registered the name. A second `session_start` in the same runtime reuses it; a
-reload builds a new guard, which is correct because Pi rebuilds the registry too.
-With no bootstrap, ownership is unverifiable and every path fails closed.
+A tool being in the registry is still not the same as the model being able to call
+it: `getAllTools()` keeps every tool a peer removed with `pi.setActiveTools()`. So
+every seam that *promises* a tool — recording an interview, offering a restored one,
+reporting an open one, naming `update_plan` in a Continuation — asks for
+availability, which is ownership **and** presence in the session's active loadout.
+A host without `getActiveTools` falls back to ownership alone. The outcomes there
+are **available**, **inactive** (owned but not in the loadout), **takeover**,
+**hidden**, and **unreadable**, and each is named for what it is.
 
 Two rules follow from the table, and both are behaviour changes from 0.3.0:
 
@@ -318,10 +327,11 @@ Two rules follow from the table, and both are behaviour changes from 0.3.0:
   The profile's tool lists are unchanged; only the false notice is gone.
 - **A session whose policy hides `propose_goal` itself still refuses**, because
   the confirmation editor is the only creation authority on that path. Its
-  refusal now names all four causes instead of asserting one, so a user who
-  filtered the tool themselves is not sent hunting for a phantom extension, and a
-  tool the session's policy merely hides is not described as one that failed to
-  register.
+  refusal now names all five causes instead of asserting one, so a user who
+  filtered the tool themselves is not sent hunting for a phantom extension, a tool
+  the session's policy merely hides is not described as one that failed to
+  register, and a tool another extension merely deactivated is not described as one
+  that was taken over.
 
 Everything except **owned** is fail-closed: not knowing costs a convenience,
 while replacing another extension's tool costs that extension its tool. A
