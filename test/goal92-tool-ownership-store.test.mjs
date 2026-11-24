@@ -748,12 +748,12 @@ test("a hidden get_goal still registers update_plan, and a real conflict still d
 	}
 });
 
-test("a policy-hidden update_plan registers silently and stays unregistered for the model", async () => {
-	// The Continuation half of this is a live question and is covered by the real-Pi
-	// scenarios in `goal92-tool-ownership.test.mjs`; what this seam pins is that the
-	// registration itself is silent, because nothing went wrong.
+test("a policy-hidden update_plan registers silently", async () => {
 	// Nothing went wrong, so nothing is said: the registration landed and the
-	// session's own policy keeps the tool out of the model's reach.
+	// session's own policy keeps the tool out of the model's reach. What this seam
+	// pins is that the registration itself succeeded silently. The model-visibility
+	// half — that no Continuation names a tool the policy hides — is a live question,
+	// owned by the real-Pi scenarios in `goal92-tool-ownership.test.mjs`.
 	const fx = fixture(PLAN_TOOL_ON, { hiddenTools: [PLAN_TOOL_NAME] });
 	try {
 		goalExtension(fx.pi);
