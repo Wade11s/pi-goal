@@ -94,6 +94,8 @@
  * budget, receives exactly one bounded wrap-up, and then stops continuing —
  * budget exhaustion is never completion.
  */
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type {
 	AgentActivityOutcome,
 	ExtensionAPI,
@@ -244,6 +246,21 @@ import {
 	type ConfirmedClarificationDraft,
 	type PendingClarification,
 } from "./clarification.ts";
+
+/**
+ * This extension's own module path, canonicalized.
+ *
+ * The path half of the tool-identity conjunction. Pi assigns each tool's
+ * `sourceInfo.path` from the file the registering extension was loaded from, so a
+ * declaration can only be pi-goal's if it came from *this* file — and no peer can
+ * present that, because Pi decides it, not the extension. Canonicalization matters:
+ * macOS resolves `/tmp` to `/private/tmp`, and the harness's temporary directories
+ * live under `/var/folders`, so the raw strings can differ while the files are the
+ * same. `undefined` when the host cannot resolve this module's location (a synthetic
+ * install path), in which case the guard falls back to the schema alone — a
+ * documented weakening, see `docs/limitations.md`.
+ */
+const PI_GOAL_SELF_PATH = canonicalPath(fileURLToPath(import.meta.url));
 
 /**
  * The `propose_goal` parameter schema, as one object for the life of the process.
@@ -664,6 +681,21 @@ function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Resolve a path to its real location, or undefined when the host cannot.
+ *
+ * `realpathSync` follows every symlink, which is what makes `/tmp` and `/private/tmp`
+ * — and the `/var/folders` the test harness works in — comparable. A path that does
+ * not resolve is never treated as a match: the caller decides what an unknown means.
+ */
+function canonicalPath(path: string): string | undefined {
+	try {
+		return realpathSync(path);
+	} catch {
+		return undefined;
+	}
+}
+
 /** What the /goal command was asked to do. */
 type GoalCommand = { kind: "status" } | { kind: "create"; objective: string } | { kind: "invalid"; message: string };
 
@@ -749,6 +781,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// Availability's second half: the tools the session actually declares to the
 		// model. Absent on an older host, in which case ownership alone answers.
 		() => (typeof pi.getActiveTools === "function" ? pi.getActiveTools() : undefined),
+		// The path half of identity, taken from this module's own location rather than
+		// from anything the registry says. `undefined` when the host cannot resolve it.
+		PI_GOAL_SELF_PATH,
 	);
 
 	/**
@@ -1168,8 +1203,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * This is the session-start answer only. Another extension can take the tool
 	 * name afterwards, and the session's tool policy can hide the tool outright, so
 	 * every seam that matters (recording an interview, offering a restored one,
-	 * confirming) re-reads the registry with {@link ownsTool} instead of trusting
-	 * this flag.
+	 * confirming) re-reads the registry through {@link proposeGoalAvailable} instead of
+	 * trusting this flag.
 	 */
 	let proposeGoalRegistered = false;
 
@@ -4314,8 +4349,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * indistinguishable from the command's side of the seam and the old single cause
 	 * was simply wrong for most of them: another extension owning the name, a
 	 * registration that failed, a session whose `--tools` / `--exclude-tools` policy
-	 * hides the tool, an active loadout that no longer declares it, and a tool
-	 * registry that cannot be read all leave `propose_goal` equally unusable. A user
+	 * hides the tool, an active loadout that no longer declares it, a takeover after
+	 * pi-goal registered the tool, and a tool registry that cannot be read all leave
+	 * `propose_goal` equally unusable. A user
 	 * who filtered the tool themselves must not be sent hunting for a phantom
 	 * extension, a tool the session's policy merely hides must not be described as one
 	 * that failed to register, and a tool another extension merely deactivated must
@@ -4327,14 +4363,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		ctx.ui.notify(
 			"Goal not created: Objective clarification is enabled (goal.clarifyOnCreate is true), but the " +
 				`${PROPOSE_GOAL_TOOL_NAME} tool is not available for this session, so there is no confirmation editor ` +
-				"to authorize a Goal. Five different causes produce that: another extension already owns the " +
+				"to authorize a Goal. Six different causes produce that: another extension already owns the " +
 				"propose_goal name (pi-goal will not replace it), the registration itself failed, this session's tool " +
 				"policy (--tools / --exclude-tools) keeps the tool out of the model's reach, the tool is registered " +
-				"but this session's active tool loadout does not declare it, or the tool registry could not be read. " +
-			"No Goal was created and no clarification was started. Rename or unload the conflicting extension, fix " +
-				"the registration, adjust the session's tool policy or its active tool loadout, make the tool " +
-				"registry readable again, and run /goal again — or set goal.clarifyOnCreate to false to create " +
-				"directly without confirmation." +
+				"but this session's active tool loadout does not declare it, another extension took the tool over " +
+				"after pi-goal registered it, or the tool registry could not be read. No Goal was created and no " +
+				"clarification was started. Rename or unload the conflicting extension, fix the registration, adjust " +
+				"the session's tool policy or its active tool loadout, or make the tool registry readable again, and " +
+				"run /goal again — or set goal.clarifyOnCreate to false to create directly without confirmation." +
 				(cause === null ? "" : ` (This session: ${cause}.)`),
 			"error",
 		);
@@ -4817,11 +4853,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// extension can take the name after pi-goal registered it, and a confirmation
 		// opened by a tool pi-goal no longer owns could never commit.
 		if (!clarifyOnCreate.enabled || !proposeGoalAvailable()) {
+			// The same diagnosis `/goal` prints, from the same predicate. The parenthetical
+			// used to enumerate alternatives, and two reachable states made every one of
+			// them false: a registration that landed but was never confirmed, and a
+			// mid-session tool state that cannot be read.
+			const reason = proposeGoalUnavailableReason();
 			return goalToolError(
-				"Goal not created: Objective clarification is off for this session (goal.clarifyOnCreate is false, or the " +
-					"propose_goal tool is not registered, was taken over by another extension, or is hidden by this " +
-					"session's tool policy), so there is no clarification to confirm. The user creates a Goal with " +
-					"/goal <objective>.",
+				"Goal not created: Objective clarification is off for this session (goal.clarifyOnCreate is false" +
+					(reason === null ? "" : `, or ${reason}`) +
+					"), so there is no clarification to confirm. The user creates a Goal with /goal <objective>.",
 				currentState(),
 			);
 		}

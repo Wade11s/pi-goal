@@ -20,12 +20,13 @@ what it cannot preempt, and what is intentionally left to the user.
   dialog-capable UI is present. A UI-less host (print/JSON) creates directly with
   a notice, and `goal.clarifyOnCreate: false` restores direct creation on any
   host; a UI-capable host whose `propose_goal` tool is unavailable fails closed
-  instead of bypassing the confirmation. Unavailable has five causes — another
+  instead of bypassing the confirmation. Unavailable has six causes — another
   extension already owns the name, the registration failed, the session's own
   `--tools` / `--exclude-tools` policy hides the tool, the tool is registered but
-  the session's active tool loadout does not declare it, or the tool registry could
-  not be read — and the refusal names all five rather than guessing, because a host
-  tool policy is not a foreign owner.
+  the session's active tool loadout does not declare it, another extension took the
+  tool over after pi-goal registered it, or the tool registry could not be read — and
+  the refusal names all six rather than guessing, because a host tool policy is not a
+  foreign owner.
   A session that hides only `get_goal` while admitting `propose_goal` runs the
   clarification flow; one that hides `propose_goal` itself still refuses, since the
   confirmation editor is that path's only creation authority. The interview, the pending
@@ -187,16 +188,19 @@ what it cannot preempt, and what is intentionally left to the user.
   session's tool policy: a session that hides `get_goal` is not a session where
   someone else owns `update_plan`, and a session that hides `update_plan` itself
   is silent at startup rather than warned about a conflict that does not exist. An
-  unreadable registry declines to register with a cause-neutral warning. Identity is
-  object identity: Pi hands the very `parameters` object passed to `registerTool`
-  back out of `getAllTools()`, so a declaration is pi-goal's iff that object is the
-  one this runtime registered. Nothing else may stand in for it — not the declaration
-  under test, and not a Goal tool, because Pi keeps the first *extension in load
-  order* that declares a name and its handlers run in that order, so a peer loaded
-  before pi-goal can take `get_goal` from its own `session_start` and win the name
-  before pi-goal ever reads the registry. Ownership alone is not availability
-  either: `getAllTools()` keeps every tool a peer removed with `setActiveTools`, so
-  every seam that promises a tool also requires it in the session's active loadout.
+  unreadable registry declines to register with a cause-neutral warning. Identity is a
+  conjunction: a declaration is pi-goal's iff it carries the very `parameters` object
+  this runtime handed to `registerTool` **and** its `sourceInfo.path` resolves to this
+  extension's own module. Neither half stands alone — `getAllTools()` publishes every
+  tool's `parameters` object to every extension, so a peer can copy the reference, and
+  two runtimes of one file share a path — and neither is learned from the registry: the
+  schema comes from the registration and the path from `import.meta.url`. The one
+  documented weakening is a host that cannot resolve this module's own location (a
+  synthetic install path): the path half is then unavailable and identity falls back to
+  the schema alone, which a peer *can* forge by copying the reference. Ownership alone
+  is not availability either: `getAllTools()` keeps every tool a peer removed with
+  `setActiveTools`, so every seam that promises a tool also requires it in the session's
+  active loadout.
 - Metrics are local and best-effort: `pi-goal:metrics` delivery has no queue,
   retry, spool, acknowledgement, or replay. A consumer that needs completeness
   must persist and verify records itself and treat gaps as possible. pi-goal

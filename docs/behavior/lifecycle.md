@@ -110,12 +110,13 @@ refuses before any clarification starts.
 
 **Unavailable is not the same thing as taken.** Pi's registry is filtered by the
 session's own tool policy, and a tool the registry lists can still be out of the
-model's reach, so a missing `propose_goal` has five possible causes — another
+model's reach, so a missing `propose_goal` has six possible causes — another
 extension already owns the name, pi-goal's registration of it failed, this session's
 `--tools` / `--exclude-tools` policy hides it, the tool is registered but this
-session's active tool loadout does not declare it, or the tool registry could not be
-read — and the refusal names all five instead of asserting one, closing with the one
-this session actually has. A session that hides only `get_goal` while admitting
+session's active tool loadout does not declare it, another extension took the tool
+over after pi-goal registered it, or the tool registry could not be read — and the
+refusal names all six instead of asserting one, closing with the one this session
+actually has. A session that hides only `get_goal` while admitting
 `propose_goal` therefore **runs the clarification flow** rather than refusing:
 hiding a Goal tool says nothing about who owns the confirmation tool's name. A
 session whose policy hides `propose_goal` itself still refuses, with wording that

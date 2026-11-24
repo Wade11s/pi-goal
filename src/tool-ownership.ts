@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+
 /**
  * Tool-name ownership: whether pi-goal may register a tool name, and whether the
  * declaration now in force is the one this runtime handed to Pi.
@@ -25,21 +27,27 @@
  *    the registry and applying the loadout runs active tools' `prepareLoadout` hooks,
  *    from *inside* pi-goal's own `registerTool` call, between its ownership check and
  *    its confirmation.
- * 2. **Nothing about a declaration's provenance can be inferred.** A source path is
- *    shared by every copy of a file, a Goal tool is exactly the name a peer that
- *    wants to be mistaken for pi-goal would take, and the declaration under test is
- *    the one a foreign owner would most like to be believed.
- * 3. **Being in the registry is not being reachable.** `getAllTools()` still lists
+ * 2. **Being in the registry is not being reachable.** `getAllTools()` still lists
  *    tools a peer removed with `pi.setActiveTools()`, so a tool the model can no
  *    longer call must not be promised.
  *
- * So identity is **object identity**, which none of those can forge: Pi returns the
- * very `parameters` object that was handed to `registerTool`, by reference. A
- * declaration is pi-goal's iff `entry.parameters` is the exact object this runtime
- * passed for that name. There is no cache to poison, no witness to steal, no path to
- * confuse, and no window a reentrant peer can slip through — it would have to
- * present an object it cannot hold. Availability adds the second half: the tool must
- * also be in the session's active loadout.
+ * So identity is a **conjunction**, and each half covers what the other cannot:
+ *
+ * - the **schema object** — Pi returns the very `parameters` object that was handed to
+ *   `registerTool`, by reference, so a declaration carries the object this runtime
+ *   passed. That half is what survives policy filtering and two runtimes of one file;
+ * - **pi-goal's own module path** — derived from this module's own location, never
+ *   from the registry, and compared against the declaration's `sourceInfo.path`, which
+ *   Pi assigns from the registering extension's file.
+ *
+ * Neither half is sufficient alone. The schema is *not* unforgeable: `getAllTools()`
+ * hands every extension the `parameters` object of every registered tool, so a peer
+ * can copy the reference into its own `registerTool` call and be believed. The path is
+ * not sufficient either, because two runtimes of one file share it, and because a
+ * session's tool policy can hide every tool that would reveal it. Together they are:
+ * only this module can be loaded from this file, and only this runtime holds the
+ * schema object it passed. Availability adds the third condition: the tool must also
+ * be in the session's active loadout.
  *
  * Both registrations pi-goal performs — `propose_goal` and the opt-in `update_plan`
  * — go through the one flow in {@link registerOwnedTool}, so the rule and the
@@ -58,6 +66,11 @@ export interface ToolRegistryEntry {
 	 * matches, which is the fail-closed direction.
 	 */
 	parameters?: unknown;
+	/**
+	 * Where the registering extension was loaded from, as Pi assigned it. Optional for
+	 * the same reason; a missing value never matches, which is fail-closed.
+	 */
+	sourceInfo?: { path?: string };
 }
 
 /** Whether a tool name is pi-goal's to register. */
@@ -205,20 +218,47 @@ export interface ToolOwnershipGuard {
 }
 
 /**
- * Build the ownership guard over Pi's registry read and its active-loadout read.
+ * Build the ownership guard over Pi's registry read, its active-loadout read, and this
+ * module's own canonical path.
  *
- * Both readers are allowed to throw, and the active-loadout reader is allowed to be
+ * The readers are allowed to throw, and the active-loadout reader is allowed to be
  * absent: a host without these seams is an outcome rather than a crash. A host
  * without `getActiveTools` falls back to ownership alone, because that is all it can
  * answer — the fail-closed half (no Continuation naming a tool the model cannot
  * call) then rests on the registry read, which such a host does provide.
+ *
+ * `selfPath` is this extension's own file, canonicalized by the caller from
+ * `import.meta.url`. It is the one piece of identity that never comes from the
+ * registry. `undefined` means the host could not resolve it — a synthetic install
+ * path — and the path half of the conjunction is then unavailable, so identity falls
+ * back to the schema alone. That is a documented weakening rather than a silent one;
+ * see `docs/limitations.md`.
  */
 export function createToolOwnershipGuard(
 	readTools: ToolRegistryReader,
 	readActiveTools: ActiveToolReader,
+	selfPath: string | undefined,
 ): ToolOwnershipGuard {
 	/** The exact schema object this runtime handed to Pi, per tool name. */
 	const schemas = new Map<string, object>();
+	/** Canonical paths already resolved, so a comparison costs one syscall at most. */
+	const canonicalPaths = new Map<string, string | undefined>();
+
+	const canonicalPath = (path: string | undefined): string | undefined => {
+		if (path === undefined || path === "") return undefined;
+		const cached = canonicalPaths.get(path);
+		if (cached !== undefined) return cached;
+		let resolved: string | undefined;
+		try {
+			resolved = realpathSync(path);
+		} catch {
+			// Unresolvable: a synthetic host path, or a file that moved since it was
+			// loaded. Never treat an unresolvable path as a match.
+			resolved = undefined;
+		}
+		canonicalPaths.set(path, resolved);
+		return resolved;
+	};
 
 	const read = (): { ok: true; tools: ToolRegistryEntry[] } | { ok: false; reason: string } => {
 		try {
@@ -228,9 +268,24 @@ export function createToolOwnershipGuard(
 		}
 	};
 
-	/** Whether the declaration of `name` now in force is the one this runtime registered. */
-	const owns = (existing: ToolRegistryEntry, schema: object | undefined): boolean =>
-		schema !== undefined && existing.parameters === schema;
+	/**
+	 * Whether the declaration of `name` now in force is the one this runtime registered.
+	 *
+	 * A conjunction, because neither half stands alone. The schema object is what this
+	 * runtime handed to Pi — but `getAllTools()` publishes every tool's `parameters`
+	 * object to every extension, so a peer can copy the reference and satisfy that half
+	 * alone. Pi assigns `sourceInfo` from the registering extension's own file, which no
+	 * peer can copy, so the declaration must also come from this extension's path. The
+	 * per-runtime schema record is checked by the caller, which is what separates this
+	 * runtime from another runtime of the same file.
+	 */
+	const owns = (existing: ToolRegistryEntry, schema: object | undefined): boolean => {
+		if (schema === undefined || existing.parameters !== schema) return false;
+		// No self path: the host could not resolve this module's own location, so the
+		// path half is unavailable and the schema alone answers.
+		if (selfPath === undefined) return true;
+		return canonicalPath(existing.sourceInfo?.path) === selfPath;
+	};
 
 	return {
 		checkName(name: string): ToolNameOwnership {

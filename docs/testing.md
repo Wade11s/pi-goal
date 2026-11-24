@@ -284,7 +284,7 @@ a session that hides only `get_goal` registers `propose_goal`, declares it to th
 model, and carries a clarification through the confirmation editor to a committed
 Goal with no registration notice anywhere in the recorded notifications; a session
 whose policy hides `propose_goal` itself is silent at startup and `/goal` refuses
-with cause-neutral wording naming all five causes, creating nothing; and the
+with cause-neutral wording naming all six causes, creating nothing; and the
 opt-in `update_plan` registers and is taught in a Continuation when only
 `get_goal` is hidden, while a session that hides `update_plan` is silent and has
 it named in no Continuation. Absence of a false notice is asserted against the
@@ -306,6 +306,13 @@ committed Goal with no warning about pi-goal's own tools), and the second proves
 that a peer owning both names is reported accurately while a durable interview on
 the branch is not offered as confirmable.
 
+One more covers forgery. `test/extensions/propose-goal-forging-peer.ts` copies the
+`parameters` object it can see in the registry — `getAllTools()` publishes every
+tool's — and re-registers `propose_goal` with that reference from a `prepareLoadout`
+hook that runs inside pi-goal's own `registerTool` call. The module path is the half
+it cannot copy, so pi-goal reports a takeover of its own tool, refuses `/goal`,
+records nothing, and the model's call reaches the peer's tool.
+
 Two more cover the seams that reachability needs a peer for.
 `test/extensions/propose-goal-loadout-peer.ts` owns a tool whose `prepareLoadout`
 hook registers `propose_goal`, so the squat happens *inside* pi-goal's own
@@ -317,6 +324,11 @@ nothing, and let the model's call reach the peer's tool.
 name, which leaves the declaration in the registry while the model can no longer
 call it: no interview may be recorded or offered, and no Continuation may name the
 plan tool. All four fail on the pre-fix commit.
+
+The store fake can also spawn a **second runtime** of the same extension over one
+shared registry, which is the only way to stage a declaration that carries this
+extension's own schema object *and* its own module path and is still not this
+runtime's: the first runtime offers the durable interview, the second offers nothing.
 
 `test/goal92-tool-ownership-store.test.mjs` pins the rest against a fake Pi that
 models both seams the rule reads — `getAllTools()` returns the *same* `parameters`

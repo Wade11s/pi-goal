@@ -33,7 +33,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import goalExtension from "../src/index.ts";
@@ -89,6 +90,10 @@ function fixture(settings = {}, options = {}) {
 		 * own schema object, registered before this runtime's.
 		 */
 		secondRuntimeProposeGoal: options.secondRuntimeProposeGoal ?? false,
+			/** A peer that copied pi-goal's schema object but not its module path. */
+		forgingProposeGoal: options.forgingProposeGoal ?? false,
+		/** The `parameters` object the extension handed over for `propose_goal`. */
+		capturedProposeGoalParameters: undefined,
 		/** Tool names removed from the model-visible loadout, as `setActiveTools` would. */
 		inactiveTools: options.inactiveTools ?? [],
 		/** Whether the active-loadout read itself fails. */
@@ -105,10 +110,21 @@ function fixture(settings = {}, options = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const tools = [];
+	/**
+	 * This extension's own module path, canonicalized exactly as `src/index.ts`
+	 * derives it, so the fake models what Pi assigns to pi-goal's own tools.
+	 */
+	const OWN_SOURCE = realpathSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
+	/** A peer extension's module path. */
+	const PEER_SOURCE = join(dir, "peer-extension.ts");
+	/**
+	 * The schema object this extension hands to Pi. A second runtime of the same file
+	 * holds the same object, and a forging peer copies the reference — which is why
+	 * the module path is the other half of identity.
+	 */
+	const OWN_SOURCE_PARAMETERS = { type: "object", properties: { title: { type: "string" } } };
 	/** A peer extension's schema object: no runtime of pi-goal can present it. */
 	const PEER_PARAMETERS = { type: "object", properties: { peer: { type: "string" } } };
-	/** A second runtime of this same file's schema object. */
-	const SECOND_RUNTIME_PARAMETERS = { type: "object", properties: { second: { type: "string" } } };
 	const entries = () =>
 		readFileSync(sessionFile, "utf8")
 			.split("\n")
@@ -119,13 +135,18 @@ function fixture(settings = {}, options = {}) {
 			handlers.set(event, handler);
 		},
 		registerTool(definition) {
-			tools.push(definition);
 			// A registration-failure seam, for the outcome a live session cannot stage.
-			// Scoped by name, because the extension's load-time tools register through
-			// the same call and must not take the session down with it.
+			// Thrown *before* the definition is stored, because that is what Pi does:
+			// a refused registration never reaches the registry. Scoped by name,
+			// because the extension's load-time tools register through the same call
+			// and must not take the session down with it.
 			if (state.registrationThrowsFor.includes(definition.name)) {
 				throw new Error(`injected registerTool failure for ${definition.name}`);
 			}
+			// Remember what the extension actually handed over, so a forging peer can
+			// copy the very object rather than a look-alike.
+			if (definition.name === "propose_goal") state.capturedProposeGoalParameters = definition.parameters;
+			tools.push(definition);
 		},
 		registerCommand(name, definition) {
 			commands.set(name, { name, ...definition });
@@ -142,27 +163,41 @@ function fixture(settings = {}, options = {}) {
 			// returns it: the guard recognises its own declaration by reference.
 			const own = tools
 				.filter((tool) => !state.hiddenTools.includes(tool.name))
-				.map((tool) => ({ name: tool.name, parameters: tool.parameters }));
+				.map((tool) => ({ name: tool.name, parameters: tool.parameters, sourceInfo: { path: OWN_SOURCE } }));
 			// A foreign declaration is the one in force, so it replaces this
 			// extension's entry for that name rather than sitting beside it.
 			const foreign = [];
 			if (state.foreignProposeGoal) {
-				foreign.push({ name: "propose_goal", parameters: PEER_PARAMETERS });
+				foreign.push({ name: "propose_goal", parameters: PEER_PARAMETERS, sourceInfo: { path: PEER_SOURCE } });
 			}
 			if (state.foreignPlan) {
-				foreign.push({ name: PLAN_TOOL_NAME, parameters: PEER_PARAMETERS });
+				foreign.push({ name: PLAN_TOOL_NAME, parameters: PEER_PARAMETERS, sourceInfo: { path: PEER_SOURCE } });
 			}
 			if (state.secondRuntimeProposeGoal) {
-				// A second runtime of this same file: a different schema object, so the
-				// guard's per-runtime record is what says it is not ours.
-				foreign.push({ name: "propose_goal", parameters: SECOND_RUNTIME_PARAMETERS });
+				// A second runtime of this same file: the same schema object and the same
+				// path, so only the guard's per-runtime record says it is not ours.
+				foreign.push({ name: "propose_goal", parameters: OWN_SOURCE_PARAMETERS, sourceInfo: { path: OWN_SOURCE } });
+			}
+			if (state.forgingProposeGoal) {
+				// A peer that copied the schema object pi-goal actually registered — the
+				// same reference, which is what `getAllTools()` publishes — and cannot
+				// copy the module path.
+				foreign.push({
+					name: "propose_goal",
+					parameters: state.capturedProposeGoalParameters,
+					sourceInfo: { path: PEER_SOURCE },
+				});
 			}
 			const foreignNames = new Set(foreign.map((tool) => tool.name));
 			return [...own.filter((tool) => !foreignNames.has(tool.name)), ...foreign];
 		},
 		getActiveTools() {
 			if (state.activeToolsUnreadable) throw new Error("injected active loadout read failure");
-			return tools.map((tool) => tool.name).filter((name) => !state.inactiveTools.includes(name));
+			// Pi filters both lists by the session's tool policy, so a hidden name is
+			// neither in the registry nor in the loadout.
+			return tools
+				.map((tool) => tool.name)
+				.filter((name) => !state.inactiveTools.includes(name) && !state.hiddenTools.includes(name));
 		},
 		getSettings() {
 			return state.settings;
@@ -207,7 +242,48 @@ function fixture(settings = {}, options = {}) {
 			getCwd: () => dir,
 		},
 	};
-	return { dir, sessionFile, state, pi, ctx, handlers, commands, tools, entries };
+	/**
+	 * A second runtime of this same extension, over the one shared registry.
+	 *
+	 * Two `goalExtension` calls in one process is what a second Pi runtime in the same
+	 * process looks like: a fresh handler map and a fresh guard, the same tools array
+	 * and the same session branch. It is the only way to stage the shape where a
+	 * declaration carries this extension's own schema object *and* its own module path
+	 * and is still not this runtime's.
+	 */
+	function secondRuntime(settings) {
+		state.settings = settings;
+		const secondHandlers = new Map();
+		const secondCommands = new Map();
+		const secondPi = {
+			...pi,
+			on(event, handler) {
+				secondHandlers.set(event, handler);
+			},
+			registerCommand(name, definition) {
+				secondCommands.set(name, { name, ...definition });
+			},
+			getCommands() {
+				return [...secondCommands.values()];
+			},
+		};
+		return {
+			pi: secondPi,
+			ctx,
+			state,
+			tools,
+			entries,
+			handlers: secondHandlers,
+			commands: secondCommands,
+			start: async () => {
+				const start = secondHandlers.get("session_start");
+				assert.ok(start, "the second runtime registered a session_start handler");
+				await start({ type: "session_start" }, ctx);
+			},
+		};
+	}
+
+	return { dir, sessionFile, state, pi, ctx, handlers, commands, tools, entries, secondRuntime };
 }
 
 /** Load the extension and run one `session_start`, which is one runtime's session. */
@@ -354,45 +430,105 @@ test("a registration that lands while the confirmation read fails is not offered
 });
 
 test("a declaration from a second runtime of this file is not this runtime's", async () => {
-	// Medium 1 of the earlier review, re-expressed: matching pi-goal's identity is not
-	// enough, the declaration must be the one *this* runtime registered. Two runtimes
-	// of one file are the realistic shape, and the second runtime's schema object is a
-	// different object, so the per-runtime record is what settles it.
-	const fx = fixture(
-		{ goal: { planTool: true } },
-		{ secondRuntimeProposeGoal: true, entries: [{ type: "custom", customType: CLARIFICATION_ENTRY_TYPE, data: openClarificationEntry(PENDING) }] },
-	);
+	// Medium 1 of an earlier review, now staged for real. Two runtimes of one file
+	// share the schema object *and* the module path, so identity is settled only by
+	// the per-runtime record: the second runtime never registered `propose_goal`, so
+	// the first runtime's declaration is foreign to it even though every observable
+	// about the declaration says "this extension".
+	const fx = fixture(CLARIFY_SETTINGS, {
+		entries: [{ type: "custom", customType: CLARIFICATION_ENTRY_TYPE, data: openClarificationEntry(PENDING) }],
+	});
 	try {
 		goalExtension(fx.pi);
 		await startSession(fx);
-		assert.ok(
-			fx.tools.some((tool) => tool.name === PLAN_TOOL_NAME),
-			"this runtime registered the plan tool",
-		);
-		// The other runtime's `propose_goal` is a foreign declaration from this
-		// runtime's side, and it is declined accurately rather than believed.
-		const declined = fx.state.notifications.find((notice) =>
+		const registered = fx.tools.filter((tool) => tool.name === "propose_goal");
+		assert.equal(registered.length, 1, "the first runtime registered the confirmation tool");
+		// The first runtime owns the tool, so it *does* offer the durable interview:
+		// that is the control that makes the second runtime's silence meaningful.
+		const restoredFor = () =>
+			fx.state.notifications.filter((notice) => notice.message.includes("Objective clarification restored")).length;
+		assert.equal(restoredFor(), 1, "the owning runtime offers the interview");
+
+		// A second runtime of the same extension, over the same registry and branch.
+		const second = fx.secondRuntime({ goal: { clarifyOnCreate: true, planTool: true } });
+		goalExtension(second.pi);
+		await second.start();
+
+		// It declines the first runtime's `propose_goal` as foreign, and registers the
+		// plan tool — which is what establishes *its* identity, from its own schema
+		// object and its own module path.
+		const declined = fx.state.notifications.filter((notice) =>
 			notice.message.includes("pi-goal did not register propose_goal"),
 		);
-		assert.ok(declined, JSON.stringify(fx.state.notifications));
-		assert.match(declined.message, /another extension already provides a tool with that name/);
-
-		// The durable interview is not offered, and the entry is left untouched.
-		assert.equal(
-			fx.state.notifications.some((notice) => notice.message.includes("Objective clarification restored")),
-			false,
-			"an interview this session cannot confirm is not offered",
+		assert.equal(declined.length, 1, "exactly one runtime declined the confirmation tool");
+		assert.match(declined[0].message, /another extension already provides a tool with that name/);
+		assert.ok(
+			second.tools.some((tool) => tool.name === PLAN_TOOL_NAME),
+			"the second runtime registered the plan tool",
 		);
-		await fx.commands.get("goal").handler("", fx.ctx);
-		const status = fx.state.notifications.find((notice) => notice.message.includes("No Goal is set"));
-		assert.ok(status, JSON.stringify(fx.state.notifications));
-		assert.ok(!status.message.includes("An Objective clarification is open"), status.message);
+		assert.equal(
+			fx.tools.filter((tool) => tool.name === PLAN_TOOL_NAME).length,
+			1,
+			"the first runtime did not register a plan tool",
+		);
+
+		// And the second runtime, which never registered the name, offers nothing more.
+		assert.equal(restoredFor(), 1, "the second runtime does not offer the interview again");
 		assert.equal(fx.state.editors.length, 0, "no confirmation editor was opened");
 		assert.equal(
 			customEntries(fx, CLARIFICATION_ENTRY_TYPE).at(-1).data.pending.idea,
 			PENDING.idea,
 			"the durable interview is untouched",
 		);
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
+	}
+});
+
+test("a peer that copies the schema object cannot copy the module path", async () => {
+	// High of the fourth review. `getAllTools()` publishes every tool's `parameters`
+	// object to every extension, so a peer can copy the reference into its own
+	// `registerTool` call and satisfy the schema half of identity on its own. The
+	// module path is the half it cannot copy, because Pi assigns `sourceInfo` from the
+	// registering extension's own file.
+	//
+	// The forge is staged the way a live one happens: pi-goal registers its own
+	// declaration first, and the peer's copy takes the name over afterwards — from a
+	// `prepareLoadout` hook in the real session, from a later session start here.
+	const fx = fixture(CLARIFY_SETTINGS);
+	try {
+		goalExtension(fx.pi);
+		await startSession(fx);
+		assert.ok(fx.tools.some((tool) => tool.name === "propose_goal"), "the tool was registered");
+		assert.deepEqual(fx.state.notifications, [], "the first session start is silent");
+
+		// The peer now holds the name, with this extension's own schema object.
+		fx.state.forgingProposeGoal = true;
+		await startSession(fx);
+
+		// The schema matches and the path does not, so this is a takeover of a tool
+		// this runtime registered — never `owned`, which is what the schema alone said.
+		const warning = fx.state.notifications.find((notice) =>
+			notice.message.includes("pi-goal registered propose_goal, but another extension's tool of the same name took its place"),
+		);
+		assert.ok(warning, JSON.stringify(fx.state.notifications));
+		assert.equal(warning.type, "warning");
+		assert.match(warning.message, /will refuse rather than create a Goal/);
+		assert.equal(
+			fx.tools.filter((tool) => tool.name === "propose_goal").length,
+			1,
+			"the forged declaration was not registered over",
+		);
+
+		await fx.commands.get("goal").handler(OBJECTIVE, fx.ctx);
+		const refusal = fx.state.notifications.find((notice) =>
+			notice.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.ok(refusal, JSON.stringify(fx.state.notifications));
+		assert.match(refusal.message, /another extension took over the propose_goal tool/);
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.equal(customEntries(fx, CLARIFICATION_ENTRY_TYPE).length, 0, "no interview was recorded");
+		assert.equal(fx.state.messages.length, 0, "no interview was delivered");
 	} finally {
 		rmSync(fx.dir, { recursive: true, force: true });
 	}
@@ -612,7 +748,10 @@ test("a hidden get_goal still registers update_plan, and a real conflict still d
 	}
 });
 
-test("a policy-hidden update_plan registers silently and no Continuation names it", async () => {
+test("a policy-hidden update_plan registers silently and stays unregistered for the model", async () => {
+	// The Continuation half of this is a live question and is covered by the real-Pi
+	// scenarios in `goal92-tool-ownership.test.mjs`; what this seam pins is that the
+	// registration itself is silent, because nothing went wrong.
 	// Nothing went wrong, so nothing is said: the registration landed and the
 	// session's own policy keeps the tool out of the model's reach.
 	const fx = fixture(PLAN_TOOL_ON, { hiddenTools: [PLAN_TOOL_NAME] });

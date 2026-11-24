@@ -54,6 +54,8 @@ const CLARIFY_SETTINGS = { goal: { clarifyOnCreate: true } };
 const PLAN_TOOL_ON = { goal: { planTool: true } };
 /** The test-only probe that records the tools a real session declares to the model. */
 const ACTIVE_TOOLS_PEER = join(import.meta.dirname, "extensions", "active-tools-peer.ts");
+/** A peer loaded *before* pi-goal that forges the identity by copying the schema. */
+const PROPOSE_GOAL_FORGING_PEER = join(import.meta.dirname, "extensions", "propose-goal-forging-peer.ts");
 /** A peer loaded *before* pi-goal that squats `propose_goal` from a `prepareLoadout` hook. */
 const PROPOSE_GOAL_LOADOUT_PEER = join(import.meta.dirname, "extensions", "propose-goal-loadout-peer.ts");
 /** A peer loaded after pi-goal that removes `propose_goal` from the active loadout. */
@@ -270,11 +272,12 @@ test("a session whose policy hides propose_goal is silent at startup and refuses
 		assert.equal(refusal.notifyType, "error");
 		// The frame does not claim the registration failed: this one landed.
 		assert.match(refusal.message, /propose_goal tool is not available for this session/);
-		// All five causes are named, and none of them is asserted as *the* cause.
+		// All six causes are named, and none of them is asserted as *the* cause.
 		assert.match(refusal.message, /another extension already owns the propose_goal name/);
 		assert.match(refusal.message, /the registration itself failed/);
 		assert.match(refusal.message, /this session's tool policy \(--tools \/ --exclude-tools\) keeps the tool out of the model's reach/);
 		assert.match(refusal.message, /this session's active tool loadout does not declare it/);
+		assert.match(refusal.message, /another extension took the tool over after pi-goal registered it/);
 		assert.match(refusal.message, /the tool registry could not be read/);
 		assert.match(refusal.message, /adjust the session's tool policy or its active tool loadout/);
 		assert.match(refusal.message, /No Goal was created and no clarification was started/);
@@ -789,6 +792,79 @@ test("a peer that deactivates update_plan leaves it out of every Continuation", 
 		}
 
 		assertStepsConsumed(session, 2, [{ stopReason: "aborted" }]);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("a peer that copies the schema reference cannot copy the module path", async () => {
+	// High of the fourth review, through real Pi. `getAllTools()` publishes every
+	// tool's `parameters` object to every extension, so this peer copies pi-goal's own
+	// schema reference and re-registers `propose_goal` with it from a `prepareLoadout`
+	// hook that runs inside pi-goal's own `registerTool` call. Object identity alone
+	// would believe it; the module path, which Pi assigns from the registering
+	// extension's file, is the half it cannot copy.
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, { preExtensions: [PROPOSE_GOAL_FORGING_PEER] });
+		script(
+			[
+				{ text: "Warm answer." },
+				{ toolCalls: [{ name: "propose_goal", args: { title: DRAFT_TITLE, objective: DRAFT_OBJECTIVE } }] },
+				{ text: "The peer tool answered." },
+			],
+			session,
+		);
+		await session.prompt("warm the session up so the provider is one request in");
+		await session.waitForSettled(1);
+
+		// Nothing claims pi-goal owns the tool: the forged declaration is reported as a
+		// takeover of a tool this runtime registered.
+		const takeover = await session.waitForNotify((record) =>
+			record.message.includes("pi-goal registered propose_goal, but another extension's tool of the same name took its place"),
+		);
+		assert.equal(takeover.notifyType, "warning");
+		assert.match(takeover.message, /will refuse rather than create a Goal/);
+		for (const message of notifyMessages(session)) {
+			assert.ok(!message.includes(FOREIGN_OWNER_NOTICE), `a false foreign owner: ${message}`);
+		}
+
+		// `/goal` refuses with the takeover named, and no interview is recorded.
+		const response = await session.prompt(`/goal ${IDEA}`);
+		assert.equal(response.data.disposition, "handled");
+		const refusal = await session.waitForNotify((record) =>
+			record.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.equal(refusal.notifyType, "error");
+		assert.match(refusal.message, /another extension took over the propose_goal tool/);
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+		assert.equal(
+			notifyMessages(session).some((message) => message.includes("Objective clarification started")),
+			false,
+			"no interview was started for a confirmation this session cannot open",
+		);
+		const { entries } = await session.getEntries();
+		assert.equal(clarificationEntries(entries).length, 0, "no pending clarification was recorded");
+		assert.equal(goalSnapshots(entries).length, 0, "no Goal was created");
+
+		// The model-visible `propose_goal` is the peer's, so a call reaches the peer —
+		// and pi-goal never believed it owned the tool that ran.
+		const tools = await declaredTools(dirs);
+		assert.ok(tools.includes("propose_goal"), `the name is still declared: ${JSON.stringify(tools)}`);
+		await session.prompt("Try to propose a Goal for this idea.");
+		const call = await session.waitForToolResult("propose_goal", 1);
+		assert.equal(call.isError, false, "the peer's own tool runs without error");
+		assert.match(
+			toolTexts(session, "propose_goal")[0],
+			/peer tool: this is not pi-goal's propose_goal/,
+			"the declaration in force is the peer's",
+		);
+		await waitForNextSettle(session);
+
+		assertCleanRun(session);
+		assertStepsConsumed(session, 3);
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await cleanup(dirs, session);

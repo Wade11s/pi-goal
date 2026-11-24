@@ -46,11 +46,12 @@ a typed `/goal` uses. The model's arguments are only the prefill. Because the
 editor is the only authority on this path, a UI-capable host whose `propose_goal`
 tool is unavailable refuses `/goal` outright instead of falling back to a direct
 creation; a UI-less host is the one exception, and it creates directly with a
-notice. *Unavailable* has five causes, and the refusal names all five rather
+notice. *Unavailable* has six causes, and the refusal names all six rather
 than asserting one: another extension already owns the name, pi-goal's
 registration of it failed, this session's tool policy (`--tools` /
 `--exclude-tools`) hides the tool, the tool is registered but this session's
-active tool loadout does not declare it, or the tool registry could not be read.
+active tool loadout does not declare it, another extension took the tool over after
+pi-goal registered it, or the tool registry could not be read.
 See
 [Tool-name ownership](#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner). A saved
 document whose first line is not the `Title:` line, or whose title breaks the
@@ -282,11 +283,19 @@ whose declaration is in force:
   extension file share a source path, and the other copy's registration is not this
   runtime's to rely on.
 
-So identity is **object identity**, which none of those can forge: Pi hands the very
-`parameters` object passed to `registerTool` back out of `getAllTools()`, by
-reference. A declaration is pi-goal's iff that object is the one this runtime
-registered for that name. There is no source path to confuse, no witness to steal,
-and no cache a reentrant peer can poison.
+So identity is a **conjunction**, and neither half is sufficient alone:
+
+| Half | What it proves | Why it is not enough |
+| --- | --- | --- |
+| the **schema object** | the declaration carries the very `parameters` object this runtime handed to `registerTool`, which Pi returns by reference | `getAllTools()` publishes every tool's `parameters` object to every extension, so a peer can copy the reference into its own registration |
+| **pi-goal's own module path** | the declaration came from this extension's file — `sourceInfo.path`, which Pi assigns from the registering extension and no extension can choose | two runtimes of one file share it, and a session's tool policy can hide every tool that would reveal it |
+
+Together they are unforgeable: only this module can be loaded from this file, and
+only this runtime holds the schema object it passed. There is no source path to
+confuse with another extension's, no witness to steal, and no cache a reentrant
+peer can poison. When the host cannot resolve this module's own location — a
+synthetic install path — the path half is unavailable and identity falls back to the
+schema alone, which *is* forgeable; see [limitations](limitations.md).
 
 Ownership is decided **before** anything is registered, so pi-goal never replaces
 another extension's tool:
@@ -327,7 +336,7 @@ Two rules follow from the table, and both are behaviour changes from 0.3.0:
   The profile's tool lists are unchanged; only the false notice is gone.
 - **A session whose policy hides `propose_goal` itself still refuses**, because
   the confirmation editor is the only creation authority on that path. Its
-  refusal now names all five causes instead of asserting one, so a user who
+  refusal now names all six causes instead of asserting one, so a user who
   filtered the tool themselves is not sent hunting for a phantom extension, a tool
   the session's policy merely hides is not described as one that failed to
   register, and a tool another extension merely deactivated is not described as one

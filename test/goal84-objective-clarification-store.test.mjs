@@ -18,7 +18,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import goalExtension from "../src/index.ts";
@@ -109,7 +110,9 @@ function fixture(settings = {}, options = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const tools = [];
-	const OWN_SOURCE = join(dir, "pi-goal", "src", "index.ts");
+	// This extension's own module path, canonicalized exactly as `src/index.ts`
+	// derives it, so the fake models what Pi assigns to pi-goal's own tools.
+	const OWN_SOURCE = realpathSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
 	const entries = () =>
 		readFileSync(sessionFile, "utf8")
 			.split("\n")
@@ -131,12 +134,19 @@ function fixture(settings = {}, options = {}) {
 		getAllTools() {
 			// The same `parameters` object the extension handed to `registerTool`, as Pi
 			// returns it: object identity is the ownership rule.
-			const own = tools.map((tool) => ({ name: tool.name, parameters: tool.parameters }));
+			const own = tools.map((tool) => ({
+				name: tool.name,
+				parameters: tool.parameters,
+				sourceInfo: { path: OWN_SOURCE },
+			}));
 			// A foreign owner of `propose_goal`, for the fail-closed registration case:
 			// a different source path means pi-goal must not shadow the tool.
 			return options.foreignProposeGoal
 				? [...own, { name: "propose_goal", sourceInfo: { path: join(dir, "peer-extension.ts") } }]
 				: own;
+		},
+		getActiveTools() {
+			return tools.map((tool) => tool.name);
 		},
 		getActiveTools() {
 			return tools.map((tool) => tool.name);
