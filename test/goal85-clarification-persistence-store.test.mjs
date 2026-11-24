@@ -14,7 +14,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import goalExtension from "../src/index.ts";
@@ -354,7 +355,9 @@ function restartFixture(branch, options = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const tools = [];
-	const OWN_SOURCE = join(dir, "pi-goal", "src", "index.ts");
+	// This extension's own module path, canonicalized exactly as `src/index.ts`
+	// derives it, so the fake models what Pi assigns to pi-goal's own tools.
+	const OWN_SOURCE = realpathSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
 	const entries = () =>
 		readFileSync(sessionFile, "utf8")
 			.split("\n")
@@ -374,12 +377,28 @@ function restartFixture(branch, options = {}) {
 			return [...commands.values()];
 		},
 		getAllTools() {
-			const own = tools.map((tool) => ({ name: tool.name, sourceInfo: { path: OWN_SOURCE } }));
+			// The same `parameters` object the extension handed to `registerTool`, as Pi
+			// returns it: object identity is the ownership rule.
+			const own = tools.map((tool) => ({
+				name: tool.name,
+				parameters: tool.parameters,
+				sourceInfo: { path: OWN_SOURCE },
+			}));
 			if (!state.foreignProposeGoal) return own;
 			return [
 				...own.filter((tool) => tool.name !== "propose_goal"),
-				{ name: "propose_goal", sourceInfo: { path: join(dir, "peer-extension.ts") } },
+				{
+					name: "propose_goal",
+					parameters: { type: "object", properties: { peer: { type: "string" } } },
+					sourceInfo: { path: join(dir, "peer-extension.ts") },
+				},
 			];
+		},
+		getActiveTools() {
+			return tools.map((tool) => tool.name);
+		},
+		getActiveTools() {
+			return tools.map((tool) => tool.name);
 		},
 		getSettings() {
 			return state.settings;
@@ -578,7 +597,7 @@ test("a late propose_goal owner blocks recording a clarification", async () => {
 		);
 		assert.ok(refusal, JSON.stringify(fx.state.notifications));
 		assert.equal(refusal.type, "error");
-		assert.match(refusal.message, /propose_goal tool could not be registered/);
+		assert.match(refusal.message, /propose_goal tool is not available for this session/);
 		assert.equal(
 			fx.entries().filter((entry) => entry.customType === CLARIFICATION_ENTRY_TYPE).length,
 			0,

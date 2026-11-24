@@ -18,7 +18,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import goalExtension from "../src/index.ts";
@@ -88,8 +89,9 @@ test("the confirmation document is one Title line, a blank line, and the Objecti
 /**
  * A fake Pi plus a command/tool context that records durable entries of every
  * custom type, so the pending clarification and the Goal snapshot are both
- * observable. `getAllTools()` reports pi-goal's own tools with one shared source
- * path, which is how the registration checks identify this extension.
+ * observable. `getAllTools()` reports pi-goal's own tools with the *same*
+ * `parameters` object each registration handed over, which is how the registration
+ * checks identify this extension — exactly what Pi does, and unforgeable.
  */
 function fixture(settings = {}, options = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-clarify-unit-"));
@@ -108,7 +110,9 @@ function fixture(settings = {}, options = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const tools = [];
-	const OWN_SOURCE = join(dir, "pi-goal", "src", "index.ts");
+	// This extension's own module path, canonicalized exactly as `src/index.ts`
+	// derives it, so the fake models what Pi assigns to pi-goal's own tools.
+	const OWN_SOURCE = realpathSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
 	const entries = () =>
 		readFileSync(sessionFile, "utf8")
 			.split("\n")
@@ -128,12 +132,24 @@ function fixture(settings = {}, options = {}) {
 			return [...commands.values()];
 		},
 		getAllTools() {
-			const own = tools.map((tool) => ({ name: tool.name, sourceInfo: { path: OWN_SOURCE } }));
+			// The same `parameters` object the extension handed to `registerTool`, as Pi
+			// returns it: object identity is the ownership rule.
+			const own = tools.map((tool) => ({
+				name: tool.name,
+				parameters: tool.parameters,
+				sourceInfo: { path: OWN_SOURCE },
+			}));
 			// A foreign owner of `propose_goal`, for the fail-closed registration case:
 			// a different source path means pi-goal must not shadow the tool.
 			return options.foreignProposeGoal
 				? [...own, { name: "propose_goal", sourceInfo: { path: join(dir, "peer-extension.ts") } }]
 				: own;
+		},
+		getActiveTools() {
+			return tools.map((tool) => tool.name);
+		},
+		getActiveTools() {
+			return tools.map((tool) => tool.name);
 		},
 		getSettings() {
 			return state.settings;
@@ -344,7 +360,7 @@ test("a host where another extension owns propose_goal refuses the creation and 
 		);
 		assert.ok(refusal, JSON.stringify(fx.state.notifications));
 		assert.equal(refusal.type, "error");
-		assert.match(refusal.message, /propose_goal tool could not be registered/);
+		assert.match(refusal.message, /propose_goal tool is not available for this session/);
 		assert.match(refusal.message, /No Goal was created and no clarification was started/);
 		assert.match(refusal.message, /set goal\.clarifyOnCreate to false/);
 

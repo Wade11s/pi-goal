@@ -149,6 +149,10 @@ test("the documented launch arguments produce a read-only real Pi session, leavi
 	assert.equal(child.args.filter((arg) => arg === "--tools").length, 1);
 
 	// Integration check: the session's actual model-visible tool set is read-only.
+	// This scenario runs with the harness default `goal.clarifyOnCreate: false`, so
+	// pi-goal registers no clarification tool here and a "clean startup" assertion
+	// would be vacuous; the scenario below starts a child with clarification enabled
+	// and owns that coverage (issue #92).
 	assert.deepEqual(JSON.parse(readFileSync(childToolsPath, "utf8")).sort(), [...READ_ONLY_TOOLS].sort());
 	const childGoalState = readSessionEntries(await child.sessionFile()).filter(
 		(entry) => entry.type === "custom" && entry.customType === "goal-state",
@@ -203,6 +207,40 @@ test("the documented launch arguments produce a read-only real Pi session, leavi
 		"the second scripted step is the re-run's reply, not a discarded step",
 	);
 	assert.deepEqual(readFileSync(parentFile), before, "the parent's durable Goal state is byte-for-byte unchanged");
+});
+
+test("the documented review-child profile starts cleanly with Objective clarification enabled", async (t) => {
+	// The profile's denylist hides `get_goal`, which is a tool policy rather than a
+	// competing extension: pi-goal must register `propose_goal` exactly as an
+	// ordinary session does and say nothing, and the child's model-visible tool set
+	// must stay the documented read-only one (issue #92).
+	const dir = tempDir(t);
+	const { json: profile } = readDocumentedProfile();
+
+	const childToolsPath = join(dir, "clarify-child-tools.json");
+	const child = await PiRpcSession.start({
+		tools: profile.tools,
+		excludeTools: profile.excludeTools,
+		settings: { goal: { clarifyOnCreate: true } },
+		extraExtensions: [ACTIVE_TOOLS_PEER],
+		env: { PI_GOAL_TEST_ACTIVE_TOOLS: childToolsPath },
+	});
+	t.after(() => child.stop());
+	script([{ text: "Review complete." }], child);
+	await child.prompt("Review the branch please.");
+	await child.waitForSettled(1);
+
+	assertProfileLaunchArgs(child.args, profile);
+	assert.deepEqual(
+		JSON.parse(readFileSync(childToolsPath, "utf8")).sort(),
+		[...READ_ONLY_TOOLS].sort(),
+		"enabling clarification does not widen the review child's tool set",
+	);
+	const notices = child.records
+		.filter((record) => record.type === "extension_ui_request" && record.method === "notify")
+		.map((record) => record.message);
+	assert.deepEqual(notices, [], "the review child's startup is silent about every Goal tool");
+	assertStepsConsumed(child, 1);
 });
 
 test("an accidental Goal-tool call in the review child is refused and writes nothing", async (t) => {

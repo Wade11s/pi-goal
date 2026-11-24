@@ -269,9 +269,89 @@ interview, the restore/malformed/open-status and replacement-instruction text, a
 the session-start wiring a real RPC session cannot reach: a UI-less host, a
 malformed newest clarification entry, an unreadable Goal branch blocking both
 restoration and start, and a late `propose_goal` takeover (blocked at `/goal` and
-withdrawn from an already-offered interview on the next turn). This Pi version
-keeps the first registration of a tool name, so the takeover seams are pinned
-against the fake Pi rather than a real peer extension.
+withdrawn from an already-offered interview on the next turn). Those takeover seams
+are pinned against the fake Pi because a *synchronous* takeover cannot be staged
+through a live peer extension: Pi keeps the first **extension in load order** that
+declares a name, so an extension loaded after pi-goal cannot displace a
+registration pi-goal made at session start. An extension loaded *before* pi-goal
+can, by registering on a later event — see the late-peer scenarios below.
+
+Tool-name ownership (issue #92) is tested at both seams, because the two halves of
+the rule need different ones. `test/goal92-tool-ownership.test.mjs` drives real
+`pi --mode rpc` sessions through the harness's `tools` / `excludeTools` arguments
+and reads the model-visible tool set through `test/extensions/active-tools-peer.ts`:
+a session that hides only `get_goal` registers `propose_goal`, declares it to the
+model, and carries a clarification through the confirmation editor to a committed
+Goal with no registration notice anywhere in the recorded notifications; a session
+whose policy hides `propose_goal` itself is silent at startup and `/goal` refuses
+with cause-neutral wording naming all six causes, creating nothing; and the
+opt-in `update_plan` registers and is taught in a Continuation when only
+`get_goal` is hidden, while a session that hides `update_plan` is silent and has
+it named in no Continuation. Absence of a false notice is asserted against the
+recorded `extension_ui_request` notifications, never against log text.
+
+Four scenarios cover the seams Pi's load-order rule makes reachable. Two use
+`test/extensions/propose-goal-late-peer.ts` and `test/extensions/plan-late-peer.ts`
+— peers loaded *before* pi-goal that register their name on `turn_start`, after
+pi-goal has already confirmed its own registration. The first proves pi-goal never
+mistakes the peer's declaration for its own: no interview is recorded, `/goal`
+refuses, and a model call to `propose_goal` returns the peer's own result. The
+second proves the Continuation gates on live ownership rather than the
+session-start flag, so an automatic Continuation never instructs a tool another
+extension took over. Two more use `test/extensions/get-goal-name-peer.ts` and
+`test/extensions/goal-names-peer.ts`, which register from their own `session_start`
+and therefore run *before* pi-goal reads the registry: the first proves a stolen
+`get_goal` cannot become pi-goal's identity (the clarification flow runs to a
+committed Goal with no warning about pi-goal's own tools), and the second proves
+that a peer owning both names is reported accurately while a durable interview on
+the branch is not offered as confirmable.
+
+One more covers forgery. `test/extensions/propose-goal-forging-peer.ts` copies the
+`parameters` object it can see in the registry — `getAllTools()` publishes every
+tool's — and re-registers `propose_goal` with that reference from a `prepareLoadout`
+hook that runs inside pi-goal's own `registerTool` call. The module path is the half
+it cannot copy, so pi-goal reports a takeover of its own tool, refuses `/goal`,
+records nothing, and the model's call reaches the peer's tool.
+
+Two more cover the seams that reachability needs a peer for.
+`test/extensions/propose-goal-loadout-peer.ts` owns a tool whose `prepareLoadout`
+hook registers `propose_goal`, so the squat happens *inside* pi-goal's own
+`registerTool` call — between its ownership check and its confirmation — and wins by
+load order: pi-goal must report a takeover of its own tool, refuse `/goal`, record
+nothing, and let the model's call reach the peer's tool.
+`test/extensions/propose-goal-deactivate-peer.ts` and
+`test/extensions/plan-deactivate-peer.ts` call `pi.setActiveTools()` without their
+name, which leaves the declaration in the registry while the model can no longer
+call it: no interview may be recorded or offered, and no Continuation may name the
+plan tool. All four fail on the pre-fix commit.
+
+The store fake can also spawn a **second runtime** of the same extension over one
+shared registry, which is the only way to stage a declaration that carries this
+extension's own schema object *and* its own module path and is still not this
+runtime's: the first runtime offers the durable interview, the second offers nothing.
+
+`test/goal92-tool-ownership-store.test.mjs` pins the rest against a fake Pi that
+models both seams the rule reads — `getAllTools()` returns the *same* `parameters`
+object `registerTool` received, as Pi does, and `getActiveTools()` reports the
+model-visible names. It covers: a registry without `get_goal` and without
+`propose_goal` still registers silently; a session where `propose_goal` is the only
+visible pi-goal tool still reaches **owned**, because the registration itself
+establishes identity; a declaration from a *second runtime* of the same file is
+**foreign**, so the durable interview is not offered; a registration Pi refuses is
+its own warning and establishes nothing; a transient registry failure between the
+ownership check and the confirmation leaves the declaration in place while the
+session never confirmed it, so a later successful registration of the plan tool does
+not make the confirmation tool available again; a registered tool the active loadout
+does not declare is unavailable; an unreadable active loadout is unavailable too; a
+registry that throws outright declines with a cause-neutral warning that never
+claims a foreign owner; a visible foreign `update_plan` can never become pi-goal's
+identity; a verified takeover keeps refusing on a later session start in the same
+runtime; and the `update_plan` matrix at both ends, whose genuine-conflict case
+`test/goal53-progress-plan.test.mjs` already covers through a real peer extension.
+`test/goal57-review-profile.test.mjs` additionally starts a review child with the
+documented profile *and* clarification enabled, proving a clean startup and an
+unchanged model-visible tool set.
+
 The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
 surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
 durable Lifecycle status, is stopped, and is reopened from a copy of its session
