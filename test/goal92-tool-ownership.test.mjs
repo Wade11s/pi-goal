@@ -54,6 +54,10 @@ const CLARIFY_SETTINGS = { goal: { clarifyOnCreate: true } };
 const PLAN_TOOL_ON = { goal: { planTool: true } };
 /** The test-only probe that records the tools a real session declares to the model. */
 const ACTIVE_TOOLS_PEER = join(import.meta.dirname, "extensions", "active-tools-peer.ts");
+/** A peer loaded *before* pi-goal that takes `get_goal` on `session_start`. */
+const GET_GOAL_NAME_PEER = join(import.meta.dirname, "extensions", "get-goal-name-peer.ts");
+/** A peer loaded *before* pi-goal that takes `get_goal` and `propose_goal` on `session_start`. */
+const GOAL_NAMES_PEER = join(import.meta.dirname, "extensions", "goal-names-peer.ts");
 /** A peer loaded *before* pi-goal that takes `propose_goal` on `turn_start`. */
 const PROPOSE_GOAL_LATE_PEER = join(import.meta.dirname, "extensions", "propose-goal-late-peer.ts");
 /** The same peer for the `update_plan` name. */
@@ -153,6 +157,13 @@ function toolTexts(session, toolName) {
 		.map((record) => String(record.result?.content?.[0]?.text ?? ""));
 }
 
+/** Editor requests the host received, in order. */
+function editorRequests(session) {
+	return session.records.filter(
+		(record) => record.type === "extension_ui_request" && record.method === "editor",
+	);
+}
+
 /** Every `goal-clarification` entry on the branch, in append order. */
 function clarificationEntries(entries) {
 	return entries.filter((entry) => entry.type === "custom" && entry.customType === CLARIFICATION_ENTRY_TYPE);
@@ -249,12 +260,17 @@ test("a session whose policy hides propose_goal is silent at startup and refuses
 			record.message.startsWith("Goal not created: Objective clarification is enabled"),
 		);
 		assert.equal(refusal.notifyType, "error");
-		// All three causes are named, and none of them is asserted as *the* cause.
+		// The frame does not claim the registration failed: this one landed.
+		assert.match(refusal.message, /propose_goal tool is not available for this session/);
+		// All four causes are named, and none of them is asserted as *the* cause.
 		assert.match(refusal.message, /another extension already owns the propose_goal name/);
 		assert.match(refusal.message, /the registration itself failed/);
 		assert.match(refusal.message, /this session's tool policy \(--tools \/ --exclude-tools\) keeps the tool out of the model's reach/);
-		assert.match(refusal.message, /could not read the tool registry to confirm that its own declaration is the one in force/);
-		assert.match(refusal.message, /fix whatever makes the tool registry unreadable/);
+		assert.match(refusal.message, /pi-goal cannot confirm that its own declaration is the one in force/);
+		assert.match(refusal.message, /because the tool registry could not be read/);
+		assert.match(refusal.message, /because nothing in it identifies pi-goal's own declarations/);
+		assert.match(refusal.message, /make the tool registry readable again/);
+		assert.match(refusal.message, /restart the session so pi-goal can identify its own declarations/);
 		assert.match(refusal.message, /No Goal was created and no clarification was started/);
 		assert.match(refusal.message, /set goal\.clarifyOnCreate to false/);
 		// Fail closed: no Goal, no interview that could never be confirmed, no editor.
@@ -467,5 +483,150 @@ test("a peer that takes update_plan on turn_start is named in no Continuation", 
 		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
 	} finally {
 		await cleanup(dirs, session);
+	}
+});
+
+test("a peer that takes get_goal on session_start does not poison pi-goal's identity", async () => {
+	// The high finding. Extension handlers run in load order, so a peer loaded
+	// before pi-goal registers `get_goal` from its own `session_start` — before
+	// pi-goal reads the registry at all — and Pi's load-time duplicate check never
+	// sees it. An identity rule that reads pi-goal's own source path out of a Goal
+	// tool adopts the peer's path here, and then reports pi-goal's own
+	// `propose_goal` as a tool another extension took over. Identity now comes only
+	// from a registration this runtime just made, so the stolen `get_goal` is
+	// irrelevant and the clarification flow works exactly as it does without it.
+	const dirs = scratch();
+	let session;
+	try {
+		session = await startSession(dirs, { preExtensions: [GET_GOAL_NAME_PEER] });
+		const gate = join(dirs.workDir, "kickoff-gate");
+		script(
+			[
+				{ text: "What should be different when this is done, and what are the hard constraints?" },
+				{ toolCalls: [{ name: "propose_goal", args: { title: DRAFT_TITLE, objective: DRAFT_OBJECTIVE } }] },
+				{ text: "Working on the confirmed onboarding goal.", waitForFile: gate },
+			],
+			session,
+		);
+
+		const response = await session.prompt(`/goal ${IDEA}`);
+		assert.equal(response.data.disposition, "handled");
+		await waitForNextSettle(session);
+		await session.waitForNotify((record) => record.message.includes("Objective clarification started"));
+
+		// The whole flow still runs: the interview, the model's own `propose_goal`
+		// call, and the confirmation editor that commits the Goal.
+		await session.prompt("Objective: two steps to a sample project. Constraints: none. Acceptance criteria: two checks.");
+		const request = await answerConfirmation(session, (prefill) => prefill);
+		assert.equal(request.prefill, `Title: ${DRAFT_TITLE}\n\n${DRAFT_OBJECTIVE}`);
+		await session.waitForToolResult("propose_goal", 1);
+		await session.waitForNotify((record) => record.message.includes("created and activated"));
+
+		const created = goalSnapshots(readSessionEntries(await session.sessionFile())).at(-1).data.goal;
+		assert.equal(created.title, DRAFT_TITLE);
+		assert.equal(created.objective, DRAFT_OBJECTIVE);
+		assert.equal(created.origin, "command");
+
+		await session.prompt("/goal:pause");
+		await session.waitForNotify((record) => record.message.includes("paused (revision"));
+		writeFileSync(gate, "", "utf8");
+		await waitForNextSettle(session);
+
+		// The stolen `get_goal` produced no warning about pi-goal's own tools.
+		for (const message of notifyMessages(session)) {
+			assert.ok(!message.includes("took its place"), `pi-goal warned about its own tool: ${message}`);
+			assert.ok(!message.includes(FOREIGN_OWNER_NOTICE), `a false foreign owner: ${message}`);
+		}
+		const tools = await declaredTools(dirs);
+		assert.ok(tools.includes("propose_goal"), `propose_goal must be declared: ${JSON.stringify(tools)}`);
+		assert.equal(tools.includes("get_goal"), true, "the peer really did take the get_goal name");
+
+		assertCleanRun(session);
+		assertStepsConsumed(session, 3);
+		assert.equal(session.extensionErrors().length, 0, JSON.stringify(session.extensionErrors()));
+	} finally {
+		await cleanup(dirs, session);
+	}
+});
+
+test("a peer that owns get_goal and propose_goal is reported accurately, and a restored clarification is not offered", async () => {
+	// The same poison with the peer also declaring `propose_goal`, against a branch
+	// that already holds a pending clarification. The startup warning must name the
+	// real cause (a foreign owner), `/goal` must refuse with a true cause, and the
+	// durable interview must not be advertised as offerable — the confirmation
+	// editor it would open belongs to the peer.
+	const dirs = scratch();
+	let first;
+	let second;
+	try {
+		// Process one records the pending clarification on a branch of its own.
+		first = await startSession(dirs);
+		script([{ text: "What should be different when this is done?" }], first);
+		await first.prompt(`/goal ${IDEA}`);
+		await waitForNextSettle(first);
+		await first.waitForNotify((record) => record.message.includes("Objective clarification started"));
+		const sessionFile = await first.sessionFile();
+		const { copyFileSync } = await import("node:fs");
+		const resumed = join(dirs.sessionDir, "resumed.jsonl");
+		copyFileSync(sessionFile, resumed);
+		await first.stop();
+		first = undefined;
+
+		// Process two reopens that branch with the peer loaded before pi-goal.
+		second = await PiRpcSession.start({
+			cwd: dirs.workDir,
+			sessionDir: dirs.sessionDir,
+			agentDir: dirs.agentDir,
+			sessionFile: resumed,
+			settings: CLARIFY_SETTINGS,
+			preExtensions: [GOAL_NAMES_PEER],
+			env: { PI_GOAL_TEST_ACTIVE_TOOLS: join(dirs.workDir, "active-tools.json") },
+			extraExtensions: [ACTIVE_TOOLS_PEER],
+		});
+		script([{ text: "Reviewing." }], second);
+
+		const declined = await second.waitForNotify((record) =>
+			record.message.includes("pi-goal did not register propose_goal"),
+		);
+		assert.match(declined.message, /another extension already provides a tool with that name/);
+		assert.match(declined.message, /pi-goal will not replace it/);
+		for (const message of notifyMessages(second)) {
+			assert.ok(!message.includes("took its place"), `pi-goal warned about its own tool: ${message}`);
+		}
+		assert.equal(
+			notifyMessages(second).some((message) => message.includes("Objective clarification restored")),
+			false,
+			"an interview this session cannot confirm is not offered",
+		);
+
+		// Bare `/goal` reports the plain no-Goal state, never an open clarification.
+		await second.prompt("/goal");
+		const status = await second.waitForNotify((record) => record.message.includes("No Goal is set"));
+		assert.ok(!status.message.includes("An Objective clarification is open"), status.message);
+
+		// And a fresh `/goal` refuses with a true cause.
+		await second.prompt(`/goal ${IDEA}`);
+		const refusal = await second.waitForNotify((record) =>
+			record.message.startsWith("Goal not created: Objective clarification is enabled"),
+		);
+		assert.equal(refusal.notifyType, "error");
+		assert.match(refusal.message, /another extension already owns the propose_goal name/);
+		assert.match(refusal.message, /No Goal was created and no clarification was started/);
+
+		const { entries } = await second.getEntries();
+		assert.equal(goalSnapshots(entries).length, 0, "no Goal was created");
+		assert.equal(
+			clarificationEntries(entries).length,
+			1,
+			"the durable interview from the first process is left untouched",
+		);
+		assert.equal(runCount(second), 0, "nothing offered an interview, so no run started");
+		assert.equal(editorRequests(second).length, 0, "no confirmation editor was opened");
+
+		assertCleanRun(second);
+		assertStepsConsumed(second, 0);
+		assert.equal(second.extensionErrors().length, 0, JSON.stringify(second.extensionErrors()));
+	} finally {
+		await cleanup(dirs, first, second);
 	}
 });

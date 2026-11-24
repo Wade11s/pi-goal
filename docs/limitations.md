@@ -20,10 +20,13 @@ what it cannot preempt, and what is intentionally left to the user.
   dialog-capable UI is present. A UI-less host (print/JSON) creates directly with
   a notice, and `goal.clarifyOnCreate: false` restores direct creation on any
   host; a UI-capable host whose `propose_goal` tool is unavailable fails closed
-  instead of bypassing the confirmation. Unavailable has three causes — another
-  extension already owns the name, the registration failed, or the session's own
-  `--tools` / `--exclude-tools` policy hides the tool — and the refusal names all
-  three rather than guessing, because a host tool policy is not a foreign owner.
+  instead of bypassing the confirmation. Unavailable has four causes — another
+  extension already owns the name, the registration failed, the session's own
+  `--tools` / `--exclude-tools` policy hides the tool, or pi-goal cannot confirm
+  that its own declaration is the one in force (either the tool registry could not
+  be read, or nothing in it identifies pi-goal's own declarations) — and the refusal
+  names all four rather than guessing, because a host tool policy is not a foreign
+  owner.
   A session that hides only `get_goal` while admitting `propose_goal` runs the
   clarification flow; one that hides `propose_goal` itself still refuses, since the
   confirmation editor is that path's only creation authority. The interview, the pending
@@ -187,10 +190,14 @@ what it cannot preempt, and what is intentionally left to the user.
   is silent at startup rather than warned about a conflict that does not exist. An
   unreadable registry declines to register with a cause-neutral warning. Identity is
   never taken from the declaration under test — a tool is not its own witness — and
-  never from an opt-in tool another extension may legitimately own: it comes from
-  one of the three tools pi-goal registers at extension load, or from the
-  declaration confirmed immediately after a registration this runtime just made.
-  With neither, ownership is unverifiable and the registration is declined.
+  never from a Goal tool either, because Pi keeps the first *extension in load
+  order* that declares a name and its handlers run in that order, so a peer loaded
+  before pi-goal can take `get_goal` from its own `session_start` and win the name
+  before pi-goal ever reads the registry. Identity comes from exactly one place:
+  the declaration confirmed in the same synchronous moment as a registration this
+  runtime just made. Matching a source path is not enough on its own either, since
+  two copies of one extension file share one. With no such confirmation, ownership
+  is unverifiable and the registration is declined.
 - Metrics are local and best-effort: `pi-goal:metrics` delivery has no queue,
   retry, spool, acknowledgement, or replay. A consumer that needs completeness
   must persist and verify records itself and treat gaps as possible. pi-goal

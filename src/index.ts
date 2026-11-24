@@ -1156,24 +1156,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let planTool: PlanToolSettings = { enabled: false, problems: [] };
 
 	/**
-	 * Whether the plan tool is registered *and* survived registration in this
-	 * session. Only this flag gates the Continuation wording, so the model is never
-	 * told to call a tool that is not in its loadout.
+	 * Register the opt-in progress-plan tool.
 	 *
-	 * Registration happens at `session_start` rather than at extension load because
-	 * Pi's effective settings are not readable before the runtime is bound, and
-	 * registering late is a supported seam. Once registered a tool cannot be
-	 * unregistered, so a setting changed mid-session leaves the registration in
-	 * place; the tool then refuses its calls rather than silently recording plans
-	 * the user switched off, and the next session start reconciles the two.
-	 */
-	let planToolRegistered = false;
-
-	/**
-	 * Register the opt-in progress-plan tool, and record whether it really landed.
-	 *
-	 * "Registration succeeded" is checked rather than assumed, for two reasons that
-	 * both come from Pi's tool registry being keyed by name across all extensions:
+	 * Nothing is recorded: whether the tool is available is answered where it is
+	 * needed, by re-reading the registry, because another extension can take the name
+	 * after this runtime registered it. "Registration succeeded" is checked rather
+	 * than assumed, for two reasons that both come from Pi's tool registry being keyed
+	 * by name across all extensions:
 	 *
 	 * - another extension may already own `update_plan`. Registering anyway would
 	 *   silently replace its tool, which is the one thing this feature must not do
@@ -1186,7 +1175,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * knowing is not to promise it.
 	 */
 	function registerPlanTool(ctx: ExtensionContext): void {
-		planToolRegistered = registerOwnedTool({
+		registerOwnedTool({
 			guard: toolOwnership,
 			name: PLAN_TOOL_NAME,
 			wording: PLAN_TOOL_REGISTRATION_WORDING,
@@ -1611,7 +1600,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		planTool = parsePlanToolSettings(pi.getSettings());
 		for (const problem of planTool.problems) notify(ctx, problem, "warning");
 		if (planTool.enabled) registerPlanTool(ctx);
-		else planToolRegistered = false;
 		store.reconstruct(ctx);
 		// A hard crash can leave the superseded identity's in-flight tail on the branch
 		// with no freeze boundary after it. Reconstruction recovers that tail into
@@ -4270,22 +4258,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	 * indistinguishable from the command's side of the seam and the old single cause
 	 * was simply wrong for most of them: another extension owning the name, a
 	 * registration that failed, a session whose `--tools` / `--exclude-tools` policy
-	 * hides the tool, and a tool registry pi-goal cannot read or cannot identify
-	 * itself in all leave `propose_goal` equally unusable. A user who filtered the
-	 * tool themselves must not be sent hunting for a phantom extension.
+	 * hides the tool, and a tool registry pi-goal cannot read or cannot identify its
+	 * own declarations in all leave `propose_goal` equally unusable. The two
+	 * unverifiable causes are separated, because their repairs differ: a registry
+	 * that could not be read is a host or extension problem, while a readable
+	 * registry that identifies nothing needs a session where pi-goal's own
+	 * declarations are visible. A user who filtered the tool themselves must not be
+	 * sent hunting for a phantom extension, and a tool the session's policy merely
+	 * hides must not be described as one that failed to register.
 	 */
 	function refuseUnavailableClarification(ctx: ExtensionCommandContext): void {
 		ctx.ui.notify(
 			"Goal not created: Objective clarification is enabled (goal.clarifyOnCreate is true), but the " +
-				`${PROPOSE_GOAL_TOOL_NAME} tool could not be registered for this session, so there is no confirmation ` +
-				"editor to authorize a Goal. Four different causes produce that: another extension already owns the " +
+				`${PROPOSE_GOAL_TOOL_NAME} tool is not available for this session, so there is no confirmation editor ` +
+				"to authorize a Goal. Four different causes produce that: another extension already owns the " +
 				"propose_goal name (pi-goal will not replace it), the registration itself failed, this session's tool " +
-				"policy (--tools / --exclude-tools) keeps the tool out of the model's reach, or pi-goal could not read " +
-				"the tool registry to confirm that its own declaration is the one in force. No Goal was created and no " +
-				"clarification was started. Rename or unload the conflicting extension, adjust the session's tool " +
-				"policy, or fix whatever makes the tool registry unreadable (a host or extension whose getAllTools() " +
-				"throws), and run /goal again — or set goal.clarifyOnCreate to false to create directly without " +
-				"confirmation.",
+				"policy (--tools / --exclude-tools) keeps the tool out of the model's reach, or pi-goal cannot confirm " +
+				"that its own declaration is the one in force — either because the tool registry could not be read, or " +
+				"because nothing in it identifies pi-goal's own declarations. No Goal was created and no clarification " +
+				"was started. Rename or unload the conflicting extension, fix the registration, adjust the session's " +
+				"tool policy, make the tool registry readable again, or restart the session so pi-goal can identify its " +
+				"own declarations, and run /goal again — or set goal.clarifyOnCreate to false to create directly " +
+				"without confirmation.",
 			"error",
 		);
 	}

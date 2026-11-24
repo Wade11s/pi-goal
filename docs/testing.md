@@ -290,7 +290,7 @@ opt-in `update_plan` registers and is taught in a Continuation when only
 it named in no Continuation. Absence of a false notice is asserted against the
 recorded `extension_ui_request` notifications, never against log text.
 
-Two scenarios cover the takeover Pi's load-order rule makes reachable, through
+Four scenarios cover the seams Pi's load-order rule makes reachable. Two use
 `test/extensions/propose-goal-late-peer.ts` and `test/extensions/plan-late-peer.ts`
 — peers loaded *before* pi-goal that register their name on `turn_start`, after
 pi-goal has already confirmed its own registration. The first proves pi-goal never
@@ -298,13 +298,23 @@ mistakes the peer's declaration for its own: no interview is recorded, `/goal`
 refuses, and a model call to `propose_goal` returns the peer's own result. The
 second proves the Continuation gates on live ownership rather than the
 session-start flag, so an automatic Continuation never instructs a tool another
-extension took over. Both fail on the pre-fix commit.
+extension took over. Two more use `test/extensions/get-goal-name-peer.ts` and
+`test/extensions/goal-names-peer.ts`, which register from their own `session_start`
+and therefore run *before* pi-goal reads the registry: the first proves a stolen
+`get_goal` cannot become pi-goal's identity (the clarification flow runs to a
+committed Goal with no warning about pi-goal's own tools), and the second proves
+that a peer owning both names is reported accurately while a durable interview on
+the branch is not offered as confirmable. All four fail on the pre-fix commit.
 
 `test/goal92-tool-ownership-store.test.mjs` pins the rest against a fake Pi whose
 registry is a filtered view of what the extension registered: a registry without
-`get_goal` and without `propose_goal` still registers silently; a registry that
-throws declines with a distinct cause-neutral warning that never claims a foreign
-owner; a visible foreign `update_plan` can never become pi-goal's identity, so the
+`get_goal` and without `propose_goal` still registers silently; identity comes only
+from a registration this runtime made, so the session where `propose_goal` is the
+only visible pi-goal tool still reaches **owned**; a declaration carrying this
+extension's own source path is still not this runtime's when another instance
+registered it, so the durable interview is not offered; a registry that throws
+declines with a distinct cause-neutral warning that never claims a foreign owner; a
+visible foreign `update_plan` can never become pi-goal's identity, so the
 confirmation tool is still owned and `/goal` still records the interview; a name
 this runtime registered but cannot attribute declines instead of claiming it; a
 verified takeover keeps refusing on a later session start in the same runtime; and

@@ -861,7 +861,7 @@ test("a host that cannot register propose_goal fails closed instead of committin
 			record.message.startsWith("Goal not created: Objective clarification is enabled"),
 		);
 		assert.equal(refusal.notifyType, "error");
-		assert.match(refusal.message, /propose_goal tool could not be registered/);
+		assert.match(refusal.message, /propose_goal tool is not available for this session/);
 		assert.match(refusal.message, /No Goal was created and no clarification was started/);
 		assert.match(refusal.message, /set goal\.clarifyOnCreate to false/);
 

@@ -578,7 +578,7 @@ test("a late propose_goal owner blocks recording a clarification", async () => {
 		);
 		assert.ok(refusal, JSON.stringify(fx.state.notifications));
 		assert.equal(refusal.type, "error");
-		assert.match(refusal.message, /propose_goal tool could not be registered/);
+		assert.match(refusal.message, /propose_goal tool is not available for this session/);
 		assert.equal(
 			fx.entries().filter((entry) => entry.customType === CLARIFICATION_ENTRY_TYPE).length,
 			0,

@@ -6,9 +6,10 @@
  * ambiguous by construction. Pi keeps the first **extension in load order** that
  * declares a name — not the first one to register it — so an extension loaded
  * before pi-goal can register on a later event and displace a registration pi-goal
- * already made; that reachable seam is covered by real-Pi scenarios in
- * `goal92-tool-ownership.test.mjs`. This seam is where the rest are reached
- * deterministically:
+ * already made. The live late-peer scenarios in `goal92-tool-ownership.test.mjs`
+ * reach that seam through real Pi; the fake here makes the same shapes
+ * deterministic, including the one a live session cannot stage: two copies of one
+ * extension file sharing a source path.
  *
  * - a registry that omits `get_goal` but not `propose_goal` (the issue's repro);
  * - a registry that cannot be read at all;
@@ -27,10 +28,17 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import goalExtension from "../src/index.ts";
-import { CLARIFICATION_ENTRY_TYPE } from "../src/clarification.ts";
+import { CLARIFICATION_ENTRY_TYPE, openClarificationEntry } from "../src/clarification.ts";
 import { PLAN_TOOL_NAME } from "../src/plan.ts";
 
 const OBJECTIVE = "Make the full test suite pass in this repository";
+/** A pending clarification a branch can hold, for the restore-offer assertions. */
+const PENDING = {
+	idea: "Make onboarding feel less confusing",
+	budget: { kind: "default" },
+	attachments: [],
+	baseGoalId: null,
+};
 const CLARIFY_SETTINGS = { goal: { clarifyOnCreate: true } };
 const PLAN_TOOL_ON = { goal: { planTool: true } };
 /** The one sentence that must never describe a session's own tool policy. */
@@ -46,7 +54,8 @@ const FOREIGN_OWNER_NOTICE = "another extension already provides a tool with tha
 function fixture(settings = {}, options = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-goal-92-unit-"));
 	const sessionFile = join(dir, "session.jsonl");
-	writeFileSync(sessionFile, "");
+	const seeded = (options.entries ?? []).map((entry) => `${JSON.stringify(entry)}\n`).join("");
+	writeFileSync(sessionFile, seeded);
 	const state = {
 		settings,
 		notifications: [],
@@ -60,6 +69,11 @@ function fixture(settings = {}, options = {}) {
 		foreignProposeGoal: options.foreignProposeGoal ?? false,
 		/** A foreign `update_plan` declaration in force. */
 		foreignPlan: options.foreignPlan ?? false,
+		/**
+		 * A `propose_goal` declaration carrying *this extension's own* source path,
+		 * as a second copy of the same extension file would produce.
+		 */
+		ownShadowProposeGoal: options.ownShadowProposeGoal ?? false,
 	};
 	const handlers = new Map();
 	const commands = new Map();
@@ -97,6 +111,9 @@ function fixture(settings = {}, options = {}) {
 			}
 			if (state.foreignPlan) {
 				foreign.push({ name: PLAN_TOOL_NAME, sourceInfo: { path: PEER_SOURCE } });
+			}
+			if (state.ownShadowProposeGoal) {
+				foreign.push({ name: "propose_goal", sourceInfo: { path: OWN_SOURCE } });
 			}
 			const foreignNames = new Set(foreign.map((tool) => tool.name));
 			return [...own.filter((tool) => !foreignNames.has(tool.name)), ...foreign];
@@ -289,6 +306,80 @@ test("a name this runtime registered but cannot attribute declines instead of cl
 		assert.equal(refusal.type, "error");
 		assert.match(refusal.message, /No Goal was created and no clarification was started/);
 		assert.equal(customEntries(fx, CLARIFICATION_ENTRY_TYPE).length, 0, "no interview was recorded");
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
+	}
+});
+
+test("identity comes only from a registration this runtime made, so the only-visible-tool session still works", async () => {
+	// Bootstrap-only identity, at its most exposed: the whole load-time trio is
+	// filtered out, so the only pi-goal tool in the registry is `propose_goal`
+	// itself. Nothing else can witness identity, and the registration this runtime
+	// just made is enough.
+	const fx = fixture(CLARIFY_SETTINGS, { hiddenTools: ["get_goal", "create_goal", "update_goal"] });
+	try {
+		goalExtension(fx.pi);
+		await startSession(fx);
+		assert.ok(fx.tools.some((tool) => tool.name === "propose_goal"), "the confirmation tool is registered");
+		assertNoFalseOwnerNotice(fx, "propose_goal");
+		assert.deepEqual(fx.state.notifications, [], "a successful registration is silent");
+
+		await fx.commands.get("goal").handler(OBJECTIVE, fx.ctx);
+		assert.equal(
+			customEntries(fx, CLARIFICATION_ENTRY_TYPE).at(-1).data.pending.idea,
+			OBJECTIVE,
+			"the clarification was recorded, so pi-goal owns the tool it just registered",
+		);
+	} finally {
+		rmSync(fx.dir, { recursive: true, force: true });
+	}
+});
+
+test("a declaration from this extension's own file is not this runtime's to rely on", async () => {
+	// Medium 1 of the review: matching pi-goal's source path is not enough. Two
+	// copies of one extension file share a path, so the other copy's `propose_goal`
+	// would be accepted as this runtime's own — and the restored clarification it
+	// offers could never be confirmed, because the model's call would run the other
+	// copy's tool. This runtime registered only `update_plan`, so it owns that and
+	// nothing else.
+	const fx = fixture(
+		{ goal: { planTool: true } },
+		{ ownShadowProposeGoal: true, entries: [{ type: "custom", customType: CLARIFICATION_ENTRY_TYPE, data: openClarificationEntry(PENDING) }] },
+	);
+	try {
+		goalExtension(fx.pi);
+		await startSession(fx);
+		assert.ok(
+			fx.tools.some((tool) => tool.name === PLAN_TOOL_NAME),
+			"this runtime registered the plan tool, which establishes its identity",
+		);
+		assertNoFalseOwnerNotice(fx, PLAN_TOOL_NAME);
+		// The shadow `propose_goal` is declined accurately: this runtime never
+		// registered that name, so from its side the name is simply taken.
+		const declined = fx.state.notifications.find((notice) =>
+			notice.message.includes("pi-goal did not register propose_goal"),
+		);
+		assert.ok(declined, JSON.stringify(fx.state.notifications));
+		assert.match(declined.message, /another extension already provides a tool with that name/);
+
+		// The other copy's `propose_goal` carries this extension's own path, and the
+		// durable interview on the branch must still not be offered.
+		assert.equal(
+			fx.state.notifications.some((notice) => notice.message.includes("Objective clarification restored")),
+			false,
+			"an interview this runtime cannot confirm is not offered",
+		);
+		await fx.commands.get("goal").handler("", fx.ctx);
+		const status = fx.state.notifications.find((notice) => notice.message.includes("No Goal is set"));
+		assert.ok(status, JSON.stringify(fx.state.notifications));
+		assert.ok(!status.message.includes("An Objective clarification is open"), status.message);
+		assert.equal(fx.state.editors.length, 0, "no confirmation editor was opened");
+		// The durable entry is left for a session that does own the name.
+		assert.equal(
+			customEntries(fx, CLARIFICATION_ENTRY_TYPE).at(-1).data.pending.idea,
+			PENDING.idea,
+			"the durable interview is untouched",
+		);
 	} finally {
 		rmSync(fx.dir, { recursive: true, force: true });
 	}

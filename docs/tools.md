@@ -260,15 +260,23 @@ Pi's tool registry is keyed by name across every loaded extension, and
 `--exclude-tools` denylist admit. So a tool missing from that list is ambiguous:
 it is as consistent with "this session hides it" as with "nobody registered it".
 Both registrations pi-goal performs — `propose_goal` and the opt-in `update_plan`
-— therefore decide ownership from what *this runtime* registered, never by
-inferring pi-goal's own identity from a particular Goal tool, and they share one
+— therefore decide ownership from what *this runtime* registered, and they share one
 rule and one set of warnings so the two cannot drift apart.
 
 Pi keeps the first **extension in load order** that declares a name — not the first
-one to register it — so an extension loaded before pi-goal can register on a later
-event and displace a registration pi-goal already made. That is why identity is
-never taken from the declaration under test: a tool is not its own witness, and a
-foreign owner of the name would otherwise authenticate itself as pi-goal.
+one to register it — and extension handlers run in load order, so an extension
+loaded before pi-goal can register a name from its own `session_start`, before
+pi-goal reads the registry at all, and win it. That rules out every shortcut for
+deciding whose declaration is in force:
+
+- **the declaration under test is never its own witness** — a foreign owner of the
+  name would otherwise authenticate itself as pi-goal;
+- **no Goal tool is a witness either** — `get_goal` is exactly the name a peer that
+  wants to be mistaken for pi-goal would take, and Pi's load-time duplicate check
+  never sees a registration made from an event handler;
+- **"this runtime registered it" is not proof by itself** — two copies of one
+  extension file share a source path, and the other copy's registration is not this
+  runtime's to rely on.
 
 Ownership is decided **before** anything is registered, so pi-goal never replaces
 another extension's tool:
@@ -286,18 +294,19 @@ what actually happened:
 
 | Outcome | Startup | What `/goal` and the Continuation do |
 | --- | --- | --- |
-| **owned** — pi-goal's own declaration is in force | silent | the tool is promised |
+| **owned** — this runtime's own declaration of the tool is in force | silent | the tool is promised |
 | **verified takeover** — another extension's declaration displaced it | a warning naming the takeover | `/goal` refuses; no Continuation names a plan tool |
 | **hidden** — the registration landed but the session's tool policy keeps the tool out of the model's reach | **silent** | `/goal` refuses with cause-neutral wording; no Continuation names a plan tool |
 | **unreadable** / **unidentified** — pi-goal cannot confirm its own declaration is in force | a cause-neutral warning | `/goal` refuses |
 
-Identity itself is established once per runtime, and only from a source that cannot
-be the tool under test: one of the three tools pi-goal registers at extension load
-(`get_goal`, `create_goal`, `update_goal`) — Pi refuses to load two extensions that
-register the same name at load, so such a name being visible on the first read of a
-runtime is pi-goal's — or the declaration visible in the same synchronous
-confirmation of a registration this runtime just made. With neither, ownership is
-unverifiable, and every path fails closed.
+Identity itself is established in exactly one way: the **bootstrap** of a
+registration this runtime just made. `checkName` proved the name free, this runtime
+registered it, and nothing has run in between, so the declaration visible in that
+same synchronous confirmation is the one pi-goal just handed to Pi. Every later
+check compares against it *and* requires that this runtime is the one that
+registered the name. A second `session_start` in the same runtime reuses it; a
+reload builds a new guard, which is correct because Pi rebuilds the registry too.
+With no bootstrap, ownership is unverifiable and every path fails closed.
 
 Two rules follow from the table, and both are behaviour changes from 0.3.0:
 
@@ -309,8 +318,10 @@ Two rules follow from the table, and both are behaviour changes from 0.3.0:
   The profile's tool lists are unchanged; only the false notice is gone.
 - **A session whose policy hides `propose_goal` itself still refuses**, because
   the confirmation editor is the only creation authority on that path. Its
-  refusal now names all three causes instead of asserting one, so a user who
-  filtered the tool themselves is not sent hunting for a phantom extension.
+  refusal now names all four causes instead of asserting one, so a user who
+  filtered the tool themselves is not sent hunting for a phantom extension, and a
+  tool the session's policy merely hides is not described as one that failed to
+  register.
 
 Everything except **owned** is fail-closed: not knowing costs a convenience,
 while replacing another extension's tool costs that extension its tool. A
