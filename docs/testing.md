@@ -272,6 +272,31 @@ restoration and start, and a late `propose_goal` takeover (blocked at `/goal` an
 withdrawn from an already-offered interview on the next turn). This Pi version
 keeps the first registration of a tool name, so the takeover seams are pinned
 against the fake Pi rather than a real peer extension.
+
+Tool-name ownership (issue #92) is tested at both seams, because the two halves of
+the rule need different ones. `test/goal92-tool-ownership.test.mjs` drives real
+`pi --mode rpc` sessions through the harness's `tools` / `excludeTools` arguments
+and reads the model-visible tool set through `test/extensions/active-tools-peer.ts`:
+a session that hides only `get_goal` registers `propose_goal`, declares it to the
+model, and carries a clarification through the confirmation editor to a committed
+Goal with no registration notice anywhere in the recorded notifications; a session
+whose policy hides `propose_goal` itself is silent at startup and `/goal` refuses
+with cause-neutral wording naming all three causes, creating nothing; and the
+opt-in `update_plan` registers and is taught in a Continuation when only
+`get_goal` is hidden, while a session that hides `update_plan` is silent and has
+it named in no Continuation. Absence of a false notice is asserted against the
+recorded `extension_ui_request` notifications, never against log text.
+`test/goal92-tool-ownership-store.test.mjs` pins the rest against a fake Pi whose
+registry is a filtered view of what the extension registered: a registry without
+`get_goal` and without `propose_goal` still registers silently; a registry that
+throws declines with a distinct cause-neutral warning that never claims a foreign
+owner; a verified takeover keeps refusing on a later session start in the same
+runtime; and the same matrix holds for `update_plan`, whose genuine-conflict case
+`test/goal53-progress-plan.test.mjs` already covers through a real peer extension.
+`test/goal57-review-profile.test.mjs` additionally starts a review child with the
+documented profile *and* clarification enabled, proving a clean startup and an
+unchanged model-visible tool set.
+
 The opt-in paused-Goal resume prompt (issue #51) is tested through the same RPC
 surface in `test/goal51-resume-prompt.test.mjs`: a builder session reaches a
 durable Lifecycle status, is stopped, and is reopened from a copy of its session

@@ -102,12 +102,22 @@ What the raw idea is held with matters:
 `goal.clarifyOnCreate: false` restores immediate creation (below). A host without
 a dialog-capable UI — print and JSON modes — skips clarification, creates directly
 from the raw idea, and prints a notice saying so; there is no interview it could
-confirm. A UI-capable host whose `propose_goal` tool could not be registered (for
-example because another extension owns that name) **fails closed**: it refuses
-with an error naming the conflicting tool and both ways forward, records no
-pending clarification, and creates no Goal. The saved editor is the only creation
-authority on that path, so a direct commit would silently bypass the mandatory
-confirmation. `goal.enabled: false` refuses before any clarification starts.
+confirm. A UI-capable host whose `propose_goal` tool is unavailable **fails
+closed**: it refuses with an error, records no pending clarification, and creates
+no Goal. The saved editor is the only creation authority on that path, so a direct
+commit would silently bypass the mandatory confirmation. `goal.enabled: false`
+refuses before any clarification starts.
+
+**Unavailable is not the same thing as taken.** Pi's registry is filtered by the
+session's own tool policy, so a missing `propose_goal` has three possible causes —
+another extension already owns the name, pi-goal's registration of it failed, or
+this session's `--tools` / `--exclude-tools` policy hides it — and the refusal
+names all three instead of asserting one. A session that hides only `get_goal`
+while admitting `propose_goal` therefore **runs the clarification flow** rather
+than refusing: hiding a Goal tool says nothing about who owns the confirmation
+tool's name. A session whose policy hides `propose_goal` itself still refuses,
+with wording that does not blame a phantom extension. See
+[model tools](../tools.md#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner).
 
 **A clarification survives the session lifecycle.** The pending entry is durable
 state: a graceful exit or an unclean kill, then a resume (`--continue` /
@@ -607,6 +617,13 @@ reconstructed from the transcript every turn.
 - **It never takes another extension's tool.** If some other extension already
   registered `update_plan`, pi-goal registers nothing, reports why, and no
   Continuation names the tool — the behavior is the parity target, not the name.
+  The ownership rule is the one `propose_goal` uses, and the two registrations
+  share it so their wording cannot drift: a session that hides only `get_goal`
+  still registers `update_plan`, a session that hides `update_plan` itself is
+  silent at startup and simply never has the tool named in a Continuation, and an
+  unreadable registry declines with a cause-neutral warning rather than claiming a
+  competing owner. See
+  [model tools](../tools.md#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner).
 
 The tool is registered at session start, not at extension load, because Pi's
 effective settings are only readable once the runtime is bound. A setting changed

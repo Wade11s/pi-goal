@@ -19,8 +19,14 @@ what it cannot preempt, and what is intentionally left to the user.
 - Objective clarification is the default `/goal` creation path only when a
   dialog-capable UI is present. A UI-less host (print/JSON) creates directly with
   a notice, and `goal.clarifyOnCreate: false` restores direct creation on any
-  host; a UI-capable host whose `propose_goal` tool cannot be registered fails
-  closed instead of bypassing the confirmation. The interview, the pending
+  host; a UI-capable host whose `propose_goal` tool is unavailable fails closed
+  instead of bypassing the confirmation. Unavailable has three causes — another
+  extension already owns the name, the registration failed, or the session's own
+  `--tools` / `--exclude-tools` policy hides the tool — and the refusal names all
+  three rather than guessing, because a host tool policy is not a foreign owner.
+  A session that hides only `get_goal` while admitting `propose_goal` runs the
+  clarification flow; one that hides `propose_goal` itself still refuses, since the
+  confirmation editor is that path's only creation authority. The interview, the pending
   clarification, and the confirmation editor add interactive steps the model can
   leave vague — the Objective it drafts is a convention, not a validated schema,
   so the user must still read and edit the saved document. A Goal created
@@ -174,7 +180,12 @@ what it cannot preempt, and what is intentionally left to the user.
   registers nothing, reports why, and no Continuation mentions the tool. pi-goal
   will not replace another extension's tool for the sake of a conventional name,
   and the tool's own registration is confirmed rather than assumed for the same
-  reason.
+  reason. Ownership is decided from what this runtime registered rather than from
+  any single pi-goal tool's presence, because the registry is filtered by the
+  session's tool policy: a session that hides `get_goal` is not a session where
+  someone else owns `update_plan`, and a session that hides `update_plan` itself
+  is silent at startup rather than warned about a conflict that does not exist. An
+  unreadable registry declines to register with a cause-neutral warning.
 - Metrics are local and best-effort: `pi-goal:metrics` delivery has no queue,
   retry, spool, acknowledgement, or replay. A consumer that needs completeness
   must persist and verify records itself and treat gaps as possible. pi-goal

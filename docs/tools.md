@@ -43,10 +43,14 @@ The user edits either part, and **saving is the creation authority**: the
 committed Goal carries exactly the saved title (one line, 1–80 characters) and
 Objective (3–2000 characters), with `origin: "command"`, through the same commit
 a typed `/goal` uses. The model's arguments are only the prefill. Because the
-editor is the only authority on this path, a UI-capable host that cannot register
-`propose_goal` (another extension owns the name, or registration failed) refuses
-`/goal` outright instead of falling back to a direct creation; a UI-less host is
-the one exception, and it creates directly with a notice. A saved
+editor is the only authority on this path, a UI-capable host whose `propose_goal`
+tool is unavailable refuses `/goal` outright instead of falling back to a direct
+creation; a UI-less host is the one exception, and it creates directly with a
+notice. *Unavailable* has three causes, and the refusal names all three rather
+than asserting one: another extension already owns the name, pi-goal's
+registration of it failed, or this session's tool policy (`--tools` /
+`--exclude-tools`) hides the tool. See
+[Tool-name ownership](#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner). A saved
 document whose first line is not the `Title:` line, or whose title breaks the
 one-line rule, is refused and the same document reopens for correction instead of
 discarding the user's Objective. The saved document uses the same title and
@@ -84,9 +88,9 @@ cleared afterwards supersedes the draft (even after a crash that lost the
 retirement write, and even if that Goal later completes), so a stale draft can
 never overwrite a Goal the user chose in the meantime. Restoration and
 confirmation fail closed while the branch's newest Goal snapshot is unreadable,
-and while `goal.clarifyOnCreate` is off, another extension owns `propose_goal`, or
-the host has no dialog-capable UI — every one of those seams re-reads the registry
-instead of trusting the session-start answer. An unreadable newest clarification
+and while `goal.clarifyOnCreate` is off, `propose_goal` is not pi-goal's own tool
+in force, or the host has no dialog-capable UI — every one of those seams re-reads
+the registry instead of trusting the session-start answer. An unreadable newest clarification
 entry also fails closed rather than reviving an older one. A **new `/goal <idea>`
 replaces** the pending clarification: the new idea and flags win, the interview
 starts over, nothing was created for the abandoned idea, and a save from the
@@ -235,7 +239,9 @@ What the tool deliberately does **not** do:
   as activity for the anti-loop counters like any other tool call.
 - **It never replaces another extension's tool.** If `update_plan` is already
   registered by someone else, pi-goal registers nothing, reports why, and no
-  Continuation names the tool.
+  Continuation names the tool. The same ownership rule and the same wording cover
+  `propose_goal` — see
+  [Tool-name ownership](#tool-name-ownership-a-host-tool-policy-is-not-a-foreign-owner).
 
 Refusals — no Goal set, a second `in_progress` step, an empty or over-long step,
 an unknown status, a malformed argument — return an error result with **no**
@@ -245,6 +251,55 @@ for a plan to describe and no Continuation that would ever show it.
 
 While the setting is off the tool does not exist: it is not declared to the model,
 and Pi refuses a call to it before any extension runs.
+
+## Tool-name ownership: a host tool policy is not a foreign owner
+
+Pi's tool registry is keyed by name across every loaded extension, and
+`getAllTools()` returns only the tools the session's `--tools` allowlist and
+`--exclude-tools` denylist admit. So a tool missing from that list is ambiguous:
+it is as consistent with "this session hides it" as with "nobody registered it".
+Both registrations pi-goal performs — `propose_goal` and the opt-in `update_plan`
+— therefore decide ownership from what *this runtime* registered, never by
+inferring pi-goal's own identity from a particular Goal tool, and they share one
+rule and one set of warnings so the two cannot drift apart.
+
+Ownership is decided **before** anything is registered, so pi-goal never replaces
+another extension's tool:
+
+| What the registry shows | Outcome |
+| --- | --- |
+| no tool of that name | the name is free; pi-goal registers it |
+| a tool of that name this runtime has not registered | **foreign**; pi-goal registers nothing and says so |
+| a tool of that name this runtime registered, from another source | **verified takeover**; pi-goal registers nothing and keeps refusing |
+| the registry cannot be read | **unverifiable**; pi-goal registers nothing with a cause-neutral warning |
+
+The registration is then **confirmed rather than assumed**, and every outcome says
+what actually happened:
+
+| Outcome | Startup | What `/goal` and the Continuation do |
+| --- | --- | --- |
+| **owned** — pi-goal's own declaration is in force | silent | the tool is promised |
+| **verified takeover** — another extension's declaration displaced it | a warning naming the takeover | `/goal` refuses; no Continuation names a plan tool |
+| **hidden** — the registration landed but the session's tool policy keeps the tool out of the model's reach | **silent** | `/goal` refuses with cause-neutral wording; no Continuation names a plan tool |
+| **unverifiable** — pi-goal cannot confirm its own declaration is in force | a cause-neutral warning | `/goal` refuses |
+
+Two rules follow from the table, and both are behaviour changes from 0.3.0:
+
+- **A session that hides only `get_goal` but admits `propose_goal` now runs the
+  clarification flow** instead of refusing. The old guard read pi-goal's own
+  identity out of `get_goal`, so any session that filtered that one tool — the
+  documented read-only review-child profile in `docs/agents/subagents.md` is the
+  common case — was told another extension owned `propose_goal` and was refused.
+  The profile's tool lists are unchanged; only the false notice is gone.
+- **A session whose policy hides `propose_goal` itself still refuses**, because
+  the confirmation editor is the only creation authority on that path. Its
+  refusal now names all three causes instead of asserting one, so a user who
+  filtered the tool themselves is not sent hunting for a phantom extension.
+
+Everything except **owned** is fail-closed: not knowing costs a convenience,
+while replacing another extension's tool costs that extension its tool. A
+registration that the session's policy hides is nobody's fault, so it is silent
+at startup and explained at the seam that needs it.
 
 ## The objective's trust boundary
 
