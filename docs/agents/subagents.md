@@ -16,10 +16,10 @@ Read this before spawning or steering a `rex-subagent`. Explicit user instructio
 | Task | Primary pool | Backups |
 | --- | --- | --- |
 | File location, log summarization, mechanical extraction | `magpie/workbuddy/hy4flash-free` + `high` (its only supported level) | `magpie/dgx-spark/inkling-2-mini` + `off` for pure extraction or `low` for light synthesis; `magpie/deepai/deepseek-v4.1-flash` + `minimal/low` |
-| Read-only code exploration, routine research | `magpie/workbuddy/hy4flash-free` + `high`; `magpie/dgx-spark/inkling-2-mini` + `high` | `magpie/stepfun-cn/step-5-preview` + `medium`; `magpie/qoder/hmodel` + `max` |
+| Read-only code exploration, routine research | `magpie/workbuddy/hy4flash-free` + `high`; `magpie/mistral/deepseek-v4-1-flash-1017` + `high` | `magpie/stepfun-cn/step-5-preview` + `medium`; `magpie/qoder/hmodel` + `max` |
 | Routine implementation, localized fixes, test runs | `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/mistral/deepseek-v4-1-flash-1017` + `high` | `magpie/kimi-code-cn/k3.1-pro` + `high`; `magpie/deepai/deepseek-v4.1-flash` + `high` |
-| Cross-module implementation, difficult debugging, architecture analysis | `magpie/aws-quick/smart` + `medium/high` | `magpie/qoder/hmodel` + `max`; `magpie/workbuddy/deepseek-v4.1-flash` + `max` |
-| Independent code review, second opinion | `magpie/qoder/hmodel` + `max`; `magpie/dgx-spark/inkling-2-mini` + `max` | `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/deepai/muse-ember` + `xhigh` |
+| Cross-module implementation, difficult debugging, architecture analysis | `magpie/mistral/deepseek-v4-1-flash-1017` + `max` | `magpie/qoder/hmodel` + `max`; `magpie/workbuddy/deepseek-v4.1-flash` + `max` |
+| Independent code review, second opinion | `magpie/qoder/hmodel` + `max`; `magpie/mistral/deepseek-v4-1-flash-1017` + `max` | `magpie/dgx-spark/inkling-2-mini` + `max`; `magpie/stepfun-cn/step-5-preview` + `high`; `magpie/deepai/muse-ember` + `xhigh` |
 | Security review, data-loss risk, final high-risk review | `magpie/workbuddy/deepseek-v4.1-flash` + `max` | A different model family from the implementer: `magpie/qoder/hmodel` + `max` or `magpie/kimi-code-cn/k3.1-pro` + `max` |
 
 ## Load balancing
@@ -35,7 +35,7 @@ For each new independent-review task, alternate between:
 
 ```text
 magpie/qoder/hmodel:max
-↔ magpie/dgx-spark/inkling-2-mini:max
+↔ magpie/mistral/deepseek-v4-1-flash-1017:max
 ```
 
 When the qoder/hmodel slot is unavailable because of exhausted quota, use
