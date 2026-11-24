@@ -22,6 +22,11 @@ reason:
   settles a session whose Goal is still active; both assert that exact failure;
 - the test-only boundary peer bounds its own continuation requests, so a
   composition test is bounded by the fixture rather than by a provider error.
+- a notification whose text can legitimately repeat within one session is
+  asserted with `notifyAfter(marker, …)` scoped to records captured after the
+  prompt that should produce it, never an unscoped `waitForNotify()` over the
+  whole history; the marker is captured before each prompt, so the second
+  command's warning cannot be read from the first.
 
 This is verified, not assumed: instrumenting the scripted provider to log every
 missing step and running the whole suite reports **zero** missing steps, so no

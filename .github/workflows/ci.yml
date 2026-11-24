@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Pi (required by the real-Pi RPC suite)
+        run: npm install -g @earendil-works/pi-coding-agent
+
+      - name: Check Pi version
+        run: pi --version
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+  pr-body:
+    name: Spec-ticket PRs close their issue
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require Closes link when a PR is part of a spec
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body="$(gh pr view "${{ github.event.pull_request.number }}" --json body --jq .body)"
+          if [[ "$body" == *"Part of #"* && "$body" != *"Closes #"* ]]; then
+            echo "PR body must link its ticket with 'Closes #<n>' so merging closes the issue automatically."
+            exit 1
+          fi

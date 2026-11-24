@@ -113,3 +113,10 @@ A subagent assigned any review of workspace changes, a PR, a commit, or a branch
 - Keep skills enabled and give the Reviewer at least `read,bash,grep,find,ls`. Bash is required for OCR and Git; do not spawn a Reviewer with a tool set that omits Bash or with `--no-skills`.
 - Reviewers only review; they must not modify code. The profile above removes `edit` and `write`, and the Reviewer must not write through `bash` either; the orchestrator arranges fixes separately based on review results.
 - If the OCR CLI is unavailable or the workflow is blocked, follow the skill's troubleshooting instructions and report the blocker; do not substitute native `open-code-review` or an ad hoc diff review.
+
+## Project review checkpoints
+
+Apply these pi-goal-specific checks on every review:
+
+- **Fail closed on every authority path.** Any fallback from a confirmation, creation-authority, admission, or tool-registration check must refuse with an actionable diagnostic. A downgrade the spec does not list is a violation, not a convenience.
+- **Validate the raw input before normalizing.** Line and format rules run on the value as supplied; trimming or normalization happens only after validation, so a violating input cannot be silently repaired into an accepted one.
